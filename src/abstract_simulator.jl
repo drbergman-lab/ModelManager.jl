@@ -123,3 +123,49 @@ Perform all sampling-level setup (typically: compile the shared custom code once
 before collecting monad tasks. Return `true` on success, `false` on failure.
 """
 function setupSampling end
+
+########################################################
+############   Database upgrade interface   ############
+########################################################
+
+"""
+    packageName(sim::AbstractSimulator)::String
+
+Return the registered Julia package name for this simulator framework
+(e.g. `"PhysiCellModelManager"`). Used by [`getPackageVersion`](@ref) to look up
+the runtime version via `Pkg`.
+"""
+function packageName end
+
+"""
+    dbVersionTableName(sim::AbstractSimulator)::String
+
+Return the name of the SQLite table used to persist the package version in the
+project database (e.g. `"pcmm_version"`). The generic upgrade machinery reads and
+writes this table to track which version a given database was last migrated to.
+"""
+function dbVersionTableName end
+
+"""
+    upgradeMilestones(sim::AbstractSimulator)::Vector{VersionNumber}
+
+Return a **sorted** vector of milestone `VersionNumber`s that have associated
+database schema changes. [`upgradeToMilestone`](@ref) is called for each milestone
+between the current database version and the target package version.
+"""
+function upgradeMilestones end
+
+"""
+    upgradeToMilestone(sim::AbstractSimulator, version::VersionNumber, auto_upgrade::Bool)::Bool
+
+Apply the database schema migration required to bring the project database up to
+`version`. Called by [`upgradePackage`](@ref) for each milestone that needs to be
+crossed. Return `true` on success, `false` to abort the upgrade chain.
+
+Implementations are responsible for:
+1. Prompting the user (when `auto_upgrade` is `false`) for any large/destructive migrations.
+2. Making all necessary DDL/DML changes to the database.
+3. **Not** updating the version table — [`upgradePackage`](@ref) does that after a
+   successful return.
+"""
+function upgradeToMilestone end

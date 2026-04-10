@@ -1,6 +1,6 @@
 name = "ModelManager"
 uuid = "2cc58058-5792-4be5-9801-0e92bd3a2373"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Daniel Bergman <danielrbergman@gmail.com> and contributors"]
 
 [deps]
