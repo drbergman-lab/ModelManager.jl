@@ -1,0 +1,70 @@
+# ModelManager.jl
+
+Simulator-agnostic infrastructure for agent-based model (ABM) management in Julia.
+
+ModelManager provides the generic base layer for managing simulation runs, parameter variations, sensitivity analysis, and database bookkeeping. Simulator-specific packages (e.g. [PhysiCellModelManager.jl](https://github.com/drbergman-lab/PhysiCellModelManager.jl)) extend this package by implementing the `AbstractSimulator` interface.
+
+## Quick start
+
+ModelManager is not used directly by end users — use a concrete simulator package instead. If you are building a new simulator package on top of ModelManager:
+
+1. Add the BergmanLabRegistry:
+```julia-repl
+pkg> registry add https://github.com/drbergman-lab/BergmanLabRegistry
+```
+2. Add ModelManager as a dependency:
+```julia-repl
+pkg> add ModelManager
+```
+3. Define your simulator:
+```julia
+using ModelManager
+
+mutable struct MySimulator <: AbstractSimulator
+    dir::String
+    # ...simulator-specific fields
+end
+```
+4. Implement the required interface methods (see `AbstractSimulator` docstring).
+5. Set the global state in your package's `__init__`:
+```julia
+function __init__()
+    ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator=MySimulator(...))
+end
+```
+
+---
+
+## Implementation Status
+
+> For Claude Code sessions: this section is the authoritative record of what has been built. Update it as features are completed. See [PRD.md](PRD.md) for behavioral specifications and [progress.md](progress.md) for decision rationale.
+
+### Completed
+
+- [x] `AbstractSimulator` interface — extension point for simulator backends
+- [x] `ModelManagerGlobals` — generic global state; simulator-specific fields moved to concrete simulators
+- [x] Project configuration — `inputs.toml` parsing, `ProjectLocations`, location path utilities
+- [x] Trial hierarchy — `Simulation`, `Monad`, `Sampling`, `Trial`, `InputFolders`, `VariationID`
+- [x] Database schema — generic SQLite schema parameterized by simulator version table/column names
+- [x] Database utilities — `queryToDataFrame`, `constructSelectQuery`, `buildWhereClause`, etc.
+- [x] Schema migrations — `up.jl` framework with `upgradePackage`, `upgradeToMilestone`
+- [x] Runner — parallel simulation execution via Julia tasks/channels; HPC SLURM support
+- [x] Deletion — `deleteSimulations`, `deleteMonad`, `deleteSampling`, `deleteTrial`, `resetDatabase`
+- [x] Parameter variations — `XMLPath`, `DiscreteVariation`, `DistributedVariation`, `CoVariation`, `LatentVariation`
+- [x] Space-filling designs — `GridVariation`, `LHSVariation`, `SobolVariation`, `RBDVariation`
+- [x] Sensitivity analysis — MOAT, Sobol', RBD-FAST (generic, no simulator-specific logic)
+- [x] `createTrial` / `run` user API — convenience wrappers over the trial hierarchy
+- [x] `postSimulationProcessing` interface stub — simulators override for cleanup/pruning
+- [x] `initializeInputFolder` / `getInputFolderDescription` / `clearSimulatorArtifacts` interface stubs
+- [x] `addVariationRows` interface stub — simulators implement DB writes for variation rows
+- [x] HPC utilities — `isRunningOnHPC`, `setJobOptions`, `defaultJobOptions`
+
+### In Progress
+
+- [ ] PCMM migration — wiring PCMM to use `ModelManagerGlobals` and implement all `AbstractSimulator` methods
+
+### Remaining
+
+- [ ] `initializeModelManager` generic entry point (currently lives in PCMM's `__init__`)
+- [ ] `createProject` generic entry point
+- [ ] Separate ModelManager.jl into its own registered package (Phase 2)
