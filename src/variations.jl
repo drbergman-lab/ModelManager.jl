@@ -395,9 +395,15 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
 end
 
 """
-    defaultLatentParameterNames(latent_parameters, targets)
+    defaultLatentParameterNames(latent_parameters::Vector, targets::Vector{XMLPath})
 
 Generate default names for latent parameters based on target column names.
+
+For each latent parameter, the name is constructed as:
+`"<target_1> | <target_2> | ... | lp#<i>"` where `<target_n>` is the column name of the n-th target parameter and `<i>` is the index of the latent parameter.
+
+# Returns
+- `Vector{String}`: A vector of default names for the latent parameters.
 """
 function defaultLatentParameterNames(latent_parameters::Vector, targets::Vector{XMLPath})
     par_names = join(columnName.(targets), " | ")

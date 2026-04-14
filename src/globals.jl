@@ -72,7 +72,7 @@ end
 """
     centralDB()
 
-Return the central [`SQLite.DB`](@ref) connection for the current project.
+Return the central `SQLite.DB` connection for the current project.
 """
 centralDB() = mm_globals().db
 
