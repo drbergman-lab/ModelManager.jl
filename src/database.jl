@@ -604,6 +604,215 @@ variationIDs(location::Symbol, M::AbstractMonad) = [M.variation_id[location]]
 variationIDs(location::Symbol, sampling::Sampling) = [monad.variation_id[location] for monad in sampling.monads]
 
 """
+    shortLocationVariationID(fieldname::Symbol)
+    shortLocationVariationID(fieldname::String)
+    shortLocationVariationID(type::Type, fieldname)
+
+Return the abbreviated column-name symbol for `fieldname`'s variation ID in display tables.
+
+Dispatches to `shortLocationVariationID(simulator(), fieldname)`. The default implementation
+returns `locationVariationIDName(fieldname) |> Symbol`. Simulator packages should extend
+`shortLocationVariationID(::TheirSimulator, fieldname::Symbol)` to provide custom abbreviations.
+"""
+shortLocationVariationID(fieldname::Symbol) = shortLocationVariationID(simulator(), fieldname)
+shortLocationVariationID(::AbstractSimulator, fieldname::Symbol) = locationVariationIDName(fieldname) |> Symbol
+shortLocationVariationID(fieldname::String) = shortLocationVariationID(Symbol(fieldname))
+shortLocationVariationID(type::Type, fieldname) = type(shortLocationVariationID(fieldname))
+
+"""
+    shortVariationName(location::Symbol, name::String)
+
+Return the display name for variation column `name` at `location`.
+
+Dispatches to `shortVariationName(simulator(), location, name)`. The default returns `name`
+unchanged. Simulator packages should extend `shortVariationName(::TheirSimulator, location, name)`
+to provide human-readable column names.
+"""
+shortVariationName(location::Symbol, name::String) = shortVariationName(simulator(), location, name)
+shortVariationName(::AbstractSimulator, ::Symbol, name::String) = name
+
+"""
+    locationVariationsTable(query::String, db::SQLite.DB; remove_constants::Bool=false)
+
+Return a DataFrame from `query` against `db`, dropping the `par_key` column.
+Removes constant columns if `remove_constants` is `true` and there is more than one row.
+"""
+function locationVariationsTable(query::String, db::SQLite.DB; remove_constants::Bool=false)
+    df = queryToDataFrame(query, db=db)
+    select!(df, Not(:par_key))
+    if remove_constants && size(df, 1) > 1
+        col_names = names(df)
+        filter!(n -> length(unique(df[!,n])) > 1, col_names)
+        select!(df, col_names)
+    end
+    return df
+end
+
+"""
+    locationVariationsTable(location::Symbol, variations_database::SQLite.DB, variation_ids::AbstractVector{<:Integer}; remove_constants::Bool=false)
+
+Return a DataFrame of variation rows for `variation_ids` from `variations_database`.
+"""
+function locationVariationsTable(location::Symbol, variations_database::SQLite.DB, variation_ids::AbstractVector{<:Integer}; remove_constants::Bool=false)
+    used_variation_ids = filter(x -> x != -1, variation_ids)
+    query = constructSelectQuery(locationVariationsTableName(location), "WHERE $(locationVariationIDName(location)) IN ($(join(used_variation_ids,",")))")
+    df = locationVariationsTable(query, variations_database; remove_constants=remove_constants)
+    rename!(name -> shortVariationName(location, name), df)
+    return df
+end
+
+"""
+    locationVariationsTable(location::Symbol, S::AbstractSampling; remove_constants::Bool=false)
+
+Return a DataFrame of variation rows for the given location and sampling.
+"""
+function locationVariationsTable(location::Symbol, S::AbstractSampling; remove_constants::Bool=false)
+    return locationVariationsTable(location, locationVariationsDatabase(location, S), variationIDs(location, S); remove_constants=remove_constants)
+end
+
+"""
+    locationVariationsTable(location::Symbol, ::Nothing, variation_ids; kwargs...)
+
+Return a single-column DataFrame for a location that is not being used (all IDs = -1).
+"""
+function locationVariationsTable(location::Symbol, ::Nothing, variation_ids::AbstractVector{<:Integer}; kwargs...)
+    @assert all(x -> x == -1, variation_ids) "If the $(location) is not being used, then all $(locationVariationIDName(location))s must be -1."
+    return DataFrame(shortLocationVariationID(location)=>variation_ids)
+end
+
+"""
+    locationVariationsTable(location::Symbol, ::Missing, variation_ids; kwargs...)
+
+Return a single-column DataFrame for a location whose folder has no variations database (all IDs = 0).
+"""
+function locationVariationsTable(location::Symbol, ::Missing, variation_ids::AbstractVector{<:Integer}; kwargs...)
+    @assert all(x -> x == 0, variation_ids) "If the $(location)_folder does not contain a $(locationVariationsDBName(location)), then all $(locationVariationIDName(location))s must be 0."
+    return DataFrame(shortLocationVariationID(location)=>variation_ids)
+end
+
+"""
+    appendVariations(location::Symbol, df::DataFrame)
+
+Join the varied parameters for `location` onto `df`.
+"""
+function appendVariations(location::Symbol, df::DataFrame)
+    short_var_name = shortLocationVariationID(location)
+    var_df = DataFrame(short_var_name => Int[], :folder_name => String[])
+    unique_tuples = [(row["$(location)_folder"], row[locationVariationIDName(location)]) for row in eachrow(df)] |> unique
+    for unique_tuple in unique_tuples
+        temp_df = locationVariationsTable(location, locationVariationsDatabase(location, unique_tuple[1]), [unique_tuple[2]]; remove_constants=false)
+        temp_df[!,:folder_name] .= unique_tuple[1]
+        append!(var_df, temp_df, cols=:union)
+    end
+    folder_pair = ("$(location)_folder" |> Symbol) => :folder_name
+    id_pair = (locationVariationIDName(location) |> Symbol) => short_var_name
+    return outerjoin(df, var_df, on = [folder_pair, id_pair])
+end
+
+"""
+    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)])
+
+Return a DataFrame for the given SQL query on the simulations table.
+
+By default, constant columns and raw ID columns are removed.
+
+# Arguments
+- `query::String`: The SQL query to execute.
+
+# Keyword Arguments
+- `remove_constants::Bool`: If true, removes columns that have the same value for all simulations. Defaults to true.
+- `sort_by::Vector{String}`: A vector of column names to sort the table by. Defaults to all columns. To populate this argument, it is recommended to first print the table to see the column names.
+- `sort_ignore::Vector{String}`: A vector of column names to ignore when sorting. Defaults to the simulation ID and the variation IDs associated with the simulations.
+"""
+function simulationsTableFromQuery(query::String;
+                                   remove_constants::Bool=true,
+                                   sort_by=String[],
+                                   sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)])
+    sort_by = (sort_by isa Vector ? sort_by : [sort_by]) .|> Symbol
+    sort_ignore = (sort_ignore isa Vector ? sort_ignore : [sort_ignore]) .|> Symbol
+
+    df = queryToDataFrame(query)
+    id_col_names_to_remove = names(df)
+
+    filter!(n -> n != "simulation_id", id_col_names_to_remove)
+    addFolderNameColumns!(df)
+
+    for loc in projectLocations().varied
+        df = appendVariations(loc, df)
+    end
+
+    select!(df, Not(id_col_names_to_remove))
+    rename!(df, :simulation_id => :SimID)
+    col_names = names(df)
+    if remove_constants && size(df, 1) > 1
+        filter!(n -> length(unique(df[!, n])) > 1, col_names)
+        select!(df, col_names)
+    end
+    if isempty(sort_by)
+        sort_by = deepcopy(col_names)
+    end
+    setdiff!(sort_by, sort_ignore)
+    filter!(n -> n in col_names, sort_by)
+    sort!(df, sort_by)
+    return df
+end
+
+"""
+    simulationsTable(args...; kwargs...)
+
+Return a DataFrame with simulation data. See [`simulationsTableFromQuery`](@ref) for keyword arguments.
+
+`args...` can be:
+- Any `AbstractTrial` objects (or arrays thereof)
+- A vector of simulation IDs
+- Omitted (returns data for all simulations)
+"""
+function simulationsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
+    query = constructSelectQuery("simulations", "WHERE simulation_id IN ($(join(simulationIDs(T),",")));")
+    return simulationsTableFromQuery(query; kwargs...)
+end
+
+simulationsTable(T::AbstractTrial, Ts::Vararg{AbstractTrial}; kwargs...) = simulationsTable([T; Ts...]; kwargs...)
+
+function simulationsTable(simulation_ids::AbstractVector{<:Integer}; kwargs...)
+    assertInitialized()
+    query = constructSelectQuery("simulations", "WHERE simulation_id IN ($(join(simulation_ids,",")));")
+    return simulationsTableFromQuery(query; kwargs...)
+end
+
+function simulationsTable(; kwargs...)
+    assertInitialized()
+    query = constructSelectQuery("simulations")
+    return simulationsTableFromQuery(query; kwargs...)
+end
+
+"""
+    printSimulationsTable(args...; sink=println, kwargs...)
+
+Print a table of simulations and their varied values. See [`simulationsTable`](@ref).
+
+# Keyword Arguments
+- `sink`: A function to receive the DataFrame (default `println`). Can also use `CSV.write`.
+
+# Examples
+```julia
+printSimulationsTable([simulation_1, monad_3, sampling_2, trial_1])
+```
+```julia
+sim_ids = [1, 2, 3]
+printSimulationsTable(sim_ids; remove_constants=false)
+```
+```julia
+using CSV
+printSimulationsTable(; sink=CSV.write("temp.csv"))
+```
+"""
+function printSimulationsTable(args...; sink=println, kwargs...)
+    assertInitialized()
+    simulationsTable(args...; kwargs...) |> sink
+end
+
+"""
     addFolderNameColumns!(df::DataFrame)
 
 Append `<location>_folder` columns to `df` by looking up folder names.

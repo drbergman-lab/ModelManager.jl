@@ -41,6 +41,9 @@ export eraseSimulationIDFromConstituents
 export SimulationProcess, updateDatabaseOnCompletion, simulationFailed
 export dispatchSimulation, runAbstractTrial, run
 export reinitializeDatabase, addFolderNameColumns!, printSimulationIDs
+export shortLocationVariationID, shortVariationName
+export locationVariationsTable, appendVariations
+export simulationsTableFromQuery, simulationsTable, printSimulationsTable
 export XMLPath
 export AbstractVariation, ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation
