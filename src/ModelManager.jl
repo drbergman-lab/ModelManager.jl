@@ -18,6 +18,7 @@ export databaseDiagnostics, variationIDs
 export ModelManagerGlobals, mm_globals_ref, mm_globals, assertInitialized
 export centralDB, dataDir, isInitialized, projectLocations, inputsDict
 export simulatorVersionIDName, currentSimulatorVersionID
+export initializeModelManager
 export setNumberOfParallelSims
 export isRunningOnHPC, prepareHPCCommand, useHPC, setJobOptions, rm_hpc_safe
 export ProjectLocations, parseProjectInputsConfigurationFile, sanitizePathElement

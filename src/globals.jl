@@ -4,6 +4,7 @@ export ModelManagerGlobals, mm_globals_ref, mm_globals
 export centralDB, dataDir, isInitialized, assertInitialized
 export projectLocations, inputsDict, simulator
 export simulatorVersionIDName, currentSimulatorVersionID
+export initializeModelManager
 
 """
     ModelManagerGlobals
@@ -135,3 +136,22 @@ Assert that the model manager has been initialized, throwing an informative erro
 function assertInitialized()
     @assert isInitialized() "The model manager has not been initialized for a project. Please run `initializeModelManager` first."
 end
+
+"""
+    initializeModelManager(simulator::AbstractSimulator, data_dir::String; kwargs...)
+
+Initialize ModelManager for a project rooted at `data_dir` using `simulator` as the
+concrete backend.
+
+This is the generic entry point that simulator packages (e.g. PhysiCellModelManager)
+should call from their own initialization logic after constructing their
+`AbstractSimulator` instance.  A complete implementation is expected to:
+
+1. Construct a [`ModelManagerGlobals`](@ref) with the provided `simulator` and
+   `data_dir` and assign it to [`mm_globals_ref`](@ref)`[]`.
+2. Connect to (or create) the central project database.
+3. Call [`postInitDisplay`](@ref) to print startup information.
+
+This stub must be extended (or wrapped) by the simulator package.
+"""
+function initializeModelManager end
