@@ -1,3 +1,5 @@
+using DataFrames
+
 # simulationsTable and printSimulationsTable are simulator-specific — exported by the simulator package
 
 ################## Database Initialization Functions ##################

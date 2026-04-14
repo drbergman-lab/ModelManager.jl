@@ -55,7 +55,6 @@ export createTrial
 
 include("utilities.jl")
 include("abstract_simulator.jl")
-include("database_utils.jl")
 include("up.jl")
 include("package_version.jl")
 include("hpc.jl")
