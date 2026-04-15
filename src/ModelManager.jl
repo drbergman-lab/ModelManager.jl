@@ -17,7 +17,6 @@ export statusCodeID, isStarted, locationVariationsDatabase
 export databaseDiagnostics, variationIDs
 export ModelManagerGlobals, mm_globals_ref, mm_globals, assertInitialized
 export centralDB, dataDir, isInitialized, projectLocations, inputsDict
-export simulatorVersionIDName, currentSimulatorVersionID
 export initializeModelManager
 export setNumberOfParallelSims
 export isRunningOnHPC, prepareHPCCommand, useHPC, setJobOptions, rm_hpc_safe
@@ -32,7 +31,6 @@ export Simulation, Monad, Sampling, Trial
 export constituentIDs, simulationIDs, monadIDs, trialFolder, pathToOutputFolder
 export lowerClassString, constituentType, constituentTypeFilename
 export MMOutput, trialID, trialType
-export recordConstituentIDs, compressIDs
 export createMMTable, createPCMMTable
 export initializeDatabase, createSchema, insertFolder
 export inputFolderName, inputFolderID
@@ -52,7 +50,7 @@ export AddVariationMethod, GridVariation, LHSVariation, SobolVariation, RBDVaria
 export AddVariationsResult, AddGridVariationsResult, AddLHSVariationsResult, AddSobolVariationsResult, AddRBDVariationsResult
 export ParsedVariations
 export addVariations, columnName, calculateGSA!
-export variationLocation, variationValues, variationTarget, variationDataType, sqliteDataType, nTargetDims
+export sqliteDataType
 export MOAT, Sobolʼ, SobolMM, RBD
 export GSAMethod, GSASampling, MOATSampling, SobolSampling, RBDSampling
 export createTrial
