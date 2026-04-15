@@ -85,12 +85,12 @@ jobs:
 
     - uses: julia-actions/julia-processcoverage@v1
       with:
-        directories: src,deps
+        directories: src
 
     - uses: codecov/codecov-action@v6
       with:
         files: lcov.info
-        token: ${{ secrets.CODECOV_TOKEN }}
+        token: ${{ secrets.CODECOV_TOKEN }} # this is a repo-specific secret since this is (currently) a private repo
         fail_ci_if_error: false
 
   docs:
