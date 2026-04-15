@@ -3,7 +3,6 @@ using Parameters, SQLite
 export ModelManagerGlobals, mm_globals_ref, mm_globals
 export centralDB, dataDir, isInitialized, assertInitialized
 export projectLocations, inputsDict, simulator
-export simulatorVersionIDName, currentSimulatorVersionID
 export initializeModelManager
 
 """

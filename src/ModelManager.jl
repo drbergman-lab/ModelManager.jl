@@ -12,9 +12,8 @@ export AbstractSimulator
 export continueMilestoneUpgrade, populateTableOnFeatureSubset, upgradePackage
 export getPackageVersion, getDBPackageVersion, resolvePackageVersion
 export queryToDataFrame, stmtToDataFrame, constructSelectQuery, tableIDName
-export tableExists, tableColumns, columnsExist, buildWhereClause
-export statusCodeID, isStarted, locationVariationsDatabase
-export databaseDiagnostics, variationIDs
+export tableExists, tableColumns
+export locationVariationsDatabase
 export ModelManagerGlobals, mm_globals_ref, mm_globals, assertInitialized
 export centralDB, dataDir, isInitialized, projectLocations, inputsDict
 export initializeModelManager
@@ -29,20 +28,16 @@ export InputFolder, InputFolders, VariationID
 export AbstractTrial, AbstractSampling, AbstractMonad
 export Simulation, Monad, Sampling, Trial
 export constituentIDs, simulationIDs, monadIDs, trialFolder, pathToOutputFolder
-export lowerClassString, constituentType, constituentTypeFilename
 export MMOutput, trialID, trialType
-export createMMTable, createPCMMTable
-export initializeDatabase, createSchema, insertFolder
-export inputFolderName, inputFolderID
+export insertFolder
 export deleteSimulation, deleteSimulations, deleteSimulationsByStatus, resetDatabase
 export deleteMonad, deleteSampling, deleteTrial
 export eraseSimulationIDFromConstituents
 export SimulationProcess, updateDatabaseOnCompletion, simulationFailed
 export dispatchSimulation, runAbstractTrial, run
-export reinitializeDatabase, addFolderNameColumns!, printSimulationIDs
-export shortLocationVariationID, shortVariationName
-export locationVariationsTable, appendVariations
-export simulationsTableFromQuery, simulationsTable, printSimulationsTable
+export printSimulationIDs
+export shortLocationVariationID
+export simulationsTable, printSimulationsTable
 export XMLPath
 export AbstractVariation, ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation

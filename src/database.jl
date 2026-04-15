@@ -211,9 +211,6 @@ function createMMTable(table_name::String, schema::String; db::SQLite.DB=central
     SQLite.execute(db, "CREATE TABLE IF NOT EXISTS $(table_name) (\n$(schema)\n)")
 end
 
-#! Backward-compatible alias used by PCMM and legacy code.
-const createPCMMTable = createMMTable
-
 """
     tableIDName(table::String; strip_s::Bool=true)
 
