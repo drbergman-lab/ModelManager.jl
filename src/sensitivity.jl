@@ -239,7 +239,7 @@ Sobolʼ(n::Int; sobol_index_methods::NamedTuple{(:first_order,:total_order),Tupl
 
 ASCII alias for [`Sobolʼ`](@ref).
 """
-SobolMM = Sobolʼ
+const SobolMM = Sobolʼ
 
 """
     SobolSampling <: GSASampling

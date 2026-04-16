@@ -1,7 +1,5 @@
 import Base.run
 
-export runAbstractTrial, run, simulationFailed, SimulationProcess, updateDatabaseOnCompletion
-
 """
     simulationFailed(simulation::Simulation, monad_id::Int)
     simulationFailed(simulation_id::Int, monad_id::Int)

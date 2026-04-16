@@ -4,7 +4,6 @@ import Distributions: cdf
 export ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation
 export GridVariation, LHSVariation, SobolVariation, RBDVariation
-export addVariations
 
 ################## Column name utility ##################
 
