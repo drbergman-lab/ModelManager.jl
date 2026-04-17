@@ -28,7 +28,7 @@ export AbstractTrial, AbstractSampling, AbstractMonad
 export Simulation, Monad, Sampling, Trial
 export constituentIDs, simulationIDs, monadIDs, trialFolder, pathToOutputFolder
 export MMOutput, trialID, trialType
-export insertFolder
+export createMMTable, insertFolder
 export deleteSimulation, deleteSimulations, deleteSimulationsByStatus, resetDatabase
 export deleteMonad, deleteSampling, deleteTrial
 export run
@@ -44,6 +44,8 @@ export columnName, calculateGSA!
 export sqliteDataType
 export MOAT, Sobolʼ, SobolMM, RBD
 export createTrial
+export getSimpleContent, retrieveElement, columnNameToXMLPath
+export parseValueFromString, getParameterValue, getAllParameterValues
 
 include("utilities.jl")
 include("abstract_simulator.jl")
@@ -57,6 +59,7 @@ include("recorder.jl")
 include("database.jl")
 include("runner.jl")
 include("deletion.jl")
+include("xml_utilities.jl")
 include("variations.jl")
 include("sensitivity.jl")
 include("user_api.jl")

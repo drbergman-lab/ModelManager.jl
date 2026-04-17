@@ -740,7 +740,7 @@ function addVariations(::GridVariation, inputs::InputFolders, pv::ParsedVariatio
     loc_dicts = map(unique_locs) do loc
         loc => (all_vals[loc_inds[loc], :], types[loc_inds[loc]], targets[loc_inds[loc]])
     end |> Dict
-    return addVariationRows(mm_globals().simulator, inputs, reference_variation_id, loc_dicts) |> AddGridVariationsResult
+    return addVariationRows(inputs, reference_variation_id, loc_dicts) |> AddGridVariationsResult
 end
 
 ################## Latin Hypercube Sampling ##################
@@ -965,5 +965,423 @@ function addCDFVariations(inputs::InputFolders, pv::ParsedVariations, reference_
     loc_dicts = map(unique_locs) do loc
         loc => (all_vals[loc_inds[loc], :], types[loc_inds[loc]], targets[loc_inds[loc]])
     end |> Dict
-    return addVariationRows(mm_globals().simulator, inputs, reference_variation_id, loc_dicts)
+    return addVariationRows(inputs, reference_variation_id, loc_dicts)
+end
+
+################## Database Helper Functions ##################
+
+"""
+    validateParsBytes(db::SQLite.DB, table_name::String)
+
+Assert that the `par_key` blob in every row of `table_name` matches the float64
+reinterpretation of the other columns.
+"""
+function validateParsBytes(db::SQLite.DB, table_name::String)
+    df = queryToDataFrame("SELECT * FROM $table_name;", db=db)
+    @assert names(df)[1] == tableIDName(table_name) "$(table_name) does not have the primary key as the first column."
+    @assert names(df)[2] == "par_key" "$(table_name) does not have par_key as the second column."
+    for row in eachrow(df)
+        par_key = row[:par_key]
+        vals = [row[3:end]...]
+        vals[vals .== "true"] .= 1.0
+        vals[vals .== "false"] .= 0.0
+        expected_par_key = reinterpret(UInt8, Vector{Float64}(vals))
+        @assert par_key == expected_par_key """
+        par_key does not match the expected values for $(table_name) ID $(row[1]).
+        Expected: $(expected_par_key)
+        Found: $(par_key)
+        """
+    end
+end
+
+"""
+    ColumnSetup
+
+A struct to hold the setup for the columns in a variations database.
+
+# Fields
+- `db::SQLite.DB`: The database connection to the variations database.
+- `table::String`: The name of the table in the database.
+- `variation_id_name::String`: The name of the variation ID column in the table.
+- `ordered_inds::Vector{Int}`: Indexes into the concatenated static and varied values to get the parameters in the order of the table columns (excluding the variation ID and par_key columns).
+- `static_values_db::Vector{String}`: The static values as strings for DB insertion.
+- `static_values_key::Vector{Float64}`: The static values as floats for the par_key hash.
+- `feature_str::String`: The string representation of the features (columns) in the table.
+- `types::Vector{DataType}`: The data types of the columns in the table.
+- `placeholders::String`: The string representation of the placeholders for the values in the table.
+- `stmt_insert::SQLite.Stmt`: The prepared statement for inserting new rows into the table.
+- `stmt_select::SQLite.Stmt`: The prepared statement for selecting existing rows from the table.
+"""
+struct ColumnSetup
+    db::SQLite.DB
+    table::String
+    variation_id_name::String
+    ordered_inds::Vector{Int}
+    static_values_db::Vector{String}
+    static_values_key::Vector{Float64}
+    feature_str::String
+    types::Vector{DataType}
+    placeholders::String
+    stmt_insert::SQLite.Stmt
+    stmt_select::SQLite.Stmt
+end
+
+"""
+    addVariationRow(column_setup::ColumnSetup, varied_values::Vector{<:Real})
+
+Add a new row to the location variations database using the prepared statement.
+If the row already exists, it returns the existing variation ID.
+"""
+function addVariationRow(column_setup::ColumnSetup, varied_values::AbstractVector{<:Real})
+    db_varied_values = [t == Bool ? v == 1.0 : v for (t, v) in zip(column_setup.types, varied_values)] .|> string
+    db_pars = [column_setup.static_values_db; db_varied_values]
+    pars_for_key = [column_setup.static_values_key; varied_values] |> Vector{Float64}
+
+    par_key = reinterpret(UInt8, pars_for_key[column_setup.ordered_inds])
+    params = Tuple([db_pars; [par_key]])
+    new_id = stmtToDataFrame(column_setup.stmt_insert, params) |> x -> x[!, 1]
+
+    new_added = length(new_id) == 1
+    if !new_added
+        df = stmtToDataFrame(column_setup.stmt_select, params; is_row=true)
+        new_id = df[!, 1]
+    end
+    @debug validateParsBytes(column_setup.db, column_setup.table)
+    return new_id[1]
+end
+
+"""
+    getColumnDefaults(location::Symbol, folder_id::Int, loc_targets::Vector{XMLPath})
+    getColumnDefaults(::AbstractSimulator, location::Symbol, folder_id::Int, loc_targets::Vector{XMLPath})
+
+Return the default values (as strings) for `loc_targets` columns when they are first added
+to the variation database for `location`/`folder_id`. Called by [`addColumns`](@ref).
+
+Default implementation reads the base XML file for the location and extracts values via
+[`getSimpleContent`](@ref). Simulator packages may override for non-XML variation sources.
+"""
+getColumnDefaults(location::Symbol, folder_id::Int, loc_targets::Vector{XMLPath}) =
+    getColumnDefaults(simulator(), location, folder_id, loc_targets)
+function getColumnDefaults(::AbstractSimulator, location::Symbol, folder_id::Int, loc_targets::Vector{XMLPath})
+    folder = inputFolderName(location, folder_id)
+    basenames = inputsDict()[location]["basename"]
+    basenames = basenames isa Vector ? basenames : [basenames]
+    basename_is_varied = inputsDict()[location]["varied"] .&& ([splitext(bn)[2] .== ".xml" for bn in basenames])
+    basename_ind = findall(basename_is_varied .&& isfile.([joinpath(locationPath(location, folder), bn) for bn in basenames]))
+    @assert !isnothing(basename_ind) "Folder $(folder) does not contain a valid $(location) file to support variations. The options are $(basenames[basename_is_varied])."
+    @assert length(basename_ind) == 1 "Folder $(folder) contains multiple valid $(location) files to support variations. The options are $(basenames[basename_is_varied])."
+    path_to_xml = joinpath(locationPath(location, folder), basenames[basename_ind[1]])
+    xml_doc = parse_file(path_to_xml)
+    default_values = [getSimpleContent(xml_doc, xp.xml_path) for xp in loc_targets]
+    free(xml_doc)
+    return default_values
+end
+
+"""
+    addColumns(location::Symbol, folder_id::Int, loc_types::Vector{DataType}, loc_targets::Vector{XMLPath})
+
+Add columns to the variations database for the given location and folder_id.
+"""
+function addColumns(location::Symbol, folder_id::Int, loc_types::Vector{DataType}, loc_targets::Vector{XMLPath})
+    folder = inputFolderName(location, folder_id)
+    db_columns = locationVariationsDatabase(location, folder)
+
+    table_name = locationVariationsTableName(location)
+
+    @debug validateParsBytes(db_columns, table_name)
+
+    id_column_name = locationVariationIDName(location)
+    prev_par_column_names = tableColumns(table_name; db=db_columns)
+    filter!(x -> !(x in (id_column_name, "par_key")), prev_par_column_names)
+    varied_par_column_names = [columnName(xp.xml_path) for xp in loc_targets]
+
+    is_new_column = [!(varied_column_name in prev_par_column_names) for varied_column_name in varied_par_column_names]
+    if any(is_new_column)
+        new_column_names = varied_par_column_names[is_new_column]
+        new_column_data_types = loc_types[is_new_column] .|> sqliteDataType
+        default_values_for_new = getColumnDefaults(location, folder_id, loc_targets[is_new_column])
+        for (new_column_name, data_type) in zip(new_column_names, new_column_data_types)
+            DBInterface.execute(db_columns, "ALTER TABLE $(table_name) ADD COLUMN '$(new_column_name)' $(data_type);")
+        end
+
+        columns = join("\"" .* new_column_names .* "\"", ",")
+        placeholders = join(["?" for _ in new_column_names], ",")
+        query = "UPDATE $table_name SET ($columns) = ($placeholders);"
+        stmt = SQLite.Stmt(db_columns, query)
+        DBInterface.execute(stmt, Tuple(default_values_for_new))
+
+        select_query = constructSelectQuery(table_name; selection="$(tableIDName(table_name)), par_key")
+        par_key_df = queryToDataFrame(select_query; db=db_columns)
+
+        default_values_for_new[default_values_for_new.=="true"] .= "1"
+        default_values_for_new[default_values_for_new.=="false"] .= "0"
+
+        new_bytes = reinterpret(UInt8, parse.(Float64, default_values_for_new))
+        for row in eachrow(par_key_df)
+            id = row[1]
+            par_key = row[2]
+            append!(par_key, new_bytes)
+            DBInterface.execute(db_columns, "UPDATE $table_name SET par_key = ? WHERE $(tableIDName(table_name)) = ?;", (par_key, id))
+        end
+    end
+
+    @debug validateParsBytes(db_columns, table_name)
+
+    static_par_column_names = deepcopy(prev_par_column_names)
+    previously_varied_names = varied_par_column_names[.!is_new_column]
+    filter!(x -> !(x in previously_varied_names), static_par_column_names)
+
+    return static_par_column_names, varied_par_column_names
+end
+
+"""
+    setUpColumns(location::Symbol, folder_id::Int, loc_types::Vector{DataType}, loc_targets::Vector{XMLPath}, reference_variation_id::Int)
+
+Set up the columns for the variations database for the given location and folder_id.
+"""
+function setUpColumns(location::Symbol, folder_id::Int, loc_types::Vector{DataType}, loc_targets::Vector{XMLPath}, reference_variation_id::Int)
+    static_par_column_names, varied_par_column_names = addColumns(location, folder_id, loc_types, loc_targets)
+    db_columns = locationVariationsDatabase(location, folder_id)
+    table_name = locationVariationsTableName(location)
+    variation_id_name = locationVariationIDName(location)
+
+    if isempty(static_par_column_names)
+        static_values_db = String[]
+        static_values_key = Float64[]
+        table_features = String[]
+    else
+        query = constructSelectQuery(table_name, "WHERE $(variation_id_name)=$(reference_variation_id);"; selection=join("\"" .* static_par_column_names .* "\"", ", "))
+        static_values = queryToDataFrame(query; db=db_columns, is_row=true) |> x -> [c[1] for c in eachcol(x)]
+        static_values_db = string.(static_values) |> Vector{String}
+        static_values_key = copy(static_values)
+        static_values_key[static_values_key.=="true"] .= 1.0
+        static_values_key[static_values_key.=="false"] .= 0.0
+        static_values_key = Vector{Float64}(static_values_key)
+        table_features = copy(static_par_column_names)
+    end
+    append!(table_features, varied_par_column_names)
+
+    feature_str = join("\"" .* table_features .* "\"", ",") * ",par_key"
+    placeholders = join(["?" for _ in table_features], ",") * ",?"
+
+    stmt_insert = SQLite.Stmt(db_columns, "INSERT OR IGNORE INTO $(table_name) ($(feature_str)) VALUES($placeholders) RETURNING $(variation_id_name);")
+    where_str = "WHERE ($(feature_str))=($(placeholders))"
+    stmt_str = constructSelectQuery(table_name, where_str; selection=variation_id_name)
+    stmt_select = SQLite.Stmt(db_columns, stmt_str)
+
+    column_to_full_index = Dict{String,Int}()
+    for (ind, col_name) in enumerate(table_features)
+        column_to_full_index[col_name] = ind
+    end
+    param_column_names = tableColumns(table_name; db=db_columns)
+    filter!(x -> !(x in (variation_id_name, "par_key")), param_column_names)
+    ordered_inds = [column_to_full_index[col_name] for col_name in param_column_names]
+
+    return ColumnSetup(db_columns, table_name, variation_id_name, ordered_inds, static_values_db, static_values_key, feature_str, loc_types, placeholders, stmt_insert, stmt_select)
+end
+
+"""
+    addVariationRows(inputs::InputFolders, reference_variation_id::VariationID, loc_dicts::Dict)
+
+Add new rows to the per-location variation databases and return the resulting variation IDs.
+
+`loc_dicts` maps each varied location symbol to a 3-tuple
+`(values_matrix, types, targets)` where `values_matrix` is a `#targets × #samples`
+numeric matrix.
+
+Called by [`addVariations`](@ref) (Grid, LHS, Sobol, RBD) and [`addCDFVariations`](@ref)
+after the generic sampling logic computes the parameter values.
+"""
+function addVariationRows(inputs::InputFolders, reference_variation_id::VariationID, loc_dicts::Dict)
+    location_variation_ids = Dict{Symbol, Vector{Int}}()
+    for (loc, (loc_vals, loc_types, loc_targets)) in pairs(loc_dicts)
+        column_setup = setUpColumns(loc, inputs[loc].id, loc_types, loc_targets, reference_variation_id[loc])
+        location_variation_ids[loc] = [addVariationRow(column_setup, c) for c in eachcol(loc_vals)]
+    end
+    n_par_vecs = length(first(values(location_variation_ids)))
+    for loc in projectLocations().varied
+        get!(location_variation_ids, loc, fill(reference_variation_id[loc], n_par_vecs))
+    end
+    return [([loc => location_variation_ids[loc][i] for loc in projectLocations().varied] |> VariationID) for i in 1:n_par_vecs]
+end
+
+################## Parameter Value Utilities ##################
+
+"""
+    parseValueFromString(v::String)
+
+Parse a string value: return `Bool` for `"true"`/`"false"`, `Float64` if numeric, or the
+original string otherwise.
+"""
+function parseValueFromString(v::String)
+    if v ∈ ("true", "false")
+        return v == "true"
+    elseif tryparse(Float64, v) |> !isnothing
+        return parse(Float64, v)
+    end
+    return v
+end
+
+"""
+    getParameterValue(M::AbstractMonad, location::Symbol, xp::XMLPath)
+
+Get the parameter value for `xp` at `location` from the monad's variations database if
+the column exists, otherwise fall back to the base XML file.
+
+- Boolean strings (`"true"` / `"false"`) are returned as `Bool`.
+- Numeric strings are returned as `Float64`.
+- Everything else is returned as-is.
+"""
+function getParameterValue(M::AbstractMonad, location::Symbol, xp::XMLPath)
+    db = locationVariationsDatabase(location, M)
+    @assert !isnothing(db) "XMLPath $(xp.xml_path) corresponds to location $(location), but that location is not being varied in this $(nameof(typeof(M)))."
+    @assert !ismissing(db) "Variations database for location $(location) not found in folder $(M.inputs[location].folder)."
+    if columnsExist([columnName(xp)], locationVariationsTableName(location); db=db)
+        query = constructSelectQuery(locationVariationsTableName(location), "WHERE $(locationVariationIDName(location))=$(M.variation_id[location])"; selection="\"" * columnName(xp) * "\"")
+        df = queryToDataFrame(query; db=db, is_row=true)
+        v = df[1, columnName(xp)]
+        if v ∈ ("true", "false")
+            return v == "true"
+        end
+        return v
+    else
+        path_to_xml = prepareBaseFile(M.inputs[location])
+        xml_doc = parse_file(path_to_xml)
+        v = getSimpleContent(xml_doc, xp.xml_path)
+        free(xml_doc)
+        return parseValueFromString(v)
+    end
+end
+
+################## getAllParameterValues ##################
+
+"""
+    getAllParameterValues(simulation_id::Int)
+    getAllParameterValues(S::AbstractSampling)
+
+Get all parameter values for the given simulation, monad, or sampling as a DataFrame.
+Simulation ID can also be passed directly as an integer.
+
+# Identifying attributes
+If sibling elements have identical tags, attributes are programmatically searched to find one that can be used to identify them.
+Priority is given to "name", "ID", and "id" attributes.
+If sibling elements cannot be uniquely identified by an attribute, artificial IDs will be added to the XML paths to ensure uniqueness for the column names.
+These will show up as `<tag>:temp_id:<index>` in the column names.
+Search for them with `contains(col_name, ":temp_id:")`.
+Note: these are not added to the XML files themselves.
+Users must manually insert such artificial IDs into their XML files to use PCMM to vary those parameters.
+
+# Converting column names into XML paths
+To convert the column names in the returned DataFrame back into XML paths, split the column names by '/':
+
+```julia
+df = getAllParameterValues(simulation_id)
+col1 = names(df)[1]
+xml_path = split(col1, '/')
+```
+
+Alternatively, [`columnNameToXMLPath`](@ref) can be used.
+
+```julia
+xml_path = columnNameToXMLPath(col1)
+```
+"""
+function getAllParameterValues(S::Sampling)
+    monad_ids = monadIDs(S)
+    dfs = [getAllParameterValues(Monad(monad_id)) for monad_id in monad_ids]
+    df = vcat(dfs...)
+    df.monad_id = monad_ids
+    return df
+end
+
+function getAllParameterValues(M::AbstractMonad)
+    D = Dict{String,Any}()
+    for (loc, input_folder) in pairs(M.inputs.input_folders)
+        if !input_folder.varied
+            continue
+        end
+
+        if isempty(input_folder.folder)
+            continue
+        end
+
+        path_to_xml = createXMLFile(loc, M)
+        xml_doc = parse_file(path_to_xml)
+        xml_root = root(xml_doc)
+        current_path = String[]
+
+        recurseToGetParameterValues!(D, current_path, xml_root)
+        free(xml_doc)
+    end
+    return DataFrame(D)
+end
+
+function getAllParameterValues(simulation_id::Int)
+    simulation = Simulation(simulation_id)
+    return getAllParameterValues(simulation)
+end
+
+"""
+    recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{String}, element::XMLElement)
+
+Recursively traverse the XML element tree to extract parameter values into `D`.
+Used by [`getAllParameterValues`](@ref).
+"""
+function recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{String}, element::XMLElement)
+    if elementIsTerminal(element)
+        v = content(element)
+        key = columnName(XMLPath(current_path))
+        D[key] = parseValueFromString(v)
+        return
+    end
+    child_tags = [name(c) for c in child_elements(element)]
+    priority_attributes = ("name", "ID", "id")
+    for tag in unique(child_tags)
+        these_children = [c for c in child_elements(element) if name(c) == tag]
+        common_attributes = intersect([collect(attributes_dict(c) |> keys) for c in these_children]...)
+        if length(these_children) == 1
+            priority_attribute_found = false
+            for attr in priority_attributes
+                if attr in common_attributes
+                    priority_attribute_found = true
+                    recurseToGetParameterValues!(D, [current_path; "$tag:$attr:$(attribute(these_children[1], attr))"], these_children[1])
+                    break
+                end
+            end
+            if !priority_attribute_found
+                recurseToGetParameterValues!(D, [current_path; tag], these_children[1])
+            end
+            continue
+        end
+        unique_attribute = nothing
+        for attr in priority_attributes
+            if !(attr in common_attributes)
+                continue
+            end
+            attr_values = [attribute(c, attr) for c in these_children]
+            if length(unique(attr_values)) == length(these_children)
+                unique_attribute = attr
+                break
+            end
+        end
+        if isnothing(unique_attribute)
+            for attr in common_attributes
+                attr_values = [attribute(c, attr) for c in these_children]
+                if length(unique(attr_values)) == length(these_children)
+                    unique_attribute = attr
+                    break
+                end
+            end
+        end
+        if isnothing(unique_attribute)
+            @warn "Could not find unique attribute to distinguish between multiple children with tag $(tag) under path $(columnName(current_path)). Adding artificial IDs to make unique keys."
+            for (i, c) in enumerate(these_children)
+                recurseToGetParameterValues!(D, [current_path; "$tag:temp_id:$i"], c)
+            end
+        else
+            for c in these_children
+                recurseToGetParameterValues!(D, [current_path; "$tag:$unique_attribute:$(attribute(c, unique_attribute))"], c)
+            end
+        end
+    end
 end
