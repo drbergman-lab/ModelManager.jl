@@ -11,6 +11,7 @@ makedocs(;
         canonical="https://drbergman-lab.github.io/ModelManager.jl",
         edit_link="main",
         assets=String[],
+        size_threshold=250 * 2^10, # 250KB
     ),
     pages=[
         "Home" => "index.md",
