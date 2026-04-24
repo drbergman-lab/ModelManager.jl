@@ -1,7 +1,7 @@
 using Distributions
 import Distributions: cdf
 
-export ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
+export ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation, variationName
 export UniformDistributedVariation, NormalDistributedVariation
 export GridVariation, LHSVariation, SobolVariation, RBDVariation
 
@@ -89,18 +89,23 @@ struct DiscreteVariation{T} <: ElementaryVariation
     location::Symbol
     target::XMLPath
     values::Vector{T}
+    name::String
 
-    function DiscreteVariation(location::Symbol, target::XMLPath, values::Vector{T}) where T
-        return new{T}(location, target, values)
+    function DiscreteVariation(location::Symbol, target::XMLPath, values::Vector{T}; name::Union{Nothing,AbstractString}=nothing) where T
+        default_name = shortVariationName(location, columnName(target))
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{T}(location, target, values, variation_name)
     end
 end
 
-DiscreteVariation(location::Symbol, target::XMLPath, value::T) where T = DiscreteVariation(location, target, Vector{T}([value]))
+DiscreteVariation(location::Symbol, target::XMLPath, value::T; name::Union{Nothing,AbstractString}=nothing) where T =
+    DiscreteVariation(location, target, Vector{T}([value]); name=name)
 
 Base.length(discrete_variation::DiscreteVariation) = length(discrete_variation.values)
 
 function Base.show(io::IO, dv::DiscreteVariation)
     println(io, "DiscreteVariation ($(variationDataType(dv))):")
+    println(io, "  name: $(variationName(dv))")
     println(io, "  location: $(dv.location)")
     println(io, "  target: $(columnName(dv))")
     println(io, "  values: $(dv.values)")
@@ -133,9 +138,12 @@ struct DistributedVariation <: ElementaryVariation
     target::XMLPath
     distribution::Distribution
     flip::Bool
+    name::String
 
-    function DistributedVariation(location::Symbol, target::XMLPath, distribution::Distribution; flip::Bool=false)
-        return new(location, target, distribution, flip)
+    function DistributedVariation(location::Symbol, target::XMLPath, distribution::Distribution; flip::Bool=false, name::Union{Nothing,AbstractString}=nothing)
+        default_name = shortVariationName(location, columnName(target))
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new(location, target, distribution, flip, variation_name)
     end
 end
 
@@ -153,12 +161,22 @@ Get the location of a variation as a `Symbol`.
 """
 variationLocation(ev::ElementaryVariation) = ev.location
 
+"""
+    variationName(av::AbstractVariation)
+
+Get the user-facing name of a variation used in reports and sensitivity scheme headers.
+If no explicit name was provided to the constructor, this is a convention-based default
+derived from `shortVariationName(location, columnName(target))`.
+"""
+variationName(ev::ElementaryVariation) = ev.name
+
 columnName(ev::ElementaryVariation) = variationTarget(ev) |> columnName
 
 Base.length(::DistributedVariation) = -1
 
 function Base.show(io::IO, dv::DistributedVariation)
     println(io, "DistributedVariation" * (dv.flip ? " (flipped)" : "") * ":")
+    println(io, "  name: $(variationName(dv))")
     println(io, "  location: $(dv.location)")
     println(io, "  target: $(columnName(dv))")
     println(io, "  distribution: $(dv.distribution)")
@@ -280,17 +298,20 @@ Each constituent variation must be of the same subtype (all `DiscreteVariation` 
 """
 struct CoVariation{T<:ElementaryVariation} <: AbstractVariation
     variations::Vector{T}
+    name::String
 
-    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Distribution},N}) where {N}
+    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Distribution},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
         variations = DistributedVariation[]
         for (xml_path, distribution) in inputs
             @assert xml_path isa Vector{<:AbstractString} "xml_path must be a vector of strings"
             push!(variations, DistributedVariation(xml_path, distribution))
         end
-        return new{DistributedVariation}(variations)
+        default_name = join(variationName.(variations), " AND ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{DistributedVariation}(variations, variation_name)
     end
 
-    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Vector},N}) where {N}
+    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Vector},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
         variations = DiscreteVariation[]
         n_discrete = -1
         for (xml_path, val) in inputs
@@ -302,23 +323,32 @@ struct CoVariation{T<:ElementaryVariation} <: AbstractVariation
             end
             push!(variations, DiscreteVariation(xml_path, val))
         end
-        return new{DiscreteVariation}(variations)
+        default_name = join(variationName.(variations), " AND ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{DiscreteVariation}(variations, variation_name)
     end
 
-    CoVariation(evs::Vector{DistributedVariation}) = return new{DistributedVariation}(evs)
+    function CoVariation(evs::Vector{DistributedVariation}; name::Union{Nothing,AbstractString}=nothing)
+        default_name = join(variationName.(evs), " AND ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{DistributedVariation}(evs, variation_name)
+    end
 
-    function CoVariation(evs::Vector{<:DiscreteVariation})
+    function CoVariation(evs::Vector{<:DiscreteVariation}; name::Union{Nothing,AbstractString}=nothing)
         @assert (length.(evs) |> unique |> length) == 1 "All DiscreteVariations in a CoVariation must have the same length."
-        return new{DiscreteVariation}(evs)
+        default_name = join(variationName.(evs), " AND ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{DiscreteVariation}(evs, variation_name)
     end
 
-    function CoVariation(inputs::Vararg{T}) where {T<:ElementaryVariation}
-        return CoVariation(Vector{T}([inputs...]))
+    function CoVariation(inputs::Vararg{T}; name::Union{Nothing,AbstractString}=nothing) where {T<:ElementaryVariation}
+        return CoVariation(Vector{T}([inputs...]); name=name)
     end
 end
 
 variationTarget(cv::CoVariation) = variationTarget.(cv.variations)
 variationLocation(cv::CoVariation) = variationLocation.(cv.variations)
+variationName(cv::CoVariation) = cv.name
 columnName(cv::CoVariation) = columnName.(cv.variations) |> x -> join(x, " AND ")
 
 function Base.length(cv::CoVariation)
@@ -331,6 +361,7 @@ function Base.show(io::IO, cv::CoVariation)
     title_str = "CoVariation ($(data_type_str)):"
     println(io, title_str)
     println(io, "-"^length(title_str))
+    println(io, "  Name: $(variationName(cv))")
     locations = variationLocation(cv)
     unique_locations = unique(locations)
     for location in unique_locations
@@ -369,8 +400,9 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
     targets::Vector{XMLPath}
     maps::Vector{<:Function}
     types::Vector{DataType}
+    name::String
 
-    function LatentVariation(latent_parameters::Vector{<:Vector{T}}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}) where T<:Real
+    function LatentVariation(latent_parameters::Vector{<:Vector{T}}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; name::Union{Nothing,AbstractString}=nothing) where T<:Real
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
         types = map(maps) do fn
@@ -378,10 +410,12 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
             sample_output = fn(sample_input)
             eltype(sample_output)
         end
-        return new{Vector{T}}(latent_parameters, lp_names, locations, targets, maps, types)
+        default_name = join(shortVariationName.(locations, columnName.(targets)), " | ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{Vector{T}}(latent_parameters, lp_names, locations, targets, maps, types, variation_name)
     end
 
-    function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}) where T<:Distribution
+    function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; name::Union{Nothing,AbstractString}=nothing) where T<:Distribution
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
         types = map(maps) do fn
@@ -389,7 +423,9 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
             sample_output = fn(sample_input)
             eltype(sample_output)
         end
-        return new{T}(latent_parameters, lp_names, locations, targets, maps, types)
+        default_name = join(shortVariationName.(locations, columnName.(targets)), " | ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{T}(latent_parameters, lp_names, locations, targets, maps, types, variation_name)
     end
 end
 
@@ -409,37 +445,43 @@ function defaultLatentParameterNames(latent_parameters::Vector, targets::Vector{
     return [par_names * " | lp#$(i)" for i in 1:length(latent_parameters)]
 end
 
-function LatentVariation(dv::T) where T<:DiscreteVariation
+function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DiscreteVariation
     latent_parameters = [dv.values]
     targets = [variationTarget(dv)]
     maps = [first]
-    return LatentVariation(latent_parameters, targets, maps, [columnName(dv)])
+    resolved_name = isnothing(name) ? variationName(dv) : String(name)
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
 end
 
-function LatentVariation(dv::T) where T<:DistributedVariation
+function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
     latent_parameters = [Uniform(0,1)]
     targets = [variationTarget(dv)]
     maps = [dv.flip ? us -> quantile(dv.distribution, 1 - us[1]) : us -> quantile(dv.distribution, us[1])]
-    return LatentVariation(latent_parameters, targets, maps, [columnName(dv)])
+    resolved_name = isnothing(name) ? variationName(dv) : String(name)
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
 end
 
-function LatentVariation(cv::CoVariation{T}) where T<:DiscreteVariation
+function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DiscreteVariation
     latent_parameters = [collect(1:length(cv))]
     targets = variationTarget(cv)
     maps = [I -> cv.variations[i].values[I[1]] for i in 1:length(cv.variations)]
-    return LatentVariation(latent_parameters, targets, maps, [columnName(cv)])
+    resolved_name = isnothing(name) ? variationName(cv) : String(name)
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
 end
 
-function LatentVariation(cv::CoVariation{T}) where T<:DistributedVariation
+function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
     latent_parameters = [Uniform(0.0, 1.0)]
     targets = variationTarget(cv)
     maps = map(cv.variations) do dv
         dv.flip ? us -> quantile(dv.distribution, 1 - us[1]) : us -> quantile(dv.distribution, us[1])
     end
-    return LatentVariation(latent_parameters, targets, maps, [columnName(cv)])
+    resolved_name = isnothing(name) ? variationName(cv) : String(name)
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
 end
 
 LatentVariation(lv::LatentVariation) = lv
+
+variationName(lv::LatentVariation) = lv.name
 
 Base.size(lv::LatentVariation{<:Vector{<:Real}}) = length.(lv.latent_parameters)
 Base.size(lv::LatentVariation{<:Distribution}) = -ones(Int, length(lv.latent_parameters))
