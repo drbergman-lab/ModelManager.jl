@@ -30,7 +30,7 @@
 - ModelManager dispatches on `mm_globals().simulator` for all simulator-specific calls.
 
 **Required interface methods:**
-- `runSimulation(sim, simulation, monad_id; do_full_setup, force_recompile)` → `SimulationProcess`
+- `runSimulation(sim, spec::SimulationSpec)` → `SimulationProcess`
 - `simulatorDir(sim)` → `String`
 - `simulatorVersionSchema(sim)` → `String` (SQL sub-schema for version table)
 - `simulatorVersionIDName(sim)` → `String` (FK column name in simulations/monads/samplings)
@@ -135,7 +135,7 @@
 
 **Behavioral specification:**
 - `run(T::AbstractTrial; force_recompile, kwargs...)` collects simulation tasks, executes up to `mm_globals().max_number_of_parallel_simulations` concurrently, and returns `MMOutput{T}`.
-- `kwargs` are forwarded to `postSimulationProcessing` (simulator-specific cleanup/pruning).
+- `kwargs` are forwarded to `prepareTrialHierarchy` (simulator hooks like `force_recompile`) and to `postSimulationProcessing` (simulator-specific cleanup/pruning). `runSimulation` takes no kwargs — it receives only the `SimulationSpec`.
 - On HPC, each simulation is wrapped in an `sbatch --wrap` invocation.
 - A simulation that fails is marked `"Failed"` in the database and removed from its monad's constituent list. If the monad becomes empty, it is deleted along with empty parents.
 - Already-started simulations are skipped (idempotent re-runs).
@@ -199,3 +199,58 @@
 **Acceptance criteria:**
 - A project at version N can be upgraded to version N+2 by walking through N→N+1→N+2.
 - If the user declines at a milestone, the upgrade stops and the DB remains at the last successfully upgraded version.
+
+---
+
+## Feature: Flatten SimulationSpec and Separate Setup from Collection
+
+**One-line description:** Remove `AbstractSimulationSpec`, harden `SimulationSpec`, and split `collectPendingSimulations` into `prepareTrialHierarchy` + `pendingSimulationSpecs`.
+
+**Priority:** Must-have (internal quality)
+
+**Behavioral specification:**
+- `SimulationSpec` is a plain struct (no abstract supertype) with `simulation::Simulation` and `monad_id::Int`. `monad_id` is always a real monad ID — setup always precedes collection.
+- `prepareTrialHierarchy(T::AbstractTrial; kwargs...) → Bool` recurses down the trial hierarchy creating folders and calling simulator hooks. Dispatches on `AbstractMonad` (Simulation/Monad), `Sampling`, and `Trial`. Never marks simulations as Queued.
+  - `AbstractMonad`: mkpath + `setupSampling` hook + `setupMonad` hook (both called on `M` directly — no wrapping `Sampling` created).
+  - `Sampling`: mkpath + `setupSampling` once for the sampling + mkpath and `setupMonad` for each monad.
+  - `Trial`: mkpath + recurse into samplings.
+- `pendingSimulationSpecs(T::AbstractTrial) → Vector{SimulationSpec}` enumerates unstarted simulations and marks them Queued. Always called after `prepareTrialHierarchy`.
+  - `Simulation`: returns `[SimulationSpec(simulation, Monad(simulation).id)]` if not started.
+  - `Monad`: returns one spec per unstarted sim.
+  - `Sampling`/`Trial`: recurse.
+- `run(T; kwargs...)` calls `prepareTrialHierarchy` then `pendingSimulationSpecs`, then launches tasks. No normalization of `T` needed.
+- The `setupSampling` and `setupMonad` simulator hook stubs accept `AbstractSampling` and `AbstractMonad` respectively (previously `Sampling`/`Monad`).
+
+**Acceptance criteria:**
+- `run(simulation)` still returns `MMOutput{Simulation}`.
+- `run(monad)`, `run(sampling)`, `run(trial)` all behave identically to before with no new DB rows created.
+- No references to `AbstractSimulationSpec` remain anywhere.
+- No `monad_id=missing` or `ismissing(spec.monad_id)` patterns remain.
+
+---
+
+## Feature: Calibration Infrastructure (ABC-SMC)
+
+**One-line description:** Framework-agnostic ABC-SMC parameter calibration migrated from PCMM.
+
+**Priority:** Must-have
+
+**Behavioral specification:**
+- `CalibrationParameter` pairs a parameter name, XML path, and prior `Distribution`.
+- `CalibrationProblem` groups inputs, parameters, observed data, summary statistic, and distance function. The `summary_statistic` and `distance` functions are user-supplied and may be simulator-specific.
+- `ABCSMC <: AbstractCalibrationMethod` holds SMC settings: `population_size`, `max_nr_populations`, `minimum_epsilon`, `epsilon_quantile`, `perturbation_kernel`.
+- `runABC(problem; kwargs...)` and `runCalibration(problem, ABCSMC(); ...)` run the full SMC loop.
+- `resumeABC(calibration, problem; method)` resumes from saved generation CSV files.
+- `mseDistance(simulated, observed)` computes mean squared error over shared keys.
+- Each particle evaluation creates a `Monad` via `addVariations` + `Monad(...)`, runs it with `use_previous=true` for transparent simulation reuse, and appends the monad ID to `data/outputs/calibrations/{id}/monads.csv`.
+- Per-generation results are saved to `data/outputs/calibrations/{id}/generations/generation_{t}.csv` (columns: parameter names, `weight`, `distance`, `monad_id`).
+- Method settings are saved to `data/outputs/calibrations/{id}/method.toml` for resume support.
+- The `calibrations` table is created as standard infrastructure in `createSchema()`.
+- `posterior(result)` returns `(df, weights)` where `df` has one column per parameter.
+
+**Acceptance criteria:**
+- `runABC(problem; population_size=50, max_nr_populations=3)` completes on a toy model with a known posterior.
+- `resumeABC(calibration, problem)` correctly loads saved generations and continues from the next one.
+- `mseDistance` returns 0.0 when simulated equals observed.
+- `ABCSMC` throws on invalid settings (`population_size < 1`, `epsilon_quantile` outside (0,1]).
+- The `calibrations` table exists after `createSchema()` with columns `calibration_id`, `datetime`, `description`, `method`.

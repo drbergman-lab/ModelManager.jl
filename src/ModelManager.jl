@@ -44,6 +44,12 @@ export MOAT, Sobolʼ, SobolMM, RBD
 export createTrial
 export getSimpleContent, retrieveElement, columnNameToXMLPath
 export parseValueFromString, getParameterValue, getAllParameterValues
+export AbstractCalibrationMethod, ABCSMC, runCalibration
+export CalibrationParameter, CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior
+export mseDistance
+export runABC, resumeABC
+export createCalibration, calibrationFolder, calibrationMonadsCSV, calibrationMonadIDs
+export calibrationsSchema
 
 include("utilities.jl")
 include("abstract_simulator.jl")
@@ -61,5 +67,6 @@ include("xml_utilities.jl")
 include("variations.jl")
 include("sensitivity.jl")
 include("user_api.jl")
+include("calibration/calibration.jl")
 
 end

@@ -57,6 +57,9 @@ Cautioned:
 - `sudo`, global package installs — ask for user input before running
 - Any command writing outside this repo's root
 
+## Prohibited
+- **Never read from or write to any file inside the `.git/` directory**, including lock files, index files, refs, or objects. This includes using any tool (Bash, Python, or otherwise) to manipulate `.git/` contents directly. Git's internal state must only be modified by git commands themselves. If a git command fails (e.g. due to a stale lock file), report the error to the user and let them resolve it on their own machine — do not attempt to work around it with file I/O tricks.
+
 ## Naming Conventions
 
 - **Functions:** `camelCase` (e.g., `addVariations`, `createTrial`, `runSensitivitySampling`)

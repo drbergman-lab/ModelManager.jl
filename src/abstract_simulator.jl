@@ -13,7 +13,7 @@ any simulator. To support a new simulator:
 2. Implement the required interface methods listed below
 
 # Required interface methods
-- [`runSimulation`](@ref)`(::MySimulator, simulation, monad_id; do_full_setup, force_recompile)`
+- [`runSimulation`](@ref)`(::MySimulator, spec::SimulationSpec)::SimulationProcess`
 - [`simulatorDir`](@ref)`(::MySimulator)::String`
 - [`simulatorVersionSchema`](@ref)`(::MySimulator)::String`
 - [`simulatorVersionIDName`](@ref)`(::MySimulator)::String`
@@ -22,8 +22,8 @@ any simulator. To support a new simulator:
 - [`currentSimulatorVersionID`](@ref)`(::MySimulator)::Int`
 - [`simulatorInfo`](@ref)`(::MySimulator)::String`
 - [`postInitDisplay`](@ref)`(::MySimulator)`
-- [`setupMonad`](@ref)`(::MySimulator, monad; force_recompile::Bool)::Bool`
-- [`setupSampling`](@ref)`(::MySimulator, sampling; force_recompile::Bool)::Bool`
+- [`setupMonad`](@ref)`(::MySimulator, M::AbstractMonad; kwargs...)::Bool`
+- [`setupSampling`](@ref)`(::MySimulator, S::AbstractSampling; kwargs...)::Bool`
 - [`addVariationRows`](@ref)`(::MySimulator, inputs, reference_variation_id, loc_dicts)::Vector{VariationID}`
 
 Note: `variationLocation` is **not** part of the ModelManager interface.  The calling
@@ -39,20 +39,20 @@ abstract type AbstractSimulator end
 ########################################################
 
 """
-    runSimulation(sim::AbstractSimulator, simulation, monad_id::Int; do_full_setup::Bool=true, force_recompile::Bool=false)
+    runSimulation(::AbstractSimulator, spec::SimulationSpec) -> SimulationProcess
 
-Prepare inputs for and execute a single simulation using the given simulator backend.
+Launch the simulation described by `spec` on the active simulator and return a
+[`SimulationProcess`](@ref) describing the outcome.
 
-Implementations are responsible for:
-1. Preparing any varied input files for this simulation.
-2. Compiling / loading custom code (if applicable) when `do_full_setup` is `true`.
-3. Executing the simulation (e.g. launching a subprocess, calling a Julia function).
-4. Updating the database with the success status.
-
-Return a `SimulationProcess` describing the outcome.
+This is the simulator-dispatched workhorse called by [`run`](@ref) inside each `@task`.
+Each simulator package implements its own method dispatching on `AbstractSimulator`.
+Setup (compilation, varied input folders) is always performed by
+[`prepareTrialHierarchy`](@ref) before this function is called, so implementations
+can assume the monad is fully prepared. No kwargs are accepted — all per-simulation
+configuration is encoded in `spec`.
 """
-function runSimulation(sim::AbstractSimulator, args...; kwargs...)
-    error("$(nameof(typeof(sim))) must implement: runSimulation(::$(nameof(typeof(sim))), simulation, monad_id::Int; do_full_setup::Bool, force_recompile::Bool)")
+function runSimulation(sim::AbstractSimulator, args...)
+    error("$(nameof(typeof(sim))) must implement: runSimulation(::$(nameof(typeof(sim))), spec::SimulationSpec)")
 end
 
 """
@@ -132,23 +132,32 @@ function postInitDisplay(sim::AbstractSimulator)
 end
 
 """
-    setupMonad(sim::AbstractSimulator, monad; force_recompile::Bool=false)::Bool
+    setupMonad(sim::AbstractSimulator, M::AbstractMonad; kwargs...)::Bool
 
-Perform all monad-level setup (compilation, input folder preparation) before
-launching per-simulation tasks. Return `true` on success, `false` on failure.
+Perform monad-level setup (prepare varied input folders, etc.) for `M`. Called by
+[`prepareTrialHierarchy`](@ref) after [`setupSampling`](@ref) has already run for
+the enclosing sampling or directly for the monad. Return `true` on success, `false`
+on failure.
+
+Accepts `AbstractMonad` so it handles both `Simulation` and `Monad` inputs without
+requiring a wrapping `Sampling` to be created.
 """
 function setupMonad(sim::AbstractSimulator, args...; kwargs...)
-    error("$(nameof(typeof(sim))) must implement: setupMonad(::$(nameof(typeof(sim))), monad; force_recompile::Bool)::Bool")
+    error("$(nameof(typeof(sim))) must implement: setupMonad(::$(nameof(typeof(sim))), M::AbstractMonad; kwargs...)::Bool")
 end
 
 """
-    setupSampling(sim::AbstractSimulator, sampling; force_recompile::Bool=false)::Bool
+    setupSampling(sim::AbstractSimulator, S::AbstractSampling; kwargs...)::Bool
 
-Perform all sampling-level setup (typically: compile the shared custom code once)
-before collecting monad tasks. Return `true` on success, `false` on failure.
+Perform sampling-level setup (typically: compile the shared custom code once for all
+monads sharing the same `InputFolders`). Called once per unique input-folder group
+by [`prepareTrialHierarchy`](@ref). Return `true` on success, `false` on failure.
+
+Accepts `AbstractSampling` so it can be called on a `Simulation`, `Monad`, or
+`Sampling` without requiring a wrapping object to be created.
 """
 function setupSampling(sim::AbstractSimulator, args...; kwargs...)
-    error("$(nameof(typeof(sim))) must implement: setupSampling(::$(nameof(typeof(sim))), sampling; force_recompile::Bool)::Bool")
+    error("$(nameof(typeof(sim))) must implement: setupSampling(::$(nameof(typeof(sim))), S::AbstractSampling; kwargs...)::Bool")
 end
 
 ########################################################

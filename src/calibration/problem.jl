@@ -1,0 +1,194 @@
+export CalibrationParameter, CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior
+
+"""
+    CalibrationParameter
+
+Defines a single parameter to be calibrated.
+
+# Fields
+- `name::String`: Parameter name used as the key in the particle parameter dictionary and for display.
+- `xml_path::XMLPath`: XML path specifying where to inject the value into the simulator's
+  configuration file.
+- `prior::Distribution`: Prior distribution over this parameter (from `Distributions.jl`).
+  Supported: `Uniform`, `Normal`, `LogNormal`, `Exponential`. Open an issue to request others.
+
+# Examples
+```julia
+p = CalibrationParameter(
+    "apoptosis_rate",
+    XMLPath(["cell_definitions", "cell_definition:name:default", "phenotype",
+             "death:model:code:100", "death_rate"]),
+    Uniform(1e-7, 1e-4)
+)
+```
+"""
+struct CalibrationParameter
+    name::String
+    xml_path::XMLPath
+    prior::Distribution
+end
+
+function CalibrationParameter(name::String, xml_path::AbstractVector{<:AbstractString}, prior::Distribution)
+    return CalibrationParameter(name, XMLPath(xml_path), prior)
+end
+
+"""
+    CalibrationProblem
+
+Defines a full calibration problem: model inputs, parameters to infer, observed data,
+and how to compare simulated to observed output.
+
+# Fields
+- `inputs::InputFolders`: Base model configuration shared across all calibration runs.
+- `parameters::Vector{CalibrationParameter}`: Parameters to calibrate.
+- `observed_data::Dict{String,<:Any}`: Observed summary statistics (keys match those
+  returned by `summary_statistic`). Values may be scalars (`Float64`) for endpoint
+  comparisons or vectors (`Vector{Float64}`) for time-series comparisons.
+- `summary_statistic::Function`: `(monad_id::Int) → Dict{String,<:Any}`.
+  Called once per proposed particle. The user controls how to aggregate over
+  `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single replicate).
+  Values must be the same shape as the corresponding entries in `observed_data`.
+- `distance::Function`: `(simulated::Dict{String,<:Any}, observed::Dict{String,<:Any}) → Float64`.
+  `simulated` is the output of `summary_statistic`; `observed` is `observed_data`.
+  Built-in: [`mseDistance`](@ref) — handles both scalar and vector values.
+- `n_replicates::Int`: Number of replicate simulations to run per proposed particle
+  (default 1). Values > 1 reduce stochastic noise in each particle evaluation at the cost
+  of N× more compute.
+- `reference_variation_id::VariationID`: Base variation ID establishing fixed parameter
+  values that apply to every particle evaluation. Obtain from a reference monad:
+  `createTrial(inputs, fixed_dvs...; n_replicates=0).variation_id`.
+
+# Examples
+```julia
+# Short run for testing — set max_time via a reference
+ref = createTrial(inputs, DiscreteVariation(["overall","max_time"], 12.0); n_replicates=0)
+
+observed = Dict("default" => 100.0)
+problem = CalibrationProblem(
+    ref,
+    [CalibrationParameter("death_rate", xml_path, Uniform(1e-7, 1e-4))],
+    observed,
+    monad_id -> endpointPopulationCounts(monad_id),
+    mseDistance
+)
+```
+"""
+struct CalibrationProblem
+    inputs::InputFolders
+    parameters::Vector{CalibrationParameter}
+    observed_data::Dict{String,Any}
+    summary_statistic::Function
+    distance::Function
+    n_replicates::Int
+    reference_variation_id::VariationID
+end
+
+function CalibrationProblem(inputs::InputFolders, parameters, observed_data::Dict{String,<:Any},
+    summary_statistic, distance;
+    n_replicates::Int=1, reference_variation_id::VariationID=VariationID(inputs))
+    return CalibrationProblem(inputs, parameters, Dict{String,Any}(observed_data),
+                              summary_statistic, distance, n_replicates, reference_variation_id)
+end
+
+function CalibrationProblem(ref::AbstractMonad, parameters, observed_data::Dict{String,<:Any},
+    summary_statistic, distance; n_replicates::Int=1)
+    return CalibrationProblem(ref.inputs, parameters, Dict{String,Any}(observed_data),
+                              summary_statistic, distance, n_replicates, ref.variation_id)
+end
+
+"""
+    Calibration
+
+Represents a calibration run tracked in the database.
+
+Created automatically by [`runABC`](@ref). The associated output folder at
+`data/outputs/calibrations/{id}/` contains:
+- `monads.csv`: monad IDs evaluated during calibration (appended as particles are proposed)
+- `generations/generation_{t}.csv`: per-generation particles, weights, distances, and monad IDs
+- `method.toml`: serialized ABC-SMC settings (used by [`resumeABC`](@ref))
+
+# Fields
+- `id::Int`: Unique ID, matched to the `calibrations` table in the database.
+"""
+struct Calibration
+    id::Int
+end
+
+"""
+    GenerationResult
+
+Result of a single ABC-SMC generation.
+
+# Fields
+- `t::Int`: Generation index (1-based).
+- `particles::DataFrame`: One row per accepted particle; columns are parameter names.
+- `weights::Vector{Float64}`: Normalized importance weights (sum to 1).
+- `distances::Vector{Float64}`: Distance for each accepted particle.
+- `epsilon::Float64`: Acceptance threshold used for this generation.
+- `n_evaluations::Int`: Total model evaluations including rejected proposals.
+- `monad_ids::Vector{Int}`: Monad IDs for each accepted particle.
+"""
+struct GenerationResult
+    t::Int
+    particles::DataFrame
+    weights::Vector{Float64}
+    distances::Vector{Float64}
+    epsilon::Float64
+    n_evaluations::Int
+    monad_ids::Vector{Int}
+end
+
+"""
+    ABCResult
+
+Holds the result of an ABC-SMC calibration run.
+
+# Fields
+- `calibration::Calibration`: The calibration record (DB entry + folder).
+- `generations::Vector{GenerationResult}`: Results per SMC generation, in order.
+- `parameters::Vector{CalibrationParameter}`: The calibrated parameters (same as in
+  the `CalibrationProblem`).
+- `method::ABCSMC`: The settings used for this run.
+
+# Examples
+```julia
+result = runABC(problem)
+df, weights = posterior(result)                # final generation
+df, weights = posterior(result; generation=2)   # specific generation
+```
+"""
+struct ABCResult
+    calibration::Calibration
+    generations::Vector{GenerationResult}
+    parameters::Vector{CalibrationParameter}
+    method::ABCSMC
+end
+
+"""
+    posterior(result::ABCResult; generation::Union{Int,Symbol}=:final)
+
+Extract posterior samples from an [`ABCResult`](@ref).
+
+# Returns
+- `df::DataFrame`: One row per particle, columns are parameter names.
+- `weights::Vector{Float64}`: Importance weights (sum to 1).
+
+# Arguments
+- `generation`: Integer generation index (1-based) or `:final` for the last generation.
+
+# Examples
+```julia
+result = runABC(problem)
+df, weights = posterior(result)                # final generation
+df, weights = posterior(result; generation=1)   # first generation
+```
+"""
+function posterior(result::ABCResult; generation::Union{Int,Symbol}=:final)
+    isempty(result.generations) && error("No generations in ABCResult — calibration may not have completed.")
+    t = generation === :final ? length(result.generations) : Int(generation)
+    1 <= t <= length(result.generations) || throw(ArgumentError(
+        "Generation $t is out of range [1, $(length(result.generations))]."
+    ))
+    gen = result.generations[t]
+    return gen.particles, gen.weights
+end
