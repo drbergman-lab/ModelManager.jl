@@ -502,6 +502,7 @@ function Base.show(io::IO, lv::LatentVariation)
     println(io, "-"^length(title_str))
     indent = "  "
 
+    println(io, indent, "Name: $(variationName(lv))")
     println(io, indent, "Latent Parameters (n = $n_latent):")
     all_latent_nums = ["lp#$(i)." for i in 1:nLatentDims(lv)]
     biggest_width = maximum(length.(all_latent_nums))
