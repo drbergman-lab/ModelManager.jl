@@ -32,20 +32,6 @@ struct SimulationProcess
 end
 
 """
-    dispatchSimulation(simulation; monad_id, do_full_setup, force_recompile)
-
-Dispatch a single simulation via [`runSimulation`](@ref) on the active simulator.
-"""
-function dispatchSimulation(simulation::Simulation; monad_id::Union{Missing,Int}=missing, do_full_setup::Bool=true, force_recompile::Bool=false)
-    if ismissing(monad_id)
-        monad = Monad(simulation)
-        monad_id = monad.id
-    end
-    return runSimulation(mm_globals().simulator, simulation, monad_id;
-                         do_full_setup=do_full_setup, force_recompile=force_recompile)
-end
-
-"""
     prepCmdForWrap(cmd::Cmd)
 
 Strip surrounding backticks from the string representation of `cmd`.
@@ -84,70 +70,141 @@ function prepareHPCCommand(cmd::Cmd, simulation_id::Int)
 end
 
 """
-    collectSimulationTasks(T::AbstractTrial; force_recompile, do_full_setup)
+    SimulationSpec
 
-Collect `Task` objects for every simulation that needs to run under `T`.
+A pending simulation to be launched. Produced by [`pendingSimulationSpecs`](@ref)
+and consumed by [`run`](@ref), which wraps each spec in a `@task` that calls
+[`runSimulation`](@ref) on the active simulator.
+
+`monad_id` is always a real monad ID — [`prepareTrialHierarchy`](@ref) always runs
+before spec collection, so setup is guaranteed to have completed.
+
+# Fields
+- `simulation::Simulation`: The simulation to launch.
+- `monad_id::Int`: ID of the enclosing monad. [`setupMonad`](@ref) has already run
+  for this monad before the spec was built.
 """
-collectSimulationTasks(simulation::Simulation; force_recompile::Bool=false) =
-    isStarted(simulation; new_status_code="Queued") ? Task[] : [@task dispatchSimulation(simulation; do_full_setup=true, force_recompile=force_recompile)]
-
-function collectSimulationTasks(monad::Monad; do_full_setup::Bool=true, force_recompile::Bool=false)
-    mkpath(trialFolder(monad))
-
-    setup_success = setupMonad(mm_globals().simulator, monad; force_recompile=force_recompile, do_full_setup=do_full_setup)
-    if !setup_success
-        return Task[]
-    end
-
-    simulation_tasks = Task[]
-    for simulation_id in simulationIDs(monad)
-        if isStarted(simulation_id; new_status_code="Queued")
-            continue
-        end
-        simulation = Simulation(simulation_id)
-        push!(simulation_tasks, @task dispatchSimulation(simulation; monad_id=monad.id, do_full_setup=false, force_recompile=false))
-    end
-    return simulation_tasks
+struct SimulationSpec
+    simulation::Simulation
+    monad_id::Int
 end
 
-function collectSimulationTasks(sampling::Sampling; force_recompile::Bool=false)
+"""
+    prepareTrialHierarchy(T::AbstractTrial; kwargs...) → Bool
+
+Recurse down the trial hierarchy, creating output folders and calling the simulator's
+[`setupSampling`](@ref) and [`setupMonad`](@ref) hooks. Returns `true` on success,
+`false` if any hook fails (in which case the remaining hierarchy is skipped).
+
+`kwargs` are forwarded to both hooks — simulator-specific flags like `force_recompile`
+flow through this channel. This function has no knowledge of console output and does
+not touch simulation status codes.
+
+Dispatch behaviour:
+- `AbstractMonad` (`Simulation` or `Monad`): mkpath + `setupSampling` on `M` (compile
+  code, etc.) + `setupMonad` on `M` (prepare varied input folders).
+- `Sampling`: mkpath + `setupSampling` once for the whole sampling + mkpath and
+  `setupMonad` for each constituent monad. `setupSampling` is called only once,
+  not once-per-monad.
+- `Trial`: mkpath + recurse into each sampling.
+"""
+function prepareTrialHierarchy(M::AbstractMonad; kwargs...)
+    mkpath(trialFolder(M))
+    success = setupSampling(mm_globals().simulator, M; kwargs...)
+    success || return false
+    return setupMonad(mm_globals().simulator, M; kwargs...)
+end
+
+function prepareTrialHierarchy(sampling::Sampling; kwargs...)
     mkpath(trialFolder(sampling))
-
-    setup_success = setupSampling(mm_globals().simulator, sampling; force_recompile=force_recompile)
-    if !setup_success
-        return Task[]
+    success = setupSampling(mm_globals().simulator, sampling; kwargs...)
+    success || return false
+    for monad in sampling.monads
+        mkpath(trialFolder(monad))
+        success = setupMonad(mm_globals().simulator, monad; kwargs...)
+        success || return false
     end
-
-    simulation_tasks = []
-    for monad in Monad.(constituentIDs(sampling))
-        append!(simulation_tasks, collectSimulationTasks(monad; do_full_setup=false, force_recompile=false))
-    end
-    return simulation_tasks
+    return true
 end
 
-function collectSimulationTasks(trial::Trial; force_recompile::Bool=false)
+function prepareTrialHierarchy(trial::Trial; kwargs...)
     mkpath(trialFolder(trial))
-    simulation_tasks = []
-    for sampling in Sampling.(constituentIDs(trial))
-        append!(simulation_tasks, collectSimulationTasks(sampling; force_recompile=force_recompile))
+    for sampling in trial.samplings
+        success = prepareTrialHierarchy(sampling; kwargs...)
+        success || return false
     end
-    return simulation_tasks
+    return true
 end
 
 """
-    run(T::AbstractTrial; force_recompile, kwargs...)
+    pendingSimulationSpecs(T::AbstractTrial) → Vector{SimulationSpec}
+
+Return a [`SimulationSpec`](@ref) for every simulation in `T` that has not yet
+started, marking each as `"Queued"` in the database. Always called after
+[`prepareTrialHierarchy`](@ref) so all monad folders and input files are in place.
+
+Dispatch behaviour:
+- `Simulation`: returns one spec (against the enclosing monad) if not started.
+- `Monad`: returns one spec per unstarted simulation in the monad.
+- `Sampling` / `Trial`: recurse.
+"""
+function pendingSimulationSpecs(simulation::Simulation)
+    isStarted(simulation; new_status_code="Queued") && return SimulationSpec[]
+    return [SimulationSpec(simulation, Monad(simulation).id)]
+end
+
+function pendingSimulationSpecs(monad::Monad)
+    specs = SimulationSpec[]
+    for sim_id in simulationIDs(monad)
+        isStarted(sim_id; new_status_code="Queued") && continue
+        push!(specs, SimulationSpec(Simulation(sim_id), monad.id))
+    end
+    return specs
+end
+
+pendingSimulationSpecs(sampling::Sampling) =
+    reduce(vcat, pendingSimulationSpecs.(sampling.monads); init=SimulationSpec[])
+
+pendingSimulationSpecs(trial::Trial) =
+    reduce(vcat, pendingSimulationSpecs.(trial.samplings); init=SimulationSpec[])
+
+"""
+    run(T::AbstractTrial; quiet=false, kwargs...) -> MMOutput
 
 Run all pending simulations in `T` and return an [`MMOutput`](@ref).
 
-`kwargs` are forwarded to [`postSimulationProcessing`](@ref) for each completed
-simulation.  For example, `PhysiCellModelManager` accepts `prune_options`.
+# Keyword arguments
+- `quiet::Bool=false`: when `true`, suppresses per-simulation and per-trial console
+  output. Per-sim "Running simulation: N..." lines, the leading "Running ..." header,
+  and the trailing "Finished ..." block are all gated by this flag. Used by ABC-SMC
+  calibration to keep console output focused on per-generation progress.
+- All other `kwargs` flow through to [`prepareTrialHierarchy`](@ref) (which forwards
+  them to the simulator's [`setupSampling`](@ref) / [`setupMonad`](@ref) hooks) and to
+  [`postSimulationProcessing`](@ref). Simulator-specific flags (e.g. `force_recompile`
+  for PhysiCell) flow through this channel. [`runSimulation`](@ref) takes no kwargs.
 """
-function run(T::AbstractTrial; force_recompile::Bool=false, kwargs...)
-    simulation_tasks = collectSimulationTasks(T; force_recompile=force_recompile)
-    n_simulation_tasks = length(simulation_tasks)
+function run(T::AbstractTrial; quiet::Bool=false, kwargs...)
+    setup_success = prepareTrialHierarchy(T; kwargs...)
+    specs = setup_success ? pendingSimulationSpecs(T) : SimulationSpec[]
+    n_simulation_tasks = length(specs)
     n_success = 0
 
-    println("Running $(typeof(T)) $(T.id) requiring $(n_simulation_tasks) simulation$(n_simulation_tasks == 1 ? "" : "s")...")
+    quiet || println("Running $(typeof(T)) $(T.id) requiring $(n_simulation_tasks) simulation$(n_simulation_tasks == 1 ? "" : "s")...")
+
+    #! Build @task wrappers here. The per-sim println sits inside @task begin … end
+    #! so it fires when the task is *scheduled* (i.e. when the simulation actually
+    #! starts running), not when the list comprehension constructs the task.
+    simulation_tasks = [
+        @task begin
+            if !quiet
+                println("\tRunning simulation: $(spec.simulation.id)...")
+                flush(stdout)
+            end
+            DBInterface.execute(centralDB(), "UPDATE simulations SET status_code_id=$(statusCodeID("Running")) WHERE simulation_id=$(spec.simulation.id);")
+            runSimulation(mm_globals().simulator, spec)
+        end
+        for spec in specs
+    ]
 
     queue_channel = Channel{Task}(n_simulation_tasks)
     result_channel = Channel{SimulationProcess}(n_simulation_tasks)
@@ -166,36 +223,38 @@ function run(T::AbstractTrial; force_recompile::Bool=false, kwargs...)
         n_success += simulation_process.success
     end
 
-    n_asterisks = 1
-    asterisks = Dict{String,Int}()
-    size_T = length(T)
-    println("Finished $(typeof(T)) $(T.id).")
-    println("\t- Consists of $(size_T) simulations.")
-    print(  "\t- Scheduled $(n_simulation_tasks) simulations to complete this $(typeof(T)).")
-    print_low_schedule_message = n_simulation_tasks < size_T
-    if print_low_schedule_message
-        println(" ($(repeat("*", n_asterisks)))")
-        asterisks["low_schedule_message"] = n_asterisks
-        n_asterisks += 1
-    else
-        println()
+    if !quiet
+        n_asterisks = 1
+        asterisks = Dict{String,Int}()
+        size_T = length(T)
+        println("Finished $(typeof(T)) $(T.id).")
+        println("\t- Consists of $(size_T) simulations.")
+        print(  "\t- Scheduled $(n_simulation_tasks) simulations to complete this $(typeof(T)).")
+        print_low_schedule_message = n_simulation_tasks < size_T
+        if print_low_schedule_message
+            println(" ($(repeat("*", n_asterisks)))")
+            asterisks["low_schedule_message"] = n_asterisks
+            n_asterisks += 1
+        else
+            println()
+        end
+        print("\t- Successful completion of $(n_success) simulations.")
+        print_low_success_warning = n_success < n_simulation_tasks
+        if print_low_success_warning
+            println(" ($(repeat("*", n_asterisks)))")
+            asterisks["low_success_warning"] = n_asterisks
+            n_asterisks += 1
+        else
+            println()
+        end
+        if print_low_schedule_message
+            println("\n($(repeat("*", asterisks["low_schedule_message"]))) ModelManager found matching simulations and will save you time by not re-running them!")
+        end
+        if print_low_success_warning
+            println("\n($(repeat("*", asterisks["low_success_warning"]))) Some simulations did not complete successfully. Check the output.err files for more information.")
+        end
+        println("\n--------------------------------------------------\n")
     end
-    print("\t- Successful completion of $(n_success) simulations.")
-    print_low_success_warning = n_success < n_simulation_tasks
-    if print_low_success_warning
-        println(" ($(repeat("*", n_asterisks)))")
-        asterisks["low_success_warning"] = n_asterisks
-        n_asterisks += 1
-    else
-        println()
-    end
-    if print_low_schedule_message
-        println("\n($(repeat("*", asterisks["low_schedule_message"]))) ModelManager found matching simulations and will save you time by not re-running them!")
-    end
-    if print_low_success_warning
-        println("\n($(repeat("*", asterisks["low_success_warning"]))) Some simulations did not complete successfully. Check the output.err files for more information.")
-    end
-    println("\n--------------------------------------------------\n")
     return MMOutput(T, n_simulation_tasks, n_success)
 end
 
@@ -212,12 +271,15 @@ end
 """
     processSimulationTask(simulation_task; kwargs...)
 
-Schedule and fetch a simulation task, then call
+Schedule and fetch a simulation task, update the database with the outcome, then call
 [`postSimulationProcessing`](@ref) on the active simulator.
 """
 function processSimulationTask(simulation_task; kwargs...)
     schedule(simulation_task)
     simulation_process = fetch(simulation_task)
+    updateDatabaseOnCompletion(simulation_process.simulation.id,
+                               simulation_process.monad_id,
+                               simulation_process.success)
     postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...)
     return simulation_process
 end

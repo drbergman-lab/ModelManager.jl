@@ -94,6 +94,21 @@ function createSchema()
     createMMTable("trials", trials_schema)
 
     createDefaultStatusCodesTable()
+    createMMTable("calibrations", calibrationsSchema())
+end
+
+"""
+    calibrationsSchema()
+
+Return the SQL schema string for the `calibrations` table.
+"""
+function calibrationsSchema()
+    return """
+    calibration_id INTEGER PRIMARY KEY,
+    datetime TEXT,
+    description TEXT,
+    method TEXT
+    """
 end
 
 """

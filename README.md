@@ -48,7 +48,7 @@ end
 - [x] Database schema — generic SQLite schema parameterized by simulator version table/column names
 - [x] Database utilities — `queryToDataFrame`, `constructSelectQuery`, `buildWhereClause`, etc.
 - [x] Schema migrations — `up.jl` framework with `upgradePackage`, `upgradeToMilestone`
-- [x] Runner — parallel simulation execution via Julia tasks/channels; HPC SLURM support
+- [x] Runner — parallel simulation execution via Julia tasks/channels; HPC SLURM support; `prepareTrialHierarchy` + `pendingSimulationSpecs` split
 - [x] Deletion — `deleteSimulations`, `deleteMonad`, `deleteSampling`, `deleteTrial`, `resetDatabase`
 - [x] Parameter variations — `XMLPath`, `DiscreteVariation`, `DistributedVariation`, `CoVariation`, `LatentVariation`
 - [x] Space-filling designs — `GridVariation`, `LHSVariation`, `SobolVariation`, `RBDVariation`
@@ -58,13 +58,10 @@ end
 - [x] `initializeInputFolder` / `getInputFolderDescription` / `clearSimulatorArtifacts` interface stubs
 - [x] `addVariationRows` interface stub — simulators implement DB writes for variation rows
 - [x] HPC utilities — `isRunningOnHPC`, `setJobOptions`, `defaultJobOptions`
-
-### In Progress
-
-- [ ] PCMM migration — wiring PCMM to use `ModelManagerGlobals` and implement all `AbstractSimulator` methods
+- [x] PCMM migration — PCMM wired to use `ModelManagerGlobals` and implement all `AbstractSimulator` methods
+- [x] Calibration infrastructure — `CalibrationProblem`, `ABCSMC`, `runABC`, `resumeABC`, `mseDistance`, ABC-SMC core algorithm, generation persistence, `calibrations` DB table; migrated from PCMM
 
 ### Remaining
 
 - [ ] `initializeModelManager` generic entry point (currently lives in PCMM's `__init__`)
 - [ ] `createProject` generic entry point
-- [ ] Separate ModelManager.jl into its own registered package (Phase 2)

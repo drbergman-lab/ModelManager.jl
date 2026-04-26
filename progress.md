@@ -68,3 +68,106 @@ Original `database_utils.jl` had full implementations of `queryToDataFrame`, `ta
 3. Update PCMM `database.jl` — add `simulatorVersionTableName(::PhysiCellSimulator)`, fix `physicell_version_id` references.
 4. Update PCMM `PhysiCellModelManager.jl` — remove moved includes, add `const PCMMOutput = MMOutput`.
 5. Run full PCMM test suite and fix failures.
+
+---
+
+## 2026-04-25 — Flatten SimulationSpec; split setup from collection
+
+### Context
+
+`AbstractSimulationSpec` was introduced as a future extension point but serves no current purpose — `AbstractSimulator` is the dispatch axis. `collectPendingSimulations` conflated folder creation, simulator hook calls, and simulation enumeration into one function, making the responsibilities hard to name and test independently.
+
+### Design decisions
+
+**No `AbstractSimulationSpec`; `SimulationSpec.monad_id::Int`**
+`SimulationSpec` is now a plain struct. `monad_id` is always a real Int — setup always precedes collection, so `ismissing` is never needed.
+
+**`prepareTrialHierarchy` dispatches on `AbstractMonad` directly**
+`Simulation <: AbstractMonad <: AbstractSampling`, so a `Simulation` or `Monad` passed directly to `prepareTrialHierarchy` calls `setupSampling(simulator, M)` + `setupMonad(simulator, M)` without creating a wrapping `Sampling` in the DB. This avoids unnecessary database rows and output folders. Rejected: `_toSampling(T::AbstractMonad)` wrapper — clean conceptually but creates DB artifacts.
+
+**`setupSampling`/`setupMonad` stubs generalized to `AbstractSampling`/`AbstractMonad`**
+`loadCustomCode(S::AbstractSampling)` and `prepareVariedInputFolder(loc, M::AbstractMonad)` already accept these abstract types in MM, so the generalization has no downstream implementation cost in PCMM.
+
+**`pendingSimulationSpecs(simulation::Simulation)` uses `Monad(simulation)`**
+`createTrial` always creates a Monad before returning a Simulation (`INSERT OR IGNORE`), so `Monad(simulation)` is always an idempotent lookup, not a creation.
+
+**`run` unchanged in structure**
+No normalization of the input `T` needed. `MMOutput{T}` preserves the original type. Existing tests pass without change.
+
+### Files touched
+- `src/runner.jl`: removed `AbstractSimulationSpec`; `SimulationSpec.monad_id::Int`; replaced `collectPendingSimulations` with `prepareTrialHierarchy` + `pendingSimulationSpecs`; simplified `run`.
+- `src/abstract_simulator.jl`: updated stub comments/docstrings for `setupSampling` and `setupMonad`.
+
+---
+
+## 2026-04-25 — Calibration infrastructure migration from PCMM
+
+### Goal
+Migrate all framework-agnostic calibration code from PCMM into ModelManager so that any simulator package can use ABC-SMC calibration without depending on PhysiCell-specific infrastructure.
+
+### Scope
+Files moved to `src/calibration/`:
+- `methods.jl` — `AbstractCalibrationMethod`, `ABCSMC` struct + validation, `runCalibration` stub
+- `problem.jl` — `CalibrationParameter`, `CalibrationProblem`, `Calibration`, `GenerationResult`, `ABCResult`, `posterior`
+- `distance.jl` — `mseDistance` (only; PhysiCell summary stats stayed in PCMM)
+- `abc_smc.jl` — full ABC-SMC core loop: `_runABCSMC`, `_runFirstGeneration`, `_runSubsequentGeneration`, importance weighting, epsilon adaptation
+- `abc.jl` — MM-specific adapter: `_createMonadForParams`, `_buildEvaluateParticle`, `runCalibration(ABCSMC)`, `runABC`, `resumeABC`, `_saveMethod`, `_loadMethod`, `_saveGeneration`, `_loadGenerations`
+- `calibration.jl` — orchestrator (includes), folder helpers, DB operations
+
+### Key Design Decisions
+
+**`_saveGeneration` / `_loadGenerations` in `abc.jl`, not `calibration.jl`**
+These are ABC-SMC-specific persistence helpers. Grouping them in `abc.jl` keeps `calibration.jl` as a generic orchestrator. Same rationale for `_saveMethod` / `_loadMethod`.
+
+**`calibrationsSchema()` moved to MM's `database.jl`**
+The `calibrations` table is now standard infrastructure, created by `createSchema()`. PCMM's `upgradeToV0_3_0` migration updated to call `ModelManager.calibrationsSchema()` so old upgrade paths still work.
+
+**No new MM dependencies**
+`Distributions`, `CSV`, `DataFrames`, `LinearAlgebra`, `Statistics` were already in `Project.toml`. Zero `Project.toml` changes needed.
+
+**PhysiCell summary statistics stayed in PCMM**
+`endpointPopulationCounts`, `endpointPopulationFractions`, `meanPopulationTimeSeries` moved into `src/analysis/standard_qois.jl` in PCMM — not into MM.
+
+**PCMM calibration files stubbed rather than deleted**
+The bash sandbox mounts the macOS filesystem via FUSE which blocks `unlink()`, making `git rm` fail. Files were overwritten with stub comments; user runs `git rm src/calibration/*.jl` from their own terminal.
+
+---
+
+## 2026-04-25 — Remove kwargs from `runSimulation`
+
+### Context
+
+PCMM's `runSimulation` and `prepareSimulationCommand` do not use any of the kwargs that `run` was passing through. Keeping `; kwargs...` on the interface created unnecessary noise and false expectations for future simulator implementors.
+
+### Change
+
+`runSimulation(sim, spec::SimulationSpec)` no longer accepts kwargs. The `run` function still forwards kwargs to `prepareTrialHierarchy` (→ `setupSampling` / `setupMonad`) and to `postSimulationProcessing`, which do use them. Only the `runSimulation` call site was narrowed.
+
+### Files touched
+- `src/runner.jl`: removed `; kwargs...` from the `runSimulation` call site and updated the `run` docstring
+- `src/abstract_simulator.jl`: removed `; kwargs...` from the stub signature, error message, and `AbstractSimulator` docstring list
+- `PRD.md`: updated `runSimulation` signature and runner behavioral description
+
+---
+
+### Files touched (MM) — calibration migration
+- `src/calibration/calibration.jl` — new
+- `src/calibration/methods.jl` — new
+- `src/calibration/problem.jl` — new
+- `src/calibration/distance.jl` — new
+- `src/calibration/abc_smc.jl` — new
+- `src/calibration/abc.jl` — new
+- `src/database.jl` — added `calibrationsSchema()`, wired into `createSchema()`
+- `src/ModelManager.jl` — added exports and `include("calibration/calibration.jl")`
+- `test/runtests.jl` — new full test suite
+- `Project.toml` — bumped version `0.4.0` → `0.5.0`
+
+### Files touched (PCMM)
+- `src/calibration/*.jl` — stubbed (6 files)
+- `src/analysis/standard_qois.jl` — new (PhysiCell summary stats)
+- `src/analysis/calibration_summaries.jl` — stubbed (renamed to `standard_qois.jl`)
+- `src/analysis/analysis.jl` — added `include("standard_qois.jl")`
+- `src/PhysiCellModelManager.jl` — removed calibration include and `calibrations` table creation
+- `src/database.jl` — removed `calibrationsSchema()`
+- `src/up.jl` — updated migration to call `ModelManager.calibrationsSchema()`
+- `test/test-scripts/CalibrationTests.jl` — updated namespace qualifications
