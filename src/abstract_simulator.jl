@@ -21,7 +21,6 @@ any simulator. To support a new simulator:
 - [`resolveSimulatorVersionID`](@ref)`(::MySimulator)::Int`
 - [`currentSimulatorVersionID`](@ref)`(::MySimulator)::Int`
 - [`simulatorInfo`](@ref)`(::MySimulator)::String`
-- [`postInitDisplay`](@ref)`(::MySimulator)`
 - [`setupMonad`](@ref)`(::MySimulator, M::AbstractMonad; kwargs...)::Bool`
 - [`setupSampling`](@ref)`(::MySimulator, S::AbstractSampling; kwargs...)::Bool`
 - [`addVariationRows`](@ref)`(::MySimulator, inputs, reference_variation_id, loc_dicts)::Vector{VariationID}`
@@ -125,11 +124,27 @@ end
 """
     postInitDisplay(sim::AbstractSimulator)
 
-Print simulator-specific information after initialization.
+Print initialization information. The default implementation prints the generic
+ModelManager fields (data directory, database path, inputs config, HPC status,
+parallelism). Simulator packages can specialize this method to prepend a logo,
+version banner, and simulator-specific fields.
 """
-function postInitDisplay(sim::AbstractSimulator)
-    error("$(nameof(typeof(sim))) must implement: postInitDisplay(::$(nameof(typeof(sim))))")
+function postInitDisplay(::AbstractSimulator)
+    println(rpad("Path to data:", 25, ' ') * dataDir())
+    println(rpad("Path to database:", 25, ' ') * centralDB().file)
+    println(rpad("Path to inputs.toml:", 25, ' ') * pathToInputsConfig())
+    println(rpad("Running on HPC:", 25, ' ') * string(mm_globals().run_on_hpc))
+    println(rpad("Max parallel sims:", 25, ' ') * string(mm_globals().max_number_of_parallel_simulations))
 end
+
+"""
+    centralDBFileName(sim::AbstractSimulator)::String
+
+Return the filename (not full path) of the central SQLite database for this simulator.
+The file will be created inside `dataDir()`.  The default is `"mm.db"`.  Simulator
+packages can override this to use a different name or implement legacy-name detection.
+"""
+centralDBFileName(::AbstractSimulator) = "mm.db"
 
 """
     setupMonad(sim::AbstractSimulator, M::AbstractMonad; kwargs...)::Bool

@@ -63,5 +63,5 @@ end
 
 ### Remaining
 
-- [ ] `initializeModelManager` generic entry point (currently lives in PCMM's `__init__`)
+- [x] `initializeModelManager` generic entry point — `initializeModelManager(::AbstractSimulator, data_dir)` with `centralDBFileName` and `postInitDisplay` extension points
 - [ ] `createProject` generic entry point

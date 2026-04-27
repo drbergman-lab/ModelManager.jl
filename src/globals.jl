@@ -137,20 +137,72 @@ function assertInitialized()
 end
 
 """
-    initializeModelManager(simulator::AbstractSimulator, data_dir::String; kwargs...)
+    initializeModelManager(simulator::AbstractSimulator, data_dir::AbstractString; auto_upgrade::Bool=false)
 
 Initialize ModelManager for a project rooted at `data_dir` using `simulator` as the
 concrete backend.
 
 This is the generic entry point that simulator packages (e.g. PhysiCellModelManager)
-should call from their own initialization logic after constructing their
-`AbstractSimulator` instance.  A complete implementation is expected to:
+call from their own path-level overloads after setting any simulator-specific fields.
+It performs all framework-agnostic initialization steps in order:
 
-1. Construct a [`ModelManagerGlobals`](@ref) with the provided `simulator` and
-   `data_dir` and assign it to [`mm_globals_ref`](@ref)`[]`.
-2. Connect to (or create) the central project database.
-3. Call [`postInitDisplay`](@ref) to print startup information.
+1. Register `simulator` and `data_dir` on the active [`ModelManagerGlobals`](@ref).
+2. Open the central SQLite database (filename determined by [`centralDBFileName`](@ref)).
+3. Resolve the package version, creating or upgrading the DB schema if needed.
+4. Parse `inputs.toml`.
+5. Initialize the database schema (tables, folder registration).
+6. Call [`postInitDisplay`](@ref) to print startup information.
+7. Run [`databaseDiagnostics`](@ref).
 
-This stub must be extended (or wrapped) by the simulator package.
+Returns `true` on success, `false` on any initialization failure — including errors that
+would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are reset to
+a clean state before any `false` return so that subsequent retries start fresh.
+
+Simulator packages typically provide their own path-level overloads (e.g. accepting
+`path_to_physicell` and `path_to_data`) that validate paths, set simulator-specific
+state, then delegate here.
 """
-function initializeModelManager end
+function initializeModelManager(simulator::AbstractSimulator, data_dir::AbstractString; auto_upgrade::Bool=false)
+    mm_globals().simulator = simulator
+    mm_globals().data_dir = abspath(normpath(data_dir))
+
+    try
+        mm_globals().db = SQLite.DB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))
+    catch e
+        println("Could not open database: $e")
+        mm_globals().data_dir = ""
+        return false
+    end
+
+    if !resolvePackageVersion(simulator, centralDB(); auto_upgrade=auto_upgrade)
+        close(centralDB())
+        mm_globals().db = SQLite.DB()
+        mm_globals().data_dir = ""
+        return false
+    end
+    if !parseProjectInputsConfigurationFile()
+        close(centralDB())
+        mm_globals().db = SQLite.DB()
+        mm_globals().data_dir = ""
+        return false
+    end
+    initializeDatabase()
+    if !isInitialized()
+        close(centralDB())
+        mm_globals().db = SQLite.DB()
+        mm_globals().data_dir = ""
+        return false
+    end
+    postInitDisplay(simulator)
+    flush(stdout)
+    try
+        databaseDiagnostics()
+    catch e
+        println("""
+        Database diagnostics failed during initialization with error: $(e).
+        ModelManager was not able to check the integrity of the database.
+        This is unexpected behavior; please report this issue on the ModelManager.jl GitHub page.
+        """)
+    end
+    return isInitialized()
+end
