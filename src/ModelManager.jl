@@ -7,7 +7,7 @@ using Statistics
 using QuasiMonteCarlo
 using Sobol
 
-export AbstractSimulator
+export AbstractSimulator, postInitDisplay, centralDBFileName
 export getPackageVersion, getDBPackageVersion, resolvePackageVersion
 export queryToDataFrame, stmtToDataFrame, constructSelectQuery, tableIDName
 export tableExists, tableColumns
