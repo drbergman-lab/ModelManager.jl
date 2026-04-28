@@ -240,7 +240,7 @@ function _computeWeights(accepted::Vector{_ParticleResult}, param_names::Vector{
 
     for (i, particle) in enumerate(accepted)
         # Prior density (product of independent marginals)
-        prior_density = prod(pdf(priors[k], particle.params[param_names[k]]) for k in eachindex(param_names))
+        prior_density = prod(pdf(prior, particle.params[name]) for (name, prior) in zip(param_names, priors))
 
         # Denominator: weighted sum of kernel densities from previous particles
         denom = 0.0
