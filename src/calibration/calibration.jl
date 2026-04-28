@@ -1,6 +1,8 @@
 include("methods.jl")
+include("parameters.jl")
 include("problem.jl")
 include("distance.jl")
+include("bank.jl")
 include("abc_smc.jl")
 include("abc.jl")
 
@@ -21,15 +23,6 @@ Return the path to the output folder for a given calibration run.
 """
 calibrationFolder(calibration_id::Int) = joinpath(calibrationsDir(), string(calibration_id))
 calibrationFolder(calibration::Calibration) = calibrationFolder(calibration.id)
-
-"""
-    calibrationMonadsCSV(calibration_id::Int)
-
-Return the path to the `monads.csv` file for a given calibration run.
-This file is appended to as each particle is evaluated.
-"""
-calibrationMonadsCSV(calibration_id::Int) = joinpath(calibrationFolder(calibration_id), "monads.csv")
-calibrationMonadsCSV(calibration::Calibration) = calibrationMonadsCSV(calibration.id)
 
 ################## Database Operations ##################
 
@@ -57,11 +50,14 @@ end
 """
     calibrationMonadIDs(calibration::Calibration) → Vector{Int}
 
-Return the monad IDs evaluated during this calibration run, in evaluation order.
+Return all monad IDs evaluated during this calibration run, aggregated across all
+per-generation monad files (`generation_*_monads.csv`) in evaluation order.
 """
 function calibrationMonadIDs(calibration::Calibration)
-    path_to_csv = calibrationMonadsCSV(calibration)
-    return constituentIDs(path_to_csv)
+    gen_dir = joinpath(calibrationFolder(calibration), "generations")
+    !isdir(gen_dir) && return Int[]
+    paths = sort(filter(f -> endswith(f, "_monads.csv"), readdir(gen_dir; join=true)))
+    return reduce(vcat, (constituentIDs(p) for p in paths); init=Int[])
 end
 
 

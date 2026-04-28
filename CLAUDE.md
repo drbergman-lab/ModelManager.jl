@@ -32,13 +32,43 @@ ModelManager is the base package. PhysiCellModelManager.jl (PCMM) depends on it 
 All work must remain strictly inside this repository folder (`~/.julia/dev/ModelManager/`).
 Do **not** access or edit files outside this repo.
 
-## Branching Rules
+## Worktree Sessions
+
+When Claude Code launches a session inside a git worktree (primary working directory ends with `.claude/worktrees/<name>`), **all file reads and writes must use paths rooted at the worktree, not the main repo root.** The main repo may appear as an "Additional working directory" in the environment block — ignore it for file edits; it is listed only so `julia --project=.` and `git` commands can resolve the package, not as a write target.
+
+**Concretely:** if the worktree is at `~/.julia/dev/ModelManager/.claude/worktrees/foo`, edit `~/.julia/dev/ModelManager/.claude/worktrees/foo/src/calibration/abc.jl`, NOT `~/.julia/dev/ModelManager/src/calibration/abc.jl`.
+
+**Pitfall — resumed sessions:** When a session is resumed from a compacted summary, the summary may cite main-repo paths from prior reads. Discard those paths and re-derive the correct worktree-rooted path before making any edits. Always confirm with `git -C <worktree> status` that your changes appear in the worktree, not the main repo.
+
+## Git Workflow — Division of Responsibilities
+
+> **Environment note:** The restrictions in this section are specific to **Cowork** (Claude desktop app), which runs shell commands in a sandboxed Linux environment that blocks `unlink` on `.git/` files. If you are using **Claude Code** (the CLI tool), it runs directly on your machine with your own filesystem permissions and has no such restriction — Claude Code can freely run `git add`, `git commit`, `git checkout`, and any other git operation exactly as you would from your terminal. The conservative rules below can be dropped entirely when using Claude Code.
+
+**The Cowork sandbox blocks `unlink` on files inside `.git/`**, even for the owning process. This means every git command that writes to HEAD or the index (`git commit`, `git checkout`, `git add`) leaves an orphaned lock file (`HEAD.lock`, `index.lock`) that requires manual cleanup from the user's terminal. There is no way to avoid this from inside the sandbox.
+
+Therefore the workflow is:
+
+**Claude's git responsibilities (read-only + ref creation):**
+- `git log`, `git status`, `git diff`, `git show` — freely
+- `git branch feature/<desc>` — safe: writes only a ref file, not HEAD or the index
+
+**User's git responsibilities (run from your own terminal):**
+- `git checkout feature/<desc>` — after Claude creates the branch with `git branch`
+- `git add` and `git commit` — Claude will provide the exact command to copy-paste
+- Any operation that requires switching branches
+
+When a feature is ready to commit, Claude will output the full command:
+```
+git add -A && git commit -m "<message>"
+```
+for the user to run, rather than running it from the sandbox.
+
+### Branching Rules
 - Never modify `main` directly.
 - Default base branch is `main` unless the user specifies another base.
-- For any task, create a feature branch:
-```
-git checkout -b feature/<desc> <base-branch>
-```
+- Claude creates the branch ref with `git branch feature/<desc>` (pointing at current HEAD).
+- User runs `git checkout feature/<desc>` from their terminal to switch.
+- **Never use `git checkout -b feature/<desc> <base>` when `<base>` differs from the current HEAD.** That form forces git to update both the index and working-tree files atomically; if the filesystem blocks the unlinking step, the index is left stranded at `<base>` while HEAD stays on the old branch, producing a severely dirty repo state.
 
 ## Local Julia Environment
 Always use the project environment:
@@ -49,7 +79,7 @@ Preferred test command:
 ## Allowed / Cautioned Commands
 Allowed:
 - `ls`, `cat`, `rg`/`grep`, build commands, test commands
-- `git` commands committing to the feature branch you are developing on
+- `git branch`, `git diff`, `git log`, `git status`, `git show`
 
 Cautioned:
 - `rm` — use only within the repo; can create `claude-temp/` for scratch space
@@ -58,7 +88,8 @@ Cautioned:
 - Any command writing outside this repo's root
 
 ## Prohibited
-- **Never read from or write to any file inside the `.git/` directory**, including lock files, index files, refs, or objects. This includes using any tool (Bash, Python, or otherwise) to manipulate `.git/` contents directly. Git's internal state must only be modified by git commands themselves. If a git command fails (e.g. due to a stale lock file), report the error to the user and let them resolve it on their own machine — do not attempt to work around it with file I/O tricks.
+- **Never read from or write to any file inside the `.git/` directory**, including index files, refs, or objects. This includes using the Read, Write, Edit, or Bash tools to touch anything under `.git/` directly. All git state must be modified exclusively through git CLI commands.
+- **Never run `git add`, `git commit`, or `git checkout`** from the sandbox. These write to HEAD or the index and leave lock files that require manual user cleanup. Instead, output the command for the user to run in their terminal.
 
 ## Naming Conventions
 
@@ -74,11 +105,11 @@ Cautioned:
 2. Wait for human approval.
    1. Update the PRD.md to include new feature or changes.
    2. Open a new entry in the progress.md and start logging the design process, decisions, and open questions there.
-3. Create a feature branch off the chosen base branch.
+3. Run `git branch feature/<desc>` to create the branch ref, then tell the user to run `git checkout feature/<desc>` from their terminal before implementation begins.
 4. Implement in the feature branch only.
-5. The user will inspect diffs manually before merging.
-6. Update [README.md](README.md) Implementation Status when a feature is complete.
-7. Trim the PRD.md and progress.md to reflect the final implementation before merging.
+5. Update [README.md](README.md) Implementation Status when a feature is complete.
+6. Trim the PRD.md and progress.md to reflect the final implementation before merging.
+7. When done, output the ready-to-run commit command for the user to copy-paste into their terminal.
 
 **Design brief template:**
 ```

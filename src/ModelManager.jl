@@ -4,6 +4,7 @@ using Compat
 using Parameters
 using Random
 using Statistics
+using NearestNeighbors
 using QuasiMonteCarlo
 using Sobol
 
@@ -45,7 +46,9 @@ export createTrial
 export getSimpleContent, retrieveElement, columnNameToXMLPath
 export parseValueFromString, getParameterValue, getAllParameterValues
 export AbstractCalibrationMethod, ABCSMC, runCalibration
-export CalibrationParameter, CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior
+export GaussianKernel, ComponentwiseKernel, LocalNNKernel, LocalNNCovKernel
+export CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior
+export ConvergenceSummary
 export mseDistance
 export runABC, resumeABC
 
@@ -66,5 +69,6 @@ include("variations.jl")
 include("sensitivity.jl")
 include("user_api.jl")
 include("calibration/calibration.jl")
+include("calibration/visualize.jl")
 
 end
