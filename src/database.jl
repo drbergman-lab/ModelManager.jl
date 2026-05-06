@@ -491,12 +491,49 @@ end
 ########### Database diagnostics ###########
 
 """
-    databaseDiagnostics()
+    _snapshotMaxIDs() → Dict{Type{<:AbstractTrial}, Int}
+
+Capture the highest ID currently present for each trial type in both the database
+and the output folder tree. Called by [`initializeModelManager`](@ref) just before
+launching the background diagnostics task so that [`databaseDiagnostics`](@ref) only
+inspects entities that existed at initialization time and is not confused by
+in-progress runs started later in the same session.
+"""
+function _snapshotMaxIDs()
+    result = Dict{Type{<:AbstractTrial}, Int}()
+    for T in (Simulation, Monad, Sampling, Trial)
+        table = lowerClassString(T) * "s"
+        id_col = tableIDName(table)
+
+        # Highest ID in the database (MAX returns NULL on empty table → missing)
+        val = queryToDataFrame(constructSelectQuery(table; selection="MAX($id_col)"))[1, 1]
+        db_max = ismissing(val) ? 0 : Int(val)
+
+        # Highest ID present as an output folder
+        out_dir = joinpath(dataDir(), "outputs", table)
+        fs_max = if isdir(out_dir)
+            ids = filter(!isnothing, tryparse.(Int, readdir(out_dir)))
+            isempty(ids) ? 0 : maximum(ids)
+        else
+            0
+        end
+
+        result[T] = max(db_max, fs_max)
+    end
+    return result
+end
+
+"""
+    databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int} = Dict{Type{<:AbstractTrial},Int}())
 
 Check consistency between the database and the output folders.
 Prints warnings for any discrepancies found.
+
+When `max_ids` is provided (as returned by [`_snapshotMaxIDs`](@ref)), each check is
+restricted to IDs ≤ the snapshot value for that type. This prevents false positives from
+simulations that were created or started after `initializeModelManager` returned.
 """
-function databaseDiagnostics()
+function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{<:AbstractTrial},Int}())
     assertInitialized()
     consensus_ids = Dict{Type{<:AbstractTrial}, Set{Int}}()
 
@@ -511,7 +548,7 @@ function databaseDiagnostics()
         @assert tableExists(table_name; db=db) "Table $(table_name) does not exist in $(basename(db.file)). Database is not complete."
         query = constructSelectQuery(table_name; selection=tableIDName(table_name))
         df = queryToDataFrame(query; db=db)
-        db_ids[T] = Set(df[!, 1])
+        all_db_ids = Set(df[!, 1])
 
         path_to_output_folder = joinpath(dataDir(), "outputs", "$(lowerClassString(T))s")
         if isdir(path_to_output_folder)
@@ -522,7 +559,17 @@ function databaseDiagnostics()
 
         folder_ids_found = tryparse.(Int, folders)
         filter!(!isnothing, folder_ids_found)
-        folder_ids[T] = Set(folder_ids_found)
+        all_folder_ids = Set(folder_ids_found)
+
+        # Restrict to IDs that existed at snapshot time (if a snapshot was provided)
+        if haskey(max_ids, T)
+            cap = max_ids[T]
+            db_ids[T]     = filter(id -> id ≤ cap, all_db_ids)
+            folder_ids[T] = filter(id -> id ≤ cap, all_folder_ids)
+        else
+            db_ids[T]     = all_db_ids
+            folder_ids[T] = all_folder_ids
+        end
 
         missing_dirs[T] = setdiff(db_ids[T], folder_ids[T])
         missing_db_entries[T] = setdiff(folder_ids[T], db_ids[T])
@@ -573,6 +620,10 @@ function databaseDiagnostics()
     #! check simulation status of all simulations; warn on concerning codes, info on Failed
     query = constructSelectQuery("simulations"; selection="simulation_id, status_code_id")
     df = queryToDataFrame(query)
+    # Restrict to simulations that existed at snapshot time
+    if haskey(max_ids, Simulation)
+        filter!(row -> row.simulation_id ≤ max_ids[Simulation], df)
+    end
     status_codes = recognizedStatusCodes()
 
     codes_with_issues = String[]
