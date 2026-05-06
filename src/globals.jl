@@ -3,7 +3,7 @@ using Parameters, SQLite
 export ModelManagerGlobals, mm_globals_ref, mm_globals
 export centralDB, dataDir, isInitialized, assertInitialized
 export projectLocations, inputsDict, simulator
-export initializeModelManager
+export initializeModelManager, waitForDiagnostics
 
 """
     ModelManagerGlobals
@@ -24,6 +24,10 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
 - `run_on_hpc::Bool`: `true` when `sbatch` is available (auto-detected).
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
 - `max_number_of_parallel_simulations::Int`: Concurrency limit.
+- `diagnostics_task::Union{Nothing,Task}`: The background `Task` running
+  [`databaseDiagnostics`](@ref), set by [`initializeModelManager`](@ref).
+  `nothing` before initialization or if diagnostics have not been launched.
+  Use [`waitForDiagnostics`](@ref) to block until it completes.
 """
 @with_kw mutable struct ModelManagerGlobals
     initialized::Bool = false
@@ -40,6 +44,8 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
     sbatch_options::Dict{String,Any} = defaultJobOptions()
 
     max_number_of_parallel_simulations::Int = 1
+
+    diagnostics_task::Union{Nothing,Task} = nothing
 end
 
 """
@@ -152,7 +158,7 @@ It performs all framework-agnostic initialization steps in order:
 4. Parse `inputs.toml`.
 5. Initialize the database schema (tables, folder registration).
 6. Call [`postInitDisplay`](@ref) to print startup information.
-7. Run [`databaseDiagnostics`](@ref).
+7. Launch [`databaseDiagnostics`](@ref) as a background `@async` task.
 
 Returns `true` on success, `false` on any initialization failure — including errors that
 would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are reset to
@@ -161,8 +167,17 @@ a clean state before any `false` return so that subsequent retries start fresh.
 Simulator packages typically provide their own path-level overloads (e.g. accepting
 `path_to_physicell` and `path_to_data`) that validate paths, set simulator-specific
 state, then delegate here.
+
+!!! note
+    Database diagnostics run in the background and may print after this function returns.
+    Call [`waitForDiagnostics`](@ref) if you need them to complete before proceeding.
 """
 function initializeModelManager(simulator::AbstractSimulator, data_dir::AbstractString; auto_upgrade::Bool=false)
+    # If a previous diagnostics task is still running, let it finish before we
+    # mutate shared globals — otherwise it may observe a partially-updated state.
+    waitForDiagnostics()
+    mm_globals().diagnostics_task = nothing
+
     mm_globals().simulator = simulator
     mm_globals().data_dir = abspath(normpath(data_dir))
 
@@ -195,14 +210,51 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     end
     postInitDisplay(simulator)
     flush(stdout)
-    try
-        databaseDiagnostics()
-    catch e
-        println("""
-        Database diagnostics failed during initialization with error: $(e).
-        ModelManager was not able to check the integrity of the database.
-        This is unexpected behavior; please report this issue on the ModelManager.jl GitHub page.
-        """)
+    # Snapshot max IDs now (before any simulations launch) so that diagnostics
+    # only check entities that existed at init time and won't be confused by
+    # in-progress runs started later in the same session.
+    snapshot = _snapshotMaxIDs()
+    mm_globals().diagnostics_task = @async begin
+        try
+            databaseDiagnostics(snapshot)
+        catch e
+            println("""
+            Database diagnostics failed during initialization with error: $(e).
+            ModelManager was not able to check the integrity of the database.
+            This is unexpected behavior; please report this issue on the ModelManager.jl GitHub page.
+            """)
+        end
     end
     return isInitialized()
+end
+
+"""
+    waitForDiagnostics()
+
+Block until the background [`databaseDiagnostics`](@ref) task launched during
+[`initializeModelManager`](@ref) completes. Returns immediately if diagnostics
+have already finished or were never started.
+
+[`initializeModelManager`](@ref) runs five read-only consistency checks
+(DB↔filesystem sync, orphaned entries, constituent ID integrity, simulation status)
+in a background task so initialization returns promptly. In interactive sessions the
+diagnostics typically finish during the first idle moment. In scripts and HPC jobs
+the task runs opportunistically during I/O-heavy work (e.g. simulation runs); call
+`waitForDiagnostics()` explicitly if you need the output before a particular step.
+
+# Example
+```julia
+initializeModelManager(sim, data_dir)
+
+# Optional: block until database consistency checks have printed their results.
+# Useful in scripts that exit quickly or test suites that inspect diagnostic output.
+# waitForDiagnostics()
+
+# ... rest of your workflow ...
+```
+"""
+function waitForDiagnostics()
+    t = mm_globals().diagnostics_task
+    isnothing(t) || wait(t)
+    return nothing
 end
