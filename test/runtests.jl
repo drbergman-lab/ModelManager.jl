@@ -202,6 +202,16 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
             Dict{String,Any}("a" => [1.0, 2.0]),
             Dict{String,Any}("a" => [1.0, 2.0, 3.0])
         )
+
+        # Vector calling convention: sum of squared differences
+        @test mseDistance([1.0, 2.0], [3.0, 4.0]) ≈ 8.0   # (1-3)^2 + (2-4)^2 = 4+4
+        @test mseDistance([1.0, 2.0], [1.0, 2.0]) ≈ 0.0
+        @test_throws DimensionMismatch mseDistance([1.0], [1.0, 2.0])
+
+        # Scalar calling convention: squared difference
+        @test mseDistance(3.0, 1.0) ≈ 4.0
+        @test mseDistance(1.0, 3.0) ≈ 4.0
+        @test mseDistance(1.0, 1.0) ≈ 0.0
     end
 
     ################## CalibrationProblem accepts variation objects ##################
@@ -261,6 +271,7 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
                ModelManager._toCalibrationParameter(cv)]
         @test all(cp -> cp isa CalibrationParameter, cps)
         @test length(cps) == 2
+
     end
 
     ################## ABCSMC ##################
@@ -1151,6 +1162,27 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
         @test size(bank_empty.cdf_coords, 2) == 0
         @test bank_empty.param_names == cp_t.lv.latent_parameter_names
         @test isnothing(bank_empty.tree)              # no tree for empty bank
+
+        # Non-dict observed_data is stored as-is (no coercion)
+        vec_obs = [1.0, 2.0, 3.0]
+        prob_vec = CalibrationProblem(
+            ModelManager.InputFolders(Pair{Symbol,Union{String,Int}}[]),
+            CalibrationParameter[cp_t],
+            vec_obs,
+            identity, mseDistance, 1,
+            ModelManager.VariationID(Pair{Symbol,Int}[])
+        )
+        @test prob_vec.observed_data === vec_obs
+
+        scalar_obs = 42.0
+        prob_scalar = CalibrationProblem(
+            ModelManager.InputFolders(Pair{Symbol,Union{String,Int}}[]),
+            CalibrationParameter[cp_t],
+            scalar_obs,
+            identity, mseDistance, 1,
+            ModelManager.VariationID(Pair{Symbol,Int}[])
+        )
+        @test prob_scalar.observed_data === scalar_obs
     end
 
     ################## CDF-grid snap helpers ##################

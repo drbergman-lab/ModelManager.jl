@@ -240,7 +240,12 @@
 - `ABCSMC <: AbstractCalibrationMethod` holds SMC settings: `population_size`, `max_nr_populations`, `minimum_epsilon`, `epsilon_quantile`, `perturbation_kernel`, plus optional stopping criteria and epsilon schedule.
 - `runABC(problem; kwargs...)` and `runCalibration(problem, ABCSMC(); ...)` run the full SMC loop.
 - `resumeABC(calibration::Calibration; method=nothing, run_kwargs=(;))` resumes from saved generation files. No `problem` argument required — the `CalibrationProblem` is loaded from `problem.jld2` (written by `runABC`/`runCalibration`). Pass `method=ABCSMC(...)` to override the saved settings.
-- `mseDistance(simulated, observed)` computes mean squared error over shared keys.
+- `mseDistance(simulated, observed)` is a family of built-in distance functions:
+  - `mseDistance(::Dict{String,<:Any}, ::Dict{String,<:Any})` — mean of per-key squared errors (scalar keys) or mean squared errors (vector keys), averaged across all keys in `observed`.
+  - `mseDistance(::AbstractVector{<:Real}, ::AbstractVector{<:Real})` — sum of squared differences `Σ(simᵢ−obsᵢ)²`; requires equal lengths (throws `DimensionMismatch` otherwise).
+  - `mseDistance(::Real, ::Real)` — squared difference `(sim − obs)²`.
+- `CalibrationProblem.observed_data` is typed `Any`; any type accepted by the user-supplied `distance` function is valid.
+- `summary_statistic` may return any type accepted by `distance` as its first argument; no dict coercion is applied.
 - Particle evaluations are batched per generation, not run one-by-one. Each generation proposes a batch of candidate parameter vectors, creates one `Monad` per candidate via `addVariations` + `Monad(...)`, assembles them into a `Sampling`, and calls `run(sampling; quiet=true)` — exploiting MM's parallel runner.
 - **Generation 1:** proposes exactly `population_size` particles in a single batch (all are accepted, no epsilon threshold). One `Sampling` run per generation.
 - **Generation t > 1:** uses iterative adaptive batching. The batch size for each round is `ceil(n_needed / acceptance_rate_est)`, where `acceptance_rate_est` is updated after each round (initialized from the previous generation's acceptance rate). Batching repeats until `population_size` accepted particles are collected; if a round overshoots, the excess is trimmed.
@@ -356,7 +361,9 @@
 - `runABC(problem; population_size=50, max_nr_populations=3)` completes on a toy model with a known posterior.
 - `resumeABC(Calibration(id))` correctly loads `problem.jld2` and saved generations, and continues from the next one without re-supplying the `CalibrationProblem`.
 - `resumeABC` validates structural match for all source types (`DVSource`, `CVSource`, `LVSource`) and errors informatively on mismatch.
-- `mseDistance` returns 0.0 when simulated equals observed.
+- `mseDistance` returns 0.0 when simulated equals observed (all three calling conventions).
+- `mseDistance([1.0, 2.0], [3.0, 4.0]) ≈ 8.0` and `mseDistance(3.0, 1.0) == 4.0`.
+- `mseDistance([1.0], [1.0, 2.0])` throws `DimensionMismatch`.
 - `ABCSMC` throws on invalid settings (`population_size < 1`, `epsilon_quantile` outside (0,1]).
 - The `calibrations` table exists after `createSchema()` with columns `calibration_id`, `datetime`, `description`, `method`.
 - `plot(result)` (corner pairs plot), `plot(result, :ridgeline)`, `plot(ConvergenceSummary(result))`, and `plot(result, :transition)` all produce plots without error on a completed `ABCResult` with ≥ 2 generations.

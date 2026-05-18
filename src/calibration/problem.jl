@@ -15,16 +15,15 @@ and how to compare simulated to observed output.
   variation and the derived `LatentVariation` used internally. Pass any combination of
   `DistributedVariation`, `CoVariation{DistributedVariation}`, or
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
-- `observed_data::Dict{String,Any}`: Observed summary statistics (keys match those
-  returned by `summary_statistic`). Values may be scalars (`Float64`) for endpoint
-  comparisons or vectors (`Vector{Float64}`) for time-series comparisons.
-- `summary_statistic::Function`: `(monad_id::Int) → Dict{String,<:Any}`.
-  Called once per proposed particle. The user controls how to aggregate over
-  `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single replicate).
-  Values must be the same shape as the corresponding entries in `observed_data`.
-- `distance::Function`: `(simulated::Dict{String,<:Any}, observed::Dict{String,<:Any}) → Float64`.
-  `simulated` is the output of `summary_statistic`; `observed` is `observed_data`.
-  Built-in: [`mseDistance`](@ref) — handles both scalar and vector values.
+- `observed_data`: Observed summary statistic in whatever form the `distance` function
+  expects as its second argument.
+- `summary_statistic::Function`: `(monad_id::Int) → T` for any `T` accepted by `distance`
+  as its first argument. Called once per proposed particle. The user controls how to
+  aggregate over `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single
+  replicate).
+- `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
+  of `summary_statistic`; `observed` is `observed_data`.
+  Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
 - `n_replicates::Int`: Number of replicate simulations to run per proposed particle
   (default 1). Values > 1 reduce stochastic noise in each particle evaluation at the cost
   of N× more compute.
@@ -59,7 +58,7 @@ problem2 = CalibrationProblem(
 struct CalibrationProblem
     inputs::InputFolders
     parameters::Vector{CalibrationParameter}
-    observed_data::Dict{String,Any}
+    observed_data::Any
     summary_statistic::Function
     distance::Function
     n_replicates::Int
@@ -67,20 +66,20 @@ struct CalibrationProblem
 end
 
 function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
-                             observed_data::Dict{String,<:Any},
+                             observed_data,
                              summary_statistic, distance;
                              n_replicates::Int=1,
                              reference_variation_id::VariationID=VariationID(inputs))
     cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
-    return CalibrationProblem(inputs, cps, Dict{String,Any}(observed_data),
+    return CalibrationProblem(inputs, cps, observed_data,
                               summary_statistic, distance, n_replicates, reference_variation_id)
 end
 
 function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
-                             observed_data::Dict{String,<:Any},
+                             observed_data,
                              summary_statistic, distance; n_replicates::Int=1)
     cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
-    return CalibrationProblem(ref.inputs, cps, Dict{String,Any}(observed_data),
+    return CalibrationProblem(ref.inputs, cps, observed_data,
                               summary_statistic, distance, n_replicates, ref.variation_id)
 end
 
