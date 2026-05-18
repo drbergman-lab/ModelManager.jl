@@ -10,18 +10,68 @@ using JLD2
 using NearestNeighbors
 using LinearAlgebra
 
-# Minimal stub simulator — satisfies the AbstractSimulator type constraint so that
-# mm_globals() doesn't assert. No methods beyond the default no-ops are needed for
-# the unit tests here, which exercise calibration infrastructure only.
-struct TestSimulator <: AbstractSimulator end
+# Full-featured stub simulator used by both the existing in-memory unit tests and the
+# new DB-backed integration tests.
+#
+# In-memory tests (calibration algorithm, kernels, etc.) never call runSimulation or
+# setupMonad/setupSampling — they bypass the runner entirely via _runABCSMC.  Those
+# tests continue to work unchanged now that the struct is mutable.
+#
+# DB-backed integration tests call initializeModelManager(TestSimulator(), dir) to
+# initialise a real SQLite project, then exercise addVariations / createTrial /
+# run / runCalibration / resumeABC / GSA / deletion through the full stack.
+mutable struct TestSimulator <: AbstractSimulator
+    current_version_id::Int
+    TestSimulator() = new(0)
+end
+
+# ---- Version metadata -------------------------------------------------------
+ModelManager.simulatorVersionTableName(::TestSimulator) = "test_versions"
+ModelManager.simulatorVersionIDName(::TestSimulator)    = "test_version_id"
+ModelManager.simulatorVersionSchema(::TestSimulator)    =
+    "test_version_id INTEGER PRIMARY KEY, tag TEXT UNIQUE"
+
+function ModelManager.resolveSimulatorVersionID(sim::TestSimulator)
+    insert_sql = "INSERT OR IGNORE INTO test_versions (tag) VALUES ('test') RETURNING test_version_id;"
+    df = ModelManager.queryToDataFrame(insert_sql)
+    if nrow(df) == 0
+        select_sql = ModelManager.constructSelectQuery("test_versions", "WHERE tag='test'"; selection="test_version_id")
+        df = ModelManager.queryToDataFrame(select_sql)
+    end
+    id = df.test_version_id[1]
+    sim.current_version_id = id
+    return id
+end
+
+ModelManager.currentSimulatorVersionID(sim::TestSimulator) = sim.current_version_id
+ModelManager.simulatorInfo(::TestSimulator) = "TestSimulator (stub)"
+ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
+
+# ---- Package version / upgrade ----------------------------------------------
+ModelManager.packageName(::TestSimulator)       = "ModelManager"
+ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
+ModelManager.upgradeMilestones(::TestSimulator)  = VersionNumber[]
+ModelManager.upgradeToMilestone(::TestSimulator, args...) = true
+
+# ---- Trial execution --------------------------------------------------------
+ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
+ModelManager.setupMonad(::TestSimulator,    args...; kwargs...) = true
+
+function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.SimulationSpec)
+    # No-op: immediately report success without launching any process.
+    return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, true)
+end
 
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
 # Must live here (not inside @testset blocks) so they get stable module-qualified names
 # rather than compiler-generated closures like #249#250.
-_test_named_ss(mid)     = Dict{String,Any}("x" => 1.0)
-_test_named_dist(s, o)  = 0.0
+_test_named_ss(mid)        = Dict{String,Any}("x" => 1.0)
+_test_named_dist(s, o)     = 0.0
+# Returns x=2.0 so mseDistance vs observed x=1.0 is always 1.0 (non-zero).
+# Used by resumeABC test to prevent premature convergence.
+_test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
 @testset "ModelManager.jl" begin
 
@@ -1853,5 +1903,314 @@ _test_named_dist(s, o)  = 0.0
         # But not vastly more than the budget (one extra batch at most)
         @test total_evals <= 50
     end
+
+    ################## DB-backed integration ##################
+    #
+    # All tests below initialise a real SQLite project in a temporary directory and
+    # exercise the code paths that the in-memory unit tests above never reach:
+    # schema creation, variation tables, the trial hierarchy (Simulation / Monad /
+    # Sampling / Trial), the runner (run / createTrial), parameter reads, calibration
+    # end-to-end (runCalibration / resumeABC), deletion, and global sensitivity.
+    #
+    # TestSimulator.runSimulation is a no-op that returns success immediately, so the
+    # tests are fast (no real simulator is launched).
+
+    # ---------------------------------------------------------------------------
+    # Helper: build the minimal project directory layout that initializeModelManager
+    # requires.  One location (:config), required, varied, one input folder ("default")
+    # containing a two-parameter XML file.
+    # ---------------------------------------------------------------------------
+    function _make_test_project(dir::String)
+        inputs_dir  = joinpath(dir, "inputs")
+        configs_dir = joinpath(inputs_dir, "configs")
+        default_dir = joinpath(configs_dir, "default")
+        outputs_dir = joinpath(dir, "outputs")
+        mkpath(default_dir)
+        mkpath(outputs_dir)
+
+        open(joinpath(inputs_dir, "inputs.toml"), "w") do io
+            print(io, """
+            [config]
+            required = true
+            varied   = true
+            basename = "params.xml"
+            """)
+        end
+
+        # Minimal XML with two leaf parameters the tests will vary.
+        # Root element is <params>; path ["data","x"] traverses <params><data><x>.
+        open(joinpath(default_dir, "params.xml"), "w") do io
+            print(io, """
+            <params>
+              <data>
+                <x>1.0</x>
+                <y>2.0</y>
+              </data>
+            </params>
+            """)
+        end
+    end
+
+    @testset "DB-backed integration" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+
+            # ---------- initialisation ----------
+            @testset "initializeModelManager" begin
+                ok = initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                @test ok
+                @test isInitialized()
+                @test dataDir() == abspath(project_dir)
+                @test isfile(joinpath(project_dir, "mm.db"))
+                @test isfile(joinpath(project_dir, "inputs", "configs", "default",
+                                      "config_variations.db"))
+            end
+
+            # Shorthand XMLPaths used throughout the section
+            xp_x = XMLPath(["data", "x"])
+            xp_y = XMLPath(["data", "y"])
+            inputs = InputFolders(config="default")
+
+            # ---------- classes ----------
+            @testset "Simulation construction" begin
+                sim1 = Simulation(inputs)
+                @test sim1 isa Simulation
+                @test sim1.id >= 1
+
+                sim2 = Simulation(sim1.id)
+                @test sim2.id == sim1.id
+
+                @test_throws ErrorException Simulation(999_999)
+            end
+
+            @testset "Monad and VariationID" begin
+                vid = VariationID(inputs)
+                m   = Monad(inputs, vid; n_replicates=0)
+                @test m isa Monad
+                @test m.id >= 1
+            end
+
+            # ---------- variations ----------
+            @testset "addVariations — GridVariation" begin
+                dv  = DiscreteVariation(:config, xp_x, [3.0, 4.0, 5.0])
+                res = ModelManager.addVariations(GridVariation(), inputs, [dv])
+                @test res isa AddGridVariationsResult
+                @test length(res.variation_ids) == 3
+                # Each VariationID is distinct
+                @test length(unique(res.variation_ids)) == 3
+            end
+
+            @testset "addVariations — LHSVariation" begin
+                dv  = UniformDistributedVariation(:config, xp_x, 1.0, 5.0)
+                res = ModelManager.addVariations(LHSVariation(4), inputs, [dv])
+                @test res isa AddLHSVariationsResult
+                @test length(res.variation_ids) == 4
+            end
+
+            @testset "addVariations — two-parameter grid" begin
+                dv1 = DiscreteVariation(:config, xp_x, [10.0, 20.0])
+                dv2 = DiscreteVariation(:config, xp_y, [30.0, 40.0])
+                res = ModelManager.addVariations(GridVariation(), inputs, [dv1, dv2])
+                @test length(res.variation_ids) == 4  # 2×2 full factorial
+            end
+
+            # ---------- createTrial / run ----------
+            @testset "createTrial and run — Monad" begin
+                dv  = DiscreteVariation(:config, xp_x, 7.0)
+                m   = createTrial(inputs, [dv]; n_replicates=2)
+                @test m isa Monad
+
+                out = run(m)
+                @test out.n_scheduled == 2
+                @test out.n_success   == 2
+
+                # use_previous=true: no new simulations launched
+                out2 = run(m)
+                @test out2.n_scheduled == 0
+                @test out2.n_success   == 0
+            end
+
+            @testset "createTrial and run — Sampling" begin
+                dv   = DiscreteVariation(:config, xp_x, [8.0, 9.0])
+                samp = createTrial(inputs, [dv]; n_replicates=1)
+                @test samp isa Sampling
+                @test length(samp.monads) == 2
+
+                out = run(samp)
+                @test out.n_scheduled == 2
+                @test out.n_success   == 2
+            end
+
+            @testset "createTrial and run — Trial" begin
+                dv    = DiscreteVariation(:config, xp_x, [11.0, 12.0])
+                samp  = createTrial(inputs, [dv]; n_replicates=1)
+                trial = Trial([samp])
+                @test trial isa Trial
+
+                out = run(trial)
+                @test out.n_success == 2
+            end
+
+            # ---------- constituentIDs / simulationIDs ----------
+            @testset "constituentIDs and simulationIDs" begin
+                dv   = DiscreteVariation(:config, xp_x, [21.0, 22.0, 23.0])
+                samp = createTrial(inputs, [dv]; n_replicates=2)
+                run(samp)
+
+                mono_ids = constituentIDs(samp)
+                @test length(mono_ids) == 3          # 3 monads
+
+                sim_ids  = simulationIDs(samp)
+                @test length(sim_ids) == 6           # 3 monads × 2 replicates
+            end
+
+            # ---------- getParameterValue ----------
+            @testset "getParameterValue" begin
+                dv = DiscreteVariation(:config, xp_x, 42.0)
+                m  = createTrial(inputs, [dv]; n_replicates=1)
+                run(m)
+
+                val = getParameterValue(m, :config, xp_x)
+                @test val ≈ 42.0
+
+                # Unvaried parameter falls back to XML default
+                val_y = getParameterValue(m, :config, xp_y)
+                @test val_y ≈ 2.0
+            end
+
+            # ---------- calibration end-to-end ----------
+            #
+            # summary_statistic: always returns {"x" => 1.0} — a named top-level function
+            # so _isAnonymousFunction returns false and _saveProblem can serialise it.
+            # distance: mseDistance against observed {"x" => 1.0} → distance always 0.
+            # With minimum_epsilon=0 and distance=0 the run stops after generation 1.
+            @testset "runCalibration end-to-end" begin
+                dv      = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_named_ss, mseDistance)
+
+                method = ABCSMC(population_size=4, max_nr_populations=3,
+                                minimum_epsilon=0.0)
+                result = runCalibration(prob, method; description="db integration")
+                waitForDiagnostics()
+
+                @test result isa ABCResult
+                @test result.calibration isa Calibration
+                @test !isempty(result.generations)
+                @test result.method isa ABCSMC
+
+                monad_ids = ModelManager.calibrationMonadIDs(result.calibration)
+                @test !isempty(monad_ids)
+
+                # Generation files on disk
+                gen_dir = joinpath(ModelManager.calibrationFolder(result.calibration),
+                                   "generations")
+                @test isdir(gen_dir)
+                @test isfile(joinpath(gen_dir, "generation_1.csv"))
+
+                # posterior
+                post_df, weights = posterior(result)
+                @test post_df isa DataFrame
+                @test sum(weights) ≈ 1.0 atol=1e-6
+                @test "$(columnName(xp_x))" ∈ names(post_df)
+
+                # out-of-range generation throws
+                @test_throws ArgumentError posterior(result; generation=99)
+            end
+
+            @testset "resumeABC" begin
+                # Use _test_nonzero_ss (always returns x=2.0) so distances are
+                # consistently 1.0 against observed x=1.0, preventing premature
+                # convergence and letting the resume actually add more generations.
+                dv       = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                observed  = Dict{String,Any}("x" => 1.0)
+                prob_resume = CalibrationProblem(inputs, [dv], observed,
+                                                 _test_nonzero_ss, mseDistance)
+
+                # Initial run: capped at 1 generation.
+                method1 = ABCSMC(population_size=4, max_nr_populations=1,
+                                  minimum_epsilon=0.0)
+                result1 = runCalibration(prob_resume, method1; description="resume base")
+                @test length(result1.generations) == 1
+
+                # Resume: allow up to 3 total generations.
+                method2 = ABCSMC(population_size=4, max_nr_populations=3,
+                                  minimum_epsilon=0.0)
+                result2 = resumeABC(result1.calibration; problem=prob_resume, method=method2)
+                waitForDiagnostics()
+
+                @test result2.calibration.id == result1.calibration.id
+                @test length(result2.generations) > 1
+                # Generation 1 particles preserved exactly across resume
+                @test result2.generations[1].particles ==
+                      result1.generations[1].particles
+            end
+
+            # ---------- deletion ----------
+            @testset "deleteSimulations" begin
+                dv   = DiscreteVariation(:config, xp_x, [50.0, 51.0])
+                samp = createTrial(inputs, [dv]; n_replicates=2)
+                run(samp)
+
+                all_ids = simulationIDs(samp)
+                @test length(all_ids) == 4   # 2 monads × 2 replicates
+
+                deleteSimulations(all_ids[1])
+                @test length(simulationIDs(samp)) == 3
+            end
+
+            @testset "deleteSimulationsByStatus" begin
+                dv   = DiscreteVariation(:config, xp_x, [60.0, 61.0])
+                samp = createTrial(inputs, [dv]; n_replicates=1)
+                run(samp)
+
+                n_before = length(simulationIDs(samp))
+                @test n_before == 2
+
+                deleteSimulationsByStatus("Completed"; user_check=false)
+                # All completed simulations (including those from earlier testsets)
+                # are deleted; these two are gone.
+                @test length(simulationIDs(samp)) == 0
+            end
+
+            # ---------- global sensitivity ----------
+            @testset "GSA — MOAT" begin
+                dv1  = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
+                dv2  = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
+                # Trivial output function: no real simulator output needed.
+                gs_fn = (_sim_id::Int) -> 1.0
+
+                samp = run(MOAT(3), inputs, [dv1, dv2]; functions=[gs_fn])
+                @test samp isa ModelManager.GSASampling
+                @test size(samp.monad_ids_df, 2) == 3   # intercept + 2 factors
+            end
+
+            @testset "GSA — Sobol" begin
+                dv1  = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
+                dv2  = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
+                gs_fn = (_sim_id::Int) -> 1.0
+
+                samp = run(Sobolʼ(4), inputs, [dv1, dv2]; functions=[gs_fn])
+                @test samp isa ModelManager.GSASampling
+            end
+
+            @testset "GSA — RBD" begin
+                dv1  = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
+                dv2  = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
+                gs_fn = (_sim_id::Int) -> 1.0
+
+                samp = run(RBD(4), inputs, [dv1, dv2]; functions=[gs_fn])
+                @test samp isa ModelManager.GSASampling
+            end
+
+            waitForDiagnostics()
+        end  # mktempdir
+
+        # Restore a clean stub state so any future tests added after this section
+        # don't inherit the temp-project globals.
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end  # @testset "DB-backed integration"
 
 end
