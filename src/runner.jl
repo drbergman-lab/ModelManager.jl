@@ -96,9 +96,9 @@ Recurse down the trial hierarchy, creating output folders and calling the simula
 [`setupSampling`](@ref) and [`setupMonad`](@ref) hooks. Returns `true` on success,
 `false` if any hook fails (in which case the remaining hierarchy is skipped).
 
-`kwargs` are forwarded to both hooks — simulator-specific flags like `force_recompile`
-flow through this channel. This function has no knowledge of console output and does
-not touch simulation status codes.
+`kwargs` are forwarded to both hooks — any simulator-specific flags flow through this
+channel. This function has no knowledge of console output and does not touch simulation
+status codes.
 
 Dispatch behaviour:
 - `AbstractMonad` (`Simulation` or `Monad`): mkpath + `setupSampling` on `M` (compile
@@ -180,8 +180,8 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   calibration to keep console output focused on per-generation progress.
 - All other `kwargs` flow through to [`prepareTrialHierarchy`](@ref) (which forwards
   them to the simulator's [`setupSampling`](@ref) / [`setupMonad`](@ref) hooks) and to
-  [`postSimulationProcessing`](@ref). Simulator-specific flags (e.g. `force_recompile`
-  for PhysiCell) flow through this channel. [`runSimulation`](@ref) takes no kwargs.
+  [`postSimulationProcessing`](@ref). Any simulator-specific flags flow through this
+  channel. [`runSimulation`](@ref) takes no kwargs.
 """
 function run(T::AbstractTrial; quiet::Bool=false, kwargs...)
     setup_success = prepareTrialHierarchy(T; kwargs...)

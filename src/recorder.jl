@@ -10,8 +10,7 @@ function recordConstituentIDs(T::Type{<:AbstractTrial}, id::Int, ids::Array{Int}
     path_to_folder = trialFolder(T, id)
     mkpath(path_to_folder)
     path_to_csv = joinpath(path_to_folder, constituentTypeFilename(T))
-    lines_table = compressIDs(ids)
-    CSV.write(path_to_csv, lines_table; header=false)
+    CSV.write(path_to_csv, Tables.table(compressIDs(ids)); header=false)
 end
 
 recordConstituentIDs(T::AbstractTrial, ids::Array{Int}) = recordConstituentIDs(typeof(T), T.id, ids)
@@ -19,38 +18,59 @@ recordConstituentIDs(T::AbstractTrial, ids::Array{Int}) = recordConstituentIDs(t
 ################## Compression Functions ##################
 
 """
-    compressIDs(ids::AbstractArray{Int})
+    compressIDs(ids) → Vector{String}
 
-Compress a sorted list of IDs into a compact run-length representation.
+Compress a collection of IDs into a compact run-length representation.
 
-Consecutive ranges are stored as `"first:last"` strings; isolated IDs are stored
-as plain integers.  This mirrors the on-disk format written by
-[`recordConstituentIDs`](@ref).
+Consecutive ranges are stored as `"first:last"`; isolated IDs as plain integer
+strings.  The result is a `Vector{String}` — callers decide what to do with it:
+
+- **Write to CSV:** `CSV.write(path, Tables.table(compressIDs(ids)); header=false)`
+- **Display in a message:** `join(compressIDs(ids), ", ")`
+
+This format is read back by [`constituentIDs`](@ref).
 
 # Examples
 ```julia
-compressIDs([1, 2, 3, 5, 7, 8]) # → Tables.table(["1:3", "5", "7:8"])
+compressIDs([1, 2, 3, 5, 7, 8])  # → ["1:3", "5", "7:8"]
+compressIDs([4])                   # → ["4"]
+compressIDs(Int[])                 # → String[]
 ```
 """
-function compressIDs(ids::AbstractArray{Int})
+function compressIDs(ids::AbstractArray{<:Integer})
     ids = ids |> vec |> unique |> sort
     lines = String[]
     while !isempty(ids)
         if length(ids) == 1
-            next_line = string(ids[1])
+            push!(lines, string(ids[1]))
             popfirst!(ids)
         else
             I = findfirst(diff(ids) .!= 1)
             I = isnothing(I) ? length(ids) : I
             if I > 1
-                next_line = "$(ids[1]):$(ids[I])"
+                push!(lines, "$(ids[1]):$(ids[I])")
                 ids = ids[I+1:end]
             else
-                next_line = string(ids[1])
+                push!(lines, string(ids[1]))
                 popfirst!(ids)
             end
         end
-        push!(lines, next_line)
     end
-    return Tables.table(lines)
+    return lines
 end
+
+compressIDs(ids::AbstractSet{<:Integer}) = compressIDs(collect(ids))
+
+"""
+    _compressedIDStr(ids) → String
+
+Format a collection of IDs as a compact human-readable string for log messages
+and warnings.  Consecutive ranges appear as `"first-last"`; isolated IDs as plain
+integers; entries are comma-separated.
+
+# Examples
+```julia
+_compressedIDStr([1, 2, 3, 5, 7, 8])  # → "1-3, 5, 7-8"
+```
+"""
+_compressedIDStr(ids) = replace(join(compressIDs(ids), ", "), ":" => "-")

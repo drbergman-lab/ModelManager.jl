@@ -100,14 +100,15 @@ function _createTrial(method::AddVariationMethod, inputs::InputFolders, referenc
 end
 
 """
-    run([method=GridVariation()], inputs_or_ref, avs...; force_recompile=false, kwargs...)
+    run([method=GridVariation()], inputs_or_ref, avs...; kwargs...)
 
 Create a trial from `inputs_or_ref` and `avs`, then run it. `kwargs` are forwarded to
-[`run`](@ref)`(::AbstractTrial; ...)`, which passes them to `postSimulationProcessing`.
+[`run`](@ref)`(::AbstractTrial; ...)`, which passes them through to
+`prepareTrialHierarchy` and the simulator hooks.
 """
-function run(method::AddVariationMethod, args...; force_recompile::Bool=false, kwargs...)
-    trial = createTrial(method, args...; kwargs...)
-    return run(trial; force_recompile=force_recompile, kwargs...)
+function run(method::AddVariationMethod, args...; n_replicates=1, use_previous=true, kwargs...)
+    trial = createTrial(method, args...; n_replicates=n_replicates, use_previous=use_previous)
+    return run(trial; kwargs...)
 end
 
 run(inputs::InputFolders, args...; kwargs...) = run(GridVariation(), inputs, args...; kwargs...)

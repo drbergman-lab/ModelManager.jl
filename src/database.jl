@@ -579,7 +579,7 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     warning_msg_dirs = ""
     for (T, missing_ids) in pairs(missing_dirs)
         if !isempty(missing_ids)
-            warning_msg_dirs *= "- $(lowerClassString(T))s with IDs: $(sort(collect(missing_ids)))\n"
+            warning_msg_dirs *= "- $(lowerClassString(T))s with IDs: $(_compressedIDStr(missing_ids))\n"
         end
     end
     if !isempty(warning_msg_dirs)
@@ -590,7 +590,7 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     warning_msg_dbs = ""
     for (T, missing_ids) in pairs(missing_db_entries)
         if !isempty(missing_ids)
-            warning_msg_dbs *= "- $(lowerClassString(T))s with IDs: $(sort(collect(missing_ids)))\n"
+            warning_msg_dbs *= "- $(lowerClassString(T))s with IDs: $(_compressedIDStr(missing_ids))\n"
         end
     end
     if !isempty(warning_msg_dbs)
@@ -610,7 +610,7 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
         if isempty(missing_ids)
             continue
         end
-        msg *= "- $(lowerClassString(T))s reference non-existent $(lowerClassString(constituentType(T))) IDs: $(sort(collect(missing_ids)))\n"
+        msg *= "- $(lowerClassString(T))s reference non-existent $(lowerClassString(constituentType(T))) IDs: $(_compressedIDStr(missing_ids))\n"
     end
     if !isempty(msg)
         msg = "The following constituents are expected but not found:\n" * msg
@@ -634,7 +634,7 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
         status_code_id = statusCodeID(status_code)
         concerning_ids = df[df.status_code_id .== status_code_id, :simulation_id]
         if !isempty(concerning_ids)
-            @warn "Found $(length(concerning_ids)) simulations in the database with status code '$(status_code)' (ID: $(status_code_id)): $(sort(collect(concerning_ids)))."
+            @warn "Found $(length(concerning_ids)) simulations in the database with status code '$(status_code)' (ID: $(status_code_id)): $(_compressedIDStr(concerning_ids))."
             push!(codes_with_issues, status_code)
         end
     end
@@ -642,7 +642,7 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     failed_status_code_id = statusCodeID("Failed")
     failed_ids = df[df.status_code_id .== failed_status_code_id, :simulation_id]
     if !isempty(failed_ids)
-        @info "Found $(length(failed_ids)) simulations in the database with status code 'Failed' (ID: $(failed_status_code_id)): $(sort(collect(failed_ids)))."
+        @info "Found $(length(failed_ids)) simulations in the database with status code 'Failed' (ID: $(failed_status_code_id)): $(_compressedIDStr(failed_ids))."
         push!(codes_with_issues, "Failed")
     end
 
@@ -712,25 +712,35 @@ function locationVariationsTable(query::String, db::SQLite.DB; remove_constants:
 end
 
 """
-    locationVariationsTable(location::Symbol, variations_database::SQLite.DB, variation_ids::AbstractVector{<:Integer}; remove_constants::Bool=false)
+    locationVariationsTable(location::Symbol, variations_database::SQLite.DB, variation_ids::AbstractVector{<:Integer}; remove_constants::Bool=false, short_names::Bool=true)
 
 Return a DataFrame of variation rows for `variation_ids` from `variations_database`.
+When `short_names=false`, column names are kept as raw XML paths (joined with `/`) rather
+than being passed through `shortVariationName`.
 """
-function locationVariationsTable(location::Symbol, variations_database::SQLite.DB, variation_ids::AbstractVector{<:Integer}; remove_constants::Bool=false)
+function locationVariationsTable(location::Symbol, variations_database::SQLite.DB, variation_ids::AbstractVector{<:Integer}; remove_constants::Bool=false, short_names::Bool=true)
     used_variation_ids = filter(x -> x != -1, variation_ids)
     query = constructSelectQuery(locationVariationsTableName(location), "WHERE $(locationVariationIDName(location)) IN ($(join(used_variation_ids,",")))")
     df = locationVariationsTable(query, variations_database; remove_constants=remove_constants)
-    rename!(name -> shortVariationName(location, name), df)
+    if short_names
+        rename!(name -> shortVariationName(location, name), df)
+    else
+        # Always rename the variation ID column so appendVariations can join on it;
+        # leave parameter columns as raw XML paths for db_column matching.
+        id_raw   = locationVariationIDName(location)
+        id_short = shortLocationVariationID(String, location)
+        id_raw in names(df) && rename!(df, id_raw => id_short)
+    end
     return df
 end
 
 """
-    locationVariationsTable(location::Symbol, S::AbstractSampling; remove_constants::Bool=false)
+    locationVariationsTable(location::Symbol, S::AbstractSampling; remove_constants::Bool=false, short_names::Bool=true)
 
 Return a DataFrame of variation rows for the given location and sampling.
 """
-function locationVariationsTable(location::Symbol, S::AbstractSampling; remove_constants::Bool=false)
-    return locationVariationsTable(location, locationVariationsDatabase(location, S), variationIDs(location, S); remove_constants=remove_constants)
+function locationVariationsTable(location::Symbol, S::AbstractSampling; remove_constants::Bool=false, short_names::Bool=true)
+    return locationVariationsTable(location, locationVariationsDatabase(location, S), variationIDs(location, S); remove_constants=remove_constants, short_names=short_names)
 end
 
 """
@@ -754,16 +764,18 @@ function locationVariationsTable(location::Symbol, ::Missing, variation_ids::Abs
 end
 
 """
-    appendVariations(location::Symbol, df::DataFrame)
+    appendVariations(location::Symbol, df::DataFrame; short_names::Bool=true)
 
 Join the varied parameters for `location` onto `df`.
+When `short_names=false`, column names are kept as raw XML paths rather than being
+shortened by `shortVariationName`.
 """
-function appendVariations(location::Symbol, df::DataFrame)
+function appendVariations(location::Symbol, df::DataFrame; short_names::Bool=true)
     short_var_name = shortLocationVariationID(location)
     var_df = DataFrame(short_var_name => Int[], :folder_name => String[])
     unique_tuples = [(row["$(location)_folder"], row[locationVariationIDName(location)]) for row in eachrow(df)] |> unique
     for unique_tuple in unique_tuples
-        temp_df = locationVariationsTable(location, locationVariationsDatabase(location, unique_tuple[1]), [unique_tuple[2]]; remove_constants=false)
+        temp_df = locationVariationsTable(location, locationVariationsDatabase(location, unique_tuple[1]), [unique_tuple[2]]; remove_constants=false, short_names=short_names)
         temp_df[!,:folder_name] .= unique_tuple[1]
         append!(var_df, temp_df, cols=:union)
     end
@@ -773,7 +785,7 @@ function appendVariations(location::Symbol, df::DataFrame)
 end
 
 """
-    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)])
+    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true)
 
 Return a DataFrame for the given SQL query on the simulations table.
 
@@ -786,11 +798,13 @@ By default, constant columns and raw ID columns are removed.
 - `remove_constants::Bool`: If true, removes columns that have the same value for all simulations. Defaults to true.
 - `sort_by::Vector{String}`: A vector of column names to sort the table by. Defaults to all columns. To populate this argument, it is recommended to first print the table to see the column names.
 - `sort_ignore::Vector{String}`: A vector of column names to ignore when sorting. Defaults to the simulation ID and the variation IDs associated with the simulations.
+- `short_names::Bool`: If true (default), column names are shortened via `shortVariationName`. Pass `false` to keep raw XML-path column names (e.g. for matching against `parameters.toml` `db_column` entries).
 """
 function simulationsTableFromQuery(query::String;
                                    remove_constants::Bool=true,
                                    sort_by=String[],
-                                   sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)])
+                                   sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)],
+                                   short_names::Bool=true)
     sort_by = (sort_by isa Vector ? sort_by : [sort_by]) .|> Symbol
     sort_ignore = (sort_ignore isa Vector ? sort_ignore : [sort_ignore]) .|> Symbol
 
@@ -801,7 +815,7 @@ function simulationsTableFromQuery(query::String;
     addFolderNameColumns!(df)
 
     for loc in projectLocations().varied
-        df = appendVariations(loc, df)
+        df = appendVariations(loc, df; short_names=short_names)
     end
 
     select!(df, Not(id_col_names_to_remove))

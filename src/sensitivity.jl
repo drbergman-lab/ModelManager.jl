@@ -52,8 +52,8 @@ end
 
 Run a global sensitivity analysis and return a [`GSASampling`](@ref) result.
 
-`kwargs` are forwarded to [`run`](@ref)`(::Sampling; ...)` (e.g. `force_recompile`,
-simulator-specific options like `prune_options`).
+`kwargs` are forwarded to [`run`](@ref)`(::Sampling; ...)` and from there to the
+simulator hooks — pass any simulator-specific options here.
 """
 function run(method::GSAMethod, inputs::InputFolders, avs::AbstractVector{<:AbstractVariation}; functions::AbstractVector{<:Function}=Function[], kwargs...)
     pv = ParsedVariations(avs)
@@ -150,7 +150,6 @@ function runSensitivitySampling end
 function runSensitivitySampling(method::MOAT, inputs::InputFolders, pv::ParsedVariations;
     reference_variation_id::VariationID=VariationID(inputs),
     ignore_indices::AbstractVector{<:Integer}=Int[],
-    force_recompile::Bool=false,
     n_replicates::Int=1,
     use_previous::Bool=true,
     kwargs...)
@@ -172,7 +171,7 @@ function runSensitivitySampling(method::MOAT, inputs::InputFolders, pv::ParsedVa
     header_line = ["base"; perturb_headers]
     monad_ids_df = DataFrame(monad_ids, header_line)
     sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
-    run(sampling; force_recompile=force_recompile, kwargs...)
+    run(sampling; kwargs...)
     return MOATSampling(sampling, monad_ids_df)
 end
 
@@ -272,7 +271,6 @@ end
 function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::ParsedVariations;
     reference_variation_id::VariationID=VariationID(inputs),
     ignore_indices::AbstractVector{<:Integer}=Int[],
-    force_recompile::Bool=false,
     n_replicates::Int=1,
     use_previous::Bool=true,
     kwargs...)
@@ -297,7 +295,7 @@ function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::Parse
     header_line = ["A"; "B"; perturb_headers]
     monad_ids_df = DataFrame(monad_ids, header_line)
     sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
-    run(sampling; force_recompile=force_recompile, kwargs...)
+    run(sampling; kwargs...)
     return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods)
 end
 
@@ -394,7 +392,6 @@ end
 function runSensitivitySampling(method::RBD, inputs::InputFolders, pv::ParsedVariations;
     reference_variation_id::VariationID=VariationID(inputs),
     ignore_indices::AbstractVector{<:Integer}=Int[],
-    force_recompile::Bool=false,
     n_replicates::Int=1,
     use_previous::Bool=true,
     kwargs...)
@@ -409,7 +406,7 @@ function runSensitivitySampling(method::RBD, inputs::InputFolders, pv::ParsedVar
     header_line = mapreduce(lv -> lv.latent_parameter_names, vcat, pv.latent_variations)
     monad_ids_df = DataFrame(monad_ids, header_line)
     sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
-    run(sampling; force_recompile=force_recompile, kwargs...)
+    run(sampling; kwargs...)
     return RBDSampling(sampling, monad_ids_df, method.rbd_variation.num_cycles; num_harmonics=method.num_harmonics)
 end
 

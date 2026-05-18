@@ -147,13 +147,13 @@ struct InputFolders
     input_folders::NamedTuple
 
     function InputFolders(location_pairs::Vector{<:Pair{Symbol,<:Union{String,Int}}})
-        locs_already_here = first.(location_pairs)
-        invalid_locations = setdiff(locs_already_here, projectLocations().all)
-        @assert isempty(invalid_locations) "Invalid locations: $invalid_locations.\nPossible locations are: $(projectLocations().all)"
-        for loc in setdiff(projectLocations().all, locs_already_here)
-            push!(location_pairs, loc => "")
-        end
-        return new([loc => InputFolder(loc, val) for (loc, val) in location_pairs] |> NamedTuple)
+        all_locs = projectLocations().all
+        d = Dict{Symbol,Union{String,Int}}(location_pairs)
+        invalid = setdiff(keys(d), all_locs)
+        @assert isempty(invalid) "Invalid locations: $invalid.\nPossible locations are: $(all_locs)"
+        # Iterate in all_locs order so NamedTuple field order is canonical — required
+        # for == to be stable across construction paths (NamedTuple equality is order-sensitive).
+        return new([loc => InputFolder(loc, get(d, loc, "")) for loc in all_locs] |> NamedTuple)
     end
 
     function InputFolders(; kwargs...)
@@ -458,10 +458,7 @@ function Base.show(io::IO, monad::Monad)
 end
 
 function printSimulationIDs(io::IO, T::AbstractTrial, n_indent::Int=1)
-    simulation_ids = simulationIDs(T) |> compressIDs
-    simulation_ids = join(simulation_ids[1], ", ")
-    simulation_ids = replace(simulation_ids, ":" => "-")
-    print(io, "  "^n_indent, "Simulations: $simulation_ids")
+    print(io, "  "^n_indent, "Simulations: $(_compressedIDStr(simulationIDs(T)))")
 end
 
 ########################################################
@@ -605,10 +602,7 @@ function Base.show(io::IO, sampling::Sampling)
 end
 
 function printMonadIDs(io::IO, sampling::Sampling, n_indent::Int=1)
-    monad_ids = constituentIDs(sampling) |> compressIDs
-    monad_ids = join(monad_ids[1], ", ")
-    monad_ids = replace(monad_ids, ":" => "-")
-    print(io, "  "^n_indent, "Monads: $(monad_ids)")
+    print(io, "  "^n_indent, "Monads: $(_compressedIDStr(constituentIDs(sampling)))")
 end
 
 ########################################################
@@ -734,12 +728,12 @@ constituentIDs(::Type{T}, id::Int) where {T<:AbstractTrial} = constituentIDs(joi
 
 function samplingSimulationIDs(sampling_id::Int)
     monad_ids = constituentIDs(Sampling, sampling_id)
-    return vcat([constituentIDs(Monad, monad_id) for monad_id in monad_ids]...)
+    return reduce(vcat, (constituentIDs(Monad, monad_id) for monad_id in monad_ids); init=Int[])
 end
 
 function trialSimulationIDs(trial_id::Int)
     sampling_ids = constituentIDs(Trial, trial_id)
-    return vcat([samplingSimulationIDs(sampling_id) for sampling_id in sampling_ids]...)
+    return reduce(vcat, (samplingSimulationIDs(sampling_id) for sampling_id in sampling_ids); init=Int[])
 end
 
 """
@@ -764,7 +758,7 @@ or trial object.
 monadIDs() = constructSelectQuery("monads"; selection="monad_id") |> queryToDataFrame |> x -> x.monad_id
 monadIDs(monad::Monad) = [monad.id]
 monadIDs(sampling::Sampling) = constituentIDs(sampling)
-monadIDs(trial::Trial) = vcat([constituentIDs(Sampling, s) for s in constituentIDs(Trial, trial.id)]...)
+monadIDs(trial::Trial) = reduce(vcat, (constituentIDs(Sampling, s) for s in constituentIDs(Trial, trial.id)); init=Int[])
 monadIDs(Ts::AbstractArray{<:AbstractTrial}) = reduce(vcat, monadIDs.(Ts))
 
 """

@@ -11,7 +11,7 @@ makedocs(;
         canonical="https://drbergman-lab.github.io/ModelManager.jl",
         edit_link="main",
         assets=String[],
-        size_threshold=300 * 2^10, # 300KB; at some point I will split the docs into multiple pages, but for now this is fine
+        size_threshold=400 * 2^10, # 300KB; at some point I will split the docs into multiple pages, but for now this is fine
     ),
     pages=[
         "Home" => "index.md",

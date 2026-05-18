@@ -392,40 +392,155 @@ Whereas [`CoVariation`](@ref)s enforce a 1D relationship between parameters,
 The latent parameters themselves are not stored in the database; only the derived target values are.
 
 Internally, [`ParsedVariations`](@ref) converts all variations to `LatentVariation`s for processing.
+
+# Fields
+- `latent_parameters`: Discrete value vectors or prior `Distribution`s, one per latent dimension.
+- `latent_parameter_names`: User-friendly names for each latent dimension.
+- `locations`: XML location symbols, one per target.
+- `targets`: XML paths to each target parameter.
+- `target_names`: User-friendly display names for each target parameter. Derived from the source
+  variation names when constructed via factory methods (`DistributedVariation`, `CoVariation`).
+  For direct construction, supply via the `target_names` keyword; defaults to
+  `shortVariationName(location, columnName(target))` for each target.
+- `maps`: Forward maps — each `map_j(lp_vals::Vector) → scalar` computes one target value from all latent values.
+- `inverse_maps`: Optional inverse maps — each `inv_map_i(target_vals::Vector{Float64}) → Float64` recovers
+  the latent parameter value `lp_i` for latent dimension `i` from the full vector of target values (ordered
+  by `targets`). The library applies `cdf(dist_i, lp_i)` internally to obtain the CDF coordinate. One
+  inverse per latent dimension. Required for `SimulationBank` support with `LVSource` calibration parameters.
+  Auto-constructed for [`DVSource`](@ref)/[`CVSource`](@ref)-backed `LatentVariation`s. Supply via the
+  `inverse_maps` keyword argument when constructing a user-defined `LatentVariation{<:Distribution}`.
+  Monotonicity of the forward map is a user responsibility and is not validated at construction time beyond
+  a round-trip accuracy check.
+- `types`: Output `eltype` of each forward map's return value.
+- `name`: User-supplied or default name.
+
+# Construction
+
+## From existing variation types (preferred for single-parameter calibration)
+
+```julia
+# From a DistributedVariation — inverse_maps auto-constructed
+dv = DistributedVariation(:config, XMLPath(["tumor", "growth_rate"]), Uniform(0.01, 0.5))
+lv = LatentVariation(dv)
+
+# From a CoVariation{DistributedVariation} — inverse_maps auto-constructed
+cv = CoVariation(DistributedVariation(:config, XMLPath(["k1"]), Uniform(0.1, 1.0)),
+                 DistributedVariation(:config, XMLPath(["k2"]), Uniform(0.5, 5.0)))
+lv = LatentVariation(cv)
+```
+
+## Direct construction with continuous latent parameters
+
+The positional arguments are:
+`LatentVariation(latent_parameters, targets, maps, lp_names, locations; inverse_maps, name)`
+
+- **1 latent dim, 1 target** — log-normal forward map:
+```julia
+# lp ~ Normal(0,1); target = exp(lp)
+lv = LatentVariation(
+    [Normal(0.0, 1.0)],
+    XMLPath[XMLPath(["tumor", "growth_rate"])],
+    Function[lp -> exp(lp[1])],
+    ["log_growth_rate"],
+    Symbol[:config];
+    target_names=["growth rate"],
+    inverse_maps=Function[tv -> log(tv[1])]   # returns lp, not CDF
+)
+```
+
+- **2 latent dims, 2 targets** — independent priors:
+```julia
+# lp1 ~ Uniform(0,1), lp2 ~ Uniform(0,1); target1 = 4*lp1, target2 = 2*lp2
+lv = LatentVariation(
+    [Uniform(0.0, 1.0), Uniform(0.0, 1.0)],
+    XMLPath[XMLPath(["k1"]), XMLPath(["k2"])],
+    Function[lp -> 4.0 * lp[1], lp -> 2.0 * lp[2]],
+    ["lp1", "lp2"],
+    Symbol[:config, :config];
+    target_names=["rate k1", "rate k2"],
+    inverse_maps=Function[tv -> tv[1] / 4.0, tv -> tv[2] / 2.0]
+)
+```
+
+- **2 latent dims, 2 targets** — coupled targets (e.g. p1 = lp1, p2 = lp1 + lp2):
+```julia
+lv = LatentVariation(
+    [Uniform(0.0, 1.0), Uniform(0.0, 1.0)],
+    XMLPath[XMLPath(["p1"]), XMLPath(["p2"])],
+    Function[lp -> lp[1], lp -> lp[1] + lp[2]],
+    ["lp1", "lp2"],
+    Symbol[:config, :config];
+    target_names=["p1", "p2"],
+    inverse_maps=Function[tv -> tv[1], tv -> tv[2] - tv[1]]
+)
+```
+
+## Direct construction with discrete latent parameters
+
+```julia
+# Discrete index maps to named configurations
+lv = LatentVariation(
+    [[1.0, 2.0, 3.0]],
+    XMLPath[XMLPath(["scenario"])],
+    Function[lp -> lp[1]],
+    ["scenario_index"],
+    Symbol[:config]
+)
+```
 """
 struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVariation
     latent_parameters::Vector{T}
     latent_parameter_names::Vector{String}
     locations::Vector{Symbol}
     targets::Vector{XMLPath}
+    target_names::Vector{String}
     maps::Vector{<:Function}
+    inverse_maps::Union{Nothing,Vector{Function}}
     types::Vector{DataType}
     name::String
 
-    function LatentVariation(latent_parameters::Vector{<:Vector{T}}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; name::Union{Nothing,AbstractString}=nothing) where T<:Real
+    function LatentVariation(latent_parameters::Vector{<:Vector{T}}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, inverse_maps::Union{Nothing,AbstractVector{<:Function}}=nothing, name::Union{Nothing,AbstractString}=nothing) where T<:Real
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
+        if !isnothing(target_names)
+            @assert length(target_names) == length(targets) "target_names length ($(length(target_names))) must equal targets length ($(length(targets)))."
+        end
+        inv = isnothing(inverse_maps) ? nothing : Vector{Function}(inverse_maps)
+        if !isnothing(inv)
+            @assert length(inv) == length(latent_parameters) "inverse_maps must have one entry per latent dimension ($(length(latent_parameters))). Got $(length(inv))."
+        end
         types = map(maps) do fn
             sample_input = [lp[1] for lp in latent_parameters]
             sample_output = fn(sample_input)
             eltype(sample_output)
         end
+        tnames = isnothing(target_names) ? shortVariationName.(locations, columnName.(targets)) : Vector{String}(target_names)
         default_name = join(shortVariationName.(locations, columnName.(targets)), " | ")
         variation_name = isnothing(name) ? default_name : String(name)
-        return new{Vector{T}}(latent_parameters, lp_names, locations, targets, maps, types, variation_name)
+        return new{Vector{T}}(latent_parameters, lp_names, locations, targets, tnames, maps, inv, types, variation_name)
     end
 
-    function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; name::Union{Nothing,AbstractString}=nothing) where T<:Distribution
+    function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, inverse_maps::Union{Nothing,AbstractVector{<:Function}}=nothing, name::Union{Nothing,AbstractString}=nothing) where T<:Distribution
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
+        if !isnothing(target_names)
+            @assert length(target_names) == length(targets) "target_names length ($(length(target_names))) must equal targets length ($(length(targets)))."
+        end
+        inv = isnothing(inverse_maps) ? nothing : Vector{Function}(inverse_maps)
+        if !isnothing(inv)
+            @assert length(inv) == length(latent_parameters) "inverse_maps must have one entry per latent dimension ($(length(latent_parameters))). Got $(length(inv))."
+        end
         types = map(maps) do fn
             sample_input = [quantile(lp, 0.5) for lp in latent_parameters]
             sample_output = fn(sample_input)
             eltype(sample_output)
         end
+        tnames = isnothing(target_names) ? shortVariationName.(locations, columnName.(targets)) : Vector{String}(target_names)
         default_name = join(shortVariationName.(locations, columnName.(targets)), " | ")
         variation_name = isnothing(name) ? default_name : String(name)
-        return new{T}(latent_parameters, lp_names, locations, targets, maps, types, variation_name)
+        lv = new{T}(latent_parameters, lp_names, locations, targets, tnames, maps, inv, types, variation_name)
+        isnothing(inv) || _validateInverseMaps(lv)
+        return lv
     end
 end
 
@@ -445,38 +560,125 @@ function defaultLatentParameterNames(latent_parameters::Vector, targets::Vector{
     return [par_names * " | lp#$(i)" for i in 1:length(latent_parameters)]
 end
 
+"""
+    _validateInverseMaps(lv::LatentVariation{<:Distribution}; n_samples=20, rtol=1e-6)
+
+Check that `lv.inverse_maps` are consistent with `lv.maps` via two round-trip tests.
+
+**Forward-then-inverse** (`u → lp → target_vals → lp′`): for `n_samples` draws of `u ∈ (0,1)^n`,
+compute latent and target values via the forward maps, then recover latent parameter values via the
+inverse maps. Verifies `lp′ ≈ lp_vals` and that `cdf(dist_i, lp′_i) ∈ (0,1)`.
+
+**Inverse-then-forward** (`lp → target_vals → lp′ → target_vals′`): using the same draws,
+forward-maps `lp′` back to target values and verifies `target_vals′ ≈ target_vals`.
+
+Returns `nothing` on success. Throws `ArgumentError` on the first failure with details.
+Returns immediately (no-op) if `lv.inverse_maps` is `nothing`.
+
+# Arguments
+- `n_samples`: Number of random `u` draws to test (default 20).
+- `rtol`: Relative tolerance for `isapprox` (default 1e-6).
+
+# Example
+```julia
+lv = LatentVariation([Normal(0,1)], [path], [lp -> exp(lp[1])], ["log_rate"], [:cell];
+                     inverse_maps=[tv -> log(tv[1])])
+ModelManager._validateInverseMaps(lv)  # passes silently
+```
+"""
+function _validateInverseMaps(lv::LatentVariation{<:Distribution};
+                               n_samples::Int=20, rtol::Real=1e-6)
+    isnothing(lv.inverse_maps) && return nothing
+    n = nLatentDims(lv)
+    for s in 1:n_samples
+        u = rand(n)
+        lp_vals = [quantile(d, u_i) for (d, u_i) in zip(lv.latent_parameters, u)]
+        target_vals = Float64[fn(lp_vals) for fn in lv.maps]
+        lp′ = [inv_map(target_vals) for inv_map in lv.inverse_maps]
+
+        # Check that cdf(dist_i, lp′_i) ∈ (0,1) (lp′ is in distribution support)
+        for (i, (d, lp_i)) in enumerate(zip(lv.latent_parameters, lp′))
+            u_i = cdf(d, lp_i)
+            if !(0 < u_i < 1)
+                throw(ArgumentError(
+                    "_validateInverseMaps: cdf(dist_$(i), inverse_maps[$(i)](target_vals)) = $(u_i) " *
+                    "for target_vals=$(target_vals), which is outside (0,1). " *
+                    "Inverse maps must return latent parameter values in the distribution support."))
+            end
+        end
+
+        # Check lp′ ≈ lp_vals
+        if !isapprox(lp′, lp_vals; rtol=rtol)
+            throw(ArgumentError(
+                "_validateInverseMaps: forward-then-inverse round-trip failed at sample $(s). " *
+                "lp_vals=$(lp_vals), target_vals=$(target_vals), inv_maps(target_vals)=$(lp′). " *
+                "Max relative error: $(maximum(abs.(lp′ .- lp_vals) ./ max.(1.0, abs.(lp_vals))))."))
+        end
+
+        # Check forward(lp′) ≈ target_vals
+        target_vals′ = Float64[fn(lp′) for fn in lv.maps]
+        if !isapprox(target_vals′, target_vals; rtol=rtol)
+            throw(ArgumentError(
+                "_validateInverseMaps: inverse-then-forward round-trip failed at sample $(s). " *
+                "target_vals=$(target_vals), lp′=$(lp′), forward(lp′)=$(target_vals′). " *
+                "Max relative error: $(maximum(abs.(target_vals′ .- target_vals) ./ max.(1.0, abs.(target_vals))))."))
+        end
+    end
+    return nothing
+end
+
 function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DiscreteVariation
     latent_parameters = [dv.values]
     targets = [variationTarget(dv)]
+    locations = [variationLocation(dv)]
     maps = [first]
     resolved_name = isnothing(name) ? variationName(dv) : String(name)
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
+    tnames = [variationName(dv)]
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, name=resolved_name)
 end
 
 function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
     latent_parameters = [Uniform(0,1)]
     targets = [variationTarget(dv)]
+    locations = [variationLocation(dv)]
     maps = [dv.flip ? us -> quantile(dv.distribution, 1 - us[1]) : us -> quantile(dv.distribution, us[1])]
+    inverse_maps = [dv.flip ? tv -> 1 - cdf(dv.distribution, tv[1]) : tv -> cdf(dv.distribution, tv[1])]
     resolved_name = isnothing(name) ? variationName(dv) : String(name)
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
+    tnames = [variationName(dv)]
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
 function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DiscreteVariation
     latent_parameters = [collect(1:length(cv))]
     targets = variationTarget(cv)
-    maps = [I -> cv.variations[i].values[I[1]] for i in 1:length(cv.variations)]
+    locations = variationLocation(cv)
+    maps = [I -> variation.values[I[1]] for variation in cv.variations]
     resolved_name = isnothing(name) ? variationName(cv) : String(name)
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
+    tnames = [variationName(v) for v in cv.variations]
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, name=resolved_name)
 end
 
 function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
     latent_parameters = [Uniform(0.0, 1.0)]
     targets = variationTarget(cv)
+    locations = variationLocation(cv)
     maps = map(cv.variations) do dv
         dv.flip ? us -> quantile(dv.distribution, 1 - us[1]) : us -> quantile(dv.distribution, us[1])
     end
+    dv1 = cv.variations[1]
+    # Recover u from first target; return NaN if remaining targets are inconsistent with u.
+    inverse_maps = [tv -> begin
+        u = dv1.flip ? 1 - cdf(dv1.distribution, tv[1]) : cdf(dv1.distribution, tv[1])
+        for i in 2:length(cv.variations)
+            dv_i  = cv.variations[i]
+            exp_i = dv_i.flip ? quantile(dv_i.distribution, 1 - u) : quantile(dv_i.distribution, u)
+            abs(exp_i - tv[i]) > 1e-8 * max(1.0, abs(exp_i)) && return NaN
+        end
+        u
+    end]
     resolved_name = isnothing(name) ? variationName(cv) : String(name)
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name]; name=resolved_name)
+    tnames = [variationName(v) for v in cv.variations]
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
 LatentVariation(lv::LatentVariation) = lv
@@ -520,9 +722,8 @@ function Base.show(io::IO, lv::LatentVariation)
     biggest_width = maximum(length.(all_target_nums))
     indent2 = indent * indent * ' '^(biggest_width + 3)
     last_n = last(all_target_nums)
-    for (n, loc, tar) in zip(all_target_nums, variationLocation(lv), variationTarget(lv))
-        short_target = shortVariationName(loc, columnName(tar))
-        println(io, indent, indent, lpad(n, biggest_width), " $(short_target)")
+    for (n, tname, loc, tar) in zip(all_target_nums, lv.target_names, variationLocation(lv), variationTarget(lv))
+        println(io, indent, indent, lpad(n, biggest_width), " $(tname)")
         println(io, indent2, "Location: $(loc)")
         print(io, indent2, "Target: $(tar)")
         if n != last_n
