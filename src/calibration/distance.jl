@@ -1,18 +1,20 @@
 export mseDistance
 
 """
-    mseDistance(simulated::Dict{String,<:Any}, observed::Dict{String,<:Any})
+    mseDistance(simulated, observed)
 
-Built-in distance function: mean squared error across matched keys.
+Built-in distance functions for use as `distance` in a [`CalibrationProblem`](@ref).
+Three calling conventions are supported:
 
-Works for both scalar and vector values:
-- Scalar values (endpoint data): `(sim - obs)^2`
-- Vector values (time-series data): `mean((sim .- obs).^2)`
+- `mseDistance(sim::Dict{String,<:Any}, obs::Dict{String,<:Any})` — mean of per-key MSE
+  contributions, averaged across all keys in `obs`. Scalar keys contribute `(sim−obs)²`;
+  vector keys contribute `mean((sim .- obs).^2)`. Keys missing from `sim` are treated as
+  zero. Keys in `sim` not in `obs` are ignored (with a one-time warning).
 
-The per-key MSE contributions are averaged across all keys in `observed`.
-Keys present in `observed` but missing from `simulated` contribute a squared error based
-on the observed value alone (i.e., simulated is treated as zero for that key).
-Pass as `distance` in a [`CalibrationProblem`](@ref).
+- `mseDistance(sim::AbstractVector{<:Real}, obs::AbstractVector{<:Real})` — sum of squared
+  differences `Σ(simᵢ−obsᵢ)²`. Throws `DimensionMismatch` when lengths differ.
+
+- `mseDistance(sim::Real, obs::Real)` — squared difference `(sim − obs)²`.
 """
 function mseDistance(simulated::Dict{String,<:Any}, observed::Dict{String,<:Any})
     if any(!in(keys(observed)), keys(simulated))
@@ -54,3 +56,13 @@ end
 # Zero sentinel that matches the shape of the observed value (used for missing keys)
 _zeroLike(::Real) = 0.0
 _zeroLike(v::AbstractVector{<:Real}) = zeros(Float64, length(v))
+
+function mseDistance(simulated::AbstractVector{<:Real}, observed::AbstractVector{<:Real})
+    length(simulated) == length(observed) || throw(DimensionMismatch(
+        "Simulated and observed vectors have different lengths " *
+        "($(length(simulated)) vs $(length(observed)))."
+    ))
+    return sum((simulated .- observed) .^ 2)
+end
+
+mseDistance(simulated::Real, observed::Real) = Float64((simulated - observed)^2)

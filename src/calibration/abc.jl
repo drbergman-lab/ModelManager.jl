@@ -69,8 +69,7 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
 
         results = map(monads) do monad
             simulated = problem.summary_statistic(monad.id)
-            simulated_dict = Dict{String,Any}(String(k) => v for (k, v) in simulated)
-            distance = problem.distance(simulated_dict, problem.observed_data)
+            distance = problem.distance(simulated, problem.observed_data)
             (Float64(distance), monad.id)
         end
 

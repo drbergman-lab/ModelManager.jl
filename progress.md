@@ -766,3 +766,34 @@ Implement all four RecipesBase visualization recipes for `ABCResult`, plus the s
 - `src/ModelManager.jl` — exports + `include("calibration/visualize.jl")`
 - `Project.toml` — `KernelDensity` added to `[deps]` and `[compat]`
 - `PRD.md` — task #7 expanded with `:transition` recipe, `store_rejected` data model, lazy-load fallback; `space=:latent` renamed to `space=:cdf`
+
+---
+
+## 2026-05-18 — Relax CalibrationProblem type constraints; extend mseDistance
+
+### Goal
+Remove the `Dict{String,Any}` coercions that forced all users into dict-based summary statistics and distance functions, and extend `mseDistance` with vector and scalar calling conventions.
+
+### Design decisions
+
+**`observed_data::Any`.** Changed from `Dict{String,Any}` to `Any` in the `CalibrationProblem` struct. Both outer constructors drop the `Dict{String,Any}(observed_data)` coercion and store the value as-is. Constructor argument types also broadened from `Dict{String,<:Any}` to `Any`.
+
+**No coercion in `evaluate_batch`.** The two-line dict coercion in `abc.jl`:
+```julia
+simulated_dict = Dict{String,Any}(String(k) => v for (k, v) in simulated)
+distance = problem.distance(simulated_dict, problem.observed_data)
+```
+collapsed to a single line: `distance = problem.distance(simulated, problem.observed_data)`. The `distance` function is now fully responsible for interpreting both arguments.
+
+**Three `mseDistance` methods.** Added two new methods alongside the existing dict method:
+- `mseDistance(sim::Real, obs::Real)` → `(sim - obs)²` — squared difference is the trivial MSE for a single value.
+- `mseDistance(sim::AbstractVector{<:Real}, obs::AbstractVector{<:Real})` → `Σ(simᵢ−obsᵢ)²` — sum of squared distances with a length guard.
+
+The three methods are intentionally heterogeneous in their reduction: absolute error for scalars, L2 norm for vectors, mean-of-per-key-MSE for dicts. Each is the natural quantity for its input shape.
+
+### Files changed
+- `src/calibration/problem.jl` — `observed_data::Any`; both constructors broadened
+- `src/calibration/abc.jl` — removed dict coercion in `evaluate_batch`
+- `src/calibration/distance.jl` — two new `mseDistance` methods; docstring updated
+- `test/runtests.jl` — new tests for vector/scalar `mseDistance`; `DimensionMismatch`; non-dict `observed_data` round-trip; non-dict `evaluate_batch` integration
+- `PRD.md` — updated `mseDistance` spec and acceptance criteria
