@@ -77,3 +77,4 @@ end
 ### Remaining
 
 - [ ] `createProject` generic entry point
+- [ ] GP-accelerated ABC — `GPAcceleratedABC <: AbstractCalibrationMethod` using a surrogate to reduce simulator evaluations; `AbstractCalibrationMethod` hierarchy is already in place.
