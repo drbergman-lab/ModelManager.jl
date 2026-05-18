@@ -1,0 +1,13 @@
+coverage:
+  status:
+    project:
+      default:
+        target: auto      # pass as long as coverage doesn't drop vs baseline
+        threshold: 1%     # allow up to 1% drop before failing
+    patch:
+      default:
+        target: auto
+        threshold: 1%
+
+ignore:
+  - "src/up.jl"          # migration scaffolding; not meaningfully testable
