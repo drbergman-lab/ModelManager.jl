@@ -5,6 +5,41 @@
 
 ---
 
+## Session: calibration progress reporting (2026-06-17)
+
+### Goal
+A calibration run printed nothing between the end of JIT compilation and the completion of generation 1 — a long silent window for slow simulations. Add console feedback at multiple granularities.
+
+### Problem diagnosis
+- `evaluate_batch` calls `run(sampling; quiet=true)` (`abc.jl`); `quiet=true` suppresses *all* per-simulation/per-trial output in the runner.
+- The only calibration log (`@info "ABC-SMC generation t: ..."`) fires *after* a generation completes (`abc_smc.jl`).
+- So all wall-time inside a generation's `run()` call is silent.
+
+### Key Design Decisions
+
+**Tiered verbosity, not a boolean.** `progress::Symbol` on `runABC`/`runCalibration`/`resumeABC` with stacked levels `:none < :generation < :batch < :bar`, plus `:auto`. Rejected a simple `verbose::Bool` because HPC/SLURM (redirected, non-TTY) logs want textual milestones but *not* a carriage-return progress bar. `:auto` resolves to `:bar` on a TTY and `:generation` otherwise — the right default for both interactive and batch contexts. Runtime-only; deliberately **not** persisted to `method.toml` (it's an I/O preference, not an algorithm setting, and resume should be free to choose its own).
+
+**Generic `on_progress` hook on `run`, not calibration-aware progress in the runner.** `run` gains `on_progress::Union{Nothing,Function}=nothing` and emits `:init`/`:step`/`:finish` events from its existing single-threaded `take!(result_channel)` completion loop (which already fires once per completed sim, identically for local and `sbatch --wait` HPC). The runner learns nothing about calibration — it just emits ticks. When `on_progress === nothing` the runner is byte-for-byte unchanged, so every existing caller and test is unaffected (verified: 914 passing). Rejected putting a `ProgressMeter` directly in `run` because that would couple the simulator-agnostic runner to a calibration-rendering concern and the bar would lack generation/batch framing.
+
+**Bar sized inside `run`, framed outside.** The bar's total = the batch's *pending* simulation count, which only `run` knows (after `pendingSimulationSpecs`). So the renderer is built in the calibration layer (with the gen/batch label as `desc`) but receives its size via the `:init` event. Zero-pending batches (all monads reused) create no bar.
+
+**ProgressMeter imported qualified.** `using ProgressMeter: next!` shadowed `Sobol.next!`, breaking `_runFirstGeneration`'s SobolSeq iteration (caught by the test suite — `MethodError: no method matching next!(::SobolSeq)`). Switched to `import ProgressMeter` + qualified `ProgressMeter.next!`/`.Progress`/`.finish!`. Lesson: prefer qualified import for any package whose exported names (`next!`, `update!`, `finish!`) are likely to collide.
+
+**New dependency:** ProgressMeter.jl (approved), compat relaxed to `"1"`.
+
+### Tests added (12 new, 914 passing)
+- `calibration progress verbosity` — rank ordering, `_resolveVerbosity` pass-through + `:auto` + `ArgumentError`, `_batchProgressCallback` returns `nothing` below `:bar`, full bar lifecycle including zero-pending no-op.
+- `run on_progress hook` (DB-backed) — `:init` first, `:finish` last and once, init size and step count both equal `n_scheduled`.
+- `runCalibration progress levels` (DB-backed) — all four explicit levels run end-to-end; invalid setting throws before any work.
+
+### Files
+- New: `src/calibration/progress.jl` (included first in `calibration.jl`).
+- `src/runner.jl` — `on_progress` hook.
+- `src/calibration/abc_smc.jl` — `verbosity` kwarg on `_runABCSMC`, gen-start log, gated gen-end/stop logs.
+- `src/calibration/abc.jl` — `progress` kwarg threaded through `runCalibration`/`runABC`/`resumeABC`; `_buildEvaluateBatch` tracks per-gen batch index, logs batch start, passes `on_progress` to `run`.
+
+---
+
 ## Session: feature/latent-inverse-maps — Visualization, resume robustness, LatentVariation enhancements (2026-05-17)
 
 ### Goal

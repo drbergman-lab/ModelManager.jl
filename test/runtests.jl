@@ -1983,6 +1983,39 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
         end
     end
 
+    @testset "calibration progress verbosity" begin
+        # Rank ordering: none < generation < batch < bar
+        @test ModelManager._verbosityRank(:none)       == 0
+        @test ModelManager._verbosityRank(:generation) == 1
+        @test ModelManager._verbosityRank(:batch)      == 2
+        @test ModelManager._verbosityRank(:bar)        == 3
+
+        # Explicit levels pass through unchanged.
+        for v in (:none, :generation, :batch, :bar)
+            @test ModelManager._resolveVerbosity(v) == v
+        end
+        # :auto resolves based on whether stdout is a TTY (either is acceptable here).
+        @test ModelManager._resolveVerbosity(:auto) in (:bar, :generation)
+        # Unknown settings throw.
+        @test_throws ArgumentError ModelManager._resolveVerbosity(:loud)
+
+        # The progress-bar callback is built only at :bar.
+        @test ModelManager._batchProgressCallback(:none, "x ")       === nothing
+        @test ModelManager._batchProgressCallback(:generation, "x ") === nothing
+        @test ModelManager._batchProgressCallback(:batch, "x ")      === nothing
+        cb = ModelManager._batchProgressCallback(:bar, "x ")
+        @test cb !== nothing
+        # Full lifecycle must not error, including the zero-pending-simulation case.
+        @test cb(:init, 2)  === nothing
+        @test cb(:step, 1)  === nothing
+        @test cb(:step, 1)  === nothing
+        @test cb(:finish, 2) === nothing
+        cb0 = ModelManager._batchProgressCallback(:bar, "y ")
+        @test cb0(:init, 0)  === nothing   # no bar created
+        @test cb0(:step, 1)  === nothing   # no-op when no bar exists
+        @test cb0(:finish, 0) === nothing
+    end
+
     @testset "DB-backed integration" begin
         mktempdir() do project_dir
             _make_test_project(project_dir)
@@ -2074,6 +2107,29 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
                 @test out.n_success   == 2
             end
 
+            @testset "run on_progress hook" begin
+                dv   = DiscreteVariation(:config, xp_x, [101.0, 102.0, 103.0])
+                samp = createTrial(inputs, [dv]; n_replicates=1)
+
+                events = Symbol[]
+                n_init = Ref(0)
+                n_step = Ref(0)
+                cb = function (event::Symbol, n::Int=0)
+                    push!(events, event)
+                    event === :init   && (n_init[] = n)
+                    event === :step   && (n_step[] += 1)
+                    return nothing
+                end
+
+                out = run(samp; on_progress=cb)
+                @test out.n_scheduled == 3
+                @test first(events) == :init        # :init fires before any :step
+                @test last(events)  == :finish      # :finish fires once at the end
+                @test n_init[]  == out.n_scheduled  # bar sized to pending simulations
+                @test n_step[]  == out.n_scheduled  # one :step per completed simulation
+                @test count(==(:finish), events) == 1
+            end
+
             @testset "createTrial and run — Trial" begin
                 dv    = DiscreteVariation(:config, xp_x, [11.0, 12.0])
                 samp  = createTrial(inputs, [dv]; n_replicates=1)
@@ -2150,6 +2206,27 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
                 # out-of-range generation throws
                 @test_throws ArgumentError posterior(result; generation=99)
+            end
+
+            @testset "runCalibration progress levels" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_named_ss, mseDistance)
+                # Each verbosity level must run end-to-end without error.
+                for prog in (:none, :generation, :batch, :bar)
+                    method = ABCSMC(population_size=4, max_nr_populations=2,
+                                    minimum_epsilon=0.0)
+                    result = runCalibration(prob, method; progress=prog,
+                                            description="progress=$prog")
+                    waitForDiagnostics()
+                    @test result isa ABCResult
+                    @test !isempty(result.generations)
+                end
+                # Invalid setting is rejected before any work begins.
+                @test_throws ArgumentError runCalibration(prob,
+                    ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
+                    progress=:verbose)
             end
 
             @testset "resumeABC" begin
