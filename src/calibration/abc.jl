@@ -44,12 +44,23 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
    overwritten on each batch call so it always contains a single fully-compressed entry
    spanning all batches in the generation.
 4. Assembles all monads into a `Sampling` and calls `run(sampling; quiet=true, run_kwargs...)`.
+   When `verbosity` is `:batch` or higher a batch-start line is logged; when it is `:bar`
+   a live per-simulation progress bar is rendered via the runner's `on_progress` hook.
 5. Returns a `Vector{Tuple{Float64,Int}}` (distance, monad_id) in proposal order.
+
+`verbosity` is a resolved level (see [`_resolveVerbosity`](@ref)); a per-generation batch
+counter is maintained across calls so batch milestones can be numbered within each generation.
 """
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
-                              max_nr_populations::Int, run_kwargs::NamedTuple=(;))
+                              max_nr_populations::Int, run_kwargs::NamedTuple=(;);
+                              verbosity::Symbol=:generation)
+    batch_counts = Dict{Int,Int}()
     function evaluate_batch(t::Int,
                              proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}})
+        batch_index = get(batch_counts, t, 0) + 1
+        batch_counts[t] = batch_index
+        _logBatchStart(verbosity, t, batch_index, length(proposals))
+
         monads = map(proposals) do (latent_cdfs, known_mid)
             if isnothing(known_mid)
                 _createMonadForParams(problem, latent_cdfs)
@@ -65,7 +76,8 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         CSV.write(monad_path, Tables.table(compressIDs(vcat(prior_ids, new_ids))); header=false)
 
         sampling = Sampling(monads, problem.inputs)
-        run(sampling; quiet=true, run_kwargs...)
+        on_progress = _batchProgressCallback(verbosity, "  gen $t batch $batch_index ")
+        run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
 
         results = map(monads) do monad
             simulated = problem.summary_statistic(monad.id)
@@ -94,6 +106,9 @@ saved in two forms:
 # Arguments
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
 - `description::String=""`: stored in the `calibrations` DB row.
+- `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
+  `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
+  and `:generation` otherwise. See [`_resolveVerbosity`](@ref).
 
 # Examples
 ```julia
@@ -103,7 +118,9 @@ df, weights = posterior(result)
 ```
 """
 function runCalibration(problem::CalibrationProblem, method::ABCSMC;
-                        description::String="", run_kwargs::NamedTuple=(;))
+                        description::String="", run_kwargs::NamedTuple=(;),
+                        progress::Symbol=:auto)
+    verbosity = _resolveVerbosity(progress)
     calibration = createCalibration("ABC-SMC"; description=description)
     _saveMethod(calibration, method)
     _saveProblem(calibration, problem)
@@ -114,11 +131,12 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
     cps         = problem.parameters
 
     bank           = _buildSimulationBank(problem)
-    evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations, run_kwargs)
+    evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations,
+                                         run_kwargs; verbosity=verbosity)
     on_generation  = gen -> _saveGeneration(calibration, gen, method.max_nr_populations, cps)
 
     generations = _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
-                              bank=bank)
+                              bank=bank, verbosity=verbosity)
 
     return ABCResult(calibration, generations, problem.parameters, method)
 end
@@ -150,6 +168,9 @@ The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
   generation may have fewer than `population_size` accepted particles).
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; ...)` call.
 - `description::String=""`: stored in the `calibrations` DB row.
+- `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`,
+  `:batch`, `:bar`). `:auto` shows a live progress bar on an interactive terminal and
+  per-generation milestones otherwise.
 
 # Examples
 ```julia
@@ -173,7 +194,8 @@ function runABC(problem::CalibrationProblem;
                 cdf_grid_k::Union{Nothing,Int}=nothing,
                 max_evaluations::Union{Nothing,Int}=nothing,
                 run_kwargs::NamedTuple=(;),
-                description::String="")
+                description::String="",
+                progress::Symbol=:auto)
     method = ABCSMC(; population_size=population_size,
                       max_nr_populations=max_nr_populations,
                       minimum_epsilon=minimum_epsilon,
@@ -186,7 +208,8 @@ function runABC(problem::CalibrationProblem;
                       accept_overflow=accept_overflow,
                       cdf_grid_k=cdf_grid_k,
                       max_evaluations=max_evaluations)
-    return runCalibration(problem, method; description=description, run_kwargs=run_kwargs)
+    return runCalibration(problem, method; description=description, run_kwargs=run_kwargs,
+                          progress=progress)
 end
 
 ################## Method Persistence ##################
@@ -793,6 +816,8 @@ new definition is used silently. Passing `problem=` in this case forces full val
   present at save time; optional otherwise (loads from `problem.jld2`).
 - `method`: Override the saved ABCSMC settings. If `nothing`, loads from `method.toml`.
 - `run_kwargs`: Forwarded to each `run(sampling; ...)` call.
+- `progress`: Console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`, `:bar`);
+  same semantics as in [`runABC`](@ref).
 
 # Examples
 ```julia
@@ -809,7 +834,9 @@ result = resumeABC(Calibration(42); method=ABCSMC(max_nr_populations=15))
 function resumeABC(calibration::Calibration;
                    problem::Union{Nothing,CalibrationProblem}=nothing,
                    method::Union{Nothing,ABCSMC}=nothing,
-                   run_kwargs::NamedTuple=(;))
+                   run_kwargs::NamedTuple=(;),
+                   progress::Symbol=:auto)
+    verbosity = _resolveVerbosity(progress)
     manifest = _loadProblem(calibration)
     active_problem = _resolveResumeProblem(manifest, problem, calibration)
 
@@ -824,17 +851,19 @@ function resumeABC(calibration::Calibration;
     if !isempty(start_generations)
         stop_reason = _stoppingReason(m, start_generations)
         if !isnothing(stop_reason)
-            @info "ABC-SMC (resume): $stop_reason — no new generations needed."
+            _verbosityRank(verbosity) >= _verbosityRank(:generation) &&
+                @info "ABC-SMC (resume): $stop_reason — no new generations needed."
             return ABCResult(calibration, start_generations, active_problem.parameters, m)
         end
     end
 
     bank           = _buildSimulationBank(active_problem)
-    evaluate_batch = _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations, run_kwargs)
+    evaluate_batch = _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations,
+                                         run_kwargs; verbosity=verbosity)
     on_generation  = gen -> _saveGeneration(calibration, gen, m.max_nr_populations, cps)
 
     generations = _runABCSMC(m, param_names, priors, evaluate_batch, on_generation;
-                              bank=bank, start_generations=start_generations)
+                              bank=bank, start_generations=start_generations, verbosity=verbosity)
 
     return ABCResult(calibration, generations, active_problem.parameters, m)
 end

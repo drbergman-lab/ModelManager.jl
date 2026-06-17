@@ -178,18 +178,26 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   output. Per-sim "Running simulation: N..." lines, the leading "Running ..." header,
   and the trailing "Finished ..." block are all gated by this flag. Used by ABC-SMC
   calibration to keep console output focused on per-generation progress.
+- `on_progress::Union{Nothing,Function}=nothing`: optional progress hook. When supplied,
+  it is called as `on_progress(:init, n_simulation_tasks)` once after the pending
+  simulation count is known, `on_progress(:step, 1)` after each simulation completes, and
+  `on_progress(:finish, n_success)` once at the end. When `nothing` (default) the runner
+  behaves exactly as before — this keeps the per-simulation completion loop framework-
+  agnostic while letting callers (e.g. ABC-SMC calibration) render a live progress bar.
 - All other `kwargs` flow through to [`prepareTrialHierarchy`](@ref) (which forwards
   them to the simulator's [`setupSampling`](@ref) / [`setupMonad`](@ref) hooks) and to
   [`postSimulationProcessing`](@ref). Any simulator-specific flags flow through this
   channel. [`runSimulation`](@ref) takes no kwargs.
 """
-function run(T::AbstractTrial; quiet::Bool=false, kwargs...)
+function run(T::AbstractTrial; quiet::Bool=false,
+             on_progress::Union{Nothing,Function}=nothing, kwargs...)
     setup_success = prepareTrialHierarchy(T; kwargs...)
     specs = setup_success ? pendingSimulationSpecs(T) : SimulationSpec[]
     n_simulation_tasks = length(specs)
     n_success = 0
 
     quiet || println("Running $(typeof(T)) $(T.id) requiring $(n_simulation_tasks) simulation$(n_simulation_tasks == 1 ? "" : "s")...")
+    isnothing(on_progress) || on_progress(:init, n_simulation_tasks)
 
     #! Build @task wrappers here. The per-sim println sits inside @task begin … end
     #! so it fires when the task is *scheduled* (i.e. when the simulation actually
@@ -221,7 +229,9 @@ function run(T::AbstractTrial; quiet::Bool=false, kwargs...)
     for _ in 1:n_simulation_tasks
         simulation_process = take!(result_channel)
         n_success += simulation_process.success
+        isnothing(on_progress) || on_progress(:step, 1)
     end
+    isnothing(on_progress) || on_progress(:finish, n_success)
 
     if !quiet
         n_asterisks = 1

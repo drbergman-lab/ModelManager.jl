@@ -271,7 +271,7 @@ end
 
 """
     _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
-               start_generations)
+               bank, start_generations, verbosity)
 
 Run the ABC-SMC algorithm. This is the framework-agnostic core.
 
@@ -297,6 +297,9 @@ unbiased prior sample while still avoiding redundant simulation work.
   (snapping disabled).
 - `start_generations::Vector{GenerationResult}`: Previously-completed generations to
   resume from (empty for a fresh run).
+- `verbosity::Symbol`: Resolved console-feedback level (see [`_resolveVerbosity`](@ref)).
+  `:generation` (the default) and higher emit the generation-start, generation-finish,
+  and stopping-reason `@info` lines; `:none` suppresses them entirely.
 
 # Returns
 `Vector{GenerationResult}`: All completed generations (including resumed ones).
@@ -305,7 +308,8 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
                     priors::Vector{<:Distribution}, evaluate_batch::Function,
                     on_generation::Function;
                     bank::SimulationBank=SimulationBank(Int[], Matrix{Float64}(undef, 0, 0), String[]),
-                    start_generations::Vector{GenerationResult}=GenerationResult[])
+                    start_generations::Vector{GenerationResult}=GenerationResult[],
+                    verbosity::Symbol=:generation)
 
     # ── k_base correction ────────────────────────────────────────────────────
     # Ensure the effective base resolution is large enough that the grid has at
@@ -347,6 +351,7 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
         empty!(mid_gen_additions)
 
         if t == 1
+            _logGenerationStart(verbosity, 1, nothing, method.population_size)
             gen = _runFirstGeneration(method, param_names, priors, evaluate_batch, bank;
                                       k_base_eff=k_base_eff,
                                       mid_gen_additions=mid_gen_additions,
@@ -359,6 +364,7 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
             else
                 _adaptEpsilon(prev.distances, method.epsilon_quantile, method.minimum_epsilon)
             end
+            _logGenerationStart(verbosity, t, epsilon_t, method.population_size)
             gen = _runSubsequentGeneration(method, param_names, priors, evaluate_batch,
                                            prev, epsilon_t, t, bank;
                                            k_base_eff=k_base_eff,
@@ -372,17 +378,20 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
         push!(generations, gen)
         on_generation(gen)
 
-        n_accepted = length(gen.distances)
-        @info "ABC-SMC generation $(gen.t): " *
-              "ε=$(round(gen.epsilon; digits=6)), " *
-              "$(n_accepted)/$(gen.n_evaluations) proposals accepted " *
-              "($(round(100*gen.acceptance_rate; digits=1))%), " *
-              "ESS=$(round(gen.ess; digits=1)) " *
-              "($(round(100 * gen.ess / n_accepted; digits=1))%)"
+        if _verbosityRank(verbosity) >= _verbosityRank(:generation)
+            n_accepted = length(gen.distances)
+            @info "ABC-SMC generation $(gen.t): " *
+                  "ε=$(round(gen.epsilon; digits=6)), " *
+                  "$(n_accepted)/$(gen.n_evaluations) proposals accepted " *
+                  "($(round(100*gen.acceptance_rate; digits=1))%), " *
+                  "ESS=$(round(gen.ess; digits=1)) " *
+                  "($(round(100 * gen.ess / n_accepted; digits=1))%)"
+        end
 
         stop_reason = _stoppingReason(method, generations; budget_hit=budget_hit[])
         if !isnothing(stop_reason)
-            @info "ABC-SMC: $stop_reason — stopping."
+            _verbosityRank(verbosity) >= _verbosityRank(:generation) &&
+                @info "ABC-SMC: $stop_reason — stopping."
             break
         end
     end

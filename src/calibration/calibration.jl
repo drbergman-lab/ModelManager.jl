@@ -1,3 +1,4 @@
+include("progress.jl")
 include("methods.jl")
 include("parameters.jl")
 include("problem.jl")
