@@ -75,3 +75,32 @@ indices. Helpers include:
 Because GSA is built on the same [space-filling designs](@ref "Space-filling designs") and the
 same [runner](@ref "Running simulations"), its simulations are deduplicated and reused like any
 other trial. See the [Sensitivity analysis](@ref) API reference for full details.
+
+## Visualizing
+
+When a plotting backend is loaded, [RecipesBase](https://github.com/JuliaPlots/RecipesBase.jl)
+recipes turn each sampling result into a sensitivity chart. Every recipe draws one series per
+output function in the result (the series label includes the function name when more than one
+function was supplied); the x-axis is the varied parameters.
+
+```julia
+using Plots
+
+# MOAT (Morris) — three chart styles selected by a positional symbol
+plot(moat)                       # :bar (default) — µ* per parameter
+plot(moat; show_sigma=true)      # add σ as ±whiskers on the µ* bars
+plot(moat, :scatter)             # classic µ*–σ screening scatter, points labeled
+plot(moat, :violin)              # full elementary-effect distribution per parameter
+
+# Sobol' — first-order (S1) bars, with total-order (ST) overlaid at reduced opacity
+plot(sobol)                      # S1 + ST
+plot(sobol; show_ST=false)       # S1 only
+
+# RBD — first-order index bars
+plot(rbd)
+```
+
+The `:violin` style needs a backend that provides the `:violin` series type (e.g.
+[StatsPlots](https://github.com/JuliaPlots/StatsPlots.jl)); the others work with any
+Plots- or Makie-compatible backend. See [`MOATSampling`](@ref), [`SobolSampling`](@ref),
+and [`RBDSampling`](@ref) for the full recipe documentation.

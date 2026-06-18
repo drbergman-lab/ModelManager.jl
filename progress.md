@@ -5,6 +5,43 @@
 
 ---
 
+## Session: GSA sensitivity plot recipes (2026-06-17)
+
+### Goal
+The calibration result objects have `RecipesBase.jl` recipes (`src/calibration/visualize.jl`), but the GSA sampling results (`MOATSampling`, `SobolSampling`, `RBDSampling`) had none. Add bar-chart recipes mirroring SmoreGSA's `SensitivityResult` recipe, plus richer MOAT visualizations.
+
+### Design decisions
+
+**New file `src/sensitivity_visualize.jl`**, included after `sensitivity.jl`. Parallels `calibration/visualize.jl`. `RecipesBase` is already a direct dep, so recipes live in-package (not in an extension like SmoreGSA, which keeps Makie/Plots out of its core deps — ModelManager already committed to the in-package approach for calibration).
+
+**Internal plot-data wrappers + builders take `(results, monad_ids_df, …)`, not the `GSASampling`.** This is the key testability decision: constructing a real `MOATSampling`/etc. requires a `Sampling` (and a live SQLite project). By having the user-facing recipe extract `m.results`/`m.monad_ids_df` and delegate to a builder (`_moatBarData`, `_sobolBarData`, …) that returns a lightweight wrapper (`_GSABarData`, `_GSAViolinData`, `_GSAScatterData`), the tests fabricate `GlobalSensitivity.MorrisResult`/`SobolResult` objects + a plain `DataFrame` and call `RecipesBase.apply_recipe` directly — no DB, no simulations. Same `_CornerPlotData` pattern as calibration.
+
+**One series per sensitivity function**, iterated in `_gsaFunctionLabel`-sorted order (the `results` Dict order is otherwise unspecified → nondeterministic legends). Labels prefix the function name only when `length(results) > 1`, matching SmoreGSA's `multi_out` convention.
+
+**Parameter names from `monad_ids_df` columns**, dropping the per-method bookkeeping columns: `base` (MOAT, index 1), `A`/`B` (Sobolʼ, indices 1–2), none (RBD). These align with the index-vector ordering already established in `sensitivity.jl` (`perturb_headers`/`focus_indices`).
+
+**MOAT got three styles** (user request beyond the SmoreGSA bar-only Morris recipe), dispatched via a `style::Symbol` positional like calibration's `plot(result, :transition)`:
+- `:bar` (default) — µ* bars; `show_sigma=true` adds σ = `sqrt(variances)` whiskers via the `yerror` attribute. `_GSABarGroup` carries an optional `yerror::Union{Nothing,Vector}` for this.
+- `:violin` — distribution of `elementary_effects` (the full `n_base × d` matrix MorrisResult already stores) per parameter. Emits `seriestype := :violin`; resolved by the backend (StatsPlots) at plot time, so no new dep.
+- `:scatter` — classic Morris µ*–σ screening plot, one point per parameter. Parameter names are placed via offset `annotations` (nudged 2% of the axis span, anchored `:left,:bottom`) rather than `series_annotations`, which centers text on the marker and overlaps it.
+
+**Sobolʼ `show_ST=true`** overlays ST at `fillalpha=0.45` (matches SmoreGSA). RBD is first-order bars only. Both reuse the shared `_GSABarData` recipe.
+
+### Rejected / considered
+- **Three independent recipes with duplicated styling** — rejected in favor of the shared `_GSABarData` recipe so xlabel/ylabel/legend/`:bar` styling stays consistent and the bar logic is written once.
+- **Putting recipes in an `ext/` extension (SmoreGSA style)** — unnecessary here since `RecipesBase` is already a hard dep and the calibration recipes set the in-package precedent.
+
+### Files changed
+- `src/sensitivity_visualize.jl` — new file: shared helpers, `_GSABarData`/`_GSAViolinData`/`_GSAScatterData` wrappers + recipes, builders, and the five user-facing `@recipe`s (MOAT bar/violin/scatter, Sobolʼ, RBD)
+- `src/ModelManager.jl` — `include("sensitivity_visualize.jl")` after `sensitivity.jl`
+- `test/runtests.jl` — `using RecipesBase` + `import GlobalSensitivity`; module-level `_gsa_fA`/`_gsa_fB` keys; `@testset "GSA plot recipes"` (series counts, σ whiskers, param-name extraction, empty-results errors)
+- `README.md`, `PRD.md` — sensitivity visualization documented
+
+### Open questions
+- None. Violin requires a `:violin`-capable backend (StatsPlots); documented in the docstring rather than adding a dep.
+
+---
+
 ## Session: documentation rework + logo (2026-06-17)
 
 ### Goal

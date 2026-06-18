@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/src/assets/logo-hero.svg" width="200" alt="ModelManager.jl"></p>
+
 # ModelManager.jl
 
 [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://drbergman-lab.github.io/ModelManager.jl/stable/)
@@ -58,6 +60,7 @@ end
 - [x] Parameter variations — `XMLPath`, `DiscreteVariation`, `DistributedVariation`, `CoVariation`, `LatentVariation`
 - [x] Space-filling designs — `GridVariation`, `LHSVariation`, `SobolVariation`, `RBDVariation`
 - [x] Sensitivity analysis — MOAT, Sobol', RBD-FAST (generic, no simulator-specific logic)
+- [x] Sensitivity visualization — `RecipesBase.jl` recipes for `MOATSampling` (`:bar` with optional σ whiskers, `:violin`, `:scatter` µ*–σ screening), `SobolSampling` (S1/ST grouped bars, `show_ST` toggle), and `RBDSampling` (first-order bars); one series per sensitivity function
 - [x] `createTrial` / `run` user API — convenience wrappers over the trial hierarchy
 - [x] `postSimulationProcessing` interface stub — simulators override for cleanup/pruning
 - [x] `initializeInputFolder` / `getInputFolderDescription` / `clearSimulatorArtifacts` interface stubs
