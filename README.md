@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/src/assets/logo-hero.svg" width="200" alt="ModelManager.jl"></p>
+
 # ModelManager.jl
 
 [![Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://drbergman-lab.github.io/ModelManager.jl/stable/)

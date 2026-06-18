@@ -40,6 +40,37 @@ The calibration result objects have `RecipesBase.jl` recipes (`src/calibration/v
 ### Open questions
 - None. Violin requires a `:violin`-capable backend (StatsPlots); documented in the docstring rather than adding a dep.
 
+---
+
+## Session: documentation rework + logo (2026-06-17)
+
+### Goal
+Replace the monolithic single-page docs (a 16-line `index.md` with one undifferentiated `@autodocs` dump) with a structured manual + API reference, mirroring the revamped PhysiCellModelManager.jl docs, and add a project logo.
+
+### What was done
+- **Structure.** `docs/make.jl` rewritten with a `man/` (narrative manual) + `lib/` (per-source-file `@autodocs`) split, `collapselevel=1`, and `checkdocs=:exports`. Sidebar: Getting Started → Core Concepts → Varying Parameters → Uncertainty Quantification → Building a Simulator Backend → Reference → Index.
+- **Manual pages** (full prose, `docs/src/man/`): overview, installation, trial hierarchy, project configuration, database, running simulations, HPC, variations, space-filling designs, sensitivity analysis, calibration, building a simulator backend, managing data; plus `misc/database_upgrades.md`. Audience is backend authors + advanced users (ModelManager has no simulator of its own), so examples assume an initialized backend.
+- **API pages** (`docs/src/lib/`): one page per `src/*.jl`, `Public`/`Private` split; calibration aggregates all `src/calibration/*.jl`; alphabetical `@index` page.
+- **Logo.** 3D extruded gear-disc database in Julia colors (green/red/purple) — three stacked gears as the DB discs (mechanistic-modeling motif), kin to the PCMM concentric-circle logo. `docs/src/assets/logo.svg` (mark) + `logo-hero.svg` (mark + wordmark). Generated via script (gear path + drop-extrude trick).
+
+### Key decisions / gotchas
+- **`CurrentModule = ModelManager` on every man/misc page.** Without it, `@ref`s to *non-exported* symbols (`runSimulation`, `prepareTrialHierarchy`, …) resolve against `Main` and fail; exported symbols resolved fine, which masked the issue at first.
+- **Documenter `Pages` filter is a path *suffix* match.** `Pages = ["utilities.jl"]` also matched `xml_utilities.jl`, double-documenting every XML symbol ("duplicate docs" errors). Fixed by using `Pages = ["/utilities.jl"]` on `lib/utilities.md`.
+- **Distinct `lib/` page titles.** Several lib titles collided with man H1s (Variations, Project configuration, HPC support, Sensitivity analysis, Database upgrades), making `@ref` ambiguous. Renamed lib pages (e.g. "Variations & designs", "Schema migrations", "HPC & SLURM", "Sensitivity analysis (GSA)"). The two "Calibration" pages use explicit `@id`s (`calibration_man`, `calibration_lib`).
+- **Multi-word header refs quoted** as `@ref "Header Title"`.
+- Build verified green locally (`julia --project=docs docs/make.jl`, EXIT=0). Only a size-threshold *warning* on the aggregated `lib/calibration.md` (10 source files) — under the hard limit.
+
+### Open questions
+- `lib/calibration.md` could be split if it later crosses the hard size threshold.
+
+### Resolved in follow-ups
+- Added docstrings to the four exported `Add*VariationsResult` structs (`checkdocs=:exports` doesn't flag undocumented exports, so they had rendered blank).
+- De-duplicated the `runCalibration` docstring (interface stub vs. ABCSMC method).
+- Renamed the "Experiments" sidebar group to "Uncertainty Quantification".
+- Variation examples now wrap targets in `XMLPath(...)` — ModelManager constructors require an `XMLPath`, not a bare `Vector{String}` (keeps the core format-agnostic).
+
+---
+
 ## Session: calibration progress reporting (2026-06-17)
 
 ### Goal

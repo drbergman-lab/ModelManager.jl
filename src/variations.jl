@@ -929,20 +929,64 @@ Abstract type for the result of [`addVariations`](@ref).
 """
 abstract type AddVariationsResult end
 
+"""
+    AddGridVariationsResult <: AddVariationsResult
+
+Result of [`addVariations`](@ref) with [`GridVariation`](@ref): the full factorial grid.
+
+# Fields
+- `variation_ids::AbstractArray{VariationID}`: One [`VariationID`](@ref) per grid point,
+  i.e. per combination of the discrete variation values. The array's shape mirrors the grid
+  axes (one dimension per varied parameter).
+"""
 struct AddGridVariationsResult <: AddVariationsResult
     variation_ids::AbstractArray{VariationID}
 end
 
+"""
+    AddLHSVariationsResult <: AddVariationsResult
+
+Result of [`addVariations`](@ref) with [`LHSVariation`](@ref) (Latin Hypercube Sampling).
+
+# Fields
+- `cdfs::Matrix{Float64}`: The sampled CDF coordinates in `[0, 1]`, one row per latent
+  dimension and one column per sample point (shape `(d, n)`).
+- `variation_ids::Vector{VariationID}`: One [`VariationID`](@ref) per sample point, in the
+  same order as the columns of `cdfs`.
+"""
 struct AddLHSVariationsResult <: AddVariationsResult
     cdfs::Matrix{Float64}
     variation_ids::Vector{VariationID}
 end
 
+"""
+    AddSobolVariationsResult <: AddVariationsResult
+
+Result of [`addVariations`](@ref) with [`SobolVariation`](@ref) (Sobol quasi-random sequence).
+
+# Fields
+- `cdfs::Array{Float64,3}`: The Sobol CDF coordinates in `[0, 1]`, indexed by latent
+  dimension, sample, and design matrix.
+- `variation_ids::AbstractArray{VariationID}`: One [`VariationID`](@ref) per sample,
+  arranged with one row per sample and one column per design matrix (shape `(n, n_matrices)`).
+"""
 struct AddSobolVariationsResult <: AddVariationsResult
     cdfs::Array{Float64,3}
     variation_ids::AbstractArray{VariationID}
 end
 
+"""
+    AddRBDVariationsResult <: AddVariationsResult
+
+Result of [`addVariations`](@ref) with [`RBDVariation`](@ref) (Random Balance Design).
+
+# Fields
+- `variation_ids::AbstractArray{VariationID}`: One [`VariationID`](@ref) per sampled point,
+  in CDF-sample order.
+- `variation_matrix::Matrix{VariationID}`: The same IDs re-sorted into the RBD layout — one
+  column per latent parameter, rows ordered along each parameter's periodic RBD curve. This
+  is the form consumed by the RBD-FAST spectral analysis.
+"""
 struct AddRBDVariationsResult <: AddVariationsResult
     variation_ids::AbstractArray{VariationID}
     variation_matrix::Matrix{VariationID}
