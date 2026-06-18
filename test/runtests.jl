@@ -2450,6 +2450,14 @@ _gsa_fB(mid) = 0.0
             @test_throws ErrorException ModelManager._moatViolinData(empty_morris, moat_df)
             @test_throws ErrorException ModelManager._moatScatterData(empty_morris, moat_df)
         end
+
+        @testset "no parameters error" begin
+            # All three wrapper recipes must reject a parameter-less sampling with a clear
+            # message rather than a BoundsError / empty-reduction error.
+            @test_throws ErrorException apply(ModelManager._GSABarData(String[], [ModelManager._GSABarGroup("f", Float64[], 1.0, nothing)]))
+            @test_throws ErrorException apply(ModelManager._GSAViolinData(String[], [("f", zeros(0, 0))]))
+            @test_throws ErrorException apply(ModelManager._GSAScatterData(String[], [("f", Float64[], Float64[])]))
+        end
     end
 
 end

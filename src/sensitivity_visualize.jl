@@ -100,6 +100,7 @@ end
 _annotationSpan(v) = (s = maximum(v) - minimum(v); s == 0 ? max(maximum(abs, v), 1.0) : s)
 
 @recipe function f(d::_GSAScatterData)
+    length(d.param_names) == 0 && error("No parameters to plot.")
     isempty(d.groups) && error(_NO_FUNCTIONS_MSG)
 
     seriestype := :scatter
