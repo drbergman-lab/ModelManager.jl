@@ -281,18 +281,7 @@ function ABCSMC(; population_size::Int=100,
                   accept_overflow, cdf_grid_k, max_evaluations, store_rejected)
 end
 
-"""
-    runCalibration(problem::CalibrationProblem, method::AbstractCalibrationMethod; description="") → ABCResult
-
-Run calibration using the specified method. Dispatches to the method-specific implementation.
-
-See [`ABCSMC`](@ref) for the ABC-SMC method and its keyword arguments.
-
-# Examples
-```julia
-method = ABCSMC(population_size=200, max_nr_populations=5)
-result = runCalibration(problem, method; description="my calibration run")
-df, weights = posterior(result)
-```
-"""
+# Generic dispatch stub. The user-facing docstring lives on the method-specific
+# implementation (e.g. `runCalibration(::CalibrationProblem, ::ABCSMC)` in abc.jl)
+# so the rendered API reference shows a single, detailed entry.
 function runCalibration end
