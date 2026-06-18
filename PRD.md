@@ -183,6 +183,19 @@
 - `calculateGSA!(gsa_sampling, f)` is idempotent (re-running with the same function does not repeat computation).
 - `recordSensitivityScheme` writes a CSV with monad IDs matching the sampling design.
 
+**Sensitivity visualization:** `RecipesBase.jl` recipes (no backend dependency) for the three `GSASampling` subtypes, mirroring the calibration recipes in `sensitivity_visualize.jl`. Each emits one series per sensitivity function in the `results` dict, iterated in label-sorted order for reproducibility; the series label includes the function name only when more than one function is present. Parameter (x-axis) names come from the `monad_ids_df` columns after the method's bookkeeping columns (`base` for MOAT; `A`,`B` for Sobolʼ; none for RBD).
+  - **`plot(m::MOATSampling, style=:bar; show_sigma=false)`** — grouped bar chart of µ* (`means_star`); `show_sigma=true` overlays σ = `sqrt(variances)` as ±whiskers (`yerror`).
+  - **`plot(m::MOATSampling, :violin)`** — violin of the full `elementary_effects` distribution per parameter (requires a `:violin`-capable backend, e.g. `StatsPlots`).
+  - **`plot(m::MOATSampling, :scatter)`** — classic Morris µ* (x) vs σ (y) screening scatter, points annotated with parameter names.
+  - **`plot(s::SobolSampling; show_ST=true)`** — first-order `S1` bars plus, when `show_ST`, total-order `ST` bars at reduced opacity (`fillalpha=0.45`); `ST` skipped if absent.
+  - **`plot(r::RBDSampling)`** — first-order index bars.
+  - Internal plot-data wrappers (`_GSABarData`, `_GSAViolinData`, `_GSAScatterData`) and builder functions (`_moatBarData`, `_moatViolinData`, `_moatScatterData`, `_sobolBarData`, `_rbdBarData`) take `(results, monad_ids_df, …)` so the chart logic is unit-testable via `RecipesBase.apply_recipe` without constructing a live `Sampling`/DB. Empty `results` raises an informative error.
+
+**Visualization acceptance criteria:**
+- `apply_recipe` on each builder's output yields one series per function (Sobolʼ: ×2 when `show_ST` and `ST` present).
+- MOAT `show_sigma=true` populates the bar group's `yerror` with `sqrt(variances)`.
+- Parameter-name extraction drops the correct leading bookkeeping columns per method.
+
 ---
 
 ## Feature: Schema Migrations

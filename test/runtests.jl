@@ -9,6 +9,8 @@ using TOML
 using JLD2
 using NearestNeighbors
 using LinearAlgebra
+using RecipesBase
+import GlobalSensitivity
 
 # Full-featured stub simulator used by both the existing in-memory unit tests and the
 # new DB-backed integration tests.
@@ -72,6 +74,11 @@ _test_named_dist(s, o)     = 0.0
 # Returns x=2.0 so mseDistance vs observed x=1.0 is always 1.0 (non-zero).
 # Used by resumeABC test to prevent premature convergence.
 _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
+
+# Named functions used as keys in the GSA sensitivity-recipe tests, so legend labels
+# are stable strings ("_gsa_fA", "_gsa_fB") rather than gensym closure names.
+_gsa_fA(mid) = 0.0
+_gsa_fB(mid) = 0.0
 
 @testset "ModelManager.jl" begin
 
@@ -2294,6 +2301,15 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
                 samp = run(MOAT(3), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
                 @test size(samp.monad_ids_df, 2) == 3   # intercept + 2 factors
+
+                # Recipe (full path: sampling → builder → wrapper) on a real sampling.
+                rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp)
+                @test rd[1].args[1] isa ModelManager._GSABarData
+                @test rd[1].args[1].param_names == names(samp.monad_ids_df)[2:end]
+                # Alternate MOAT styles dispatch without error; bad style throws.
+                @test RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp, :violin)[1].args[1] isa ModelManager._GSAViolinData
+                @test RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp, :scatter)[1].args[1] isa ModelManager._GSAScatterData
+                @test_throws ErrorException RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp, :nope)
             end
 
             @testset "GSA — Sobol" begin
@@ -2303,6 +2319,11 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
                 samp = run(Sobolʼ(4), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
+
+                rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp)
+                @test rd[1].args[1] isa ModelManager._GSABarData
+                @test rd[1].args[1].param_names == names(samp.monad_ids_df)[3:end]
+                @test length(rd[1].args[1].groups) == 2   # S1 + ST for one function
             end
 
             @testset "GSA — RBD" begin
@@ -2312,6 +2333,10 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
                 samp = run(RBD(4), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
+
+                rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp)
+                @test rd[1].args[1] isa ModelManager._GSABarData
+                @test rd[1].args[1].param_names == names(samp.monad_ids_df)
             end
 
             waitForDiagnostics()
@@ -2321,5 +2346,110 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
         # don't inherit the temp-project globals.
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end  # @testset "DB-backed integration"
+
+    ################## GSA plot recipes ##################
+
+    @testset "GSA plot recipes" begin
+        d = 3
+        pnames = ["p1", "p2", "p3"]
+
+        # Fabricate GlobalSensitivity result objects directly (no simulations needed):
+        # the recipes only read the index fields, not the sampling/DB.
+        morris(seed) = (Random.seed!(seed);
+            GlobalSensitivity.MorrisResult(
+                reshape([0.0, 0.1, -0.2], 1, d),   # means
+                reshape([0.1, 0.5, 0.2], 1, d),    # means_star (µ*)
+                reshape([0.01, 0.04, 0.02], 1, d), # variances (σ²)
+                randn(5, d)))                      # elementary_effects (n_base × d)
+        sobol() = GlobalSensitivity.SobolResult(
+            [0.2, 0.5, 0.1], nothing, nothing, nothing, [0.3, 0.6, 0.2], nothing)
+
+        moat_df  = DataFrame("base" => [1, 2, 3], "p1" => [4, 5, 6], "p2" => [7, 8, 9], "p3" => [10, 11, 12])
+        sobol_df = DataFrame("A" => [1, 2], "B" => [3, 4], "p1" => [5, 6], "p2" => [7, 8], "p3" => [9, 10])
+        rbd_df   = DataFrame("p1" => [1, 2], "p2" => [3, 4], "p3" => [5, 6])
+
+        nseries(recipe_data) = length(recipe_data)
+        apply(d) = RecipesBase.apply_recipe(Dict{Symbol,Any}(), d)
+
+        @testset "parameter name extraction" begin
+            @test ModelManager._moatParameterNames(moat_df)   == pnames
+            @test ModelManager._sobolParameterNames(sobol_df) == pnames
+            @test ModelManager._rbdParameterNames(rbd_df)     == pnames
+        end
+
+        @testset "MOAT — bar" begin
+            res1 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1))
+            bd   = ModelManager._moatBarData(res1, moat_df, false)
+            @test bd.param_names == pnames
+            @test nseries(apply(bd)) == 1                 # one function → one series
+            @test bd.groups[1].label == "µ*"
+            @test isnothing(bd.groups[1].yerror)
+
+            # show_sigma adds σ whiskers (still one series)
+            bd_s = ModelManager._moatBarData(res1, moat_df, true)
+            @test bd_s.groups[1].yerror ≈ sqrt.([0.01, 0.04, 0.02])
+            @test nseries(apply(bd_s)) == 1
+
+            # two functions → two series, function-labeled
+            res2 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1), _gsa_fB => morris(2))
+            bd2  = ModelManager._moatBarData(res2, moat_df, false)
+            @test nseries(apply(bd2)) == 2
+            @test Set(g.label for g in bd2.groups) == Set(["µ*: _gsa_fA", "µ*: _gsa_fB"])
+        end
+
+        @testset "MOAT — violin" begin
+            res1 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1))
+            vd   = ModelManager._moatViolinData(res1, moat_df)
+            @test vd.param_names == pnames
+            @test nseries(apply(vd)) == 1
+
+            res2 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1), _gsa_fB => morris(2))
+            @test nseries(apply(ModelManager._moatViolinData(res2, moat_df))) == 2
+        end
+
+        @testset "MOAT — scatter" begin
+            res1 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1))
+            sd   = ModelManager._moatScatterData(res1, moat_df)
+            @test sd.param_names == pnames
+            @test sd.groups[1][2] ≈ [0.1, 0.5, 0.2]                  # µ*
+            @test sd.groups[1][3] ≈ sqrt.([0.01, 0.04, 0.02])       # σ
+            @test nseries(apply(sd)) == 1
+
+            res2 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1), _gsa_fB => morris(2))
+            @test nseries(apply(ModelManager._moatScatterData(res2, moat_df))) == 2
+        end
+
+        @testset "Sobolʼ" begin
+            res1 = Dict{Function,GlobalSensitivity.SobolResult}(_gsa_fA => sobol())
+            @test nseries(apply(ModelManager._sobolBarData(res1, sobol_df, true)))  == 2  # S1 + ST
+            @test nseries(apply(ModelManager._sobolBarData(res1, sobol_df, false))) == 1  # S1 only
+
+            bd = ModelManager._sobolBarData(res1, sobol_df, true)
+            @test bd.param_names == pnames
+            @test [g.label for g in bd.groups] == ["S1", "ST"]
+            @test bd.groups[2].fillalpha == 0.45                     # ST de-emphasized
+
+            res2 = Dict{Function,GlobalSensitivity.SobolResult}(_gsa_fA => sobol(), _gsa_fB => sobol())
+            @test nseries(apply(ModelManager._sobolBarData(res2, sobol_df, true))) == 4   # 2 fns × (S1+ST)
+        end
+
+        @testset "RBD" begin
+            res1 = Dict{Function,Vector{<:Real}}(_gsa_fA => [0.1, 0.2, 0.3])
+            bd   = ModelManager._rbdBarData(res1, rbd_df)
+            @test bd.param_names == pnames
+            @test bd.groups[1].label == "S1"
+            @test nseries(apply(bd)) == 1
+
+            res2 = Dict{Function,Vector{<:Real}}(_gsa_fA => [0.1, 0.2, 0.3], _gsa_fB => [0.4, 0.5, 0.6])
+            @test nseries(apply(ModelManager._rbdBarData(res2, rbd_df))) == 2
+        end
+
+        @testset "empty results error" begin
+            empty_morris = Dict{Function,GlobalSensitivity.MorrisResult}()
+            @test_throws ErrorException ModelManager._moatBarData(empty_morris, moat_df, false)
+            @test_throws ErrorException ModelManager._moatViolinData(empty_morris, moat_df)
+            @test_throws ErrorException ModelManager._moatScatterData(empty_morris, moat_df)
+        end
+    end
 
 end
