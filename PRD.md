@@ -125,6 +125,16 @@
 - `addVariations(GridVariation(), inputs, [dv])` inserts rows and returns one `VariationID` per grid point.
 - Re-adding an identical variation returns the existing ID (idempotent).
 
+**Future enhancement (not yet scoped):** Let variation constructors accept a bare
+`Vector{String}` target. ModelManager would identify the input file's format (from the target
+location) and convert the vector to the appropriate path type — `XMLPath` for XML, another path
+type for other formats — so users need not wrap the path themselves. Today the constructors
+require an explicit path object (`XMLPath`) to keep the core format-agnostic; this would add the
+ergonomic shortcut *without* baking XML into the API. Would cover `DiscreteVariation`,
+`DistributedVariation`, `Uniform`/`NormalDistributedVariation`, `LatentVariation`, and the
+`CoVariation` tuple forms, and requires a format-detection/dispatch mechanism keyed on the
+target location's file type.
+
 ---
 
 ## Feature: Simulation Runner
