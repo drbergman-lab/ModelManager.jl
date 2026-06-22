@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/src/assets/logo-hero.svg" width="200" alt="ModelManager.jl"></p>
+<p align="center"><img src="docs/src/assets/logo-hero.svg" width="250" alt="ModelManager.jl"></p>
 
 # ModelManager.jl
 

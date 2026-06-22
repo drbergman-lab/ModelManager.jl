@@ -3,7 +3,7 @@ CurrentModule = ModelManager
 ```
 
 ```@raw html
-<p align="center"><img src="assets/logo-hero.svg" width="240" alt="ModelManager.jl"></p>
+<p align="center"><img src="assets/logo-hero.svg" width="300" alt="ModelManager.jl"></p>
 ```
 
 # ModelManager.jl

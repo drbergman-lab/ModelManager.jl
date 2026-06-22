@@ -150,7 +150,7 @@ Branch `feature/latent-inverse-maps` is ready to merge. MM version bumped to `0.
 ## Session: Phase 2b — Populate ModelManager with generic infrastructure (2026-04-12)
 
 ### Goal
-Extract all simulator-agnostic code from PCMM into ModelManager so that BergiCell (a new Julia ABM package) can build on the same infrastructure without duplication.
+Extract all simulator-agnostic code from PCMM into ModelManager so that future simulator packages (new Julia ABM frontends) can build on the same infrastructure without duplication.
 
 ### Key Design Decisions
 
