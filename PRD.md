@@ -8,7 +8,7 @@
 
 **Vision:** ModelManager provides simulator-agnostic ABM infrastructure so that any Julia-based agent-based modeling framework can inherit a complete simulation management stack — parameter variation, space-filling designs, sensitivity analysis, database provenance, and HPC support — without reimplementing it.
 
-**Target Users:** Julia package authors building simulator-specific frontends (e.g. PhysiCellModelManager.jl, BergiCell.jl).
+**Target Users:** Julia package authors building simulator-specific frontends (e.g. PhysiCellModelManager.jl).
 
 **Business Objectives:**
 1. Eliminate duplicated infrastructure across simulator packages.

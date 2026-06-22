@@ -15,14 +15,22 @@ reference implementation; this page describes the contract it (and your package)
 ## The big picture
 
 ```
-your package                         ModelManager
-────────────                         ────────────
-MySimulator <: AbstractSimulator
-  runSimulation(sim, spec)  ◀──────  runner dispatches each pending simulation here
-  setupSampling / setupMonad ◀─────  prepareTrialHierarchy calls these before running
-  simulatorVersion* methods  ◀─────  database schema + version tracking
-  upgrade* methods           ◀─────  schema migrations
-  __init__ sets mm_globals_ref ────▶ initializeModelManager wires everything up
+Arrows point from caller to callee (X ──▶ Y means "X calls Y").
+
+You define one concrete type and implement a handful of methods on it:
+
+  MySimulator <: AbstractSimulator
+
+ModelManager calls your methods at the right moments during a run:
+
+  runner                ──▶  runSimulation(sim, spec)     dispatch each pending simulation
+  prepareTrialHierarchy ──▶  setupSampling / setupMonad   prepare before running
+  database + versioning ──▶  simulatorVersion* methods    schema + version tracking
+  migration framework   ──▶  upgrade* methods             schema migrations
+
+You call ModelManager once, at load time, to wire everything up:
+
+  __init__ (sets mm_globals_ref) ──▶  initializeModelManager
 ```
 
 You supply a concrete type and a handful of methods; ModelManager calls them at the right

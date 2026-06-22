@@ -14,7 +14,7 @@ Assistant professor working on computational modeling of cancer-immune interacti
 Start any feature session by reading the relevant PRD entry and the Implementation Status section of `README.md`.
 
 ## Project Overview
-ModelManager.jl is a simulator-agnostic Julia package providing the generic ABM infrastructure used by [PhysiCellModelManager.jl](https://github.com/drbergman-lab/PhysiCellModelManager.jl) and future simulator packages (e.g. BergiCell). It provides:
+ModelManager.jl is a simulator-agnostic Julia package providing the generic ABM infrastructure used by [PhysiCellModelManager.jl](https://github.com/drbergman-lab/PhysiCellModelManager.jl) and future simulator packages. It provides:
 - `AbstractSimulator` interface for simulator backends
 - Trial hierarchy: `Simulation`, `Monad`, `Sampling`, `Trial`
 - Parameter variation management (discrete, distributed, LHS, Sobol, RBD)

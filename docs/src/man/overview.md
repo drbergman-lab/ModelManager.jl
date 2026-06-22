@@ -23,15 +23,15 @@ point: the [`AbstractSimulator`](@ref) interface.
 
 ```
         ┌─────────────────────────────────────────────┐
-        │              ModelManager.jl                 │
-        │  trial hierarchy · variations · database ·    │
-        │  runner · sensitivity · calibration           │
+        │               ModelManager.jl               │
+        │  trial hierarchy · variations · database ·  │
+        │  runner · sensitivity · calibration         │
         └───────────────────────┬─────────────────────┘
-                                 │  AbstractSimulator interface
-            ┌────────────────────┼────────────────────┐
-            ▼                    ▼                     ▼
-   PhysiCellModelManager   BergiCell(MM)         (your backend)
-      (PhysiCell)            (BergiCell)            (MySimulator)
+                                │  AbstractSimulator interface
+            ┌───────────────────┴───────────────────┐
+            ▼                                       ▼
+  PhysiCellModelManager                      (your backend)
+       (PhysiCell)                            (MySimulator)
 ```
 
 A simulator package depends on ModelManager, defines `MySimulator <: AbstractSimulator`,
