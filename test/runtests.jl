@@ -2160,6 +2160,54 @@ _gsa_fB(mid) = 0.0
                 @test length(sim_ids) == 6           # 3 monads × 2 replicates
             end
 
+            # ---------- simulationsTable / monadsTable ----------
+            @testset "monadsTable" begin
+                dv   = DiscreteVariation(:config, xp_x, [201.0, 202.0, 203.0])
+                samp = createTrial(inputs, [dv]; n_replicates=2)
+                run(samp)
+
+                # One row per monad (3), not per simulation (6).
+                mt = monadsTable(samp)
+                @test mt isa DataFrame
+                @test nrow(mt) == length(constituentIDs(samp)) == 3
+                @test :MonadID in propertynames(mt)
+                @test :SimID ∉ propertynames(mt)
+
+                # The varied parameter appears as a (short-named) column with all 3 values.
+                x_col = only(filter(n -> occursin("x", n), names(mt)))
+                @test Set(mt[!, x_col]) == Set([201.0, 202.0, 203.0])
+
+                # simulationsTable over the same sampling has one row per simulation.
+                st = simulationsTable(samp)
+                @test nrow(st) == length(simulationIDs(samp)) == 6
+                @test :SimID in propertynames(st)
+
+                # Dispatch forms agree with the monad-ID vector form.
+                monad_ids = constituentIDs(samp)
+                @test nrow(monadsTable(monad_ids)) == 3
+                m1 = Monad(monad_ids[1])
+                @test nrow(monadsTable(m1)) == 1
+                @test nrow(monadsTable(m1, Monad(monad_ids[2]))) == 2
+
+                # No-arg form returns all monads in the project (⊇ this sampling's monads).
+                all_mt = monadsTable()
+                @test nrow(all_mt) >= 3
+
+                # remove_constants=false keeps the constant y column; default drops it.
+                mt_full = monadsTable(monad_ids; remove_constants=false)
+                @test any(n -> occursin("y", n), names(mt_full))
+
+                # short_names=false keeps the raw XML-path column name for the varied parameter.
+                mt_raw = monadsTable(samp; short_names=false)
+                @test "data/x" in names(mt_raw)
+
+                # printMonadsTable routes the DataFrame through the sink.
+                captured = Ref{Any}(nothing)
+                printMonadsTable(samp; sink=(df -> captured[] = df))
+                @test captured[] isa DataFrame
+                @test nrow(captured[]) == 3
+            end
+
             # ---------- getParameterValue ----------
             @testset "getParameterValue" begin
                 dv = DiscreteVariation(:config, xp_x, 42.0)

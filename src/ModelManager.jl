@@ -34,6 +34,7 @@ export run
 export printSimulationIDs
 export shortLocationVariationID
 export simulationsTable, printSimulationsTable
+export monadsTable, printMonadsTable
 export XMLPath
 export AbstractVariation, ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation

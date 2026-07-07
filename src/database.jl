@@ -805,13 +805,54 @@ function simulationsTableFromQuery(query::String;
                                    sort_by=String[],
                                    sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)],
                                    short_names::Bool=true)
+    return _variationsTableFromQuery(query, :simulation_id, :SimID;
+                                     remove_constants=remove_constants, sort_by=sort_by,
+                                     sort_ignore=sort_ignore, short_names=short_names)
+end
+
+"""
+    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:MonadID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true)
+
+Return a DataFrame for the given SQL query on the `monads` table. This is the monad-level
+analogue of [`simulationsTableFromQuery`](@ref): one row per monad and its varied parameters.
+
+Keyword arguments match [`simulationsTableFromQuery`](@ref), except `sort_ignore` defaults to
+the monad ID column `:MonadID` (rather than `:SimID`).
+"""
+function monadsTableFromQuery(query::String;
+                              remove_constants::Bool=true,
+                              sort_by=String[],
+                              sort_ignore=[:MonadID; shortLocationVariationID.(projectLocations().varied)],
+                              short_names::Bool=true)
+    return _variationsTableFromQuery(query, :monad_id, :MonadID;
+                                     remove_constants=remove_constants, sort_by=sort_by,
+                                     sort_ignore=sort_ignore, short_names=short_names)
+end
+
+"""
+    _variationsTableFromQuery(query::String, id_column::Symbol, display_id_column::Symbol; kwargs...)
+
+Shared implementation behind [`simulationsTableFromQuery`](@ref) and
+[`monadsTableFromQuery`](@ref). Runs `query`, keeps only `id_column` from the raw ID columns
+(renaming it to `display_id_column`), joins on folder-name and varied-parameter columns, then
+optionally drops constant columns and sorts.
+
+Both the `simulations` and `monads` tables carry the same input-ID and variation-ID columns,
+so the join logic ([`addFolderNameColumns!`](@ref) / [`appendVariations`](@ref)) is identical;
+only the primary key column differs.
+"""
+function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_column::Symbol;
+                                   remove_constants::Bool=true,
+                                   sort_by=String[],
+                                   sort_ignore,
+                                   short_names::Bool=true)
     sort_by = (sort_by isa Vector ? sort_by : [sort_by]) .|> Symbol
     sort_ignore = (sort_ignore isa Vector ? sort_ignore : [sort_ignore]) .|> Symbol
 
     df = queryToDataFrame(query)
     id_col_names_to_remove = names(df)
 
-    filter!(n -> n != "simulation_id", id_col_names_to_remove)
+    filter!(n -> n != string(id_column), id_col_names_to_remove)
     addFolderNameColumns!(df)
 
     for loc in projectLocations().varied
@@ -819,7 +860,7 @@ function simulationsTableFromQuery(query::String;
     end
 
     select!(df, Not(id_col_names_to_remove))
-    rename!(df, :simulation_id => :SimID)
+    rename!(df, id_column => display_id_column)
     col_names = names(df)
     if remove_constants && size(df, 1) > 1
         filter!(n -> length(unique(df[!, n])) > 1, col_names)
@@ -887,6 +928,68 @@ printSimulationsTable(; sink=CSV.write("temp.csv"))
 function printSimulationsTable(args...; sink=println, kwargs...)
     assertInitialized()
     simulationsTable(args...; kwargs...) |> sink
+end
+
+"""
+    monadsTable(args...; kwargs...)
+
+Return a DataFrame with one row per monad and its varied parameters — the monad-level
+analogue of [`simulationsTable`](@ref). See [`monadsTableFromQuery`](@ref) for keyword arguments.
+
+`args...` can be:
+- Any `AbstractTrial` objects (or arrays thereof) — the monads they contain are collected
+  via [`monadIDs`](@ref).
+- A vector of monad IDs.
+- Omitted (returns data for all monads).
+
+# Examples
+```julia
+monadsTable(sampling)
+```
+```julia
+monad_ids = [1, 2, 3]
+monadsTable(monad_ids; remove_constants=false)
+```
+"""
+function monadsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
+    query = constructSelectQuery("monads", "WHERE monad_id IN ($(join(monadIDs(T),",")));")
+    return monadsTableFromQuery(query; kwargs...)
+end
+
+monadsTable(T::AbstractTrial, Ts::Vararg{AbstractTrial}; kwargs...) = monadsTable([T; Ts...]; kwargs...)
+
+function monadsTable(monad_ids::AbstractVector{<:Integer}; kwargs...)
+    assertInitialized()
+    query = constructSelectQuery("monads", "WHERE monad_id IN ($(join(monad_ids,",")));")
+    return monadsTableFromQuery(query; kwargs...)
+end
+
+function monadsTable(; kwargs...)
+    assertInitialized()
+    query = constructSelectQuery("monads")
+    return monadsTableFromQuery(query; kwargs...)
+end
+
+"""
+    printMonadsTable(args...; sink=println, kwargs...)
+
+Print a table of monads and their varied values. See [`monadsTable`](@ref).
+
+# Keyword Arguments
+- `sink`: A function to receive the DataFrame (default `println`). Can also use `CSV.write`.
+
+# Examples
+```julia
+printMonadsTable([monad_3, sampling_2, trial_1])
+```
+```julia
+using CSV
+printMonadsTable(; sink=CSV.write("temp.csv"))
+```
+"""
+function printMonadsTable(args...; sink=println, kwargs...)
+    assertInitialized()
+    monadsTable(args...; kwargs...) |> sink
 end
 
 """

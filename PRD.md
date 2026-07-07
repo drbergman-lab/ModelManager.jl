@@ -157,6 +157,27 @@ target location's file type.
 
 ---
 
+## Feature: Analysis Tables
+
+**One-line description:** Tabular summaries of trials and their varied parameters, at simulation and monad granularity.
+
+**Priority:** Must-have
+
+**Behavioral specification:**
+- `simulationsTable(args...; kwargs...)` returns a `DataFrame` with one row per simulation and its varied parameters. `printSimulationsTable` routes the result through a `sink` (default `println`).
+- `monadsTable(args...; kwargs...)` is the monad-level analogue: one row per monad and its varied parameters. `printMonadsTable` routes the result through a `sink`.
+- Both accept the same `args...` forms: `AbstractTrial` objects (or arrays), a vector of IDs (simulation IDs / monad IDs respectively), or no argument (all simulations / all monads). ID collection uses `simulationIDs` / `monadIDs`.
+- Both share keyword arguments (via `simulationsTableFromQuery` / `monadsTableFromQuery`): `remove_constants` (default `true`, drop columns constant across rows), `sort_by`, `sort_ignore` (defaults to the table's ID column plus variation-ID columns), and `short_names` (default `true`, shorten column names via `shortVariationName`; `false` keeps raw XML-path names).
+- The primary-key column is renamed for display: `:SimID` for simulations, `:MonadID` for monads.
+
+**Acceptance criteria:**
+- For a `Sampling` of `m` monads with `r` replicates each, `monadsTable(sampling)` has `m` rows and `simulationsTable(sampling)` has `m·r` rows.
+- Varied parameters appear as columns; a parameter held constant is dropped when `remove_constants=true` and retained when `false`.
+- `short_names=false` yields raw `columnName` (XML-path) column names.
+- `monadsTable(monad_ids)`, `monadsTable(monad)`, and `monadsTable(trial)` agree with the underlying monad set.
+
+---
+
 ## Feature: Deletion
 
 **One-line description:** Remove simulations and their parent containers from the database and disk.

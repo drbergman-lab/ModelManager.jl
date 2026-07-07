@@ -898,3 +898,28 @@ The three methods are intentionally heterogeneous in their reduction: absolute e
 - `src/calibration/distance.jl` — two new `mseDistance` methods; docstring updated
 - `test/runtests.jl` — new tests for vector/scalar `mseDistance`; `DimensionMismatch`; non-dict `observed_data` round-trip; non-dict `evaluate_batch` integration
 - `PRD.md` — updated `mseDistance` spec and acceptance criteria
+
+---
+
+## Session: monadsTable — monad-level analysis table (2026-07-07)
+
+### Goal
+Add `monadsTable`, the monad analogue of `simulationsTable`: one row per monad and its varied parameters. First of the handoff tasks (e); read-only, no schema change.
+
+### Design decisions
+
+**Shared helper, not copy-paste.** Both `simulations` and `monads` tables carry the same input-ID and variation-ID columns, so the join pipeline (`addFolderNameColumns!` + `appendVariations` + constant-dropping + sort) is identical — only the primary-key column differs. Factored the body of `simulationsTableFromQuery` into a private `_variationsTableFromQuery(query, id_column, display_id_column; …)`. `simulationsTableFromQuery` and the new `monadsTableFromQuery` are thin wrappers that fix the key column (`:simulation_id` → `:SimID`, `:monad_id` → `:MonadID`) and the `sort_ignore` default. This makes drift between the two tables impossible.
+
+**Public `simulationsTableFromQuery` signature unchanged.** It keeps its exact kwargs (including the `sort_ignore=[:SimID; …]` default) and delegates — so existing callers (`calibration/visualize.jl`) are untouched. The helper takes `sort_ignore` as a required kwarg (already resolved by the wrapper) rather than recomputing it.
+
+**Dispatch mirrors `simulationsTable`.** `monadsTable` has the same four forms (`AbstractArray{<:AbstractTrial}`, `Vararg{AbstractTrial}`, `AbstractVector{<:Integer}`, no-arg), collecting IDs via the pre-existing `monadIDs` dispatch. No ambiguity: the integer-vector and trial-array methods have disjoint element types.
+
+### Rejected / not done
+- No `@test_throws assertInitialized()` test: not practically testable inside the DB-backed testset (globals stay initialized), and `simulationsTable` has no such test either — matched the existing convention.
+
+### Files changed
+- `src/database.jl` — extracted `_variationsTableFromQuery`; added `monadsTableFromQuery`, `monadsTable` (4 methods), `printMonadsTable`; `simulationsTableFromQuery` now delegates
+- `src/ModelManager.jl` — export `monadsTable`, `printMonadsTable`
+- `test/runtests.jl` — new `monadsTable` testset in DB-backed integration (row counts vs `simulationsTable`, dispatch forms, `remove_constants`/`short_names`, `printMonadsTable` sink)
+- `PRD.md` — new "Analysis Tables" feature section
+- `README.md` — Implementation Status: analysis tables entry
