@@ -1075,11 +1075,13 @@ Addressing Copilot review comments on PR #20 plus a reproduced-bug handoff from 
 ### Async worker hang (critical; handoff + Copilot)
 **Bug:** in `run`, each simulation is processed by a bare `@async for … put!(result_channel, processSimulationTask(...))` worker. If `processSimulationTask` threw (a throwing `runSimulation`/`fetch`, a simulator hook, or the user `post_processor`), the worker died silently, the `put!` never fired, and the completion loop's `take!` blocked **forever** — a silent, indefinite hang (reproduced in PCMM: hung a test run 9+ hours, twice, from a `MethodError`). Especially dangerous now that arbitrary user code (`post_processor`) runs in this path.
 
-**Fix (`src/runner.jl`):**
-- `_PostProcessedResult` gains `process::Union{Nothing,SimulationProcess}` and `error::Union{Nothing,NamedTuple}`.
-- `_runStage(stage, sim_id, thunk)` runs each per-simulation stage capturing any exception as `(stage, sim_id, exception, backtrace)` instead of letting it escape. `processSimulationTask` runs `postSimulationProcessing` → `post_processor` → `postSimulationCleanup` through it and returns the captured error rather than throwing.
-- The worker loop wraps `processSimulationTask` in `try/catch` so even a throwing `fetch`/`runSimulation` yields an error result — **the pool always delivers exactly one result per scheduled simulation.**
-- The completion loop checks `result.error` first and, if set, `_rethrowWorkerError` throws a clear `ErrorException` naming the stage (user `post_processor` vs. which simulator hook) and simulation, embedding the original stacktrace via `sprint(showerror, exc, bt)`. **Fail-fast**, never hang.
+**Fix (`src/runner.jl`):** a single private exception type flowing through the result channel.
+- `_SimulationStageError <: Exception` — `(stage, sim_id, captured::CapturedException)` with a `Base.showerror` method that names the stage (user `post_processor` vs. which simulator hook vs. the simulation worker) and simulation, then prints the original exception + backtrace. `CapturedException` is the stock Base type for carrying an exception across tasks.
+- `_runStage(stage, sim_id, thunk)` rethrows any exception from a per-simulation stage as a tagged `_SimulationStageError`; `processSimulationTask` wraps `postSimulationProcessing` → `post_processor` → `postSimulationCleanup` in it and otherwise keeps its straight-line shape (exceptions propagate as exceptions — no error-tuple plumbing).
+- The worker loop's single `try/catch` puts either a `_PostProcessedResult` or the `_SimulationStageError` on the (union-typed) result channel — **the pool always delivers exactly one result per scheduled simulation.** A non-stage exception (throwing `fetch`/`runSimulation`) is wrapped as stage `:simulation`.
+- The completion loop: `result isa _SimulationStageError && throw(result)`. **Fail-fast**, never hang.
+
+First cut used Go-style `(err, value)` returns from `_runStage`, an `error::Union{Nothing,NamedTuple}` field on `_PostProcessedResult` (forcing `process` to `Union{Nothing,…}`), and a `_rethrowWorkerError` that hand-built the message — reworked on review to the exception-type design above: same guarantees, fewer mechanisms, display logic in `showerror` where Julia expects it, and `_PostProcessedResult` stays two clean fields.
 
 Decision: fail-fast (abort) is the default; no `:skip_and_continue` policy kwarg for now (YAGNI — can layer on later). In-flight simulations may still finish; their results are discarded once `run` throws.
 
@@ -1094,7 +1096,7 @@ Decision: fail-fast (abort) is the default; no `:skip_and_continue` policy kwarg
 
 ### Tests (`test/runtests.jl`)
 - TestSimulator hooks gained a `_throw_in_hook` flag to simulate a throwing simulator hook.
-- "post-processing errors surface instead of hanging": throwing `post_processor` and throwing `postSimulationProcessing`/`postSimulationCleanup` each make `run` throw a stage-tagged `ErrorException`; a normal run still works afterward.
+- "post-processing errors surface instead of hanging": throwing `post_processor` and throwing `postSimulationProcessing`/`postSimulationCleanup` each make `run` throw a stage-tagged `_SimulationStageError`; a normal run still works afterward.
 - "post-processing sink input hardening": a QoI name containing `"` round-trips; colliding dict keys (`1` vs `"1"`) → `ArgumentError`.
 
 Full suite 1037/1037.

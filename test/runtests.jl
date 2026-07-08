@@ -2377,23 +2377,24 @@ _gsa_fB(mid) = 0.0
 
             @testset "post-processing errors surface instead of hanging" begin
                 # A throwing post_processor makes run() fail fast (not hang), tagged as such.
-                e = @test_throws ErrorException run(
+                e = @test_throws ModelManager._SimulationStageError run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 361.0)]; n_replicates=1);
                     post_processor = sp -> error("boom"))
-                @test occursin("post_processor", e.value.msg)
-                @test occursin("boom", e.value.msg)
+                msg = sprint(showerror, e.value)
+                @test occursin("post_processor", msg)
+                @test occursin("boom", msg)
 
                 # A throwing simulator hook likewise surfaces, tagged with the stage.
                 try
                     _throw_in_hook[] = :processing
-                    e2 = @test_throws ErrorException run(
+                    e2 = @test_throws ModelManager._SimulationStageError run(
                         createTrial(inputs, [DiscreteVariation(:config, xp_x, 362.0)]; n_replicates=1))
-                    @test occursin("postSimulationProcessing", e2.value.msg)
+                    @test occursin("postSimulationProcessing", sprint(showerror, e2.value))
 
                     _throw_in_hook[] = :cleanup
-                    e3 = @test_throws ErrorException run(
+                    e3 = @test_throws ModelManager._SimulationStageError run(
                         createTrial(inputs, [DiscreteVariation(:config, xp_x, 363.0)]; n_replicates=1))
-                    @test occursin("postSimulationCleanup", e3.value.msg)
+                    @test occursin("postSimulationCleanup", sprint(showerror, e3.value))
                 finally
                     _throw_in_hook[] = nothing
                 end
