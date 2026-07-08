@@ -1065,3 +1065,36 @@ Task c was first mis-implemented as a global per-`run` "simulation budget" gate 
 - `src/calibration/methods.jl`, `src/calibration/abc.jl` — `max_evaluations` docstrings updated to "before dispatch"
 - `test/runtests.jl` — updated/added budget tests
 - `docs/src/man/calibration.md`, `PRD.md` — before-dispatch semantics
+
+---
+
+## Session: PR #20 review fixes — async hang + sink hardening (2026-07-08)
+
+Addressing Copilot review comments on PR #20 plus a reproduced-bug handoff from the PCMM side.
+
+### Async worker hang (critical; handoff + Copilot)
+**Bug:** in `run`, each simulation is processed by a bare `@async for … put!(result_channel, processSimulationTask(...))` worker. If `processSimulationTask` threw (a throwing `runSimulation`/`fetch`, a simulator hook, or the user `post_processor`), the worker died silently, the `put!` never fired, and the completion loop's `take!` blocked **forever** — a silent, indefinite hang (reproduced in PCMM: hung a test run 9+ hours, twice, from a `MethodError`). Especially dangerous now that arbitrary user code (`post_processor`) runs in this path.
+
+**Fix (`src/runner.jl`):**
+- `_PostProcessedResult` gains `process::Union{Nothing,SimulationProcess}` and `error::Union{Nothing,NamedTuple}`.
+- `_runStage(stage, sim_id, thunk)` runs each per-simulation stage capturing any exception as `(stage, sim_id, exception, backtrace)` instead of letting it escape. `processSimulationTask` runs `postSimulationProcessing` → `post_processor` → `postSimulationCleanup` through it and returns the captured error rather than throwing.
+- The worker loop wraps `processSimulationTask` in `try/catch` so even a throwing `fetch`/`runSimulation` yields an error result — **the pool always delivers exactly one result per scheduled simulation.**
+- The completion loop checks `result.error` first and, if set, `_rethrowWorkerError` throws a clear `ErrorException` naming the stage (user `post_processor` vs. which simulator hook) and simulation, embedding the original stacktrace via `sprint(showerror, exc, bt)`. **Fail-fast**, never hang.
+
+Decision: fail-fast (abort) is the default; no `:skip_and_continue` policy kwarg for now (YAGNI — can layer on later). In-flight simulations may still finish; their results are discarded once `run` throws.
+
+### Sink input hardening (Copilot)
+- **SQL identifier injection:** user QoI names were interpolated raw into `ALTER TABLE … ADD COLUMN "$(name)"` / INSERT. Added `_qIdent` (wrap + double interior `"`) used for all sink identifiers; logical names still used for the `in existing` check and value binding.
+- **Dict key collision:** `_normalizePostProcessingQoI` now rejects `AbstractDict`s whose keys collide after `string(k)` (e.g. `1` and `"1"`) with a clear `ArgumentError`, instead of a confusing SQLite duplicate-column error.
+- **Consistency:** `printPostProcessingTable` now calls `assertInitialized()` like the other `print…Table` helpers.
+
+### Not changed (Copilot comments resolved by drbergman)
+- Error message "Real, Bool, or String": `Integer <: Real`, so it is covered — no change.
+- Reject non-positive `max_evaluations`: already validated (`>= 1`) in the `ABCSMC` constructor (`methods.jl:277`); an empty gen-1 batch cannot occur — no change.
+
+### Tests (`test/runtests.jl`)
+- TestSimulator hooks gained a `_throw_in_hook` flag to simulate a throwing simulator hook.
+- "post-processing errors surface instead of hanging": throwing `post_processor` and throwing `postSimulationProcessing`/`postSimulationCleanup` each make `run` throw a stage-tagged `ErrorException`; a normal run still works afterward.
+- "post-processing sink input hardening": a QoI name containing `"` round-trips; colliding dict keys (`1` vs `"1"`) → `ArgumentError`.
+
+Full suite 1037/1037.

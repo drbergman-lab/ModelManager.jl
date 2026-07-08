@@ -175,6 +175,11 @@ The sink stays consistent with the central database: deleting simulations (see
 [Managing data](@ref)) removes their sink rows, and [`resetDatabase`](@ref) removes the sink
 entirely.
 
+If your `post_processor` (or a simulator hook) throws, `run` **fails fast** — it rethrows a
+clear error naming the stage (`post_processor` vs. a simulator hook) and the simulation, with
+the original stacktrace. It never hangs or silently swallows the exception, so a typo or a
+bad assumption in a callback surfaces immediately rather than parking a long HPC campaign.
+
 For cluster execution, see [HPC support](@ref). For the complete runner API
 ([`SimulationSpec`](@ref), [`prepareTrialHierarchy`](@ref), [`pendingSimulationSpecs`](@ref),
 [`SimulationProcess`](@ref)), see the [Runner](@ref) reference.

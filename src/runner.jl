@@ -231,7 +231,9 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   - any other type → an `ArgumentError` is thrown.
   The callback runs inside the per-simulation worker task (so heavy compute parallelizes),
   but all sink writes are serialized in the main completion loop; user code never touches the
-  sink DB directly. `post_processor` is not forwarded to the simulator hooks.
+  sink DB directly. `post_processor` is not forwarded to the simulator hooks. If the callback
+  (or a simulator hook) throws, `run` **fails fast**: it rethrows a clear error naming the
+  stage and simulation with the original stacktrace — it never hangs or swallows the exception.
 - All other `kwargs` flow through to [`prepareTrialHierarchy`](@ref) (which forwards
   them to the simulator's [`setupSampling`](@ref) / [`setupMonad`](@ref) hooks) and to
   both [`postSimulationProcessing`](@ref) and [`postSimulationCleanup`](@ref) (e.g.
@@ -272,7 +274,17 @@ function run(T::AbstractTrial; quiet::Bool=false,
 
     for _ in 1:mm_globals().max_number_of_parallel_simulations
         @async for simulation_task in queue_channel
-            put!(result_channel, processSimulationTask(simulation_task; post_processor=post_processor, kwargs...))
+            #! Always deliver a result. Without this catch, an exception in
+            #! processSimulationTask (a throwing runSimulation/fetch, simulator hook, or user
+            #! post_processor) would kill this worker silently and the completion loop's
+            #! `take!` would block forever — a silent, indefinite hang.
+            result = try
+                processSimulationTask(simulation_task; post_processor=post_processor, kwargs...)
+            catch e
+                _PostProcessedResult(nothing, nothing,
+                                     (stage=:simulation, sim_id=nothing, exception=e, backtrace=catch_backtrace()))
+            end
+            put!(result_channel, result)
         end
     end
 
@@ -284,6 +296,10 @@ function run(T::AbstractTrial; quiet::Bool=false,
     try
         for _ in 1:n_simulation_tasks
             result = take!(result_channel)
+            #! Fail fast on any captured per-simulation error rather than hanging or silently
+            #! dropping it. In-flight simulations may still be running; their results are
+            #! discarded once we throw.
+            isnothing(result.error) || _rethrowWorkerError(result.error)
             n_success += result.process.success
             if !isnothing(result.qoi)
                 isnothing(sink_db) && (sink_db = _openPostProcessingDB())
@@ -345,13 +361,39 @@ end
     _PostProcessedResult
 
 Internal pairing carried back from a worker task to the main completion loop: the
-[`SimulationProcess`](@ref) plus the value returned by the user `post_processor` (or
-`nothing` when there is no post-processor or the simulation failed). Kept private so the
-public `SimulationProcess` struct stays unchanged.
+[`SimulationProcess`](@ref), the value returned by the user `post_processor` (or `nothing`),
+and any captured error.
+
+`process` is `nothing` only when the simulation task itself threw before a
+`SimulationProcess` was produced. `error`, when non-`nothing`, is a `NamedTuple`
+`(stage, sim_id, exception, backtrace)` identifying where the failure occurred (`:simulation`,
+`:postSimulationProcessing`, `:post_processor`, or `:postSimulationCleanup`); the completion
+loop in [`run`](@ref) rethrows it with context so a failure surfaces as a clear error instead
+of silently hanging the run. Kept private so the public `SimulationProcess` struct stays
+unchanged.
 """
 struct _PostProcessedResult
-    process::SimulationProcess
+    process::Union{Nothing,SimulationProcess}
     qoi::Any
+    error::Union{Nothing,NamedTuple}
+end
+
+_PostProcessedResult(process, qoi) = _PostProcessedResult(process, qoi, nothing)
+
+"""
+    _runStage(stage::Symbol, sim_id, thunk) -> (error_or_nothing, value_or_nothing)
+
+Run `thunk()` capturing any exception as a `(stage, sim_id, exception, backtrace)` NamedTuple
+instead of letting it escape. Returns `(nothing, value)` on success and `(error, nothing)` on
+failure. Used by [`processSimulationTask`](@ref) so a throwing per-simulation stage becomes a
+result carried back to the completion loop rather than a lost exception that hangs the run.
+"""
+function _runStage(stage::Symbol, sim_id::Union{Nothing,Int}, thunk)
+    try
+        return (nothing, thunk())
+    catch e
+        return ((stage=stage, sim_id=sim_id, exception=e, backtrace=catch_backtrace()), nothing)
+    end
 end
 
 """
@@ -364,9 +406,10 @@ per-simulation post steps in order:
 3. [`postSimulationCleanup`](@ref) — destructive simulator cleanup (e.g. pruning), so the
    user callback always sees the intact output folder.
 
-Returns a [`_PostProcessedResult`](@ref). The captured value (if any) is written to the
-post-processing sink by the caller's serial completion loop, not here, so this function
-never touches the sink DB.
+Each stage's exceptions are captured (with which stage and which simulation) and returned in a
+[`_PostProcessedResult`](@ref) rather than thrown, so the worker never dies silently. The
+captured value (if any) is written to the post-processing sink by the caller's serial
+completion loop, not here, so this function never touches the sink DB.
 """
 function processSimulationTask(simulation_task; post_processor::Union{Nothing,Function}=nothing, kwargs...)
     schedule(simulation_task)
@@ -374,16 +417,44 @@ function processSimulationTask(simulation_task; post_processor::Union{Nothing,Fu
     updateDatabaseOnCompletion(simulation_process.simulation.id,
                                simulation_process.monad_id,
                                simulation_process.success)
+    sid = simulation_process.simulation.id
+
     #! Per-simulation ordering: non-destructive simulator processing → user post_processor
     #! → destructive simulator cleanup. The user callback must see the intact (but processed)
     #! output folder, so pruning/deletion is deferred to postSimulationCleanup.
-    postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...)
+    err, _ = _runStage(:postSimulationProcessing, sid,
+                       () -> postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...))
+    isnothing(err) || return _PostProcessedResult(simulation_process, nothing, err)
+
     qoi = nothing
     if !isnothing(post_processor) && simulation_process.success
-        qoi = post_processor(simulation_process)
+        err, qoi = _runStage(:post_processor, sid, () -> post_processor(simulation_process))
+        isnothing(err) || return _PostProcessedResult(simulation_process, nothing, err)
     end
-    postSimulationCleanup(mm_globals().simulator, simulation_process; kwargs...)
-    return _PostProcessedResult(simulation_process, qoi)
+
+    err, _ = _runStage(:postSimulationCleanup, sid,
+                       () -> postSimulationCleanup(mm_globals().simulator, simulation_process; kwargs...))
+    isnothing(err) || return _PostProcessedResult(simulation_process, qoi, err)
+
+    return _PostProcessedResult(simulation_process, qoi, nothing)
+end
+
+"""
+    _rethrowWorkerError(err::NamedTuple)
+
+Rethrow a per-simulation error captured by a worker task (see [`_runStage`](@ref)) as a clear,
+actionable `ErrorException` naming the stage and simulation and embedding the original
+stacktrace. Distinguishes a failure in the user `post_processor` (actionable by the user) from
+one in a simulator hook (actionable by the simulator package author).
+"""
+function _rethrowWorkerError(err::NamedTuple)
+    stage_desc = err.stage === :post_processor          ? "the user post_processor" :
+                 err.stage === :postSimulationProcessing ? "the simulator's postSimulationProcessing hook" :
+                 err.stage === :postSimulationCleanup    ? "the simulator's postSimulationCleanup hook" :
+                                                           "the simulation worker"
+    sim_str = isnothing(err.sim_id) ? "" : " (simulation $(err.sim_id))"
+    error("run failed in $(stage_desc)$(sim_str):\n\n" *
+          sprint(showerror, err.exception, err.backtrace))
 end
 
 """

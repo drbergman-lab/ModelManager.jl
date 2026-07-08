@@ -1071,8 +1071,24 @@ function _normalizePostProcessingQoI(qoi)
         throw(ArgumentError("post_processor must return `nothing`, a NamedTuple, or an AbstractDict " *
             "of name => scalar; got a $(typeof(qoi))."))
     end
+    col_names = first.(named_pairs)
+    if !allunique(col_names)
+        dups = unique(name for name in col_names if count(==(name), col_names) > 1)
+        throw(ArgumentError("post_processor produced duplicate quantity name(s) after conversion to " *
+            "strings: $(join(dups, ", ")). Distinct keys that map to the same column name " *
+            "(e.g. `1` and \"1\") are not allowed."))
+    end
     return [(name, _postProcessingColumnSpec(name, value)...) for (name, value) in named_pairs]
 end
+
+"""
+    _qIdent(name::AbstractString) -> String
+
+Return `name` as a safely-quoted SQLite identifier: wrapped in double quotes with any interior
+double quotes doubled. Used for the user-controlled quantity-of-interest column names in the
+post-processing sink so a name containing a `"` cannot break or inject into the SQL.
+"""
+_qIdent(name::AbstractString) = "\"" * replace(String(name), "\"" => "\"\"") * "\""
 
 """
     _writePostProcessingRow(db::SQLite.DB, simulation_id::Integer, qoi)
@@ -1089,16 +1105,16 @@ function _writePostProcessingRow(db::SQLite.DB, simulation_id::Integer, qoi)
     existing = tableColumns(_POST_PROCESSING_TABLE; db=db)
     for (name, sqlite_type, _) in specs
         if !(name in existing)
-            DBInterface.execute(db, "ALTER TABLE $(_POST_PROCESSING_TABLE) ADD COLUMN \"$(name)\" $(sqlite_type);")
+            DBInterface.execute(db, "ALTER TABLE $(_POST_PROCESSING_TABLE) ADD COLUMN $(_qIdent(name)) $(sqlite_type);")
             push!(existing, name)
         end
     end
 
     col_names = [s[1] for s in specs]
     all_cols = ["simulation_id"; col_names]
-    cols_sql = join("\"" .* all_cols .* "\"", ", ")
+    cols_sql = join(_qIdent.(all_cols), ", ")
     placeholders = join(fill("?", length(all_cols)), ", ")
-    update_sql = join(["\"$(c)\"=excluded.\"$(c)\"" for c in col_names], ", ")
+    update_sql = join(["$(_qIdent(c))=excluded.$(_qIdent(c))" for c in col_names], ", ")
     stmt = "INSERT INTO $(_POST_PROCESSING_TABLE) ($(cols_sql)) VALUES ($(placeholders)) " *
            "ON CONFLICT(simulation_id) DO UPDATE SET $(update_sql);"
     DBInterface.execute(db, stmt, Tuple(Any[simulation_id; [s[3] for s in specs]]))
@@ -1212,6 +1228,7 @@ Print the post-processing quantities-of-interest table. See [`postProcessingTabl
 - `sink`: A function to receive the DataFrame (default `println`). Can also use `CSV.write`.
 """
 function printPostProcessingTable(args...; sink=println)
+    assertInitialized()
     postProcessingTable(args...) |> sink
 end
 

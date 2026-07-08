@@ -173,7 +173,9 @@ target location's file type.
   - `nothing` → nothing is stored.
   - `NamedTuple` / `AbstractDict` of `name => scalar` (`Real`, `Bool`, or `String`) → one row keyed by `simulation_id` is upserted into the sink DB `data/outputs/postprocessing.db`, table `post_processing`. Columns are added on demand; a re-run overwrites the existing row for that `simulation_id`.
   - any other return type, or a non-scalar value → `ArgumentError`.
+  - quantity names are quoted safely for SQL (interior `"` doubled); an `AbstractDict` whose keys collide after string conversion (e.g. `1` and `"1"`) → `ArgumentError`.
 - `post_processor` is not forwarded to the simulator setup hooks. The callback runs inside the per-simulation worker task; **all sink writes are serialized** in the main completion loop, so user code never writes the sink DB concurrently.
+- **Fail-fast on errors.** An exception in the `post_processor`, a simulator hook (`postSimulationProcessing`/`postSimulationCleanup`), or the simulation worker is captured per-simulation and rethrown by `run` as a clear error naming the stage and simulation ID with the original stacktrace. `run` never hangs or silently drops the exception (the worker pool always delivers exactly one result per scheduled simulation).
 - `postProcessingTable(args...)` / `printPostProcessingTable` read the sink back as a `DataFrame` keyed by `:SimID` (joinable to `simulationsTable`), with `missing` for quantities not computed for a given simulation. `postProcessingDBPath()` returns the sink path.
 - `simulationsTable(args...; post_processing=true)` appends the stored quantities directly onto the simulations table (left-join by `:SimID`, `missing` where not computed, row order preserved; the appended columns are not subject to `remove_constants` or sorting). The kwarg is simulation-level only — `monadsTable` does not accept it, since quantities are per-simulation.
 - Deletion keeps the sink consistent with the central database: `deleteSimulations` removes each deleted simulation's sink row (so cascading `deleteMonad`/`deleteSampling`/`deleteTrial` do too, since they route through it), and `resetDatabase` removes the sink database entirely.
@@ -183,7 +185,9 @@ target location's file type.
 - A `nothing` return leaves no sink row; a NamedTuple/Dict return produces a joinable row.
 - A new quantity introduces a new column; earlier rows read back `missing` for it.
 - Re-writing a `simulation_id` overwrites its stored quantities.
-- Unsupported return types raise `ArgumentError`.
+- Unsupported return types, and dict keys that collide after string conversion, raise `ArgumentError`.
+- A quantity name containing a `"` round-trips through the sink unchanged.
+- A throwing `post_processor` or simulator hook makes `run` throw a clear, stage-tagged error within bounded time — it never hangs.
 - `run` without `post_processor` behaves exactly as before.
 - After `deleteSimulations`/`deleteMonad`/`deleteSampling`/`deleteTrial`, the deleted simulations have no rows in the sink; after `resetDatabase`, the sink database no longer exists.
 

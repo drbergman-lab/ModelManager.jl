@@ -68,10 +68,17 @@ end
 # postSimulationProcessing → post_processor → postSimulationCleanup. Appends on every sim in
 # every testset; the ordering test empties the log immediately before inspecting it.
 const _post_order_log = String[]
-ModelManager.postSimulationProcessing(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) =
-    (push!(_post_order_log, "processing:$(sp.simulation.id)"); nothing)
-ModelManager.postSimulationCleanup(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) =
-    (push!(_post_order_log, "cleanup:$(sp.simulation.id)"); nothing)
+# When set to :processing or :cleanup, the corresponding hook throws — used to test that an
+# exception inside a per-simulation worker surfaces as an error instead of hanging run().
+const _throw_in_hook = Ref{Union{Nothing,Symbol}}(nothing)
+ModelManager.postSimulationProcessing(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) = begin
+    _throw_in_hook[] === :processing && error("processing boom")
+    push!(_post_order_log, "processing:$(sp.simulation.id)"); nothing
+end
+ModelManager.postSimulationCleanup(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) = begin
+    _throw_in_hook[] === :cleanup && error("cleanup boom")
+    push!(_post_order_log, "cleanup:$(sp.simulation.id)"); nothing
+end
 
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
@@ -2366,6 +2373,48 @@ _gsa_fB(mid) = 0.0
                     (; q = 1.0)
                 end)
                 @test _post_order_log == ["processing:$(ord_id)", "user:$(ord_id)", "cleanup:$(ord_id)"]
+            end
+
+            @testset "post-processing errors surface instead of hanging" begin
+                # A throwing post_processor makes run() fail fast (not hang), tagged as such.
+                e = @test_throws ErrorException run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 361.0)]; n_replicates=1);
+                    post_processor = sp -> error("boom"))
+                @test occursin("post_processor", e.value.msg)
+                @test occursin("boom", e.value.msg)
+
+                # A throwing simulator hook likewise surfaces, tagged with the stage.
+                try
+                    _throw_in_hook[] = :processing
+                    e2 = @test_throws ErrorException run(
+                        createTrial(inputs, [DiscreteVariation(:config, xp_x, 362.0)]; n_replicates=1))
+                    @test occursin("postSimulationProcessing", e2.value.msg)
+
+                    _throw_in_hook[] = :cleanup
+                    e3 = @test_throws ErrorException run(
+                        createTrial(inputs, [DiscreteVariation(:config, xp_x, 363.0)]; n_replicates=1))
+                    @test occursin("postSimulationCleanup", e3.value.msg)
+                finally
+                    _throw_in_hook[] = nothing
+                end
+
+                # After the failures, a normal run still works (the pool is not left broken).
+                @test run(createTrial(inputs, [DiscreteVariation(:config, xp_x, 364.0)]; n_replicates=1)).n_success == 1
+            end
+
+            @testset "post-processing sink input hardening" begin
+                # QoI names are safely quoted: a name containing a double quote round-trips.
+                weird = "od\"d"
+                samp = createTrial(inputs, [DiscreteVariation(:config, xp_x, 371.0)]; n_replicates=1)
+                run(samp; post_processor = sp -> Dict(weird => 5.0))
+                pt = postProcessingTable(samp)
+                @test weird in names(pt)
+                @test pt[1, weird] == 5.0
+
+                # Dict keys that collide after string conversion (1 vs "1") → ArgumentError.
+                @test_throws ArgumentError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 372.0)]; n_replicates=1);
+                    post_processor = sp -> Dict(1 => 1.0, "1" => 2.0))
             end
 
             @testset "post-processing sink follows deletions" begin
