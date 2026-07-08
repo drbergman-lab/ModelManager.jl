@@ -236,17 +236,37 @@ end
 """
     postSimulationProcessing(sim::AbstractSimulator, simulation_process; kwargs...)
 
-Perform any simulator-specific work immediately after a simulation finishes.
+Perform simulator-specific, **non-destructive** processing immediately after a simulation
+finishes and **before** the user `post_processor` (see [`run`](@ref)) runs.
 
-Called by [`processSimulationTask`](@ref) for every completed simulation.
-The default implementation is a no-op; simulator packages override this to
-clean up error files, prune output, log diagnostics, etc.
+Called by [`processSimulationTask`](@ref) for every completed simulation. This is the slot
+for work whose results a user `post_processor` may want to read — e.g. transforming or
+standardizing raw output. It must **not** delete simulation output, or a user callback
+downstream would be handed an incomplete folder; destructive cleanup belongs in
+[`postSimulationCleanup`](@ref), which runs after the callback.
+
+The default implementation is a no-op.
+"""
+function postSimulationProcessing(sim::AbstractSimulator, simulation_process; kwargs...) end
+
+"""
+    postSimulationCleanup(sim::AbstractSimulator, simulation_process; kwargs...)
+
+Perform simulator-specific cleanup immediately after a simulation finishes and **after** the
+user `post_processor` (see [`run`](@ref)) has run — the last per-simulation step.
+
+Called by [`processSimulationTask`](@ref) for every completed simulation, regardless of
+success (so failed simulations are still cleaned up). This is where **destructive** work
+belongs — pruning/deleting output files, removing error files, etc. — because by this point
+any user `post_processor` has already read whatever it needed from the intact output folder.
+
+The default implementation is a no-op.
 
 Common keyword arguments (simulator-defined):
 - `prune_options` — options controlling which output files to delete
   (used by `PhysiCellModelManager`).
 """
-function postSimulationProcessing(sim::AbstractSimulator, simulation_process; kwargs...) end
+function postSimulationCleanup(sim::AbstractSimulator, simulation_process; kwargs...) end
 
 ########################################################
 ############   Input folder initialization  ############

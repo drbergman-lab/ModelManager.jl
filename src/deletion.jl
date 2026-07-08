@@ -1,12 +1,16 @@
 using Dates
 
-export deleteSimulation, deleteSimulations, deleteSimulationsByStatus, resetDatabase
+export deleteSimulation, deleteSimulations, deleteAllSimulations, deleteSimulationsByStatus
+export deleteMonad, deleteSampling, deleteTrial, resetDatabase
 
 """
     deleteSimulations(simulation_ids; delete_supers, filters)
     deleteSimulation(args...; kwargs...)
 
 Delete simulations from the database and from disk.
+
+Also removes each deleted simulation's row (if any) from the post-processing sink
+(`data/outputs/postprocessing.db`), keeping it consistent with the central database.
 
 If `delete_supers` is `true` (default), also removes any monads/samplings/trials
 that become empty after the deletion.  `filters` adds extra SQL `WHERE` conditions.
@@ -30,6 +34,11 @@ function deleteSimulations(simulation_ids::AbstractVector{<:Union{Integer,Missin
     simulation_ids = sim_df.simulation_id
 
     DBInterface.execute(centralDB(), "DELETE FROM simulations WHERE simulation_id IN ($(join(simulation_ids, ",")));")
+
+    # Keep the post-processing sink consistent with the central DB. Every cascading deletion
+    # (deleteMonad/deleteSampling/deleteTrial with delete_subs) routes actual simulation
+    # removal through here, so this one call covers them all.
+    _deletePostProcessingRows(simulation_ids)
 
     for row in eachrow(sim_df)
         rm_hpc_safe(trialFolder(Simulation, row.simulation_id); force=true, recursive=true)
@@ -224,9 +233,10 @@ deleteTrial(trial_id::Int; kwargs...) = deleteTrial([trial_id]; kwargs...)
 """
     resetDatabase(; force_reset, force_continue)
 
-Reset the database after user confirmation: delete all output folders, clear all
-variation files, call [`clearSimulatorArtifacts`](@ref) on the active simulator,
-then reinitialize the database.
+Reset the database after user confirmation: delete all output folders, remove the
+post-processing sink (`data/outputs/postprocessing.db`), clear all variation files,
+call [`clearSimulatorArtifacts`](@ref) on the active simulator, then reinitialize the
+database.
 """
 function resetDatabase(; force_reset::Bool=false, force_continue::Bool=false)
     assertInitialized()
@@ -250,6 +260,7 @@ function resetDatabase(; force_reset::Bool=false, force_continue::Bool=false)
     for folder in ["simulations", "monads", "samplings", "trials", "calibrations"]
         rm_hpc_safe(joinpath(dataDir(), "outputs", folder); force=true, recursive=true)
     end
+    rm_hpc_safe(postProcessingDBPath(); force=true)
 
     for (location, location_dict) in pairs(inputsDict())
         if !any(location_dict["varied"])

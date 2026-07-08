@@ -30,6 +30,11 @@ supports variation gets its own small SQLite database (e.g. `config_variations.d
 the folder, reached via [`locationVariationsDatabase`](@ref). This keeps variation rows next
 to the inputs they modify. See [Variations](@ref).
 
+Likewise, **post-processing quantities of interest** are kept in a separate database,
+`data/outputs/postprocessing.db` (path from [`postProcessingDBPath`](@ref)), created lazily
+the first time a `post_processor` returns quantities to store. See
+[Post-processing each simulation](@ref).
+
 [`initializeDatabase`](@ref) creates the schema if needed; [`createMMTable`](@ref) and
 [`insertFolder`](@ref) are the building blocks backends use to register tables and folders.
 
@@ -59,7 +64,16 @@ Useful building blocks:
 
 For inspecting what has been run, [`simulationsTable`](@ref) returns a tidy, human-readable
 table of simulations with their parameter values expanded into columns; pass
-`short_names=false` for raw XML-path column names.
+`short_names=false` for raw XML-path column names. [`monadsTable`](@ref) is the monad-level
+analogue — one row per [`Monad`](@ref) instead of per simulation — sharing the same
+`remove_constants` / `sort_by` / `short_names` keywords. Both accept trials, arrays of trials,
+a vector of IDs, or no argument (the whole project), and have `print…` variants that route the
+`DataFrame` through a `sink` (e.g. `CSV.write`).
+
+Quantities of interest produced by a `post_processor` (see
+[Post-processing each simulation](@ref)) are read back with [`postProcessingTable`](@ref),
+keyed by `:SimID`. To see them next to each simulation's parameters, pass
+`post_processing=true` to `simulationsTable` and the quantities are appended as columns.
 
 ## Consistency diagnostics
 

@@ -145,7 +145,8 @@ target location's file type.
 
 **Behavioral specification:**
 - `run(T::AbstractTrial; force_recompile, kwargs...)` collects simulation tasks, executes up to `mm_globals().max_number_of_parallel_simulations` concurrently, and returns `MMOutput{T}`.
-- `kwargs` are forwarded to `prepareTrialHierarchy` (simulator hooks like `force_recompile`) and to `postSimulationProcessing` (simulator-specific cleanup/pruning). `runSimulation` takes no kwargs — it receives only the `SimulationSpec`.
+- `run(Ts::AbstractVector; kwargs...)` bundles a collection of already-built trials (`Simulation`/`Monad`/`Sampling`/`Trial`, possibly in a `Vector{Any}`) into one `Trial` via `createTrial(::AbstractVector)` and runs it as a single parallelized batch. Non-`AbstractTrial` elements and empty vectors raise `ArgumentError`.
+- `kwargs` are forwarded to `prepareTrialHierarchy` (simulator hooks like `force_recompile`) and to `postSimulationProcessing`/`postSimulationCleanup`. The `post_processor` hook (see the Post-Processing feature) runs per successful simulation between them. `runSimulation` takes no kwargs — it receives only the `SimulationSpec`.
 - On HPC, each simulation is wrapped in an `sbatch --wrap` invocation.
 - A simulation that fails is marked `"Failed"` in the database and removed from its monad's constituent list. If the monad becomes empty, it is deleted along with empty parents.
 - Already-started simulations are skipped (idempotent re-runs).
@@ -154,6 +155,37 @@ target location's file type.
 - `run(simulation)` runs a single simulation and returns `MMOutput{Simulation}`.
 - `run(monad)` runs all pending replicates and returns correct success counts.
 - A failed simulation does not prevent other simulations in the same monad from running.
+- `run([sim, monad, sampling])` runs every constituent simulation as one batch and returns `MMOutput{Trial}`; a vector containing a non-trial element raises `ArgumentError`.
+
+---
+
+## Feature: Per-Simulation Post-Processing
+
+**One-line description:** Run a user-supplied function after each successful simulation, optionally collecting returned quantities of interest into a standardized sink.
+
+**Priority:** Should-have
+
+**Behavioral specification:**
+- Per-simulation ordering is: `postSimulationProcessing` (simulator-specific, non-destructive) → `post_processor` (user) → `postSimulationCleanup` (simulator-specific, destructive, e.g. pruning). The user callback therefore always sees the intact (but processed) output folder; destructive cleanup is deferred until after it. `postSimulationProcessing` and `post_processor` are only meaningful pre-cleanup; `postSimulationCleanup` runs regardless of success so failed simulations are still cleaned up.
+- `run(T; post_processor::Union{Nothing,Function}=nothing, …)` invokes `post_processor(simulation_process)` once per **successfully completed** simulation, in the ordering above. Failed/skipped simulations do not trigger it.
+- The callback receives the `SimulationProcess`; from it the user reaches `simulation.id`, `monad_id`, and the output folder via `pathToOutputFolder(id)`. Inside the callback the user may do anything (compute quantities, write files, delete outputs).
+- Return-value contract:
+  - `nothing` → nothing is stored.
+  - `NamedTuple` / `AbstractDict` of `name => scalar` (`Real`, `Bool`, or `String`) → one row keyed by `simulation_id` is upserted into the sink DB `data/outputs/postprocessing.db`, table `post_processing`. Columns are added on demand; a re-run overwrites the existing row for that `simulation_id`.
+  - any other return type, or a non-scalar value → `ArgumentError`.
+- `post_processor` is not forwarded to the simulator setup hooks. The callback runs inside the per-simulation worker task; **all sink writes are serialized** in the main completion loop, so user code never writes the sink DB concurrently.
+- `postProcessingTable(args...)` / `printPostProcessingTable` read the sink back as a `DataFrame` keyed by `:SimID` (joinable to `simulationsTable`), with `missing` for quantities not computed for a given simulation. `postProcessingDBPath()` returns the sink path.
+- `simulationsTable(args...; post_processing=true)` appends the stored quantities directly onto the simulations table (left-join by `:SimID`, `missing` where not computed, row order preserved; the appended columns are not subject to `remove_constants` or sorting). The kwarg is simulation-level only — `monadsTable` does not accept it, since quantities are per-simulation.
+- Deletion keeps the sink consistent with the central database: `deleteSimulations` removes each deleted simulation's sink row (so cascading `deleteMonad`/`deleteSampling`/`deleteTrial` do too, since they route through it), and `resetDatabase` removes the sink database entirely.
+
+**Acceptance criteria:**
+- The callback fires exactly once per successful simulation and not at all when nothing is re-scheduled (`use_previous`).
+- A `nothing` return leaves no sink row; a NamedTuple/Dict return produces a joinable row.
+- A new quantity introduces a new column; earlier rows read back `missing` for it.
+- Re-writing a `simulation_id` overwrites its stored quantities.
+- Unsupported return types raise `ArgumentError`.
+- `run` without `post_processor` behaves exactly as before.
+- After `deleteSimulations`/`deleteMonad`/`deleteSampling`/`deleteTrial`, the deleted simulations have no rows in the sink; after `resetDatabase`, the sink database no longer exists.
 
 ---
 

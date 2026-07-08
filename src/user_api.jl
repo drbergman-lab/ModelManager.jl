@@ -56,6 +56,59 @@ createTrial(reference::AbstractMonad, args...; kwargs...) = createTrial(GridVari
 
 createTrial(output_ref::MMOutput{<:AbstractMonad}, args...; kwargs...) = createTrial(output_ref.trial, args...; kwargs...)
 
+"""
+    createTrial(Ts::AbstractVector) -> Trial
+
+Bundle a collection of already-built trials into a single [`Trial`](@ref) so they can be
+launched together — e.g. after accumulating the results of earlier `createTrial` calls in a
+vector:
+
+```julia
+sims = []
+push!(sims, createTrial(inputs, dv1))
+push!(sims, createTrial(inputs, dv2))
+run(sims)                 # launch all as one batch
+```
+
+Each element may be a `Simulation`, `Monad`, `Sampling`, or `Trial` (a `Trial` contributes its
+constituent samplings). The vector may be loosely typed (`Vector{Any}`); its elements are
+narrowed to [`AbstractTrial`](@ref), with a clear `ArgumentError` if any element is not one.
+Already-built trials are wrapped as-is — no new replicates are added.
+"""
+function createTrial(Ts::AbstractVector)
+    trials = _toAbstractTrialVector(Ts)
+    isempty(trials) && throw(ArgumentError("createTrial received an empty collection; nothing to run."))
+    samplings = AbstractSampling[]
+    for T in trials
+        if T isa AbstractSampling      # Simulation, Monad, or Sampling
+            push!(samplings, T)
+        else                           # Trial — contributes its samplings
+            append!(samplings, T.samplings)
+        end
+    end
+    return Trial(samplings)
+end
+
+"""
+    _toAbstractTrialVector(Ts::AbstractVector) -> Vector{AbstractTrial}
+
+Narrow a (possibly `Vector{Any}`) collection to `Vector{AbstractTrial}`, throwing an
+`ArgumentError` that lists the offending indices if any element is not an [`AbstractTrial`](@ref).
+"""
+function _toAbstractTrialVector(Ts::AbstractVector)
+    try
+        return Vector{AbstractTrial}(Ts)
+    catch _
+        msg = "run/createTrial over a vector requires every element to be an AbstractTrial " *
+              "(Simulation, Monad, Sampling, or Trial).\nThe following indices are not:"
+        for (i, T) in enumerate(Ts)
+            T isa AbstractTrial && continue
+            msg *= "\n  - Index $i: $(typeof(T))"
+        end
+        throw(ArgumentError(msg))
+    end
+end
+
 function convertToAbstractVariationVector(avs::Vector)
     try
         return Vector{AbstractVariation}(avs)
@@ -116,3 +169,17 @@ run(inputs::InputFolders, args...; kwargs...) = run(GridVariation(), inputs, arg
 run(reference::AbstractMonad, arg1, args...; kwargs...) = run(GridVariation(), reference, arg1, args...; kwargs...)
 
 run(output_ref::MMOutput{<:AbstractMonad}, args...; kwargs...) = run(output_ref.trial, args...; kwargs...)
+
+"""
+    run(Ts::AbstractVector; kwargs...) -> MMOutput
+
+Bundle a collection of already-built trials into one [`Trial`](@ref) (see
+[`createTrial`](@ref)`(::AbstractVector)`) and run it as a single parallelized batch. `kwargs`
+are forwarded to [`run`](@ref)`(::AbstractTrial; ...)` (including `post_processor`).
+
+```julia
+sims = [createTrial(inputs, dv1), createTrial(inputs, dv2)]
+run(sims)
+```
+"""
+run(Ts::AbstractVector; kwargs...) = run(createTrial(Ts); kwargs...)

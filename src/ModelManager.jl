@@ -28,13 +28,16 @@ export AbstractTrial, AbstractSampling, AbstractMonad
 export Simulation, Monad, Sampling, Trial
 export constituentIDs, simulationIDs, monadIDs, trialFolder, pathToOutputFolder
 export MMOutput, trialID, trialType
+export simulationID, monadID, wasSuccessful
 export createMMTable, insertFolder
-export deleteSimulation, deleteSimulations, deleteSimulationsByStatus, resetDatabase
+export deleteSimulation, deleteSimulations, deleteAllSimulations, deleteSimulationsByStatus
+export deleteMonad, deleteSampling, deleteTrial, resetDatabase
 export run
 export printSimulationIDs
 export shortLocationVariationID
 export simulationsTable, printSimulationsTable
 export monadsTable, printMonadsTable
+export postProcessingTable, printPostProcessingTable, postProcessingDBPath
 export XMLPath
 export AbstractVariation, ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation

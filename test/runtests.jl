@@ -64,6 +64,15 @@ function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.Simulati
     return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, true)
 end
 
+# Records the per-simulation post-step call order so the ordering test below can assert
+# postSimulationProcessing → post_processor → postSimulationCleanup. Appends on every sim in
+# every testset; the ordering test empties the log immediately before inspecting it.
+const _post_order_log = String[]
+ModelManager.postSimulationProcessing(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) =
+    (push!(_post_order_log, "processing:$(sp.simulation.id)"); nothing)
+ModelManager.postSimulationCleanup(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) =
+    (push!(_post_order_log, "cleanup:$(sp.simulation.id)"); nothing)
+
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
@@ -2147,6 +2156,35 @@ _gsa_fB(mid) = 0.0
                 @test out.n_success == 2
             end
 
+            @testset "run/createTrial over a vector" begin
+                s1    = createTrial(inputs, [DiscreteVariation(:config, xp_x, 801.0)]; n_replicates=1)          # Simulation
+                m1    = createTrial(inputs, [DiscreteVariation(:config, xp_x, 802.0)]; n_replicates=2)          # Monad
+                samp1 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [803.0, 804.0])]; n_replicates=1) # Sampling
+                @test s1 isa Simulation && m1 isa Monad && samp1 isa Sampling
+
+                # Accumulate heterogeneous trials in a Vector{Any}, then batch them.
+                batch = []
+                push!(batch, s1); push!(batch, m1); push!(batch, samp1)
+
+                @test createTrial(batch) isa Trial
+
+                out = run(batch)
+                @test out isa MMOutput
+                @test trialType(out) == Trial
+                @test out.n_success == 1 + 2 + 2      # s1 + m1(2 reps) + samp1(2 monads)
+
+                # Single-element vector still yields a Trial.
+                @test createTrial([s1]) isa Trial
+
+                # A Trial element is flattened into its samplings.
+                @test createTrial([Trial([samp1]), s1]) isa Trial
+
+                # Non-trial elements and empties raise a clear ArgumentError.
+                @test_throws ArgumentError createTrial([s1, 42])
+                @test_throws ArgumentError run(Any[s1, "nope"])
+                @test_throws ArgumentError createTrial(AbstractTrial[])
+            end
+
             # ---------- constituentIDs / simulationIDs ----------
             @testset "constituentIDs and simulationIDs" begin
                 dv   = DiscreteVariation(:config, xp_x, [21.0, 22.0, 23.0])
@@ -2206,6 +2244,129 @@ _gsa_fB(mid) = 0.0
                 printMonadsTable(samp; sink=(df -> captured[] = df))
                 @test captured[] isa DataFrame
                 @test nrow(captured[]) == 3
+            end
+
+            # ---------- post-processing hook + sink ----------
+            @testset "post-processing sink" begin
+                # Callback returning a NamedTuple → one sink row per successful simulation.
+                dv   = DiscreteVariation(:config, xp_x, [301.0, 302.0])
+                samp = createTrial(inputs, [dv]; n_replicates=1)
+                calls = Ref(0)
+                out = run(samp; post_processor = sp -> begin
+                    calls[] += 1
+                    (; sid = sp.simulation.id, doubled = 2.0 * sp.simulation.id)
+                end)
+                @test out.n_success == 2
+                @test calls[] == 2                       # fired once per successful sim
+
+                # Accessors let the callback avoid reaching into struct internals.
+                acc = createTrial(inputs, [DiscreteVariation(:config, xp_x, 351.0)]; n_replicates=1)
+                acc_id = simulationIDs(acc)[1]
+                seen = Ref{Any}(nothing)
+                run(acc; post_processor = sp -> begin
+                    seen[] = (simulationID(sp), monadID(sp), wasSuccessful(sp), pathToOutputFolder(sp))
+                    nothing
+                end)
+                @test seen[][1] == acc_id
+                @test seen[][2] == Monad(acc).id
+                @test seen[][3] == true
+                @test seen[][4] == pathToOutputFolder(acc_id)
+                @test seen[][4] == pathToOutputFolder(Simulation(acc_id))
+
+                # simulationsTable(...; post_processing=true) joins the QoIs by :SimID.
+                st_pp = simulationsTable(samp; post_processing=true, remove_constants=false)
+                @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(st_pp))
+                @test nrow(st_pp) == 2
+                for row in eachrow(st_pp)
+                    @test row.doubled == 2.0 * row.SimID   # joined on the right SimID
+                end
+                # Without the kwarg, no QoI columns appear.
+                @test "doubled" ∉ names(simulationsTable(samp))
+
+                pt = postProcessingTable(samp)
+                @test pt isa DataFrame
+                @test nrow(pt) == 2
+                @test :SimID in propertynames(pt)
+                @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(pt))
+                @test all(pt.doubled .== 2.0 .* pt.SimID) # values round-trip
+
+                # use_previous ⇒ nothing re-scheduled ⇒ callback not fired again.
+                calls[] = 0
+                run(samp; post_processor = sp -> (; sid = sp.simulation.id))
+                @test calls[] == 0
+
+                # Callback returning `nothing` ⇒ no sink row for that sim.
+                m_none = createTrial(inputs, [DiscreteVariation(:config, xp_x, 311.0)]; n_replicates=1)
+                run(m_none; post_processor = sp -> nothing)
+                none_id = simulationIDs(m_none)[1]
+                all_ids = ("SimID" in names(postProcessingTable())) ? postProcessingTable().SimID : Int[]
+                @test none_id ∉ all_ids
+
+                # AbstractDict return + a *new* quantity ⇒ dynamic column; earlier rows get `missing`.
+                m_new = createTrial(inputs, [DiscreteVariation(:config, xp_x, 321.0)]; n_replicates=1)
+                run(m_new; post_processor = sp -> Dict("newq" => 7.0))
+                pt2 = postProcessingTable()
+                @test "newq" in names(pt2)
+                new_id = simulationIDs(m_new)[1]
+                @test pt2.newq[findfirst(==(new_id), pt2.SimID)] == 7.0
+                first_samp_id = simulationIDs(samp)[1]
+                @test ismissing(pt2.newq[findfirst(==(first_samp_id), pt2.SimID)])
+
+                # Upsert: writing the same simulation_id twice overwrites and adds columns.
+                db = ModelManager._openPostProcessingDB()
+                try
+                    ModelManager._writePostProcessingRow(db, 100_001, (; a = 1.0))
+                    ModelManager._writePostProcessingRow(db, 100_001, (; a = 2.0, b = 3.0))
+                finally
+                    close(db)
+                end
+                up = postProcessingTable([100_001])
+                @test nrow(up) == 1
+                @test up.a[1] == 2.0
+                @test up.b[1] == 3.0
+
+                # Invalid return values ⇒ ArgumentError (surfaced from the serial write loop).
+                @test_throws ArgumentError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 331.0)]; n_replicates=1);
+                    post_processor = sp -> [1, 2, 3])
+                @test_throws ArgumentError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 332.0)]; n_replicates=1);
+                    post_processor = sp -> (; bad = [1.0, 2.0]))
+
+                # printPostProcessingTable routes the DataFrame through the sink.
+                captured = Ref{Any}(nothing)
+                printPostProcessingTable(samp; sink = df -> captured[] = df)
+                @test captured[] isa DataFrame
+                @test nrow(captured[]) == 2
+
+                # Ordering: postSimulationProcessing (non-destructive) runs before the user
+                # post_processor, which runs before postSimulationCleanup (destructive), so the
+                # callback always sees the intact output folder.
+                m_ord = createTrial(inputs, [DiscreteVariation(:config, xp_x, 401.0)]; n_replicates=1)
+                ord_id = simulationIDs(m_ord)[1]
+                empty!(_post_order_log)
+                run(m_ord; post_processor = sp -> begin
+                    push!(_post_order_log, "user:$(sp.simulation.id)")
+                    (; q = 1.0)
+                end)
+                @test _post_order_log == ["processing:$(ord_id)", "user:$(ord_id)", "cleanup:$(ord_id)"]
+            end
+
+            @testset "post-processing sink follows deletions" begin
+                dv   = DiscreteVariation(:config, xp_x, [501.0, 502.0])
+                samp = createTrial(inputs, [dv]; n_replicates=2)   # 2 monads × 2 replicates
+                run(samp; post_processor = sp -> (; v = simulationID(sp)))
+                sids = simulationIDs(samp)
+                @test nrow(postProcessingTable(sids)) == 4
+
+                # Deleting simulations removes their sink rows; others remain.
+                deleteSimulations(sids[1:2]; delete_supers=false)
+                @test Set(postProcessingTable(sids).SimID) == Set(sids[3:4])
+
+                # Cascade: deleting the sampling removes the rest of its sink rows.
+                # (also exercises that deleteSampling is exported)
+                deleteSampling(samp.id)
+                @test nrow(postProcessingTable(sids)) == 0
             end
 
             # ---------- getParameterValue ----------
@@ -2394,6 +2555,43 @@ _gsa_fB(mid) = 0.0
         # don't inherit the temp-project globals.
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end  # @testset "DB-backed integration"
+
+    @testset "resetDatabase clears post-processing sink" begin
+        # Isolated project so the reset does not disturb the shared integration project.
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+
+            inputs = InputFolders(config="default")
+            dv = DiscreteVariation(:config, XMLPath(["data", "x"]), 601.0)
+            run(createTrial(inputs, [dv]; n_replicates=1); post_processor = sp -> (; v = 1.0))
+            @test isfile(postProcessingDBPath())
+
+            resetDatabase(; force_reset=true, force_continue=true)
+            @test !isfile(postProcessingDBPath())
+        end
+    end
+
+    @testset "post-processing sink created lazily" begin
+        # A post_processor that only ever returns nothing must not create the sink file.
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            run(createTrial(inputs, [DiscreteVariation(:config, xp, 701.0)]; n_replicates=1);
+                post_processor = sp -> nothing)
+            @test !isfile(postProcessingDBPath())   # nothing stored ⇒ no sink file
+
+            run(createTrial(inputs, [DiscreteVariation(:config, xp, 702.0)]; n_replicates=1);
+                post_processor = sp -> (; v = 1.0))
+            @test isfile(postProcessingDBPath())     # first stored quantity creates it
+        end
+    end
 
     ################## GSA plot recipes ##################
 
