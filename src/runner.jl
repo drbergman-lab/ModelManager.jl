@@ -32,6 +32,35 @@ struct SimulationProcess
 end
 
 """
+    simulationID(simulation_process::SimulationProcess)
+
+Return the ID of the simulation this process ran. Accessor for use inside a `post_processor`
+(see [`run`](@ref)) so users need not reach into `simulation_process.simulation.id`.
+"""
+simulationID(simulation_process::SimulationProcess) = simulation_process.simulation.id
+
+"""
+    monadID(simulation_process::SimulationProcess)
+
+Return the ID of the monad enclosing this simulation.
+"""
+monadID(simulation_process::SimulationProcess) = simulation_process.monad_id
+
+"""
+    wasSuccessful(simulation_process::SimulationProcess)
+
+Return `true` if the simulation completed successfully.
+"""
+wasSuccessful(simulation_process::SimulationProcess) = simulation_process.success
+
+"""
+    pathToOutputFolder(simulation_process::SimulationProcess)
+
+Return the path to the output folder for the simulation this process ran.
+"""
+pathToOutputFolder(simulation_process::SimulationProcess) = pathToOutputFolder(simulationID(simulation_process))
+
+"""
     prepCmdForWrap(cmd::Cmd)
 
 Strip surrounding backticks from the string representation of `cmd`.
@@ -184,13 +213,36 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   `on_progress(:finish, n_success)` once at the end. When `nothing` (default) the runner
   behaves exactly as before — this keeps the per-simulation completion loop framework-
   agnostic while letting callers (e.g. ABC-SMC calibration) render a live progress bar.
+- `post_processor::Union{Nothing,Function}=nothing`: optional user hook run once per
+  **successfully completed** simulation, after the simulator's non-destructive
+  [`postSimulationProcessing`](@ref) and before its destructive [`postSimulationCleanup`](@ref)
+  — so the callback always sees the intact (but processed) output folder.
+  It is called as `post_processor(simulation_process::SimulationProcess)`. Use the accessors
+  [`simulationID`](@ref), [`monadID`](@ref), [`wasSuccessful`](@ref), and
+  [`pathToOutputFolder`](@ref)`(simulation_process)` to access these fields;
+  reading the actual simulation output into usable data is the responsibility of the user
+  or the simulator package (e.g. PhysiCellModelManager loaders keyed by `simulationID`).
+  Its return value determines storage:
+  - `nothing` → nothing is stored (pure side effects).
+  - a `NamedTuple` or `AbstractDict` of `name => scalar` → one row keyed by `simulation_id`
+    is upserted into the project's post-processing sink (`data/outputs/postprocessing.db`),
+    readable via [`postProcessingTable`](@ref). Columns grow dynamically; sims lacking a
+    given quantity have `NULL`.
+  - any other type → an `ArgumentError` is thrown.
+  The callback runs inside the per-simulation worker task (so heavy compute parallelizes),
+  but all sink writes are serialized in the main completion loop; user code never touches the
+  sink DB directly. `post_processor` is not forwarded to the simulator hooks. If the callback
+  (or a simulator hook) throws, `run` **fails fast**: it rethrows a clear error naming the
+  stage and simulation with the original stacktrace — it never hangs or swallows the exception.
 - All other `kwargs` flow through to [`prepareTrialHierarchy`](@ref) (which forwards
   them to the simulator's [`setupSampling`](@ref) / [`setupMonad`](@ref) hooks) and to
-  [`postSimulationProcessing`](@ref). Any simulator-specific flags flow through this
-  channel. [`runSimulation`](@ref) takes no kwargs.
+  both [`postSimulationProcessing`](@ref) and [`postSimulationCleanup`](@ref) (e.g.
+  `prune_options`). Any simulator-specific flags flow through this channel.
+  [`runSimulation`](@ref) takes no kwargs.
 """
 function run(T::AbstractTrial; quiet::Bool=false,
-             on_progress::Union{Nothing,Function}=nothing, kwargs...)
+             on_progress::Union{Nothing,Function}=nothing,
+             post_processor::Union{Nothing,Function}=nothing, kwargs...)
     setup_success = prepareTrialHierarchy(T; kwargs...)
     specs = setup_success ? pendingSimulationSpecs(T) : SimulationSpec[]
     n_simulation_tasks = length(specs)
@@ -215,21 +267,48 @@ function run(T::AbstractTrial; quiet::Bool=false,
     ]
 
     queue_channel = Channel{Task}(n_simulation_tasks)
-    result_channel = Channel{SimulationProcess}(n_simulation_tasks)
+    result_channel = Channel{Union{_PostProcessedResult,_SimulationStageError}}(n_simulation_tasks)
     @async for simulation_task in simulation_tasks
         put!(queue_channel, simulation_task)
     end
 
     for _ in 1:mm_globals().max_number_of_parallel_simulations
         @async for simulation_task in queue_channel
-            put!(result_channel, processSimulationTask(simulation_task; kwargs...))
+            #! Always deliver a result. Without this catch, an exception in
+            #! processSimulationTask (a throwing runSimulation/fetch, simulator hook, or user
+            #! post_processor) would kill this worker silently and the completion loop's
+            #! `take!` would block forever — a silent, indefinite hang.
+            result = try
+                processSimulationTask(simulation_task; post_processor=post_processor, kwargs...)
+            catch e
+                e isa _SimulationStageError ? e :
+                    _SimulationStageError(:simulation, nothing, CapturedException(e, catch_backtrace()))
+            end
+            put!(result_channel, result)
         end
     end
 
-    for _ in 1:n_simulation_tasks
-        simulation_process = take!(result_channel)
-        n_success += simulation_process.success
-        isnothing(on_progress) || on_progress(:step, 1)
+    #! Sink writes are funneled through this single-threaded loop (never the worker tasks)
+    #! so a `yield` inside user post-processing code cannot interleave a half-written row.
+    #! The sink DB is opened lazily on the first stored quantity, so a post_processor that
+    #! only ever returns `nothing` (pure side effects) never creates the file.
+    sink_db = nothing
+    try
+        for _ in 1:n_simulation_tasks
+            result = take!(result_channel)
+            #! Fail fast on any captured per-simulation error rather than hanging or silently
+            #! dropping it. In-flight simulations may still be running; their results are
+            #! discarded once we throw.
+            result isa _SimulationStageError && throw(result)
+            n_success += result.process.success
+            if !isnothing(result.qoi)
+                isnothing(sink_db) && (sink_db = _openPostProcessingDB())
+                _writePostProcessingRow(sink_db, result.process.simulation.id, result.qoi)
+            end
+            isnothing(on_progress) || on_progress(:step, 1)
+        end
+    finally
+        isnothing(sink_db) || close(sink_db)
     end
     isnothing(on_progress) || on_progress(:finish, n_success)
 
@@ -279,19 +358,97 @@ function runAbstractTrial(T::AbstractTrial; kwargs...)
 end
 
 """
-    processSimulationTask(simulation_task; kwargs...)
+    _PostProcessedResult
 
-Schedule and fetch a simulation task, update the database with the outcome, then call
-[`postSimulationProcessing`](@ref) on the active simulator.
+Internal pairing carried back from a worker task to the main completion loop: the
+[`SimulationProcess`](@ref) plus the value returned by the user `post_processor` (or
+`nothing` when there is no post-processor or the simulation failed). Kept private so the
+public `SimulationProcess` struct stays unchanged. Failures travel on the same channel as a
+[`_SimulationStageError`](@ref) instead.
 """
-function processSimulationTask(simulation_task; kwargs...)
+struct _PostProcessedResult
+    process::SimulationProcess
+    qoi::Any
+end
+
+"""
+    _SimulationStageError <: Exception
+
+A failure inside a per-simulation worker: which stage threw (`:simulation` for the launch and
+bookkeeping itself, `:postSimulationProcessing`, `:post_processor`, or
+`:postSimulationCleanup`), which simulation (when known), and the original exception with its
+backtrace as a `CapturedException`.
+
+Workers must never let an exception escape — that would kill the worker task silently and
+leave the completion loop in [`run`](@ref) blocked forever on `take!`. Instead the failure is
+sent through the result channel as one of these and rethrown by the completion loop, so `run`
+fails fast with a message that distinguishes a bug in the user's `post_processor` (actionable
+by the user) from one in a simulator hook (actionable by the simulator package author).
+"""
+struct _SimulationStageError <: Exception
+    stage::Symbol
+    sim_id::Union{Nothing,Int}
+    captured::CapturedException
+end
+
+function Base.showerror(io::IO, err::_SimulationStageError)
+    stage_desc = err.stage === :post_processor           ? "the user post_processor" :
+                 err.stage === :postSimulationProcessing ? "the simulator's postSimulationProcessing hook" :
+                 err.stage === :postSimulationCleanup    ? "the simulator's postSimulationCleanup hook" :
+                                                           "the simulation worker"
+    sim_str = isnothing(err.sim_id) ? "" : " (simulation $(err.sim_id))"
+    println(io, "run failed in ", stage_desc, sim_str, ":\n")
+    showerror(io, err.captured)
+end
+
+"""
+    _runStage(stage::Symbol, sim_id, thunk)
+
+Run `thunk()`, rethrowing any exception as a [`_SimulationStageError`](@ref) tagged with
+`stage` and `sim_id` so [`run`](@ref) can report where a per-simulation failure occurred.
+"""
+function _runStage(stage::Symbol, sim_id::Union{Nothing,Int}, thunk)
+    try
+        return thunk()
+    catch e
+        throw(_SimulationStageError(stage, sim_id, CapturedException(e, catch_backtrace())))
+    end
+end
+
+"""
+    processSimulationTask(simulation_task; post_processor=nothing, kwargs...)
+
+Schedule and fetch a simulation task, update the database with the outcome, then run the
+per-simulation post steps in order:
+1. [`postSimulationProcessing`](@ref) — non-destructive simulator processing.
+2. the user `post_processor` (only for a successful simulation) — return value captured.
+3. [`postSimulationCleanup`](@ref) — destructive simulator cleanup (e.g. pruning), so the
+   user callback always sees the intact output folder.
+
+A throwing stage surfaces as a [`_SimulationStageError`](@ref) naming the stage and
+simulation. The captured value (if any) is written to the post-processing sink by the
+caller's serial completion loop, not here, so this function never touches the sink DB.
+"""
+function processSimulationTask(simulation_task; post_processor::Union{Nothing,Function}=nothing, kwargs...)
     schedule(simulation_task)
     simulation_process = fetch(simulation_task)
     updateDatabaseOnCompletion(simulation_process.simulation.id,
                                simulation_process.monad_id,
                                simulation_process.success)
-    postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...)
-    return simulation_process
+    sid = simulation_process.simulation.id
+
+    #! Per-simulation ordering: non-destructive simulator processing → user post_processor
+    #! → destructive simulator cleanup. The user callback must see the intact (but processed)
+    #! output folder, so pruning/deletion is deferred to postSimulationCleanup.
+    _runStage(:postSimulationProcessing, sid,
+              () -> postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...))
+    qoi = nothing
+    if !isnothing(post_processor) && simulation_process.success
+        qoi = _runStage(:post_processor, sid, () -> post_processor(simulation_process))
+    end
+    _runStage(:postSimulationCleanup, sid,
+              () -> postSimulationCleanup(mm_globals().simulator, simulation_process; kwargs...))
+    return _PostProcessedResult(simulation_process, qoi)
 end
 
 """

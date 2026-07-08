@@ -898,3 +898,205 @@ The three methods are intentionally heterogeneous in their reduction: absolute e
 - `src/calibration/distance.jl` — two new `mseDistance` methods; docstring updated
 - `test/runtests.jl` — new tests for vector/scalar `mseDistance`; `DimensionMismatch`; non-dict `observed_data` round-trip; non-dict `evaluate_batch` integration
 - `PRD.md` — updated `mseDistance` spec and acceptance criteria
+
+---
+
+## Session: monadsTable — monad-level analysis table (2026-07-07)
+
+### Goal
+Add `monadsTable`, the monad analogue of `simulationsTable`: one row per monad and its varied parameters. First of the handoff tasks (e); read-only, no schema change.
+
+### Design decisions
+
+**Shared helper, not copy-paste.** Both `simulations` and `monads` tables carry the same input-ID and variation-ID columns, so the join pipeline (`addFolderNameColumns!` + `appendVariations` + constant-dropping + sort) is identical — only the primary-key column differs. Factored the body of `simulationsTableFromQuery` into a private `_variationsTableFromQuery(query, id_column, display_id_column; …)`. `simulationsTableFromQuery` and the new `monadsTableFromQuery` are thin wrappers that fix the key column (`:simulation_id` → `:SimID`, `:monad_id` → `:MonadID`) and the `sort_ignore` default. This makes drift between the two tables impossible.
+
+**Public `simulationsTableFromQuery` signature unchanged.** It keeps its exact kwargs (including the `sort_ignore=[:SimID; …]` default) and delegates — so existing callers (`calibration/visualize.jl`) are untouched. The helper takes `sort_ignore` as a required kwarg (already resolved by the wrapper) rather than recomputing it.
+
+**Dispatch mirrors `simulationsTable`.** `monadsTable` has the same four forms (`AbstractArray{<:AbstractTrial}`, `Vararg{AbstractTrial}`, `AbstractVector{<:Integer}`, no-arg), collecting IDs via the pre-existing `monadIDs` dispatch. No ambiguity: the integer-vector and trial-array methods have disjoint element types.
+
+### Rejected / not done
+- No `@test_throws assertInitialized()` test: not practically testable inside the DB-backed testset (globals stay initialized), and `simulationsTable` has no such test either — matched the existing convention.
+
+### Files changed
+- `src/database.jl` — extracted `_variationsTableFromQuery`; added `monadsTableFromQuery`, `monadsTable` (4 methods), `printMonadsTable`; `simulationsTableFromQuery` now delegates
+- `src/ModelManager.jl` — export `monadsTable`, `printMonadsTable`
+- `test/runtests.jl` — new `monadsTable` testset in DB-backed integration (row counts vs `simulationsTable`, dispatch forms, `remove_constants`/`short_names`, `printMonadsTable` sink)
+- `PRD.md` — new "Analysis Tables" feature section
+- `README.md` — Implementation Status: analysis tables entry
+
+---
+
+## Session: String variation values — considered and rejected (2026-07-07)
+
+### Decision
+Do **not** add string values to `DiscreteVariation`. Categorical/string parameters are instead handled by using a **separate config (input) folder per categorical value** — folders are already first-class in ModelManager, so the varied-parameter machinery stays numeric.
+
+### Why (investigation findings)
+Supporting strings would require Float64-locked core internals to be generalized in three layers, none of it localized to "column typing" as first assumed:
+1. **Type layer** — `LatentVariation{T<:Union{Vector{<:Real},<:Distribution}}` (`src/variations.jl:491`) is numeric-only; the single-`DiscreteVariation` conversion (`:630`) uses `latent_parameters=[dv.values]` + `maps=[first]`, so `Vector{String}` fails the `T<:Real` constraint.
+2. **Sampling layer** — `variationValues(lv::LatentVariation{<:Vector{<:Real}})` (`:743`) allocates `Array{Float64}`; `addVariationRow` is typed `AbstractVector{<:Real}` (`:1323`).
+3. **`par_key` layer** — row-uniqueness fingerprint is `reinterpret(UInt8, Vector{Float64}(vals))` in `addVariationRow`, `addColumns`, `setUpColumns`, and `validateParsBytes` (`:1267`).
+
+A viable path existed (index-based latent params like the `CoVariation{DiscreteVariation}` case at `:651`, length-prefixed UTF-8 bytes appended to `par_key` to avoid a migration), but the cost/risk (~150–250 LOC across core sampling internals, Medium risk) is not justified given the config-folder alternative. Note `sqliteDataType` already maps non-numeric → `"TEXT"`, so nothing about the current schema blocks the folder-based approach.
+
+---
+
+## Session: Per-simulation post-processing hook + QoI sink (2026-07-07)
+
+### Goal
+Handoff task b: let a user run their own code after each simulation, and optionally collect returned quantities of interest (QoIs) into a standardized, queryable store — without giving up the freedom to just compute/save/delete however they want.
+
+### Design decisions
+
+**Two layers: callback primitive + opt-in sink.** `run(T; post_processor=f)` calls `f(simulation_process)` once per *successful* sim, after the simulator's own `postSimulationProcessing`. The return value decides storage: `nothing` → pure side effects ("wild west"); a `NamedTuple`/`AbstractDict` of `name => scalar` → a row upserted into a single project-level sink DB; anything else → `ArgumentError`. This satisfies both the "do whatever you want" and the "standardized sink with missing entries" goals the user described.
+
+**Single sink DB at `data/outputs/postprocessing.db`, separate from the central DB.** Table `post_processing`, PK `simulation_id`, columns grown on demand via `ALTER TABLE ADD COLUMN` (typed by value: Bool/Integer→INTEGER, Real→REAL, String→TEXT). A sim that never produced a given quantity reads back `missing`. Because it is a *separate* file created lazily on first write, there is **no `up.jl` migration and no PCMM coordination** — nothing about the central schema changes.
+
+**Upsert semantics (user choice).** Re-writing a `simulation_id` overwrites its row (`INSERT … ON CONFLICT(simulation_id) DO UPDATE SET …`). Latest run wins; keeps one row per sim.
+
+**Concurrency: writes funneled to the serial main loop.** The callback runs inside the per-sim worker task (`processSimulationTask`) so heavy compute parallelizes, but its return value is carried back on the result channel via a private `_PostProcessedResult(process, qoi)` wrapper, and **all sink writes happen in the single-threaded completion loop** in `run`. User code never touches the sink DB, so a `yield` inside user code cannot interleave a half-written row. `SimulationProcess` (public struct) is unchanged; only the internal channel payload widened. The sink DB handle is opened once per `run` (when `post_processor` is set) and closed in a `finally`.
+
+**`post_processor` is an explicit `run` kwarg**, not part of `kwargs...`, so it is not forwarded to `prepareTrialHierarchy` / simulator setup hooks. `MMOutput` fields left unchanged (QoIs are read via `postProcessingTable`, not returned in `MMOutput`) — easy to add in-memory return later if wanted.
+
+### Rejected
+- Storing QoIs in the central DB (would need a schema migration + coordinated PCMM `up.jl` entry) — the separate sink file avoids all of that.
+- Passing a bespoke NamedTuple to the callback instead of `SimulationProcess` — reusing `SimulationProcess` keeps it consistent with `postSimulationProcessing`.
+
+### Files changed
+- `src/runner.jl` — `post_processor` kwarg on `run`; `_PostProcessedResult`; `processSimulationTask` runs the callback (success only) and returns the wrapper; serial sink-write loop with lazy-open/`finally`-close
+- `src/database.jl` — `postProcessingDBPath`, `_openPostProcessingDB`, `_postProcessingColumnSpec`, `_normalizePostProcessingQoI`, `_writePostProcessingRow` (upsert + dynamic columns), `_readPostProcessingTable`, `postProcessingTable` (4 forms), `printPostProcessingTable`
+- `src/ModelManager.jl` — exports `postProcessingTable`, `printPostProcessingTable`, `postProcessingDBPath`
+- `test/runtests.jl` — new "post-processing sink" testset (fires on success only; not on `use_previous`; `nothing` vs NamedTuple vs Dict; dynamic column + `missing`; direct upsert; `ArgumentError` on bad returns; `printPostProcessingTable` sink)
+- `PRD.md` — new "Per-Simulation Post-Processing" feature section
+- `README.md` — Implementation Status entry
+
+### Correction: split destructive cleanup into `postSimulationCleanup` (ordering fix)
+
+The first cut ran the simulator's `postSimulationProcessing` **before** the user `post_processor`. That is wrong for PCMM, whose `postSimulationProcessing` *prunes* (deletes) simulation output — the user callback would be handed an already-gutted folder and could compute nothing.
+
+**Fix:** three well-defined per-simulation slots around the user hook, applied in `processSimulationTask`:
+1. `postSimulationProcessing` — simulator-specific, **non-destructive**, runs **before** `post_processor` (future-proofing: a simulator can standardize/transform output that the user then reads).
+2. `post_processor` — user callback (successful sims only).
+3. `postSimulationCleanup` — **new** interface stub (`src/abstract_simulator.jl`, default no-op), simulator-specific **destructive** cleanup/pruning, runs **after** `post_processor`, regardless of success.
+
+**PCMM coordination (required):** PCMM must move its pruning (and its err-file handling) from `postSimulationProcessing` into a new `postSimulationCleanup(::PhysiCellSimulator, …)`. Because `postSimulationCleanup`'s default is a no-op, an unmodified PCMM would simply stop pruning — so this is a coordinated PCMM bump. This is the one interface change task b introduces (the initial brief's "no PCMM coordination" no longer holds).
+
+Test: TestSimulator now records `postSimulationProcessing`/`postSimulationCleanup` calls into a log; the ordering test asserts `["processing:id", "user:id", "cleanup:id"]`.
+
+### Ergonomics: SimulationProcess accessors for `post_processor`
+
+Added so a user callback never has to reach into `SimulationProcess` internals:
+- `pathToOutputFolder(::SimulationProcess)` and `pathToOutputFolder(::Simulation)` (alongside the existing `::Int` method).
+- `simulationID(sp)`, `monadID(sp)`, `wasSuccessful(sp)` accessors (exported).
+
+**Division of labor (the design question):** ModelManager provides the generic plumbing — identify the simulation (`simulationID`) and locate its output (`pathToOutputFolder`). It deliberately does **not** parse output, because "output" is simulator-specific. Turning a simulation's folder into usable data (cells, populations, substrates, …) is the downstream package's job: e.g. PhysiCellModelManager should offer loaders keyed by `simulationID(sp)` so a user's `post_processor` becomes a one-liner. The `run` docstring states this explicitly.
+
+### Deletion consistency for the post-processing sink
+
+The sink (`data/outputs/postprocessing.db`) is a separate DB, so deletions of the central DB had to be taught about it:
+- `_deletePostProcessingRows(simulation_ids)` (`src/database.jl`) deletes sink rows; no-op if the sink file doesn't exist yet.
+- Wired into `deleteSimulations` (`src/deletion.jl`) — the **single choke point** through which every cascading deletion (`deleteMonad`/`deleteSampling`/`deleteTrial` with `delete_subs`) removes simulations, so one call covers them all.
+- `resetDatabase` additionally removes the whole sink file via `rm_hpc_safe(postProcessingDBPath())`.
+
+Tests: deleting simulations removes their rows (others remain); cascade via `deleteSampling` clears the rest; `resetDatabase` (isolated mktempdir project) removes the sink file.
+
+Also fixed a related export gap: `deleteMonad`/`deleteSampling`/`deleteTrial`/`deleteAllSimulations` were used bare in `docs/src/man/managing_data.md` but were **not exported** (only `deleteSimulation(s)`, `deleteSimulationsByStatus`, `resetDatabase` were), so those documented calls would `UndefVarError`. Now exporting all deletion functions (in both `src/ModelManager.jl` and `src/deletion.jl`); the sink-deletion test uses bare `deleteSampling` to exercise the export.
+
+### Convenience: `simulationsTable(...; post_processing=true)`
+
+Since the sink and the simulations table are both keyed by `:SimID`, added a `post_processing::Bool=false` kwarg to `simulationsTable`/`simulationsTableFromQuery` that left-joins the stored quantities onto the table. Implementation: `_appendPostProcessing!(df)` (`src/database.jl`) looks up `postProcessingTable(df.SimID)` and appends one column per quantity via a `SimID→value` Dict, preserving `df` row order and filling `missing` where absent. Order-preserving Dict lookup rather than `DataFrames.leftjoin` to avoid depending on join row-order semantics. Appended columns are deliberately exempt from `remove_constants`/sorting. Simulation-level only — not added to `monadsTable` (quantities are per-simulation). Note: `df.SimID` comes back `Union{Missing,Int}` from SQLite, so it is narrowed with `Vector{Int}` before the ID query.
+
+### Review pass — fixes before moving on
+
+Second look over the whole post-processing change caught:
+- **Lazy sink creation.** `run` was opening (creating) `postprocessing.db` whenever a `post_processor` was supplied, even one that only ever returns `nothing` — contradicting the `postProcessingDBPath` docstring. Now the sink is opened lazily on the first stored quantity, so pure side-effect callbacks never create the file. Added a test (`post-processing sink created lazily`).
+- **Empty-ID guard** in `_appendPostProcessing!` (avoids `WHERE simulation_id IN ()` if `simulationsTable(...; post_processing=true)` is ever called on an empty result).
+- **Docstring consistency.** `postProcessingTable` example now uses `simulationID(sp)` instead of `sp.simulation.id`; `run` kwargs bullet notes that `postSimulationCleanup` also receives kwargs (`prune_options`); removed a trailing-whitespace nit.
+
+Final: 1011/1011 tests pass; docs build clean.
+
+---
+
+## Session: Batch run/createTrial over a vector (task f) (2026-07-07)
+
+### Goal
+Support the accumulate-then-launch pattern: `sims = []; push!(sims, createTrial(...)); …; run(sims)`.
+
+### Design decisions
+
+**Bundle into one `Trial`, not a loop.** `run(Ts::AbstractVector)` → `run(createTrial(Ts))`. `createTrial(Ts::AbstractVector)` narrows the (possibly `Vector{Any}`) collection to `Vector{AbstractTrial}` (via `_toAbstractTrialVector`, mirroring `convertToAbstractVariationVector`), collects each element's samplings, and returns a single `Trial`. One Trial = one parallel pool across *all* constituent simulations (better than sequential per-element `run`s).
+
+**Type hierarchy made this easy.** `Simulation`/`Monad`/`Sampling` are all `<: AbstractSampling`, and `Trial(Ss::AbstractArray{<:AbstractSampling})` broadcasts `Sampling.` over them (`Sampling(::AbstractMonad)` wraps, `Sampling(::Sampling)` reloads). So the only element needing special handling is a `Trial` (which is `<: AbstractTrial` but not `AbstractSampling`) — flattened to its `.samplings`.
+
+**Decisions:** single-element vector still returns a `Trial`-wrapped `MMOutput` (consistent, batch-oriented); pre-built trials are wrapped as-is with `n_replicates=0`/`use_previous=true` (no new replicates); empty vectors and non-`AbstractTrial` elements raise a clear `ArgumentError` listing offending indices; `MMOutput` elements are not accepted (users pass `.trial`).
+
+**No dispatch ambiguity:** no existing `run`/`createTrial` method takes a bare `Vector` as its sole first argument.
+
+### Files changed
+- `src/user_api.jl` — `createTrial(Ts::AbstractVector)`, `_toAbstractTrialVector`, `run(Ts::AbstractVector)`
+- `test/runtests.jl` — "run/createTrial over a vector" testset (heterogeneous batch, single element, Trial flattening, ArgumentError cases)
+- `PRD.md` — Simulation Runner feature updated (batch spec + acceptance; also refreshed the hook wording to `postSimulationProcessing`/`postSimulationCleanup` + `post_processor`)
+- `README.md` — Implementation Status entry
+- `docs/src/man/running_simulations.md` — "Batching pre-built trials" section
+
+---
+
+## Session: Calibration evaluation budget — enforce before dispatch (task c, corrected) (2026-07-08)
+
+### Correction
+Task c was first mis-implemented as a global per-`run` "simulation budget" gate (new `simulation_budget` global, `setSimulationBudget`, `nPendingSimulations`, `force` kwarg). That was **not** the intent and was fully reverted. The budget is specifically for **calibration runs**: the existing `ABCSMC.max_evaluations`, but checked **before** sending off a batch rather than only after.
+
+### The actual problem
+`max_evaluations` already capped total evaluated particles, but `_updateBudget!` ran *after* `evaluate_batch`, so a batch was fully dispatched (simulations launched) and the run overshot the budget before `budget_hit` stopped it. The docstring even said "the current batch is fully processed."
+
+### Fix
+`_capBatchToBudget(proposals, budget, max_evaluations)` (`src/calibration/abc_smc.jl`) trims a planned batch to `max_evaluations - budget[]` **before** it is dispatched to `evaluate_batch`. Applied at all three dispatch sites: `_runFirstGeneration` (both no-snap and CDF-snap paths) and the batch loop in `_runSubsequentGeneration`. Consequences:
+- The run never evaluates more than `max_evaluations` simulations (trim-to-fit — uses the budget maximally, then stops).
+- Generation 1 is trimmed too when the budget is smaller than `population_size` (partial first generation, weights renormalized to the trimmed size).
+- Subsequent-generation loop guards an empty trimmed batch (sets `budget_hit`, breaks) so the acceptance-rate update never divides by zero.
+- `_updateBudget!` still runs after dispatch to advance `budget[]`/`budget_hit` (now by the trimmed count).
+
+### Tests
+- "max_evaluations caps total evaluations (checked before each batch)": total evaluated `== 25` and `eval_count == 25` (exactly the budget; never dispatched over).
+- "max_evaluations smaller than a generation trims generation 1": budget 4 < population 10 → one partial generation of 4 particles, weights `fill(0.25, 4)`.
+
+### Files changed
+- `src/calibration/abc_smc.jl` — `_capBatchToBudget`; capping at the three dispatch sites; empty-batch guard
+- `src/calibration/methods.jl`, `src/calibration/abc.jl` — `max_evaluations` docstrings updated to "before dispatch"
+- `test/runtests.jl` — updated/added budget tests
+- `docs/src/man/calibration.md`, `PRD.md` — before-dispatch semantics
+
+---
+
+## Session: PR #20 review fixes — async hang + sink hardening (2026-07-08)
+
+Addressing Copilot review comments on PR #20 plus a reproduced-bug handoff from the PCMM side.
+
+### Async worker hang (critical; handoff + Copilot)
+**Bug:** in `run`, each simulation is processed by a bare `@async for … put!(result_channel, processSimulationTask(...))` worker. If `processSimulationTask` threw (a throwing `runSimulation`/`fetch`, a simulator hook, or the user `post_processor`), the worker died silently, the `put!` never fired, and the completion loop's `take!` blocked **forever** — a silent, indefinite hang (reproduced in PCMM: hung a test run 9+ hours, twice, from a `MethodError`). Especially dangerous now that arbitrary user code (`post_processor`) runs in this path.
+
+**Fix (`src/runner.jl`):** a single private exception type flowing through the result channel.
+- `_SimulationStageError <: Exception` — `(stage, sim_id, captured::CapturedException)` with a `Base.showerror` method that names the stage (user `post_processor` vs. which simulator hook vs. the simulation worker) and simulation, then prints the original exception + backtrace. `CapturedException` is the stock Base type for carrying an exception across tasks.
+- `_runStage(stage, sim_id, thunk)` rethrows any exception from a per-simulation stage as a tagged `_SimulationStageError`; `processSimulationTask` wraps `postSimulationProcessing` → `post_processor` → `postSimulationCleanup` in it and otherwise keeps its straight-line shape (exceptions propagate as exceptions — no error-tuple plumbing).
+- The worker loop's single `try/catch` puts either a `_PostProcessedResult` or the `_SimulationStageError` on the (union-typed) result channel — **the pool always delivers exactly one result per scheduled simulation.** A non-stage exception (throwing `fetch`/`runSimulation`) is wrapped as stage `:simulation`.
+- The completion loop: `result isa _SimulationStageError && throw(result)`. **Fail-fast**, never hang.
+
+First cut used Go-style `(err, value)` returns from `_runStage`, an `error::Union{Nothing,NamedTuple}` field on `_PostProcessedResult` (forcing `process` to `Union{Nothing,…}`), and a `_rethrowWorkerError` that hand-built the message — reworked on review to the exception-type design above: same guarantees, fewer mechanisms, display logic in `showerror` where Julia expects it, and `_PostProcessedResult` stays two clean fields.
+
+Decision: fail-fast (abort) is the default; no `:skip_and_continue` policy kwarg for now (YAGNI — can layer on later). In-flight simulations may still finish; their results are discarded once `run` throws.
+
+### Sink input hardening (Copilot)
+- **SQL identifier injection:** user QoI names were interpolated raw into `ALTER TABLE … ADD COLUMN "$(name)"` / INSERT. Added `_qIdent` (wrap + double interior `"`) used for all sink identifiers; logical names still used for the `in existing` check and value binding.
+- **Dict key collision:** `_normalizePostProcessingQoI` now rejects `AbstractDict`s whose keys collide after `string(k)` (e.g. `1` and `"1"`) with a clear `ArgumentError`, instead of a confusing SQLite duplicate-column error.
+- **Consistency:** `printPostProcessingTable` now calls `assertInitialized()` like the other `print…Table` helpers.
+
+### Not changed (Copilot comments resolved by drbergman)
+- Error message "Real, Bool, or String": `Integer <: Real`, so it is covered — no change.
+- Reject non-positive `max_evaluations`: already validated (`>= 1`) in the `ABCSMC` constructor (`methods.jl:277`); an empty gen-1 batch cannot occur — no change.
+
+### Tests (`test/runtests.jl`)
+- TestSimulator hooks gained a `_throw_in_hook` flag to simulate a throwing simulator hook.
+- "post-processing errors surface instead of hanging": throwing `post_processor` and throwing `postSimulationProcessing`/`postSimulationCleanup` each make `run` throw a stage-tagged `_SimulationStageError`; a normal run still works afterward.
+- "post-processing sink input hardening": a QoI name containing `"` round-trips; colliding dict keys (`1` vs `"1"`) → `ArgumentError`.
+
+Full suite 1037/1037.

@@ -64,6 +64,22 @@ function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.Simulati
     return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, true)
 end
 
+# Records the per-simulation post-step call order so the ordering test below can assert
+# postSimulationProcessing → post_processor → postSimulationCleanup. Appends on every sim in
+# every testset; the ordering test empties the log immediately before inspecting it.
+const _post_order_log = String[]
+# When set to :processing or :cleanup, the corresponding hook throws — used to test that an
+# exception inside a per-simulation worker surfaces as an error instead of hanging run().
+const _throw_in_hook = Ref{Union{Nothing,Symbol}}(nothing)
+ModelManager.postSimulationProcessing(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) = begin
+    _throw_in_hook[] === :processing && error("processing boom")
+    push!(_post_order_log, "processing:$(sp.simulation.id)"); nothing
+end
+ModelManager.postSimulationCleanup(::TestSimulator, sp::ModelManager.SimulationProcess; kwargs...) = begin
+    _throw_in_hook[] === :cleanup && error("cleanup boom")
+    push!(_post_order_log, "cleanup:$(sp.simulation.id)"); nothing
+end
+
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
@@ -1919,28 +1935,44 @@ _gsa_fB(mid) = 0.0
         )
     end
 
-    @testset "max_evaluations stops the run early" begin
+    @testset "max_evaluations caps total evaluations (checked before each batch)" begin
         Random.seed!(42)
         eval_count = Ref(0)
         evaluate_batch = function(t, proposals)
             eval_count[] += length(proposals)
             return [(rand(), 0) for _ in proposals]
         end
-        # Gen 1 evaluates exactly population_size=10 particles.
-        # Budget=25 → gen 1 (10) + gen 2 (10) = 20 < 25 → gen 3 starts; after first
-        # batch of gen 3 budget hits 30 ≥ 25 → stop.
+        # The budget is enforced BEFORE each batch is dispatched, so the batch that would
+        # cross the budget is trimmed to exactly the remaining allowance — the run never
+        # evaluates more than max_evaluations simulations.
         method = ABCSMC(population_size=10, max_nr_populations=10, minimum_epsilon=0.0,
                         max_evaluations=25)
         gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
                                         evaluate_batch, g -> nothing)
 
-        # Should have stopped before running all 10 generations
-        @test length(gens) < 10
-        # Total evaluations must have reached or exceeded the budget
+        @test length(gens) < 10                          # stopped early
         total_evals = sum(g.n_evaluations for g in gens)
-        @test total_evals >= 25
-        # But not vastly more than the budget (one extra batch at most)
-        @test total_evals <= 50
+        @test total_evals <= method.max_evaluations      # never overshoots the budget
+        @test total_evals == 25                          # budget hit exactly (final batch trimmed)
+        @test eval_count[] == 25                         # evaluate_batch never dispatched over budget
+    end
+
+    @testset "max_evaluations smaller than a generation trims generation 1" begin
+        Random.seed!(1)
+        eval_count = Ref(0)
+        evaluate_batch = function(t, proposals)
+            eval_count[] += length(proposals)
+            return [(rand(), 0) for _ in proposals]
+        end
+        # Budget below population_size: even generation 1 is trimmed to the budget.
+        method = ABCSMC(population_size=10, max_nr_populations=5, minimum_epsilon=0.0,
+                        max_evaluations=4)
+        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                        evaluate_batch, g -> nothing)
+        @test length(gens) == 1
+        @test eval_count[] == 4                     # never dispatched more than the budget
+        @test nrow(gens[1].particles) == 4          # partial first generation
+        @test gens[1].weights ≈ fill(0.25, 4)       # weights renormalized to the trimmed size
     end
 
     ################## DB-backed integration ##################
@@ -2147,6 +2179,35 @@ _gsa_fB(mid) = 0.0
                 @test out.n_success == 2
             end
 
+            @testset "run/createTrial over a vector" begin
+                s1    = createTrial(inputs, [DiscreteVariation(:config, xp_x, 801.0)]; n_replicates=1)          # Simulation
+                m1    = createTrial(inputs, [DiscreteVariation(:config, xp_x, 802.0)]; n_replicates=2)          # Monad
+                samp1 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [803.0, 804.0])]; n_replicates=1) # Sampling
+                @test s1 isa Simulation && m1 isa Monad && samp1 isa Sampling
+
+                # Accumulate heterogeneous trials in a Vector{Any}, then batch them.
+                batch = []
+                push!(batch, s1); push!(batch, m1); push!(batch, samp1)
+
+                @test createTrial(batch) isa Trial
+
+                out = run(batch)
+                @test out isa MMOutput
+                @test trialType(out) == Trial
+                @test out.n_success == 1 + 2 + 2      # s1 + m1(2 reps) + samp1(2 monads)
+
+                # Single-element vector still yields a Trial.
+                @test createTrial([s1]) isa Trial
+
+                # A Trial element is flattened into its samplings.
+                @test createTrial([Trial([samp1]), s1]) isa Trial
+
+                # Non-trial elements and empties raise a clear ArgumentError.
+                @test_throws ArgumentError createTrial([s1, 42])
+                @test_throws ArgumentError run(Any[s1, "nope"])
+                @test_throws ArgumentError createTrial(AbstractTrial[])
+            end
+
             # ---------- constituentIDs / simulationIDs ----------
             @testset "constituentIDs and simulationIDs" begin
                 dv   = DiscreteVariation(:config, xp_x, [21.0, 22.0, 23.0])
@@ -2158,6 +2219,220 @@ _gsa_fB(mid) = 0.0
 
                 sim_ids  = simulationIDs(samp)
                 @test length(sim_ids) == 6           # 3 monads × 2 replicates
+            end
+
+            # ---------- simulationsTable / monadsTable ----------
+            @testset "monadsTable" begin
+                dv   = DiscreteVariation(:config, xp_x, [201.0, 202.0, 203.0])
+                samp = createTrial(inputs, [dv]; n_replicates=2)
+                run(samp)
+
+                # One row per monad (3), not per simulation (6).
+                mt = monadsTable(samp)
+                @test mt isa DataFrame
+                @test nrow(mt) == length(constituentIDs(samp)) == 3
+                @test :MonadID in propertynames(mt)
+                @test :SimID ∉ propertynames(mt)
+
+                # The varied parameter appears as a (short-named) column with all 3 values.
+                x_col = only(filter(n -> occursin("x", n), names(mt)))
+                @test Set(mt[!, x_col]) == Set([201.0, 202.0, 203.0])
+
+                # simulationsTable over the same sampling has one row per simulation.
+                st = simulationsTable(samp)
+                @test nrow(st) == length(simulationIDs(samp)) == 6
+                @test :SimID in propertynames(st)
+
+                # Dispatch forms agree with the monad-ID vector form.
+                monad_ids = constituentIDs(samp)
+                @test nrow(monadsTable(monad_ids)) == 3
+                m1 = Monad(monad_ids[1])
+                @test nrow(monadsTable(m1)) == 1
+                @test nrow(monadsTable(m1, Monad(monad_ids[2]))) == 2
+
+                # No-arg form returns all monads in the project (⊇ this sampling's monads).
+                all_mt = monadsTable()
+                @test nrow(all_mt) >= 3
+
+                # remove_constants=false keeps the constant y column; default drops it.
+                mt_full = monadsTable(monad_ids; remove_constants=false)
+                @test any(n -> occursin("y", n), names(mt_full))
+
+                # short_names=false keeps the raw XML-path column name for the varied parameter.
+                mt_raw = monadsTable(samp; short_names=false)
+                @test "data/x" in names(mt_raw)
+
+                # printMonadsTable routes the DataFrame through the sink.
+                captured = Ref{Any}(nothing)
+                printMonadsTable(samp; sink=(df -> captured[] = df))
+                @test captured[] isa DataFrame
+                @test nrow(captured[]) == 3
+            end
+
+            # ---------- post-processing hook + sink ----------
+            @testset "post-processing sink" begin
+                # Callback returning a NamedTuple → one sink row per successful simulation.
+                dv   = DiscreteVariation(:config, xp_x, [301.0, 302.0])
+                samp = createTrial(inputs, [dv]; n_replicates=1)
+                calls = Ref(0)
+                out = run(samp; post_processor = sp -> begin
+                    calls[] += 1
+                    (; sid = sp.simulation.id, doubled = 2.0 * sp.simulation.id)
+                end)
+                @test out.n_success == 2
+                @test calls[] == 2                       # fired once per successful sim
+
+                # Accessors let the callback avoid reaching into struct internals.
+                acc = createTrial(inputs, [DiscreteVariation(:config, xp_x, 351.0)]; n_replicates=1)
+                acc_id = simulationIDs(acc)[1]
+                seen = Ref{Any}(nothing)
+                run(acc; post_processor = sp -> begin
+                    seen[] = (simulationID(sp), monadID(sp), wasSuccessful(sp), pathToOutputFolder(sp))
+                    nothing
+                end)
+                @test seen[][1] == acc_id
+                @test seen[][2] == Monad(acc).id
+                @test seen[][3] == true
+                @test seen[][4] == pathToOutputFolder(acc_id)
+                @test seen[][4] == pathToOutputFolder(Simulation(acc_id))
+
+                # simulationsTable(...; post_processing=true) joins the QoIs by :SimID.
+                st_pp = simulationsTable(samp; post_processing=true, remove_constants=false)
+                @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(st_pp))
+                @test nrow(st_pp) == 2
+                for row in eachrow(st_pp)
+                    @test row.doubled == 2.0 * row.SimID   # joined on the right SimID
+                end
+                # Without the kwarg, no QoI columns appear.
+                @test "doubled" ∉ names(simulationsTable(samp))
+
+                pt = postProcessingTable(samp)
+                @test pt isa DataFrame
+                @test nrow(pt) == 2
+                @test :SimID in propertynames(pt)
+                @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(pt))
+                @test all(pt.doubled .== 2.0 .* pt.SimID) # values round-trip
+
+                # use_previous ⇒ nothing re-scheduled ⇒ callback not fired again.
+                calls[] = 0
+                run(samp; post_processor = sp -> (; sid = sp.simulation.id))
+                @test calls[] == 0
+
+                # Callback returning `nothing` ⇒ no sink row for that sim.
+                m_none = createTrial(inputs, [DiscreteVariation(:config, xp_x, 311.0)]; n_replicates=1)
+                run(m_none; post_processor = sp -> nothing)
+                none_id = simulationIDs(m_none)[1]
+                all_ids = ("SimID" in names(postProcessingTable())) ? postProcessingTable().SimID : Int[]
+                @test none_id ∉ all_ids
+
+                # AbstractDict return + a *new* quantity ⇒ dynamic column; earlier rows get `missing`.
+                m_new = createTrial(inputs, [DiscreteVariation(:config, xp_x, 321.0)]; n_replicates=1)
+                run(m_new; post_processor = sp -> Dict("newq" => 7.0))
+                pt2 = postProcessingTable()
+                @test "newq" in names(pt2)
+                new_id = simulationIDs(m_new)[1]
+                @test pt2.newq[findfirst(==(new_id), pt2.SimID)] == 7.0
+                first_samp_id = simulationIDs(samp)[1]
+                @test ismissing(pt2.newq[findfirst(==(first_samp_id), pt2.SimID)])
+
+                # Upsert: writing the same simulation_id twice overwrites and adds columns.
+                db = ModelManager._openPostProcessingDB()
+                try
+                    ModelManager._writePostProcessingRow(db, 100_001, (; a = 1.0))
+                    ModelManager._writePostProcessingRow(db, 100_001, (; a = 2.0, b = 3.0))
+                finally
+                    close(db)
+                end
+                up = postProcessingTable([100_001])
+                @test nrow(up) == 1
+                @test up.a[1] == 2.0
+                @test up.b[1] == 3.0
+
+                # Invalid return values ⇒ ArgumentError (surfaced from the serial write loop).
+                @test_throws ArgumentError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 331.0)]; n_replicates=1);
+                    post_processor = sp -> [1, 2, 3])
+                @test_throws ArgumentError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 332.0)]; n_replicates=1);
+                    post_processor = sp -> (; bad = [1.0, 2.0]))
+
+                # printPostProcessingTable routes the DataFrame through the sink.
+                captured = Ref{Any}(nothing)
+                printPostProcessingTable(samp; sink = df -> captured[] = df)
+                @test captured[] isa DataFrame
+                @test nrow(captured[]) == 2
+
+                # Ordering: postSimulationProcessing (non-destructive) runs before the user
+                # post_processor, which runs before postSimulationCleanup (destructive), so the
+                # callback always sees the intact output folder.
+                m_ord = createTrial(inputs, [DiscreteVariation(:config, xp_x, 401.0)]; n_replicates=1)
+                ord_id = simulationIDs(m_ord)[1]
+                empty!(_post_order_log)
+                run(m_ord; post_processor = sp -> begin
+                    push!(_post_order_log, "user:$(sp.simulation.id)")
+                    (; q = 1.0)
+                end)
+                @test _post_order_log == ["processing:$(ord_id)", "user:$(ord_id)", "cleanup:$(ord_id)"]
+            end
+
+            @testset "post-processing errors surface instead of hanging" begin
+                # A throwing post_processor makes run() fail fast (not hang), tagged as such.
+                e = @test_throws ModelManager._SimulationStageError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 361.0)]; n_replicates=1);
+                    post_processor = sp -> error("boom"))
+                msg = sprint(showerror, e.value)
+                @test occursin("post_processor", msg)
+                @test occursin("boom", msg)
+
+                # A throwing simulator hook likewise surfaces, tagged with the stage.
+                try
+                    _throw_in_hook[] = :processing
+                    e2 = @test_throws ModelManager._SimulationStageError run(
+                        createTrial(inputs, [DiscreteVariation(:config, xp_x, 362.0)]; n_replicates=1))
+                    @test occursin("postSimulationProcessing", sprint(showerror, e2.value))
+
+                    _throw_in_hook[] = :cleanup
+                    e3 = @test_throws ModelManager._SimulationStageError run(
+                        createTrial(inputs, [DiscreteVariation(:config, xp_x, 363.0)]; n_replicates=1))
+                    @test occursin("postSimulationCleanup", sprint(showerror, e3.value))
+                finally
+                    _throw_in_hook[] = nothing
+                end
+
+                # After the failures, a normal run still works (the pool is not left broken).
+                @test run(createTrial(inputs, [DiscreteVariation(:config, xp_x, 364.0)]; n_replicates=1)).n_success == 1
+            end
+
+            @testset "post-processing sink input hardening" begin
+                # QoI names are safely quoted: a name containing a double quote round-trips.
+                weird = "od\"d"
+                samp = createTrial(inputs, [DiscreteVariation(:config, xp_x, 371.0)]; n_replicates=1)
+                run(samp; post_processor = sp -> Dict(weird => 5.0))
+                pt = postProcessingTable(samp)
+                @test weird in names(pt)
+                @test pt[1, weird] == 5.0
+
+                # Dict keys that collide after string conversion (1 vs "1") → ArgumentError.
+                @test_throws ArgumentError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 372.0)]; n_replicates=1);
+                    post_processor = sp -> Dict(1 => 1.0, "1" => 2.0))
+            end
+
+            @testset "post-processing sink follows deletions" begin
+                dv   = DiscreteVariation(:config, xp_x, [501.0, 502.0])
+                samp = createTrial(inputs, [dv]; n_replicates=2)   # 2 monads × 2 replicates
+                run(samp; post_processor = sp -> (; v = simulationID(sp)))
+                sids = simulationIDs(samp)
+                @test nrow(postProcessingTable(sids)) == 4
+
+                # Deleting simulations removes their sink rows; others remain.
+                deleteSimulations(sids[1:2]; delete_supers=false)
+                @test Set(postProcessingTable(sids).SimID) == Set(sids[3:4])
+
+                # Cascade: deleting the sampling removes the rest of its sink rows.
+                # (also exercises that deleteSampling is exported)
+                deleteSampling(samp.id)
+                @test nrow(postProcessingTable(sids)) == 0
             end
 
             # ---------- getParameterValue ----------
@@ -2346,6 +2621,43 @@ _gsa_fB(mid) = 0.0
         # don't inherit the temp-project globals.
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end  # @testset "DB-backed integration"
+
+    @testset "resetDatabase clears post-processing sink" begin
+        # Isolated project so the reset does not disturb the shared integration project.
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+
+            inputs = InputFolders(config="default")
+            dv = DiscreteVariation(:config, XMLPath(["data", "x"]), 601.0)
+            run(createTrial(inputs, [dv]; n_replicates=1); post_processor = sp -> (; v = 1.0))
+            @test isfile(postProcessingDBPath())
+
+            resetDatabase(; force_reset=true, force_continue=true)
+            @test !isfile(postProcessingDBPath())
+        end
+    end
+
+    @testset "post-processing sink created lazily" begin
+        # A post_processor that only ever returns nothing must not create the sink file.
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            run(createTrial(inputs, [DiscreteVariation(:config, xp, 701.0)]; n_replicates=1);
+                post_processor = sp -> nothing)
+            @test !isfile(postProcessingDBPath())   # nothing stored ⇒ no sink file
+
+            run(createTrial(inputs, [DiscreteVariation(:config, xp, 702.0)]; n_replicates=1);
+                post_processor = sp -> (; v = 1.0))
+            @test isfile(postProcessingDBPath())     # first stored quantity creates it
+        end
+    end
 
     ################## GSA plot recipes ##################
 

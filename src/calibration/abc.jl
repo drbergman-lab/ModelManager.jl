@@ -164,8 +164,10 @@ The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
   existing monads, they are reused in preference to running new simulations; an empty
   bank is silently skipped and snapping proceeds normally.
 - `max_evaluations::Union{Nothing,Int}=nothing`: maximum total evaluated particles across
-  the entire run. When reached, the current batch completes and the run stops (the
-  generation may have fewer than `population_size` accepted particles).
+  the entire run. Enforced *before* each batch is dispatched — a batch that would exceed the
+  budget is trimmed to the remaining allowance, so the run never evaluates more than
+  `max_evaluations` simulations — then the run stops (the final generation may have fewer than
+  `population_size` accepted particles).
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; ...)` call.
 - `description::String=""`: stored in the `calibrations` DB row.
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`,

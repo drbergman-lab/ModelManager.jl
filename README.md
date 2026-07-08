@@ -61,8 +61,10 @@ end
 - [x] Space-filling designs — `GridVariation`, `LHSVariation`, `SobolVariation`, `RBDVariation`
 - [x] Sensitivity analysis — MOAT, Sobol', RBD-FAST (generic, no simulator-specific logic)
 - [x] Sensitivity visualization — `RecipesBase.jl` recipes for `MOATSampling` (`:bar` with optional σ whiskers, `:violin`, `:scatter` µ*–σ screening), `SobolSampling` (S1/ST grouped bars, `show_ST` toggle), and `RBDSampling` (first-order bars); one series per sensitivity function
-- [x] `createTrial` / `run` user API — convenience wrappers over the trial hierarchy
-- [x] `postSimulationProcessing` interface stub — simulators override for cleanup/pruning
+- [x] `createTrial` / `run` user API — convenience wrappers over the trial hierarchy; `run(Ts::AbstractVector)` / `createTrial(::AbstractVector)` bundle a collection of pre-built trials into one `Trial` for a single batched run
+- [x] Analysis tables — `simulationsTable` / `printSimulationsTable` (one row per simulation) and `monadsTable` / `printMonadsTable` (one row per monad); shared `remove_constants` / `sort_by` / `sort_ignore` / `short_names` kwargs
+- [x] `postSimulationProcessing` / `postSimulationCleanup` interface stubs — simulators override for non-destructive processing (before the user hook) and destructive cleanup/pruning (after it), respectively
+- [x] User post-processing hook — `run(T; post_processor=f)` runs `f(simulation_process)` after each successful sim (ordering: `postSimulationProcessing` → `post_processor` → `postSimulationCleanup`, so the callback sees the intact output folder); returning a `NamedTuple`/`Dict` of quantities upserts a row into the `data/outputs/postprocessing.db` sink (dynamic columns, one row per `simulation_id`); read back via `postProcessingTable` / `printPostProcessingTable`, or joined onto the simulations table with `simulationsTable(...; post_processing=true)`. Callback ergonomics: `simulationID`, `monadID`, `wasSuccessful`, and `pathToOutputFolder(simulation_process)` accessors so users avoid struct internals (simulator-specific output loading stays in the downstream package)
 - [x] `initializeInputFolder` / `getInputFolderDescription` / `clearSimulatorArtifacts` interface stubs
 - [x] `addVariationRows` interface stub — simulators implement DB writes for variation rows
 - [x] HPC utilities — `isRunningOnHPC`, `setJobOptions`, `defaultJobOptions`

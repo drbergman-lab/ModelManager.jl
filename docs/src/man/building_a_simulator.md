@@ -149,7 +149,8 @@ These have working defaults; override only when your simulator needs them.
 | --- | --- | --- |
 | [`postInitDisplay`](@ref) | prints generic fields | prepend a logo/version banner |
 | [`centralDBFileName`](@ref) | `"mm.db"` | use a custom database filename |
-| [`postSimulationProcessing`](@ref) | no-op | clean up or prune output after each run |
+| [`postSimulationProcessing`](@ref) | no-op | **non-destructive** processing after each run, *before* the user `post_processor` (e.g. standardize output the user will read) |
+| [`postSimulationCleanup`](@ref) | no-op | **destructive** cleanup/pruning after each run, *after* the user `post_processor` (so the callback sees the intact output) |
 | [`initializeInputFolder`](@ref) | no-op | compile a template into a new input folder |
 | [`getInputFolderDescription`](@ref) | `""` | read folder metadata for the DB |
 | [`clearSimulatorArtifacts`](@ref) | no-op | remove compiled artifacts on database reset |

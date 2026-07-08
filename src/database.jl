@@ -785,7 +785,7 @@ function appendVariations(location::Symbol, df::DataFrame; short_names::Bool=tru
 end
 
 """
-    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true)
+    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true, post_processing::Bool=false)
 
 Return a DataFrame for the given SQL query on the simulations table.
 
@@ -799,11 +799,56 @@ By default, constant columns and raw ID columns are removed.
 - `sort_by::Vector{String}`: A vector of column names to sort the table by. Defaults to all columns. To populate this argument, it is recommended to first print the table to see the column names.
 - `sort_ignore::Vector{String}`: A vector of column names to ignore when sorting. Defaults to the simulation ID and the variation IDs associated with the simulations.
 - `short_names::Bool`: If true (default), column names are shortened via `shortVariationName`. Pass `false` to keep raw XML-path column names (e.g. for matching against `parameters.toml` `db_column` entries).
+- `post_processing::Bool`: If true, left-joins each simulation's stored post-processing quantities (see [`postProcessingTable`](@ref)) onto the table by `:SimID`, appending one column per quantity (`missing` where a quantity was not computed). Defaults to false. Post-processing columns are appended as-is and are not subject to `remove_constants` or sorting.
 """
 function simulationsTableFromQuery(query::String;
                                    remove_constants::Bool=true,
                                    sort_by=String[],
                                    sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)],
+                                   short_names::Bool=true,
+                                   post_processing::Bool=false)
+    df = _variationsTableFromQuery(query, :simulation_id, :SimID;
+                                   remove_constants=remove_constants, sort_by=sort_by,
+                                   sort_ignore=sort_ignore, short_names=short_names)
+    post_processing && _appendPostProcessing!(df)
+    return df
+end
+
+"""
+    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:MonadID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true)
+
+Return a DataFrame for the given SQL query on the `monads` table. This is the monad-level
+analogue of [`simulationsTableFromQuery`](@ref): one row per monad and its varied parameters.
+
+Keyword arguments match [`simulationsTableFromQuery`](@ref), except `sort_ignore` defaults to
+the monad ID column `:MonadID` (rather than `:SimID`).
+"""
+function monadsTableFromQuery(query::String;
+                              remove_constants::Bool=true,
+                              sort_by=String[],
+                              sort_ignore=[:MonadID; shortLocationVariationID.(projectLocations().varied)],
+                              short_names::Bool=true)
+    return _variationsTableFromQuery(query, :monad_id, :MonadID;
+                                     remove_constants=remove_constants, sort_by=sort_by,
+                                     sort_ignore=sort_ignore, short_names=short_names)
+end
+
+"""
+    _variationsTableFromQuery(query::String, id_column::Symbol, display_id_column::Symbol; kwargs...)
+
+Shared implementation behind [`simulationsTableFromQuery`](@ref) and
+[`monadsTableFromQuery`](@ref). Runs `query`, keeps only `id_column` from the raw ID columns
+(renaming it to `display_id_column`), joins on folder-name and varied-parameter columns, then
+optionally drops constant columns and sorts.
+
+Both the `simulations` and `monads` tables carry the same input-ID and variation-ID columns,
+so the join logic ([`addFolderNameColumns!`](@ref) / [`appendVariations`](@ref)) is identical;
+only the primary key column differs.
+"""
+function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_column::Symbol;
+                                   remove_constants::Bool=true,
+                                   sort_by=String[],
+                                   sort_ignore,
                                    short_names::Bool=true)
     sort_by = (sort_by isa Vector ? sort_by : [sort_by]) .|> Symbol
     sort_ignore = (sort_ignore isa Vector ? sort_ignore : [sort_ignore]) .|> Symbol
@@ -811,7 +856,7 @@ function simulationsTableFromQuery(query::String;
     df = queryToDataFrame(query)
     id_col_names_to_remove = names(df)
 
-    filter!(n -> n != "simulation_id", id_col_names_to_remove)
+    filter!(n -> n != string(id_column), id_col_names_to_remove)
     addFolderNameColumns!(df)
 
     for loc in projectLocations().varied
@@ -819,7 +864,7 @@ function simulationsTableFromQuery(query::String;
     end
 
     select!(df, Not(id_col_names_to_remove))
-    rename!(df, :simulation_id => :SimID)
+    rename!(df, id_column => display_id_column)
     col_names = names(df)
     if remove_constants && size(df, 1) > 1
         filter!(n -> length(unique(df[!, n])) > 1, col_names)
@@ -843,6 +888,13 @@ Return a DataFrame with simulation data. See [`simulationsTableFromQuery`](@ref)
 - Any `AbstractTrial` objects (or arrays thereof)
 - A vector of simulation IDs
 - Omitted (returns data for all simulations)
+
+Pass `post_processing=true` to append each simulation's stored post-processing quantities
+(see [`postProcessingTable`](@ref)) as extra columns:
+
+```julia
+simulationsTable(sampling; post_processing=true)
+```
 """
 function simulationsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
     query = constructSelectQuery("simulations", "WHERE simulation_id IN ($(join(simulationIDs(T),",")));")
@@ -887,6 +939,297 @@ printSimulationsTable(; sink=CSV.write("temp.csv"))
 function printSimulationsTable(args...; sink=println, kwargs...)
     assertInitialized()
     simulationsTable(args...; kwargs...) |> sink
+end
+
+"""
+    monadsTable(args...; kwargs...)
+
+Return a DataFrame with one row per monad and its varied parameters — the monad-level
+analogue of [`simulationsTable`](@ref). See [`monadsTableFromQuery`](@ref) for keyword arguments.
+
+`args...` can be:
+- Any `AbstractTrial` objects (or arrays thereof) — the monads they contain are collected
+  via [`monadIDs`](@ref).
+- A vector of monad IDs.
+- Omitted (returns data for all monads).
+
+# Examples
+```julia
+monadsTable(sampling)
+```
+```julia
+monad_ids = [1, 2, 3]
+monadsTable(monad_ids; remove_constants=false)
+```
+"""
+function monadsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
+    query = constructSelectQuery("monads", "WHERE monad_id IN ($(join(monadIDs(T),",")));")
+    return monadsTableFromQuery(query; kwargs...)
+end
+
+monadsTable(T::AbstractTrial, Ts::Vararg{AbstractTrial}; kwargs...) = monadsTable([T; Ts...]; kwargs...)
+
+function monadsTable(monad_ids::AbstractVector{<:Integer}; kwargs...)
+    assertInitialized()
+    query = constructSelectQuery("monads", "WHERE monad_id IN ($(join(monad_ids,",")));")
+    return monadsTableFromQuery(query; kwargs...)
+end
+
+function monadsTable(; kwargs...)
+    assertInitialized()
+    query = constructSelectQuery("monads")
+    return monadsTableFromQuery(query; kwargs...)
+end
+
+"""
+    printMonadsTable(args...; sink=println, kwargs...)
+
+Print a table of monads and their varied values. See [`monadsTable`](@ref).
+
+# Keyword Arguments
+- `sink`: A function to receive the DataFrame (default `println`). Can also use `CSV.write`.
+
+# Examples
+```julia
+printMonadsTable([monad_3, sampling_2, trial_1])
+```
+```julia
+using CSV
+printMonadsTable(; sink=CSV.write("temp.csv"))
+```
+"""
+function printMonadsTable(args...; sink=println, kwargs...)
+    assertInitialized()
+    monadsTable(args...; kwargs...) |> sink
+end
+
+############## Post-processing sink ##############
+
+const _POST_PROCESSING_TABLE = "post_processing"
+
+"""
+    postProcessingDBPath()
+
+Return the path to the project's post-processing sink database
+(`<data_dir>/outputs/postprocessing.db`). The file is created lazily the first time a
+`post_processor` (see [`run`](@ref)) returns quantities of interest to store.
+"""
+postProcessingDBPath() = joinpath(dataDir(), "outputs", "postprocessing.db")
+
+"""
+    _openPostProcessingDB()
+
+Open (creating if necessary) the post-processing sink database and ensure the
+`post_processing` table exists with `simulation_id` as its primary key. Additional
+columns are added on demand by [`_writePostProcessingRow`](@ref).
+"""
+function _openPostProcessingDB()
+    assertInitialized()
+    path = postProcessingDBPath()
+    mkpath(dirname(path))
+    db = SQLite.DB(path)
+    DBInterface.execute(db, "CREATE TABLE IF NOT EXISTS $(_POST_PROCESSING_TABLE) (simulation_id INTEGER PRIMARY KEY);")
+    return db
+end
+
+"""
+    _postProcessingColumnSpec(name, value) -> (sqlite_type, db_value)
+
+Map a single quantity-of-interest `value` to its SQLite column type and stored value.
+Only scalar `Bool`, `Integer`, `Real`, and `AbstractString` values are supported; anything
+else throws an `ArgumentError` (richer outputs should be written to the simulation's output
+folder by the `post_processor` itself).
+"""
+function _postProcessingColumnSpec(name, value)
+    if value isa Bool
+        return "INTEGER", Int(value)
+    elseif value isa Integer
+        return "INTEGER", value
+    elseif value isa Real
+        return "REAL", float(value)
+    elseif value isa AbstractString
+        return "TEXT", String(value)
+    end
+    throw(ArgumentError("post_processor returned an unsupported value for `$(name)`: a $(typeof(value)). " *
+        "Post-processing sink values must be a scalar Real, Bool, or String. " *
+        "For richer per-simulation outputs, write a file to the simulation's output folder instead."))
+end
+
+"""
+    _normalizePostProcessingQoI(qoi) -> Vector{Tuple{String,String,Any}}
+
+Normalize a `post_processor` return value into `(column_name, sqlite_type, db_value)` tuples.
+Accepts a `NamedTuple` or an `AbstractDict` of `name => scalar`; throws an `ArgumentError`
+for any other type.
+"""
+function _normalizePostProcessingQoI(qoi)
+    named_pairs = if qoi isa NamedTuple
+        [String(k) => v for (k, v) in pairs(qoi)]
+    elseif qoi isa AbstractDict
+        [string(k) => v for (k, v) in qoi]
+    else
+        throw(ArgumentError("post_processor must return `nothing`, a NamedTuple, or an AbstractDict " *
+            "of name => scalar; got a $(typeof(qoi))."))
+    end
+    col_names = first.(named_pairs)
+    if !allunique(col_names)
+        dups = unique(name for name in col_names if count(==(name), col_names) > 1)
+        throw(ArgumentError("post_processor produced duplicate quantity name(s) after conversion to " *
+            "strings: $(join(dups, ", ")). Distinct keys that map to the same column name " *
+            "(e.g. `1` and \"1\") are not allowed."))
+    end
+    return [(name, _postProcessingColumnSpec(name, value)...) for (name, value) in named_pairs]
+end
+
+"""
+    _qIdent(name::AbstractString) -> String
+
+Return `name` as a safely-quoted SQLite identifier: wrapped in double quotes with any interior
+double quotes doubled. Used for the user-controlled quantity-of-interest column names in the
+post-processing sink so a name containing a `"` cannot break or inject into the SQL.
+"""
+_qIdent(name::AbstractString) = "\"" * replace(String(name), "\"" => "\"\"") * "\""
+
+"""
+    _writePostProcessingRow(db::SQLite.DB, simulation_id::Integer, qoi)
+
+Upsert one row of quantities of interest for `simulation_id` into the post-processing sink.
+New quantities become new columns (typed via [`_postProcessingColumnSpec`](@ref)); an
+existing row for the same `simulation_id` is overwritten. Called only from the serial
+completion loop in [`run`](@ref), never from a worker task.
+"""
+function _writePostProcessingRow(db::SQLite.DB, simulation_id::Integer, qoi)
+    specs = _normalizePostProcessingQoI(qoi)
+    isempty(specs) && return nothing
+
+    existing = tableColumns(_POST_PROCESSING_TABLE; db=db)
+    for (name, sqlite_type, _) in specs
+        if !(name in existing)
+            DBInterface.execute(db, "ALTER TABLE $(_POST_PROCESSING_TABLE) ADD COLUMN $(_qIdent(name)) $(sqlite_type);")
+            push!(existing, name)
+        end
+    end
+
+    col_names = [s[1] for s in specs]
+    all_cols = ["simulation_id"; col_names]
+    cols_sql = join(_qIdent.(all_cols), ", ")
+    placeholders = join(fill("?", length(all_cols)), ", ")
+    update_sql = join(["$(_qIdent(c))=excluded.$(_qIdent(c))" for c in col_names], ", ")
+    stmt = "INSERT INTO $(_POST_PROCESSING_TABLE) ($(cols_sql)) VALUES ($(placeholders)) " *
+           "ON CONFLICT(simulation_id) DO UPDATE SET $(update_sql);"
+    DBInterface.execute(db, stmt, Tuple(Any[simulation_id; [s[3] for s in specs]]))
+    return nothing
+end
+
+"""
+    _deletePostProcessingRows(simulation_ids::AbstractVector{<:Integer})
+
+Remove sink rows for the given `simulation_ids` from the post-processing database, keeping it
+consistent with deletions from the central database. A no-op if no sink database exists yet.
+Called by [`deleteSimulations`](@ref) — the single choke point through which every cascading
+deletion removes simulations.
+"""
+function _deletePostProcessingRows(simulation_ids::AbstractVector{<:Integer})
+    isempty(simulation_ids) && return nothing
+    path = postProcessingDBPath()
+    isfile(path) || return nothing
+    db = SQLite.DB(path)
+    try
+        tableExists(_POST_PROCESSING_TABLE; db=db) || return nothing
+        DBInterface.execute(db, "DELETE FROM $(_POST_PROCESSING_TABLE) WHERE simulation_id IN ($(join(simulation_ids, ",")));")
+    finally
+        close(db)
+    end
+    return nothing
+end
+
+"""
+    _readPostProcessingTable(query::String) -> DataFrame
+
+Run `query` against the post-processing sink and return the result with `simulation_id`
+renamed to `:SimID`. Returns an empty `DataFrame` (with a `:SimID` column) if no sink
+database exists yet.
+"""
+function _readPostProcessingTable(query::String)
+    assertInitialized()
+    path = postProcessingDBPath()
+    isfile(path) || return DataFrame(SimID=Int[])
+    db = SQLite.DB(path)
+    df = try
+        queryToDataFrame(query; db=db)
+    finally
+        close(db)
+    end
+    "simulation_id" in names(df) && rename!(df, :simulation_id => :SimID)
+    return df
+end
+
+"""
+    postProcessingTable(args...)
+
+Return a `DataFrame` of stored post-processing quantities of interest, one row per
+simulation (keyed by `:SimID`). See [`run`](@ref)'s `post_processor` keyword for how rows
+are produced. The result is joinable to [`simulationsTable`](@ref) on `:SimID`.
+
+`args...` can be:
+- Any `AbstractTrial` objects (or arrays thereof) — their simulations are collected via
+  [`simulationIDs`](@ref).
+- A vector of simulation IDs.
+- Omitted (returns data for all simulations that have stored quantities).
+
+Simulations without stored quantities are absent from the table; quantities not computed for
+a given simulation appear as `missing`. Returns an empty table if no post-processing has run.
+
+# Examples
+```julia
+out = run(sampling; post_processor = sp -> (; final_count = countCells(simulationID(sp))))
+postProcessingTable(sampling)
+```
+"""
+function postProcessingTable(T::AbstractArray{<:AbstractTrial})
+    return _readPostProcessingTable(constructSelectQuery(_POST_PROCESSING_TABLE, "WHERE simulation_id IN ($(join(simulationIDs(T),",")));"))
+end
+
+postProcessingTable(T::AbstractTrial, Ts::Vararg{AbstractTrial}) = postProcessingTable([T; Ts...])
+
+function postProcessingTable(simulation_ids::AbstractVector{<:Integer})
+    return _readPostProcessingTable(constructSelectQuery(_POST_PROCESSING_TABLE, "WHERE simulation_id IN ($(join(simulation_ids,",")));"))
+end
+
+postProcessingTable() = _readPostProcessingTable(constructSelectQuery(_POST_PROCESSING_TABLE))
+
+"""
+    _appendPostProcessing!(df::DataFrame)
+
+Append each simulation's stored post-processing quantities to `df` (which must have a `:SimID`
+column), preserving `df`'s row order. Adds one column per quantity, with `missing` where a
+simulation has no stored value. A no-op if `df` has no `:SimID` column or the sink is empty.
+Backs the `post_processing=true` keyword of [`simulationsTable`](@ref).
+"""
+function _appendPostProcessing!(df::DataFrame)
+    "SimID" in names(df) || return df
+    sim_ids = Vector{Int}(df.SimID)   # SQLite columns come back as Union{Missing,Int}
+    isempty(sim_ids) && return df
+    pp = postProcessingTable(sim_ids)
+    for col in names(pp)
+        col == "SimID" && continue
+        lookup = Dict(pp.SimID .=> pp[!, col])
+        df[!, col] = [get(lookup, sid, missing) for sid in sim_ids]
+    end
+    return df
+end
+
+"""
+    printPostProcessingTable(args...; sink=println)
+
+Print the post-processing quantities-of-interest table. See [`postProcessingTable`](@ref).
+
+# Keyword Arguments
+- `sink`: A function to receive the DataFrame (default `println`). Can also use `CSV.write`.
+"""
+function printPostProcessingTable(args...; sink=println)
+    assertInitialized()
+    postProcessingTable(args...) |> sink
 end
 
 """

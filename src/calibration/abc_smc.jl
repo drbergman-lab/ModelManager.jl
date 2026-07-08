@@ -493,11 +493,13 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
         # ── No snapping: evaluate Sobol points directly, accept all. ────────────
         proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
                         (Dict(param_names[i] => pts[j][i] for i in 1:d), nothing) for j in 1:N]
+        proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
+        M         = length(proposals)
         results   = evaluate_batch(1, proposals)
-        accepted  = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:N]
-        weights   = fill(1.0 / N, N)
-        _updateBudget!(budget, budget_hit, N, method.max_evaluations)
-        return _buildGenerationResult(1, accepted, weights, N, N, param_names)
+        accepted  = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:M]
+        weights   = fill(1.0 / M, M)
+        _updateBudget!(budget, budget_hit, M, method.max_evaluations)
+        return _buildGenerationResult(1, accepted, weights, M, M, param_names)
     end
 
     # ── CDF-grid snapping: snap each Sobol point, accumulate N proposals. ───────
@@ -512,12 +514,14 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
                                          mid_gen_additions))
     end
 
+    proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
+    M        = length(proposals)
     results  = evaluate_batch(1, proposals)
-    accepted = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:N]
+    accepted = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:M]
     _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
-    _updateBudget!(budget, budget_hit, N, method.max_evaluations)
-    weights = fill(1.0 / N, N)
-    return _buildGenerationResult(1, accepted, weights, N, N, param_names)
+    _updateBudget!(budget, budget_hit, M, method.max_evaluations)
+    weights = fill(1.0 / M, M)
+    return _buildGenerationResult(1, accepted, weights, M, M, param_names)
 end
 
 """
@@ -581,6 +585,14 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                     push!(proposals, (latent_cdfs, nothing))
                 end
             end
+        end
+
+        # Enforce the budget BEFORE dispatch: trim the planned batch to what the budget
+        # allows so the run never evaluates more than `max_evaluations` simulations.
+        proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)
+        if isempty(proposals)
+            budget_hit[] = true
+            break
         end
 
         results = evaluate_batch(t, proposals)
@@ -872,6 +884,26 @@ function _updateBudget!(budget::Ref{Int}, budget_hit::Ref{Bool},
                          n::Int, max_evaluations::Union{Nothing,Int})
     budget[] += n
     !isnothing(max_evaluations) && budget[] >= max_evaluations && (budget_hit[] = true)
+end
+
+"""
+    _capBatchToBudget(proposals, budget, max_evaluations) -> trimmed_proposals
+
+Trim `proposals` **before** they are sent to `evaluate_batch` so that dispatching them cannot
+push the cumulative evaluation count (`budget[]`) past `max_evaluations`. Returns `proposals`
+unchanged when `max_evaluations` is `nothing` or the whole batch already fits within the
+remaining budget; otherwise returns only the first `max_evaluations - budget[]` proposals (an
+empty vector if the budget is already spent).
+
+This enforces the budget on the *planned* batch, so a calibration never runs more simulations
+than `max_evaluations` — as opposed to checking only after a batch has been evaluated.
+"""
+function _capBatchToBudget(proposals::Vector, budget::Ref{Int}, max_evaluations::Union{Nothing,Int})
+    isnothing(max_evaluations) && return proposals
+    remaining = max_evaluations - budget[]
+    remaining <= 0 && return proposals[1:0]
+    length(proposals) <= remaining && return proposals
+    return proposals[1:remaining]
 end
 
 ################## Epsilon Adaptation ##################

@@ -145,7 +145,8 @@ target location's file type.
 
 **Behavioral specification:**
 - `run(T::AbstractTrial; force_recompile, kwargs...)` collects simulation tasks, executes up to `mm_globals().max_number_of_parallel_simulations` concurrently, and returns `MMOutput{T}`.
-- `kwargs` are forwarded to `prepareTrialHierarchy` (simulator hooks like `force_recompile`) and to `postSimulationProcessing` (simulator-specific cleanup/pruning). `runSimulation` takes no kwargs — it receives only the `SimulationSpec`.
+- `run(Ts::AbstractVector; kwargs...)` bundles a collection of already-built trials (`Simulation`/`Monad`/`Sampling`/`Trial`, possibly in a `Vector{Any}`) into one `Trial` via `createTrial(::AbstractVector)` and runs it as a single parallelized batch. Non-`AbstractTrial` elements and empty vectors raise `ArgumentError`.
+- `kwargs` are forwarded to `prepareTrialHierarchy` (simulator hooks like `force_recompile`) and to `postSimulationProcessing`/`postSimulationCleanup`. The `post_processor` hook (see the Post-Processing feature) runs per successful simulation between them. `runSimulation` takes no kwargs — it receives only the `SimulationSpec`.
 - On HPC, each simulation is wrapped in an `sbatch --wrap` invocation.
 - A simulation that fails is marked `"Failed"` in the database and removed from its monad's constituent list. If the monad becomes empty, it is deleted along with empty parents.
 - Already-started simulations are skipped (idempotent re-runs).
@@ -154,6 +155,62 @@ target location's file type.
 - `run(simulation)` runs a single simulation and returns `MMOutput{Simulation}`.
 - `run(monad)` runs all pending replicates and returns correct success counts.
 - A failed simulation does not prevent other simulations in the same monad from running.
+- `run([sim, monad, sampling])` runs every constituent simulation as one batch and returns `MMOutput{Trial}`; a vector containing a non-trial element raises `ArgumentError`.
+
+---
+
+## Feature: Per-Simulation Post-Processing
+
+**One-line description:** Run a user-supplied function after each successful simulation, optionally collecting returned quantities of interest into a standardized sink.
+
+**Priority:** Should-have
+
+**Behavioral specification:**
+- Per-simulation ordering is: `postSimulationProcessing` (simulator-specific, non-destructive) → `post_processor` (user) → `postSimulationCleanup` (simulator-specific, destructive, e.g. pruning). The user callback therefore always sees the intact (but processed) output folder; destructive cleanup is deferred until after it. `postSimulationProcessing` and `post_processor` are only meaningful pre-cleanup; `postSimulationCleanup` runs regardless of success so failed simulations are still cleaned up.
+- `run(T; post_processor::Union{Nothing,Function}=nothing, …)` invokes `post_processor(simulation_process)` once per **successfully completed** simulation, in the ordering above. Failed/skipped simulations do not trigger it.
+- The callback receives the `SimulationProcess`; from it the user reaches `simulation.id`, `monad_id`, and the output folder via `pathToOutputFolder(id)`. Inside the callback the user may do anything (compute quantities, write files, delete outputs).
+- Return-value contract:
+  - `nothing` → nothing is stored.
+  - `NamedTuple` / `AbstractDict` of `name => scalar` (`Real`, `Bool`, or `String`) → one row keyed by `simulation_id` is upserted into the sink DB `data/outputs/postprocessing.db`, table `post_processing`. Columns are added on demand; a re-run overwrites the existing row for that `simulation_id`.
+  - any other return type, or a non-scalar value → `ArgumentError`.
+  - quantity names are quoted safely for SQL (interior `"` doubled); an `AbstractDict` whose keys collide after string conversion (e.g. `1` and `"1"`) → `ArgumentError`.
+- `post_processor` is not forwarded to the simulator setup hooks. The callback runs inside the per-simulation worker task; **all sink writes are serialized** in the main completion loop, so user code never writes the sink DB concurrently.
+- **Fail-fast on errors.** An exception in the `post_processor`, a simulator hook (`postSimulationProcessing`/`postSimulationCleanup`), or the simulation worker is captured per-simulation and rethrown by `run` as a clear error naming the stage and simulation ID with the original stacktrace. `run` never hangs or silently drops the exception (the worker pool always delivers exactly one result per scheduled simulation).
+- `postProcessingTable(args...)` / `printPostProcessingTable` read the sink back as a `DataFrame` keyed by `:SimID` (joinable to `simulationsTable`), with `missing` for quantities not computed for a given simulation. `postProcessingDBPath()` returns the sink path.
+- `simulationsTable(args...; post_processing=true)` appends the stored quantities directly onto the simulations table (left-join by `:SimID`, `missing` where not computed, row order preserved; the appended columns are not subject to `remove_constants` or sorting). The kwarg is simulation-level only — `monadsTable` does not accept it, since quantities are per-simulation.
+- Deletion keeps the sink consistent with the central database: `deleteSimulations` removes each deleted simulation's sink row (so cascading `deleteMonad`/`deleteSampling`/`deleteTrial` do too, since they route through it), and `resetDatabase` removes the sink database entirely.
+
+**Acceptance criteria:**
+- The callback fires exactly once per successful simulation and not at all when nothing is re-scheduled (`use_previous`).
+- A `nothing` return leaves no sink row; a NamedTuple/Dict return produces a joinable row.
+- A new quantity introduces a new column; earlier rows read back `missing` for it.
+- Re-writing a `simulation_id` overwrites its stored quantities.
+- Unsupported return types, and dict keys that collide after string conversion, raise `ArgumentError`.
+- A quantity name containing a `"` round-trips through the sink unchanged.
+- A throwing `post_processor` or simulator hook makes `run` throw a clear, stage-tagged error within bounded time — it never hangs.
+- `run` without `post_processor` behaves exactly as before.
+- After `deleteSimulations`/`deleteMonad`/`deleteSampling`/`deleteTrial`, the deleted simulations have no rows in the sink; after `resetDatabase`, the sink database no longer exists.
+
+---
+
+## Feature: Analysis Tables
+
+**One-line description:** Tabular summaries of trials and their varied parameters, at simulation and monad granularity.
+
+**Priority:** Must-have
+
+**Behavioral specification:**
+- `simulationsTable(args...; kwargs...)` returns a `DataFrame` with one row per simulation and its varied parameters. `printSimulationsTable` routes the result through a `sink` (default `println`).
+- `monadsTable(args...; kwargs...)` is the monad-level analogue: one row per monad and its varied parameters. `printMonadsTable` routes the result through a `sink`.
+- Both accept the same `args...` forms: `AbstractTrial` objects (or arrays), a vector of IDs (simulation IDs / monad IDs respectively), or no argument (all simulations / all monads). ID collection uses `simulationIDs` / `monadIDs`.
+- Both share keyword arguments (via `simulationsTableFromQuery` / `monadsTableFromQuery`): `remove_constants` (default `true`, drop columns constant across rows), `sort_by`, `sort_ignore` (defaults to the table's ID column plus variation-ID columns), and `short_names` (default `true`, shorten column names via `shortVariationName`; `false` keeps raw XML-path names).
+- The primary-key column is renamed for display: `:SimID` for simulations, `:MonadID` for monads.
+
+**Acceptance criteria:**
+- For a `Sampling` of `m` monads with `r` replicates each, `monadsTable(sampling)` has `m` rows and `simulationsTable(sampling)` has `m·r` rows.
+- Varied parameters appear as columns; a parameter held constant is dropped when `remove_constants=true` and retained when `false`.
+- `short_names=false` yields raw `columnName` (XML-path) column names.
+- `monadsTable(monad_ids)`, `monadsTable(monad)`, and `monadsTable(trial)` agree with the underlying monad set.
 
 ---
 
@@ -327,7 +384,7 @@ target location's file type.
   - `latent_params(result::ABCResult; generation=:final)` → particle DataFrame in CDF-coordinate space
   - `target_params(result::ABCResult; generation=:final)` → particle DataFrame in target-parameter space
 
-- **Evaluation budget — `max_evaluations`**: `max_evaluations::Union{Nothing,Int} = nothing` on `ABCSMC`. Counts total evaluated particles (monads) across the entire calibration run — one count per entry in `evaluate_batch`'s results, regardless of whether the monad was already in the DB or was a fresh simulation. `_runABCSMC` initializes a shared `budget::Ref{Int}` counter and `budget_hit::Ref{Bool}` flag, then passes them to both generation runners. Each runner calls `_updateBudget!(budget, budget_hit, n, max_evaluations)` after every `evaluate_batch` call, which increments `budget[]` by `n` and sets `budget_hit[] = true` when the budget is reached. After each generation, `_stoppingReason` checks `budget_hit` first (before all other criteria) and returns `"max_evaluations=N reached"` when true; the current generation's accepted particles are saved before stopping. Log level is `@info`. `nothing` disables the safeguard (default). This is the ultimate backstop for overaggressive `epsilon_schedule` runs and for snapping runs with difficult-to-reach grid regions. Persisted to `method.toml`.
+- **Evaluation budget — `max_evaluations`**: `max_evaluations::Union{Nothing,Int} = nothing` on `ABCSMC`. Caps total evaluated particles (monads) across the entire calibration run — one count per proposal sent to `evaluate_batch`, regardless of whether the monad was already in the DB or was a fresh simulation. `_runABCSMC` initializes a shared `budget::Ref{Int}` counter and `budget_hit::Ref{Bool}` flag, then passes them to both generation runners. The budget is enforced **before each batch is dispatched**: `_capBatchToBudget(proposals, budget, max_evaluations)` trims a planned batch to the remaining allowance (`max_evaluations - budget[]`) so the run never evaluates more than `max_evaluations` simulations — including generation 1, which is trimmed when the budget is smaller than `population_size`. After dispatch, `_updateBudget!(budget, budget_hit, n, max_evaluations)` increments `budget[]` by the dispatched count and sets `budget_hit[]` when the budget is reached; an empty trimmed batch also sets it. After each generation, `_stoppingReason` checks `budget_hit` first (before all other criteria) and returns `"max_evaluations=N reached"` when true; the current generation's accepted particles are saved before stopping. Log level is `@info`. `nothing` disables the safeguard (default). This is the ultimate backstop for overaggressive `epsilon_schedule` runs and for snapping runs with difficult-to-reach grid regions. Persisted to `method.toml`.
 
 *Low priority — advanced / power-user features*
 

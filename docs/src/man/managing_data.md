@@ -31,6 +31,11 @@ The `delete_subs` / `delete_supers` keywords control how far the cascade reaches
 
 [`deleteSimulations`](@ref) additionally accepts `filters` to restrict which rows are removed.
 
+Deletions also keep the [post-processing sink](@ref "Post-processing each simulation")
+consistent: a deleted simulation's stored quantities are removed from
+`data/outputs/postprocessing.db` (cascading deletes route through `deleteSimulations`, so they
+are covered too).
+
 ## Deleting by status
 
 To clear out failed runs (the most common cleanup):
@@ -54,8 +59,9 @@ resetDatabase(; force_reset=true)     # skip the prompt (scripts/CI)
 ```
 
 This is destructive and irreversible — every simulation, monad, sampling, and trial is
-deleted. Use it deliberately. [`resetFolder`](@ref) resets a single input folder's variation
-state without touching the rest of the project.
+deleted, and the post-processing sink (`data/outputs/postprocessing.db`) is removed. Use it
+deliberately. [`resetFolder`](@ref) resets a single input folder's variation state without
+touching the rest of the project.
 
 ## Safe removal on shared filesystems
 

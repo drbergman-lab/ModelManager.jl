@@ -80,7 +80,10 @@ making progress:
 - `min_epsilon_decrease` — stop when epsilon's relative decrease per generation is too small.
 - `min_ess_fraction` — stop when the effective sample size falls below this fraction of
   `population_size`.
-- `max_evaluations` — a hard cap on total particle evaluations across the whole run.
+- `max_evaluations` — a hard cap on total particle evaluations across the whole run. It is
+  checked *before* each batch is dispatched: a batch that would exceed the budget is trimmed to
+  the remaining allowance, so the run never evaluates more than `max_evaluations` simulations
+  (the final generation may hold fewer than `population_size` particles).
 
 ### Perturbation kernels
 

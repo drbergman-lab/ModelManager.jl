@@ -782,10 +782,15 @@ lowerClassString(T::AbstractTrial) = lowerClassString(typeof(T))
 
 """
     pathToOutputFolder(simulation_id::Int)
+    pathToOutputFolder(simulation::Simulation)
+    pathToOutputFolder(simulation_process::SimulationProcess)
 
-Return the path to the output folder for `simulation_id`.
+Return the path to the output folder for a simulation. Accepts a raw ID, a [`Simulation`](@ref),
+or the [`SimulationProcess`](@ref) handed to a `post_processor` (see [`run`](@ref)) — so a
+post-processor can locate its simulation's output without reaching into struct internals.
 """
 pathToOutputFolder(simulation_id::Int) = joinpath(trialFolder(Simulation, simulation_id), "output")
+pathToOutputFolder(simulation::Simulation) = pathToOutputFolder(simulation.id)
 
 ########################################################
 ############   MMOutput   ##############################
