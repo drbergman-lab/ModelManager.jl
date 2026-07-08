@@ -1928,28 +1928,44 @@ _gsa_fB(mid) = 0.0
         )
     end
 
-    @testset "max_evaluations stops the run early" begin
+    @testset "max_evaluations caps total evaluations (checked before each batch)" begin
         Random.seed!(42)
         eval_count = Ref(0)
         evaluate_batch = function(t, proposals)
             eval_count[] += length(proposals)
             return [(rand(), 0) for _ in proposals]
         end
-        # Gen 1 evaluates exactly population_size=10 particles.
-        # Budget=25 → gen 1 (10) + gen 2 (10) = 20 < 25 → gen 3 starts; after first
-        # batch of gen 3 budget hits 30 ≥ 25 → stop.
+        # The budget is enforced BEFORE each batch is dispatched, so the batch that would
+        # cross the budget is trimmed to exactly the remaining allowance — the run never
+        # evaluates more than max_evaluations simulations.
         method = ABCSMC(population_size=10, max_nr_populations=10, minimum_epsilon=0.0,
                         max_evaluations=25)
         gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
                                         evaluate_batch, g -> nothing)
 
-        # Should have stopped before running all 10 generations
-        @test length(gens) < 10
-        # Total evaluations must have reached or exceeded the budget
+        @test length(gens) < 10                          # stopped early
         total_evals = sum(g.n_evaluations for g in gens)
-        @test total_evals >= 25
-        # But not vastly more than the budget (one extra batch at most)
-        @test total_evals <= 50
+        @test total_evals <= method.max_evaluations      # never overshoots the budget
+        @test total_evals == 25                          # budget hit exactly (final batch trimmed)
+        @test eval_count[] == 25                         # evaluate_batch never dispatched over budget
+    end
+
+    @testset "max_evaluations smaller than a generation trims generation 1" begin
+        Random.seed!(1)
+        eval_count = Ref(0)
+        evaluate_batch = function(t, proposals)
+            eval_count[] += length(proposals)
+            return [(rand(), 0) for _ in proposals]
+        end
+        # Budget below population_size: even generation 1 is trimmed to the budget.
+        method = ABCSMC(population_size=10, max_nr_populations=5, minimum_epsilon=0.0,
+                        max_evaluations=4)
+        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                        evaluate_batch, g -> nothing)
+        @test length(gens) == 1
+        @test eval_count[] == 4                     # never dispatched more than the budget
+        @test nrow(gens[1].particles) == 4          # partial first generation
+        @test gens[1].weights ≈ fill(0.25, 4)       # weights renormalized to the trimmed size
     end
 
     ################## DB-backed integration ##################

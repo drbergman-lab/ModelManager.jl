@@ -182,12 +182,15 @@ calibration (Toni et al. 2009, Beaumont et al. 2009).
   resolution is raised to satisfy `(2^k-1)^d ≥ population_size`; an `@info` is emitted when
   this correction fires.
 - `max_evaluations::Union{Nothing,Int}`: Maximum total number of evaluated particles
-  (monads) across the entire calibration run. Each entry in any `evaluate_batch` result
+  (monads) across the entire calibration run. Each proposal sent to `evaluate_batch`
   counts as one evaluation, regardless of whether the monad was a fresh simulation or a
-  bank reuse. When the budget is reached, the current batch is fully processed, the
-  completed portion of the current generation is saved (possibly with fewer than
-  `population_size` accepted particles), and the run stops. `nothing` (default) disables
-  the budget. Persisted to `method.toml`.
+  bank reuse. The budget is enforced **before each batch is dispatched**: a planned batch
+  that would exceed the budget is trimmed to exactly the remaining allowance, so the run
+  never evaluates more than `max_evaluations` simulations. The completed portion of the
+  current generation is then saved (possibly with fewer than `population_size` accepted
+  particles) and the run stops. If the budget is smaller than `population_size`, even
+  generation 1 is trimmed. `nothing` (default) disables the budget. Persisted to
+  `method.toml`.
 - `store_rejected::Bool`: When `true`, each `GenerationResult` (for generations t > 1)
   stores all rejected proposal CDF coordinates in `rejected_proposals::DataFrame` (same
   column names as `particles`; converted to target space at plot time). Useful for the

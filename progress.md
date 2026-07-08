@@ -1038,3 +1038,30 @@ Support the accumulate-then-launch pattern: `sims = []; push!(sims, createTrial(
 - `PRD.md` — Simulation Runner feature updated (batch spec + acceptance; also refreshed the hook wording to `postSimulationProcessing`/`postSimulationCleanup` + `post_processor`)
 - `README.md` — Implementation Status entry
 - `docs/src/man/running_simulations.md` — "Batching pre-built trials" section
+
+---
+
+## Session: Calibration evaluation budget — enforce before dispatch (task c, corrected) (2026-07-08)
+
+### Correction
+Task c was first mis-implemented as a global per-`run` "simulation budget" gate (new `simulation_budget` global, `setSimulationBudget`, `nPendingSimulations`, `force` kwarg). That was **not** the intent and was fully reverted. The budget is specifically for **calibration runs**: the existing `ABCSMC.max_evaluations`, but checked **before** sending off a batch rather than only after.
+
+### The actual problem
+`max_evaluations` already capped total evaluated particles, but `_updateBudget!` ran *after* `evaluate_batch`, so a batch was fully dispatched (simulations launched) and the run overshot the budget before `budget_hit` stopped it. The docstring even said "the current batch is fully processed."
+
+### Fix
+`_capBatchToBudget(proposals, budget, max_evaluations)` (`src/calibration/abc_smc.jl`) trims a planned batch to `max_evaluations - budget[]` **before** it is dispatched to `evaluate_batch`. Applied at all three dispatch sites: `_runFirstGeneration` (both no-snap and CDF-snap paths) and the batch loop in `_runSubsequentGeneration`. Consequences:
+- The run never evaluates more than `max_evaluations` simulations (trim-to-fit — uses the budget maximally, then stops).
+- Generation 1 is trimmed too when the budget is smaller than `population_size` (partial first generation, weights renormalized to the trimmed size).
+- Subsequent-generation loop guards an empty trimmed batch (sets `budget_hit`, breaks) so the acceptance-rate update never divides by zero.
+- `_updateBudget!` still runs after dispatch to advance `budget[]`/`budget_hit` (now by the trimmed count).
+
+### Tests
+- "max_evaluations caps total evaluations (checked before each batch)": total evaluated `== 25` and `eval_count == 25` (exactly the budget; never dispatched over).
+- "max_evaluations smaller than a generation trims generation 1": budget 4 < population 10 → one partial generation of 4 particles, weights `fill(0.25, 4)`.
+
+### Files changed
+- `src/calibration/abc_smc.jl` — `_capBatchToBudget`; capping at the three dispatch sites; empty-batch guard
+- `src/calibration/methods.jl`, `src/calibration/abc.jl` — `max_evaluations` docstrings updated to "before dispatch"
+- `test/runtests.jl` — updated/added budget tests
+- `docs/src/man/calibration.md`, `PRD.md` — before-dispatch semantics
