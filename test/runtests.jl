@@ -2269,6 +2269,39 @@ _gsa_fB(mid) = 0.0
                 @test nrow(captured[]) == 3
             end
 
+            # ---------- simulationsTable / monadsTable sorting semantics ----------
+            @testset "simulationsTable sorting" begin
+                # Two single-simulation trials created in a deliberate order so that SimID
+                # order (creation order) is the *opposite* of ascending parameter order:
+                # the higher x-value gets the smaller SimID.
+                s_hi = createTrial(inputs, [DiscreteVariation(:config, xp_x, 602.0),
+                                            DiscreteVariation(:config, xp_y, 2.0)]; n_replicates=1)  # smaller ID
+                s_lo = createTrial(inputs, [DiscreteVariation(:config, xp_x, 601.0),
+                                            DiscreteVariation(:config, xp_y, 2.0)]; n_replicates=1)  # larger ID
+                run(s_hi); run(s_lo)
+                pair = [s_hi, s_lo]
+
+                # (1) An explicit `sort_by` changes the row order. Sorting by :SimID yields
+                #     creation order (x = 602 then 601); the default sort orders by the sole
+                #     varied parameter column (x = 601 then 602).
+                st_id = simulationsTable(pair; sort_by=["SimID"])
+                xcol  = only(filter(n -> occursin("x", n), names(st_id)))
+                @test issorted(st_id.SimID)
+                @test st_id[!, xcol] == [602.0, 601.0]
+
+                st_default = simulationsTable(pair)                 # default: sort by parameter
+                @test issorted(st_default[!, xcol])                 # ascending → [601, 602]
+                @test st_default[!, xcol] == [601.0, 602.0]
+
+                # (2) A `sort_by` naming no existing column is a hard error.
+                @test_throws ArgumentError simulationsTable(pair; sort_by=["not_a_column"])
+
+                # (3) Requesting a column that exists but is dropped by `remove_constants`
+                #     (the constant y parameter) warns and falls back to the default sort.
+                st_warn = @test_logs (:warn,) match_mode=:any simulationsTable(pair; sort_by=["data/y"])
+                @test issorted(st_warn[!, xcol])                    # fell back to the parameter sort
+            end
+
             # ---------- post-processing hook + sink ----------
             @testset "post-processing sink" begin
                 # Callback returning a NamedTuple → one sink row per successful simulation.

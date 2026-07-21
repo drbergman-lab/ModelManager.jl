@@ -785,7 +785,7 @@ function appendVariations(location::Symbol, df::DataFrame; short_names::Bool=tru
 end
 
 """
-    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true, post_processing::Bool=false)
+    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, post_processing::Bool=false)
 
 Return a DataFrame for the given SQL query on the simulations table.
 
@@ -796,15 +796,15 @@ By default, constant columns and raw ID columns are removed.
 
 # Keyword Arguments
 - `remove_constants::Bool`: If true, removes columns that have the same value for all simulations. Defaults to true.
-- `sort_by::Vector{String}`: A vector of column names to sort the table by. Defaults to all columns. To populate this argument, it is recommended to first print the table to see the column names.
-- `sort_ignore::Vector{String}`: A vector of column names to ignore when sorting. Defaults to the simulation ID and the variation IDs associated with the simulations.
+- `sort_by::Vector{String}`: A vector of column names to sort the table by. When empty (the default), sorts by every parameter column in table order (i.e. the first parameter column is the primary key), excluding `:SimID` and the variation-ID columns. `:SimID` is *not* sorted by default but may be requested explicitly here. To populate this argument, it is recommended to first print the table to see the column names.
+- `sort_ignore::Vector{String}`: Additional column names to exclude from sorting, on top of the always-excluded variation-ID columns. Defaults to none.
 - `short_names::Bool`: If true (default), column names are shortened via `shortVariationName`. Pass `false` to keep raw XML-path column names (e.g. for matching against `parameters.toml` `db_column` entries).
 - `post_processing::Bool`: If true, left-joins each simulation's stored post-processing quantities (see [`postProcessingTable`](@ref)) onto the table by `:SimID`, appending one column per quantity (`missing` where a quantity was not computed). Defaults to false. Post-processing columns are appended as-is and are not subject to `remove_constants` or sorting.
 """
 function simulationsTableFromQuery(query::String;
                                    remove_constants::Bool=true,
                                    sort_by=String[],
-                                   sort_ignore=[:SimID; shortLocationVariationID.(projectLocations().varied)],
+                                   sort_ignore=String[],
                                    short_names::Bool=true,
                                    post_processing::Bool=false)
     df = _variationsTableFromQuery(query, :simulation_id, :SimID;
@@ -815,23 +815,34 @@ function simulationsTableFromQuery(query::String;
 end
 
 """
-    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=[:MonadID; shortLocationVariationID.(projectLocations().varied)], short_names::Bool=true)
+    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true)
 
 Return a DataFrame for the given SQL query on the `monads` table. This is the monad-level
 analogue of [`simulationsTableFromQuery`](@ref): one row per monad and its varied parameters.
 
-Keyword arguments match [`simulationsTableFromQuery`](@ref), except `sort_ignore` defaults to
-the monad ID column `:MonadID` (rather than `:SimID`).
+Keyword arguments match [`simulationsTableFromQuery`](@ref), except the display ID column
+excluded from the default sort is `:MonadID` (rather than `:SimID`).
 """
 function monadsTableFromQuery(query::String;
                               remove_constants::Bool=true,
                               sort_by=String[],
-                              sort_ignore=[:MonadID; shortLocationVariationID.(projectLocations().varied)],
+                              sort_ignore=String[],
                               short_names::Bool=true)
     return _variationsTableFromQuery(query, :monad_id, :MonadID;
                                      remove_constants=remove_constants, sort_by=sort_by,
                                      sort_ignore=sort_ignore, short_names=short_names)
 end
+
+"""
+    _asSymbolVector(x) -> Vector{Symbol}
+
+Coerce a column argument (e.g. `sort_by`, `sort_ignore`) — a single `Symbol`/`String`, or a
+collection thereof — to a `Vector{Symbol}`.
+"""
+_asSymbolVector(x::AbstractVector) = Symbol.(x)
+_asSymbolVector(x::Tuple)          = collect(Symbol.(x))
+_asSymbolVector(x::Symbol)         = [x]
+_asSymbolVector(x::AbstractString) = [Symbol(x)]
 
 """
     _variationsTableFromQuery(query::String, id_column::Symbol, display_id_column::Symbol; kwargs...)
@@ -850,8 +861,8 @@ function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_
                                    sort_by=String[],
                                    sort_ignore,
                                    short_names::Bool=true)
-    sort_by = (sort_by isa Vector ? sort_by : [sort_by]) .|> Symbol
-    sort_ignore = (sort_ignore isa Vector ? sort_ignore : [sort_ignore]) .|> Symbol
+    sort_by     = _asSymbolVector(sort_by)
+    sort_ignore = _asSymbolVector(sort_ignore)
 
     df = queryToDataFrame(query)
     id_col_names_to_remove = names(df)
@@ -865,16 +876,33 @@ function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_
 
     select!(df, Not(id_col_names_to_remove))
     rename!(df, id_column => display_id_column)
-    col_names = names(df)
+
+    #! validate against the full column set, before `remove_constants` prunes anything: a `sort_by`
+    #! entry not found here names no column at all (likely a typo) and is a hard error.
+    col_names = names(df) .|> Symbol
+    unknown = setdiff(sort_by, col_names)
+    isempty(unknown) || throw(ArgumentError("`sort_by` names column(s) that do not exist: " *
+        "$(join(unknown, ", ")). Valid columns are: $(join(col_names, ", "))."))
+
     if remove_constants && size(df, 1) > 1
-        filter!(n -> length(unique(df[!, n])) > 1, col_names)
+        col_names = filter(n -> length(unique(df[!, n])) > 1, col_names)
         select!(df, col_names)
     end
-    if isempty(sort_by)
-        sort_by = deepcopy(col_names)
-    end
-    setdiff!(sort_by, sort_ignore)
-    filter!(n -> n in col_names, sort_by)
+
+    #! variation-ID columns are never a valid sort key — forced, regardless of user `sort_ignore`.
+    #! (a user who really wants to sort by them can do so on the returned DataFrame.)
+    never_sort = [shortLocationVariationID.(projectLocations().varied); sort_ignore]
+    setdiff!(sort_by, never_sort)
+
+    #! a requested column that survived validation but is gone from the final table was dropped by
+    #! `remove_constants` — warn rather than silently ignoring it, then drop it from the sort.
+    dropped = setdiff(sort_by, col_names)
+    isempty(dropped) || @warn "`sort_by` column(s) were removed from the table before sorting and " *
+        "will not affect ordering (likely constant columns removed by `remove_constants=true`): $(join(dropped, ", "))."
+    setdiff!(sort_by, dropped)
+
+    #! default: sort by every parameter column (in table order), excluding the display ID column
+    isempty(sort_by) && (sort_by = setdiff(col_names, [display_id_column; never_sort]))
     sort!(df, sort_by)
     return df
 end
