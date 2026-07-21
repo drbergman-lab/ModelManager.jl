@@ -882,7 +882,7 @@ function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_
     col_names = names(df) .|> Symbol
     unknown = setdiff(sort_by, col_names)
     isempty(unknown) || throw(ArgumentError("`sort_by` names column(s) that do not exist: " *
-        "$(unknown). Valid columns are: $(col_names)."))
+        "$(join(unknown, ", ")). Valid columns are: $(join(col_names, ", "))."))
 
     if remove_constants && size(df, 1) > 1
         col_names = filter(n -> length(unique(df[!, n])) > 1, col_names)
@@ -898,7 +898,7 @@ function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_
     #! `remove_constants` — warn rather than silently ignoring it, then drop it from the sort.
     dropped = setdiff(sort_by, col_names)
     isempty(dropped) || @warn "`sort_by` column(s) were removed from the table before sorting and " *
-        "will not affect ordering (likely constant columns removed by `remove_constants=true`): $(dropped)."
+        "will not affect ordering (likely constant columns removed by `remove_constants=true`): $(join(dropped, ", "))."
     setdiff!(sort_by, dropped)
 
     #! default: sort by every parameter column (in table order), excluding the display ID column
