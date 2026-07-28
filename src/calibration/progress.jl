@@ -74,6 +74,99 @@ function _logBatchStart(verbosity::Symbol, t::Int, batch_index::Int, n_proposals
     return nothing
 end
 
+################## Evaluation-Failure Reporting ##################
+#
+# A proposed particle can fail to produce a distance: every simulation in its monad may
+# fail (the runner then deletes the emptied monad, so the user's `summary_statistic`
+# throws or returns `missing`), or the user's own `summary_statistic`/`distance` may
+# raise for a monad that is otherwise intact. Under `on_evaluation_failure=:reject` the
+# particle is assigned `Inf` and the run continues; these helpers report it.
+#
+# Warnings are throttled to the first `_MAX_REJECTION_WARNINGS` per generation — a large
+# population with a systematically broken region would otherwise bury the log — and the
+# per-generation total is reported once the generation completes.
+
+const _MAX_REJECTION_WARNINGS = 5
+
+"""
+    _warnParticleRejected(verbosity, t, n_rejected, monad_id, sim_ids, monad_deleted, err)
+
+Warn that a particle was rejected because its evaluation raised. `n_rejected` is the
+running count of rejections in generation `t` **including this one**; warnings are
+suppressed past `_MAX_REJECTION_WARNINGS`. `sim_ids` are the monad's simulation IDs as
+snapshotted *before* the batch ran (they are unrecoverable afterwards if the monad was
+deleted). `monad_deleted` selects the diagnosis: a vanished monad means every simulation
+failed, whereas an intact monad points at the user's `summary_statistic`/`distance` or at
+missing simulation output. Silent when `verbosity` is `:none`.
+"""
+function _warnParticleRejected(verbosity::Symbol, t::Int, n_rejected::Int, monad_id::Int,
+                               sim_ids::AbstractVector{<:Integer}, monad_deleted::Bool,
+                               err)
+    _verbosityRank(verbosity) >= _verbosityRank(:generation) || return nothing
+    n_rejected > _MAX_REJECTION_WARNINGS && return nothing
+
+    diagnosis = if monad_deleted
+        folders = join(["  - $(trialFolder(Simulation, sid))" for sid in sim_ids], "\n")
+        """
+        Monad $monad_id is no longer in the database: all $(length(sim_ids)) of its \
+        simulations failed, so the emptied monad was deleted. Check the simulation output \
+        folders for the cause:
+        $folders
+        """
+    else
+        """
+        Monad $monad_id is still in the database, so this is not a wholesale simulation \
+        failure. Either some of its simulations produced no usable output, or \
+        `summary_statistic`/`distance` has a bug. Re-run with \
+        `on_evaluation_failure=:error` to get the full backtrace.
+        """
+    end
+
+    throttle_note = n_rejected == _MAX_REJECTION_WARNINGS ?
+        "\nFurther rejection warnings for generation $t are suppressed; " *
+        "the total is reported when the generation finishes." : ""
+
+    @warn """
+    ABC-SMC generation $t: rejecting a particle (distance = Inf) — evaluating monad \
+    $monad_id raised.
+    $diagnosis
+    Cause: $(sprint(showerror, err))$throttle_note
+    """
+    return nothing
+end
+
+"""
+    _logGenerationRejections(verbosity, t, n_rejected)
+
+Report the total number of particles rejected due to failed evaluation in generation `t`.
+No output when `n_rejected` is zero or `verbosity` is `:none`.
+"""
+function _logGenerationRejections(verbosity::Symbol, t::Int, n_rejected::Int)
+    n_rejected > 0 || return nothing
+    _verbosityRank(verbosity) >= _verbosityRank(:generation) || return nothing
+    @warn "ABC-SMC generation $t: $n_rejected particle$(n_rejected == 1 ? "" : "s") " *
+          "rejected because their evaluation failed (distance set to Inf)."
+    return nothing
+end
+
+"""
+    _warnBatchSimulationFailures(verbosity, t, batch_index, n_success, n_scheduled)
+
+Warn when a batch's `run` completed fewer simulations than it scheduled. Calibration runs
+each batch with `quiet=true`, which suppresses the runner's own low-success notice, so
+without this the first sign of trouble is a failed particle evaluation (or none at all,
+when a monad retains enough successful replicates). Silent when `verbosity` is `:none`.
+"""
+function _warnBatchSimulationFailures(verbosity::Symbol, t::Int, batch_index::Int,
+                                      n_success::Int, n_scheduled::Int)
+    n_success < n_scheduled || return nothing
+    _verbosityRank(verbosity) >= _verbosityRank(:generation) || return nothing
+    @warn "ABC-SMC generation $t · batch $batch_index: only $n_success of $n_scheduled " *
+          "scheduled simulations completed successfully. Check the failed simulations' " *
+          "output folders under $(joinpath(dataDir(), "outputs", "simulations"))."
+    return nothing
+end
+
 """
     _batchProgressCallback(verbosity, desc) → Union{Nothing,Function}
 

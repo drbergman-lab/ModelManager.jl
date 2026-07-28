@@ -114,6 +114,32 @@ otherwise), `:none`, `:generation`, `:batch`, or `:bar`. Particle evaluations ru
 ordinary [parallel runner](@ref "Running simulations"), so calibration benefits from
 [`setNumberOfParallelSims`](@ref) and [HPC](@ref "HPC support") just like any other trial.
 
+### When a particle's evaluation fails
+
+`summary_statistic` and `distance` are your code, run against a monad whose simulations may
+have failed. When *every* simulation in a proposed monad fails, the runner deletes the emptied
+monad — after which a statistic that touches it throws (`Monad N not in the database`) or
+returns `missing`, which then throws inside `distance`.
+
+`on_evaluation_failure` chooses what happens:
+
+```julia
+result = runABC(problem; on_evaluation_failure=:reject)   # default
+result = runABC(problem; on_evaluation_failure=:error)    # debugging
+```
+
+- `:reject` assigns the particle a distance of `Inf`, so ABC-SMC rejects it and the run
+  continues. A warning names the monad and the failed simulations' output folders; warnings are
+  capped at five per generation, with the generation's total reported when it finishes.
+- `:error` rethrows the original exception (backtrace intact) after logging which monad was
+  being evaluated. Use this when every particle is being rejected — that usually means a bug in
+  `summary_statistic`/`distance` rather than a failing simulator.
+
+A generation whose particles all fail keeps proposing until `max_evaluations` is reached, so a
+single bad monad never ends a run. The one exception is generation 1, which has no acceptance
+threshold: if nothing there survives, the run errors out rather than continue with a degenerate
+`ε = Inf`.
+
 ## The simulation bank and CDF-grid reuse
 
 Calibration can evaluate thousands of particles, many close together in parameter space.

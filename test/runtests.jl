@@ -59,9 +59,15 @@ ModelManager.upgradeToMilestone(::TestSimulator, args...) = true
 ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
 ModelManager.setupMonad(::TestSimulator,    args...; kwargs...) = true
 
+# When set, `runSimulation` reports failure for any spec the predicate accepts — used by the
+# calibration failure-handling tests to make specific monads lose all of their simulations
+# (which makes the runner delete the emptied monad, exactly as in the reported bug).
+const _fail_sim_predicate = Ref{Union{Nothing,Function}}(nothing)
+
 function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.SimulationSpec)
     # No-op: immediately report success without launching any process.
-    return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, true)
+    should_fail = !isnothing(_fail_sim_predicate[]) && _fail_sim_predicate[](spec)
+    return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, !should_fail)
 end
 
 # Records the per-simulation post-step call order so the ordering test below can assert
@@ -95,6 +101,17 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 # are stable strings ("_gsa_fA", "_gsa_fB") rather than gensym closure names.
 _gsa_fA(mid) = 0.0
 _gsa_fB(mid) = 0.0
+
+# Summary statistics that reproduce the two reported calibration failure modes.
+# _test_monad_ss touches the monad, so it throws "Monad N not in the database" once every
+# simulation in that monad has failed and the emptied monad has been deleted.
+function _test_monad_ss(mid)
+    monad = Monad(mid)
+    return Dict{String,Any}("x" => Float64(length(ModelManager.simulationIDs(monad))))
+end
+# _test_missing_ss returns `missing` for a deleted monad instead of throwing; the failure
+# then surfaces one frame later, inside `distance` (the originally reported MethodError).
+_test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" => 1.0) : missing
 
 @testset "ModelManager.jl" begin
 
@@ -1003,6 +1020,82 @@ _gsa_fB(mid) = 0.0
         @test length(gens) == 2
         @test gens[1].acceptance_rate ≈ 1.0
         @test gens[2].acceptance_rate ≈ 1.0
+    end
+
+    ################## non-finite distances (failed evaluations) ##################
+
+    @testset "_acceptFirstGeneration drops non-finite distances" begin
+        proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
+            (Dict("x" => 0.1), nothing), (Dict("x" => 0.2), nothing),
+            (Dict("x" => 0.3), nothing), (Dict("x" => 0.4), nothing)]
+
+        # Two rejections (Inf) among four proposals: only the finite ones are accepted,
+        # in order, carrying their monad IDs through as metadata.
+        results = [(1.0, 11), (Inf, 12), (2.0, 13), (Inf, 14)]
+        accepted = ModelManager._acceptFirstGeneration(proposals, results)
+        @test length(accepted) == 2
+        @test [p.distance for p in accepted] == [1.0, 2.0]
+        @test [p.metadata for p in accepted] == [11, 13]
+        @test [p.latent_cdfs["x"] for p in accepted] == [0.1, 0.3]
+
+        # NaN counts as non-finite too.
+        @test length(ModelManager._acceptFirstGeneration(proposals,
+                        [(1.0, 11), (NaN, 12), (Inf, 13), (3.0, 14)])) == 2
+
+        # Nothing survives → error rather than an all-rejected generation.
+        @test_throws ErrorException ModelManager._acceptFirstGeneration(proposals,
+                        [(Inf, 11), (Inf, 12), (Inf, 13), (Inf, 14)])
+
+        # An empty batch is reported as such, not as "all 0 proposals were non-finite".
+        empty_proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[]
+        @test_throws ErrorException ModelManager._acceptFirstGeneration(empty_proposals,
+                        Tuple{Float64,Int}[])
+    end
+
+    @testset "generation 1 epsilon and weights ignore rejections" begin
+        # Without filtering, one Inf would make gen-1 epsilon = Inf, after which every
+        # gen-2 proposal passes `distance <= epsilon`.
+        Random.seed!(11)
+        n_seen = Ref(0)
+        # Reject the 2nd and 4th proposal of generation 1; everything else scores 0.5.
+        evaluate_flaky = function (t, proposals)
+            map(proposals) do _
+                n_seen[] += 1
+                (t == 1 && n_seen[] in (2, 4)) ? (Inf, 0) : (0.5, 0)
+            end
+        end
+        method = ABCSMC(population_size=6, max_nr_populations=2, minimum_epsilon=0.0)
+        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                        evaluate_flaky, g -> nothing)
+
+        @test isfinite(gens[1].epsilon)
+        @test gens[1].epsilon ≈ 0.5
+        # 4 of 6 survive; weights renormalized over survivors, n_evaluations unchanged.
+        @test length(gens[1].weights) == 4
+        @test sum(gens[1].weights) ≈ 1.0
+        @test nrow(gens[1].particles) == 4
+        @test gens[1].n_evaluations == 6
+        @test gens[1].acceptance_rate ≈ 4/6
+    end
+
+    @testset "_updateMidGenAdditions! skips non-finite results" begin
+        bank = ModelManager.SimulationBank(Int[], Matrix{Float64}(undef, 0, 0), ["x"])
+        proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
+            (Dict("x" => 0.1), nothing), (Dict("x" => 0.2), nothing),
+            (Dict("x" => 0.3), 99)]
+        # Monad 21 was rejected (Inf) — its monad has been deleted, so banking the ID would
+        # hand back an unloadable known_mid in a later generation. Monad 99 was a reuse
+        # (proposal_mid non-nothing), which is skipped as before.
+        results = [(1.0, 20), (Inf, 21), (2.0, 99)]
+        additions = Tuple{Vector{Float64},Int}[]
+        ModelManager._updateMidGenAdditions!(additions, proposals, results, bank, ["x"])
+        @test [mid for (_, mid) in additions] == [20]
+    end
+
+    @testset "_validateEvaluationFailurePolicy" begin
+        @test ModelManager._validateEvaluationFailurePolicy(:reject) === nothing
+        @test ModelManager._validateEvaluationFailurePolicy(:error)  === nothing
+        @test_throws ArgumentError ModelManager._validateEvaluationFailurePolicy(:ignore)
     end
 
     ################## accept_overflow ##################
@@ -2542,6 +2635,151 @@ _gsa_fB(mid) = 0.0
                 @test_throws ArgumentError runCalibration(prob,
                     ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
                     progress=:verbose)
+            end
+
+            # ---------- failed particle evaluation ----------
+            #
+            # Reproduces the reported bug: when every simulation in a proposed monad fails,
+            # the runner deletes the emptied monad, and the user's summary_statistic then
+            # either throws (_test_monad_ss) or returns missing, which throws inside
+            # `distance` (_test_missing_ss). `_fail_sim_predicate` forces the failures.
+            @testset "on_evaluation_failure=:reject" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(10.0, 12.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_monad_ss, mseDistance)
+                method = ABCSMC(population_size=6, max_nr_populations=2,
+                                minimum_epsilon=0.0)
+
+                # Fail the first two simulations dispatched; with n_replicates=1 that empties
+                # (and so deletes) exactly two monads. The runner's workers are async tasks,
+                # not threads, so this counter needs no lock.
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) <= 2
+                result = try
+                    runCalibration(prob, method; description="reject failures")
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                # The run survives: healthy particles give x=1 → distance 0 → gen-1 ε=0.
+                @test result isa ABCResult
+                @test length(result.generations) >= 1
+                @test all(isfinite, result.generations[1].distances)
+                # Two of six proposals were rejected, so four particles remain.
+                @test nrow(result.generations[1].particles) == 4
+                @test result.generations[1].n_evaluations == 6
+                @test isfinite(result.generations[1].epsilon)
+
+                # A monad was genuinely deleted (that is what made the evaluation fail).
+                monad_ids = ModelManager.calibrationMonadIDs(result.calibration)
+                @test any(!ModelManager._monadExists, monad_ids)
+            end
+
+            @testset "on_evaluation_failure=:reject — missing summary statistic" begin
+                # Same failure, but surfacing inside `distance` rather than in the summary
+                # statistic: mseDistance(missing, observed) raises a MethodError.
+                dv       = DistributedVariation(:config, xp_x, Uniform(13.0, 15.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_missing_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1,
+                                minimum_epsilon=0.0)
+
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
+                result = try
+                    runCalibration(prob, method; description="reject missing stat")
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                @test result isa ABCResult
+                @test nrow(result.generations[1].particles) == 3
+                @test all(isfinite, result.generations[1].distances)
+            end
+
+            @testset "on_evaluation_failure=:error" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(16.0, 18.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_monad_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1,
+                                minimum_epsilon=0.0)
+
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
+                try
+                    # The original exception surfaces rather than being turned into Inf.
+                    @test_throws ErrorException runCalibration(prob, method;
+                        description="error on failure", on_evaluation_failure=:error)
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                # An unrecognized policy is rejected before any work begins.
+                @test_throws ArgumentError runCalibration(prob,
+                    ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
+                    on_evaluation_failure=:ignore)
+            end
+
+            @testset "every generation-1 particle failing is fatal" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(19.0, 21.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_monad_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1,
+                                minimum_epsilon=0.0)
+
+                _fail_sim_predicate[] = spec -> true
+                try
+                    # Nothing survives generation 1 → error instead of a degenerate ε=Inf run.
+                    @test_throws ErrorException runCalibration(prob, method;
+                        description="all particles fail")
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+            end
+
+            @testset "failure-reporting helpers" begin
+                err = ErrorException("boom")
+
+                # Deleted monad: diagnosis names the failed simulations' output folders.
+                @test_logs (:warn, r"all 2 of its simulations failed") match_mode=:any begin
+                    ModelManager._warnParticleRejected(:generation, 3, 1, 77, [4, 5], true, err)
+                end
+                # Intact monad: diagnosis points at the user's own functions instead.
+                @test_logs (:warn, r"still in the database") match_mode=:any begin
+                    ModelManager._warnParticleRejected(:generation, 3, 1, 77, [4], false, err)
+                end
+                # The throttle note appears exactly at the cap.
+                @test_logs (:warn, r"Further rejection warnings") match_mode=:any begin
+                    ModelManager._warnParticleRejected(:generation, 3,
+                        ModelManager._MAX_REJECTION_WARNINGS, 77, [4], true, err)
+                end
+
+                # Past the cap, and at progress=:none, nothing is emitted.
+                logs, _ = Test.collect_test_logs() do
+                    ModelManager._warnParticleRejected(:generation, 3,
+                        ModelManager._MAX_REJECTION_WARNINGS + 1, 77, [4], true, err)
+                    ModelManager._warnParticleRejected(:none, 3, 1, 77, [4], true, err)
+                    ModelManager._logGenerationRejections(:generation, 3, 0)  # zero → silent
+                    ModelManager._logGenerationRejections(:none, 3, 5)
+                    ModelManager._warnBatchSimulationFailures(:generation, 3, 1, 4, 4)  # none failed
+                    ModelManager._warnBatchSimulationFailures(:none, 3, 1, 1, 4)
+                end
+                @test isempty(logs)
+
+                @test_logs (:warn, r"2 particles rejected") match_mode=:any begin
+                    ModelManager._logGenerationRejections(:generation, 3, 2)
+                end
+                @test_logs (:warn, r"only 1 of 4 scheduled") match_mode=:any begin
+                    ModelManager._warnBatchSimulationFailures(:generation, 3, 1, 1, 4)
+                end
             end
 
             @testset "resumeABC" begin

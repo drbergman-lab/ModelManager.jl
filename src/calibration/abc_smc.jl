@@ -496,10 +496,10 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
         proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
         M         = length(proposals)
         results   = evaluate_batch(1, proposals)
-        accepted  = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:M]
-        weights   = fill(1.0 / M, M)
+        accepted  = _acceptFirstGeneration(proposals, results)
+        weights   = fill(1.0 / length(accepted), length(accepted))
         _updateBudget!(budget, budget_hit, M, method.max_evaluations)
-        return _buildGenerationResult(1, accepted, weights, M, M, param_names)
+        return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names)
     end
 
     # ── CDF-grid snapping: snap each Sobol point, accumulate N proposals. ───────
@@ -517,11 +517,49 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
     proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
     M        = length(proposals)
     results  = evaluate_batch(1, proposals)
-    accepted = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:M]
+    accepted = _acceptFirstGeneration(proposals, results)
     _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
     _updateBudget!(budget, budget_hit, M, method.max_evaluations)
-    weights = fill(1.0 / M, M)
-    return _buildGenerationResult(1, accepted, weights, M, M, param_names)
+    weights = fill(1.0 / length(accepted), length(accepted))
+    return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names)
+end
+
+"""
+    _acceptFirstGeneration(proposals, results) → Vector{_ParticleResult}
+
+Build generation 1's accepted set. Generation 1 has no epsilon threshold and accepts every
+proposal — *except* those whose distance is not finite, which are dropped here.
+
+A non-finite distance means the particle was rejected because its evaluation failed (see
+[`_buildEvaluateBatch`](@ref)). Keeping one would set `epsilon = maximum(distances) = Inf`
+for the generation, after which every subsequent proposal passes `distance <= epsilon` and
+the run silently degenerates. Errors when no particle survives — a whole generation of
+failed evaluations is a broken model or summary statistic, not sampling noise.
+"""
+function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}},
+                                 results::Vector{<:Tuple})
+    accepted = _ParticleResult[_ParticleResult(proposals[i][1], results[i][1], results[i][2])
+                               for i in eachindex(proposals) if isfinite(results[i][1])]
+    if isempty(proposals)
+        error("ABC-SMC generation 1: received an empty batch of proposals, so no particles " *
+              "could be accepted.")
+    end
+    if isempty(accepted)
+        error("""
+        ABC-SMC generation 1: all $(length(proposals)) proposals had a non-finite distance, \
+        so no particles could be accepted.
+        Every particle evaluation either failed (all simulations in the monad failed, or \
+        `summary_statistic`/`distance` raised) or returned a non-finite distance. Re-run with \
+        `on_evaluation_failure=:error` for the underlying exception, and check the failed \
+        simulations' output folders.
+        """)
+    end
+    n_dropped = length(proposals) - length(accepted)
+    n_dropped > 0 && @warn "ABC-SMC generation 1: dropped $n_dropped of " *
+                           "$(length(proposals)) proposals with non-finite distances; " *
+                           "ε and the particle weights are set from the $(length(accepted)) " *
+                           "surviving particles."
+    return accepted
 end
 
 """
@@ -840,6 +878,11 @@ monad ID was `nothing` (a fresh grid snap), the resolved monad ID from `results`
 recorded alongside the proposal's CDF coordinates. Monads already in the bank or
 already tracked in `mid_gen_additions` are skipped to maintain the invariant that
 entries are unique and not in the bank.
+
+Proposals with a non-finite distance are also skipped: those are rejections from a failed
+evaluation (see [`_buildEvaluateBatch`](@ref)), and a monad whose every simulation failed has
+been deleted from the database. Banking its ID would hand it back as a `known_mid` reuse in a
+later generation, where reconstructing it fails.
 """
 function _updateMidGenAdditions!(mid_gen_additions::Vector{Tuple{Vector{Float64},Int}},
                                   proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}},
@@ -847,8 +890,9 @@ function _updateMidGenAdditions!(mid_gen_additions::Vector{Tuple{Vector{Float64}
                                   bank::SimulationBank,
                                   param_names::Vector{String})
     tracked = Set(mid for (_, mid) in mid_gen_additions)
-    for ((eff_cdfs, proposal_mid), (_, result_mid)) in zip(proposals, results)
-        if isnothing(proposal_mid) && result_mid ∉ bank.monad_ids && result_mid ∉ tracked
+    for ((eff_cdfs, proposal_mid), (distance, result_mid)) in zip(proposals, results)
+        if isnothing(proposal_mid) && isfinite(distance) &&
+           result_mid ∉ bank.monad_ids && result_mid ∉ tracked
             push!(mid_gen_additions, ([eff_cdfs[name] for name in param_names], result_mid))
             push!(tracked, result_mid)
         end
