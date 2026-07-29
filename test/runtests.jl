@@ -1031,46 +1031,54 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test gens[2].acceptance_rate ≈ 1.0
     end
 
-    ################## non-finite distances (failed evaluations) ##################
+    ################## missing distances (monads with no successful sim) ##################
 
-    @testset "_acceptFirstGeneration drops non-finite distances" begin
+    @testset "_acceptFirstGeneration drops missing distances" begin
         proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
             (Dict("x" => 0.1), nothing), (Dict("x" => 0.2), nothing),
             (Dict("x" => 0.3), nothing), (Dict("x" => 0.4), nothing)]
 
-        # Two rejections (Inf) among four proposals: only the finite ones are accepted,
+        # Two failed monads among four proposals: only those with a distance are accepted,
         # in order, carrying their monad IDs through as metadata.
-        results = [(1.0, 11), (Inf, 12), (2.0, 13), (Inf, 14)]
+        results = Tuple{Union{Float64,Missing},Int}[
+            (1.0, 11), (missing, 12), (2.0, 13), (missing, 14)]
         accepted = ModelManager._acceptFirstGeneration(proposals, results)
         @test length(accepted) == 2
         @test [p.distance for p in accepted] == [1.0, 2.0]
         @test [p.metadata for p in accepted] == [11, 13]
         @test [p.latent_cdfs["x"] for p in accepted] == [0.1, 0.3]
 
-        # NaN counts as non-finite too.
-        @test length(ModelManager._acceptFirstGeneration(proposals,
-                        [(1.0, 11), (NaN, 12), (Inf, 13), (3.0, 14)])) == 2
+        # `Inf` is a distance, not a failure signal, so it is accepted rather than dropped —
+        # but ε = maximum(distances) would then be infinite and accept every later proposal
+        # regardless of fit, so the run stops with that explained rather than silently
+        # degenerating. Same for NaN.
+        @test_throws "not finite" ModelManager._acceptFirstGeneration(proposals,
+                        Tuple{Union{Float64,Missing},Int}[
+                            (1.0, 11), (Inf, 12), (2.0, 13), (3.0, 14)])
+        @test_throws "not finite" ModelManager._acceptFirstGeneration(proposals,
+                        Tuple{Union{Float64,Missing},Int}[
+                            (1.0, 11), (NaN, 12), (2.0, 13), (3.0, 14)])
 
-        # Nothing survives → error rather than an all-rejected generation.
-        @test_throws ErrorException ModelManager._acceptFirstGeneration(proposals,
-                        [(Inf, 11), (Inf, 12), (Inf, 13), (Inf, 14)])
+        # No monad succeeded → error rather than an all-rejected generation.
+        @test_throws "had a successful simulation" ModelManager._acceptFirstGeneration(proposals,
+                        Tuple{Union{Float64,Missing},Int}[
+                            (missing, 11), (missing, 12), (missing, 13), (missing, 14)])
 
-        # An empty batch is reported as such, not as "all 0 proposals were non-finite".
+        # An empty batch is reported as such, not as "none of the 0 monads succeeded".
         empty_proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[]
-        @test_throws ErrorException ModelManager._acceptFirstGeneration(empty_proposals,
-                        Tuple{Float64,Int}[])
+        @test_throws "empty batch" ModelManager._acceptFirstGeneration(empty_proposals,
+                        Tuple{Union{Float64,Missing},Int}[])
     end
 
-    @testset "generation 1 epsilon and weights ignore rejections" begin
-        # Without filtering, one Inf would make gen-1 epsilon = Inf, after which every
-        # gen-2 proposal passes `distance <= epsilon`.
+    @testset "generation 1 epsilon and weights ignore failed monads" begin
+        # Without filtering, one missing would corrupt gen-1 epsilon = maximum(distances).
         Random.seed!(11)
         n_seen = Ref(0)
-        # Reject the 2nd and 4th proposal of generation 1; everything else scores 0.5.
+        # Fail the 2nd and 4th monad of generation 1; everything else scores 0.5.
         evaluate_flaky = function (t, proposals)
             map(proposals) do _
                 n_seen[] += 1
-                (t == 1 && n_seen[] in (2, 4)) ? (Inf, 0) : (0.5, 0)
+                (t == 1 && n_seen[] in (2, 4)) ? (missing, 0) : (0.5, 0)
             end
         end
         method = ABCSMC(population_size=6, max_nr_populations=2, minimum_epsilon=0.0)
@@ -1085,6 +1093,29 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test nrow(gens[1].particles) == 4
         @test gens[1].n_evaluations == 6
         @test gens[1].acceptance_rate ≈ 4/6
+    end
+
+    @testset "later generations reject missing distances without comparing to epsilon" begin
+        # `missing <= epsilon` is `missing`, not `false`, so an unguarded comparison would
+        # throw when used as a condition. Every 3rd monad in generation 2 fails.
+        Random.seed!(13)
+        n_seen = Ref(0)
+        evaluate_flaky = function (t, proposals)
+            map(proposals) do _
+                n_seen[] += 1
+                (t > 1 && n_seen[] % 3 == 0) ? (missing, 0) : (0.25, 0)
+            end
+        end
+        method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                        evaluate_flaky, g -> nothing)
+        @test length(gens) == 2
+        # Failed monads are never accepted, so the target population is still filled from the
+        # rest, and more proposals were needed than were accepted.
+        @test nrow(gens[2].particles) == 4
+        @test all(isfinite, gens[2].distances)
+        @test gens[2].n_evaluations > 4
+        @test gens[2].acceptance_rate < 1.0
     end
 
     @testset "_validateEvaluationFailurePolicy" begin
@@ -2743,8 +2774,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 _fail_sim_predicate[] = spec -> true
                 try
-                    # Nothing survives generation 1 → error instead of a degenerate ε=Inf run.
-                    @test_throws "non-finite distance" runCalibration(prob, method;
+                    # Nothing survives generation 1 → error instead of an empty population.
+                    @test_throws "had a successful simulation" runCalibration(prob, method;
                         description="all particles fail")
                 finally
                     _fail_sim_predicate[] = nothing
@@ -2835,19 +2866,20 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     "WHERE simulation_id=$unrun_sid;")
                 @test unrun.id in ModelManager._monadsWithStartedSimulations([unrun.id])
 
-                # Same rule gates bank additions mid-run, keyed on the monad's own state
-                # rather than on the particle's distance — so an infinite distance from a
-                # user's `distance` function does not bar a good monad from reuse.
+                # Same rule gates bank additions mid-run, keyed on the monad's own state rather
+                # than on the particle's distance — so an unusual but legitimate distance from
+                # a user's `distance` function does not bar a good monad from reuse.
                 bank = ModelManager.SimulationBank(Int[], Matrix{Float64}(undef, 1, 0), ["x"])
                 ModelManager.DBInterface.execute(ModelManager.centralDB(),
                     "UPDATE simulations SET " *
                     "status_code_id=$(ModelManager.statusCodeID("Not Started")) " *
                     "WHERE simulation_id=$unrun_sid;")
                 proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
-                    (Dict("x" => 0.1), nothing),   # ran → added despite Inf distance
+                    (Dict("x" => 0.1), nothing),   # ran → added despite its Inf distance
                     (Dict("x" => 0.2), nothing),   # never started → skipped
                     (Dict("x" => 0.3), 99)]        # a reuse (proposal_mid given) → skipped
-                results   = [(Inf, ran.id), (1.0, unrun.id), (2.0, 99)]
+                results   = Tuple{Union{Float64,Missing},Int}[
+                    (Inf, ran.id), (1.0, unrun.id), (2.0, 99)]
                 additions = Tuple{Vector{Float64},Int}[]
                 ModelManager._updateMidGenAdditions!(additions, proposals, results, bank, ["x"])
                 @test [mid for (_, mid) in additions] == [ran.id]

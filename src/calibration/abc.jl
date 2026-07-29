@@ -93,7 +93,9 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
    a live per-simulation progress bar is rendered via the runner's `on_progress` hook.
 5. Classifies the outcome (see [`_batchOutcome`](@ref)) and records any failed simulation and
    monad IDs to the generation's failure files (see [`_recordBatchFailures`](@ref)).
-6. Returns a `Vector{Tuple{Float64,Int}}` (distance, monad_id) in proposal order.
+6. Returns a `Vector{Tuple{Union{Float64,Missing},Int}}` (distance, monad_id) in proposal order.
+   A `missing` distance means the monad had no successful simulation, so no distance exists —
+   distinct from any value the user's `distance` function could return.
 
 `verbosity` is a resolved level (see [`_resolveVerbosity`](@ref)); a per-generation batch
 counter is maintained across calls so batch milestones can be numbered within each generation.
@@ -103,8 +105,9 @@ A monad whose simulations all fail has no output for `summary_statistic` to read
 runner has by then deleted the emptied monad, so even `Monad(monad_id)` throws. Such monads are
 detected from the database *before* any user code runs, and `on_evaluation_failure` decides:
 
-- `:reject` (default) — the particle's distance is `Inf`, so ABC-SMC rejects it and the run
-  continues.
+- `:reject` (default) — the particle's distance is `missing`, which ABC-SMC treats as "never
+  accept", and the run continues. `missing` rather than a sentinel like `Inf` so that a failed
+  monad is unambiguous: `Inf` is a value a user's `distance` may legitimately return.
 - `:error` — the run stops with a message pointing at the generation's failure files.
 
 Partially failed monads (at least one success) are evaluated normally from whatever succeeded;
@@ -152,18 +155,18 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         failed_set = Set(failed_simulations)
         no_success = Set(without_success)
 
-        return map(monads) do monad
+        return Tuple{Union{Float64,Missing},Int}[
             if monad.id in no_success
                 on_evaluation_failure === :error &&
                     _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad.id,
                                                   sim_ids_before[monad.id])
-                (Inf, monad.id)
+                (missing, monad.id)
             else
                 (_evaluateParticle(problem, monad.id,
                                    count(in(failed_set), sim_ids_before[monad.id])),
                  monad.id)
             end
-        end
+            for monad in monads]
     end
     return evaluate_batch
 end
@@ -234,8 +237,7 @@ function _throwNoSuccessfulSimulations(calibration::Calibration, t::Int, max_nr_
     Failed simulation and monad IDs for generation $t are recorded in
       - $(_failedSimulationsPath(calibration, t, max_nr_populations))
       - $(_failedMonadsPath(calibration, t, max_nr_populations))$folders
-    Pass `on_evaluation_failure=:reject` to give such particles a distance of `Inf` and continue \
-    the run instead.
+    Pass `on_evaluation_failure=:reject` to reject such particles and continue the run instead.
     """)
 end
 
@@ -258,10 +260,10 @@ saved in two forms:
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise. See [`_resolveVerbosity`](@ref).
-- `on_evaluation_failure::Symbol=:reject`: what to do when a particle's `summary_statistic`
-  or `distance` raises — typically because every simulation in its monad failed. `:reject`
-  assigns the particle a distance of `Inf` (so ABC-SMC rejects it), warns, and continues;
-  `:error` rethrows. See [`_buildEvaluateBatch`](@ref).
+- `on_evaluation_failure::Symbol=:reject`: what to do when a proposed monad has no successful
+  simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
+  which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
+  simulation and monad IDs are recorded per generation. See [`_buildEvaluateBatch`](@ref).
 
 # Examples
 ```julia
@@ -329,9 +331,10 @@ The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`,
   `:batch`, `:bar`). `:auto` shows a live progress bar on an interactive terminal and
   per-generation milestones otherwise.
-- `on_evaluation_failure::Symbol=:reject`: `:reject` gives particles whose evaluation raises
-  a distance of `Inf` (rejecting them) and continues; `:error` rethrows. Evaluation raises
-  most often when every simulation in a proposed monad fails.
+- `on_evaluation_failure::Symbol=:reject`: what to do when a proposed monad has no successful
+  simulation. `:reject` records its distance as `missing` (so the particle is never accepted) and
+  continues; `:error` stops the run. Failed simulation and monad IDs are recorded per generation
+  either way. See [`_buildEvaluateBatch`](@ref).
 
 # Examples
 ```julia

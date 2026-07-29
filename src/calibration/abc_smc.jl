@@ -285,10 +285,17 @@ unbiased prior sample while still avoiding redundant simulation work.
 - `param_names::Vector{String}`: Parameter names (column order in results).
 - `priors::Vector{<:Distribution}`: Prior distributions, one per parameter.
 - `evaluate_batch::Function`: `(t::Int, proposals::Vector{Tuple{Dict{String,Float64},Union{Nothing,Int}}}) →
-  Vector{Tuple{Float64,Any}}`. Each proposal is `(latent_cdfs, known_mid)` where `known_mid`
-  is an `Int` for bank/mid-generation reuses and `nothing` for fresh grid snaps.
+  Vector{Tuple{Union{Float64,Missing},Any}}`. Each proposal is `(latent_cdfs, known_mid)` where
+  `known_mid` is an `Int` for bank/mid-generation reuses and `nothing` for fresh grid snaps.
   Returns `(distance, monad_id)` for each in the same order. Receiving `t` allows the
   caller to route provenance records to a per-generation file.
+
+  A `missing` distance means no distance could be computed for that particle — for the
+  ModelManager implementation, that its monad had no successful simulation (see
+  [`_buildEvaluateBatch`](@ref)). Such particles are never accepted: generation 1 drops them
+  before setting ε, and later generations reject them without comparing against ε. `missing`
+  rather than a sentinel value keeps the signal distinct from any distance a user's `distance`
+  function might legitimately return, `Inf` included.
 - `on_generation::Function`: `(gen::GenerationResult) → nothing`.
   Called after each completed generation (for persistence / logging).
 - `bank::SimulationBank`: Pre-built registry of existing monads in CDF space, built once
@@ -528,37 +535,47 @@ end
     _acceptFirstGeneration(proposals, results) → Vector{_ParticleResult}
 
 Build generation 1's accepted set. Generation 1 has no epsilon threshold and accepts every
-proposal — *except* those whose distance is not finite, which are dropped here.
+proposal — *except* those whose distance is `missing`, which are dropped here.
 
-A non-finite distance means the particle was rejected because its evaluation failed (see
-[`_buildEvaluateBatch`](@ref)). Keeping one would set `epsilon = maximum(distances) = Inf`
-for the generation, after which every subsequent proposal passes `distance <= epsilon` and
-the run silently degenerates. Errors when no particle survives — a whole generation of
-failed evaluations is a broken model or summary statistic, not sampling noise.
+`missing` means the particle has no distance at all: its monad had no successful simulation, so
+the summary statistic was never computed (see [`_buildEvaluateBatch`](@ref)). Such a particle
+cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` for the whole
+generation. Errors when no particle survives — a whole generation of failed monads is a broken
+model, not sampling noise.
+
+Also errors when the surviving particles give a non-finite `epsilon`. That is not a failure
+signal but a property of the user's `distance` function: with `ε = Inf` every later proposal
+passes `distance <= epsilon`, so the run would silently degenerate into accepting everything.
 """
-function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}},
-                                 results::Vector{<:Tuple})
-    accepted = _ParticleResult[_ParticleResult(proposals[i][1], results[i][1], results[i][2])
-                               for i in eachindex(proposals) if isfinite(results[i][1])]
+function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Union{Nothing,Int}}},
+                                results::Vector{<:Tuple})
     if isempty(proposals)
         error("ABC-SMC generation 1: received an empty batch of proposals, so no particles " *
               "could be accepted.")
     end
+    accepted = _ParticleResult[_ParticleResult(proposals[i][1], results[i][1], results[i][2])
+                               for i in eachindex(proposals) if !ismissing(results[i][1])]
     if isempty(accepted)
         error("""
-        ABC-SMC generation 1: all $(length(proposals)) proposals had a non-finite distance, \
-        so no particles could be accepted.
-        Every particle evaluation either failed (all simulations in the monad failed, or \
-        `summary_statistic`/`distance` raised) or returned a non-finite distance. Re-run with \
-        `on_evaluation_failure=:error` for the underlying exception, and check the failed \
-        simulations' output folders.
+        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads had a successful \
+        simulation, so no particles could be accepted.
+        Check the generation's failure files and the failed simulations' output folders, and \
+        re-run with `on_evaluation_failure=:error` to stop at the first failure.
         """)
     end
     n_dropped = length(proposals) - length(accepted)
     n_dropped > 0 && @warn "ABC-SMC generation 1: dropped $n_dropped of " *
-                           "$(length(proposals)) proposals with non-finite distances; " *
-                           "ε and the particle weights are set from the $(length(accepted)) " *
-                           "surviving particles."
+                           "$(length(proposals)) proposals whose monads had no successful " *
+                           "simulation; ε and the particle weights are set from the " *
+                           "$(length(accepted)) surviving particles."
+    if !isfinite(maximum(p.distance for p in accepted))
+        error("""
+        ABC-SMC generation 1: the largest accepted distance is not finite, so ε would be infinite \
+        and every later proposal would be accepted regardless of fit.
+        This comes from the `distance` function rather than from a failed simulation — have it \
+        return a finite value (capped, if need be) for every parameter set in the prior support.
+        """)
+    end
     return accepted
 end
 
@@ -643,7 +660,9 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
 
         n_accepted_this_round = 0
         for (i, (distance, metadata)) in enumerate(results)
-            if distance <= epsilon
+            #! A `missing` distance means the monad had no successful simulation, so there is
+            #! nothing to compare against ε — the particle is rejected outright.
+            if !ismissing(distance) && distance <= epsilon
                 n_accepted_this_round += 1
                 can_add = method.accept_overflow || length(accepted) < method.population_size
                 can_add && push!(accepted, _ParticleResult(proposals[i][1], distance, metadata))

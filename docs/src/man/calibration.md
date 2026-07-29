@@ -139,14 +139,21 @@ result = runABC(problem; on_evaluation_failure=:reject)   # default
 result = runABC(problem; on_evaluation_failure=:error)    # stop on the first one
 ```
 
-- `:reject` gives the particle a distance of `Inf`, so ABC-SMC rejects it and the run continues.
+- `:reject` records the particle's distance as `missing` — no distance exists — so ABC-SMC never
+  accepts it and the run continues. `missing` rather than a sentinel like `Inf`, which is a value
+  your own `distance` function is entitled to return.
 - `:error` stops the run, naming the monad, the two failure files, and the output folders of its
   failed simulations (those survive even though their monad does not).
 
 A later generation in which every particle fails keeps proposing until `max_evaluations` is
 reached, so one bad monad never ends a run. Generation 1 is the exception — it has no acceptance
-threshold, so if nothing there survives the run errors out rather than continuing with a
-degenerate `ε = Inf`.
+threshold, so if no monad there succeeds the run errors out rather than continuing with an empty
+population.
+
+One consequence of ε being the largest accepted distance: if your `distance` returns `Inf` or
+`NaN` for any generation-1 particle, ε itself would be non-finite and every later proposal would
+pass `distance <= ε` regardless of fit. Rather than degenerate silently, the run stops and says
+so — have `distance` return a finite value (capped, if need be) across the prior support.
 
 ### Your functions must produce a real distance
 

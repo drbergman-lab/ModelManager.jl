@@ -1164,19 +1164,32 @@ internals. `_evaluateParticle` logs the monad ID (plus the count of that monad's
 simulations when non-zero — the likeliest reason otherwise-correct code trips) and then
 `rethrow()`s, so the original backtrace survives; deliberately not wrapped in a new exception.
 
-**`Inf` as the rejection distance, not `nothing`/`missing`.** `evaluate_batch`'s contract is
-`Vector{Tuple{Float64,Int}}` and `_runSubsequentGeneration`'s `distance <= epsilon` rejects `Inf`
-for free. `nothing` would widen that tuple type and ripple through the accepted-particle path,
-the weights computation, and `GenerationResult`.
+**`missing` carries the failure, not a sentinel distance.** First two cuts used `Inf`, on the
+grounds that `evaluate_batch`'s `Vector{Tuple{Float64,Int}}` contract stayed intact and
+`distance <= epsilon` rejects `Inf` for free. Reworked on review (drbergman): `Inf` is a value a
+user's `distance` is entitled to return, so overloading it as a control signal makes "monad
+failed" and "terrible fit" indistinguishable — and it forced generation 1 to decide *acceptance*
+by finiteness. The contract is now `Vector{Tuple{Union{Float64,Missing},Int}}`. The ripple was
+smaller than feared: `_ParticleResult.distance` and `GenerationResult.distances` stay `Float64`
+because only accepted particles reach them. The one trap is that `missing <= epsilon` is
+`missing`, not `false`, which throws when used as a condition — `_runSubsequentGeneration` needs
+an explicit `!ismissing(distance) &&` guard, and there is a test that would catch its removal.
 
 **Generation 1 needed a real fix; later generations did not.** Gen 1 accepts everything and sets
-`epsilon = maximum(distances)`, so one `Inf` makes ε infinite and *every* subsequent proposal
-passes — a silent degeneration worse than the original crash. `_acceptFirstGeneration` filters
-non-finite distances, warns, renormalizes the uniform weights over survivors, and errors when
-none survive. `n_evaluations` still counts all proposals while `n_accepted` counts survivors, so
-the acceptance rate stays unbiased. No backstop for an all-failed batch in later generations
-(considered, rejected by drbergman): the adaptive batching loop keeps proposing under
-`max_evaluations`, and throwing would let one bad monad in a small batch kill a healthy run.
+`epsilon = maximum(distances)`. `_acceptFirstGeneration` drops `missing` particles, warns,
+renormalizes the uniform weights over survivors, and errors when no monad succeeded.
+`n_evaluations` still counts all proposals while `n_accepted` counts survivors, so the acceptance
+rate stays unbiased. No backstop for an all-failed batch in later generations (considered,
+rejected by drbergman): the adaptive batching loop keeps proposing under `max_evaluations`, and
+throwing would let one bad monad in a small batch kill a healthy run.
+
+**Non-finite ε is a separate failure from a failed monad.** Once `missing` handles failures, an
+`Inf`/`NaN` distance in gen 1 is purely the user's `distance` function — but since ε is the
+largest accepted distance, one of them makes ε infinite and every later proposal passes
+`distance <= ε`. Previously (and on `main`) that produced a silent garbage posterior.
+`_acceptFirstGeneration` now errors with that spelled out, which is strictly better than either
+silently accepting everything or quietly dropping the particle as if it had failed. Note the
+consequence: an `Inf` anywhere in gen 1 is fatal, because `Inf` is always the maximum.
 
 **One reusability rule for monad IDs, keyed on the monad's own state.** A deleted monad's ID was
 being absorbed into the `SimulationBank`, from where a later generation could hand it back as a
@@ -1225,4 +1238,4 @@ other testset touches.
 - `CLAUDE.md` — to-do: preserve failed-simulation artifacts for post-hoc inspection
 - `PRD.md`, `README.md`, `docs/src/man/calibration.md`
 
-Full suite 1107/1107.
+Full suite 1113/1113.
