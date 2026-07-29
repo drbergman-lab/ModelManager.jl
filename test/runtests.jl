@@ -1048,16 +1048,12 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test [p.metadata for p in accepted] == [11, 13]
         @test [p.latent_cdfs["x"] for p in accepted] == [0.1, 0.3]
 
-        # `Inf` is a distance, not a failure signal, so it is accepted rather than dropped —
-        # but ε = maximum(distances) would then be infinite and accept every later proposal
-        # regardless of fit, so the run stops with that explained rather than silently
-        # degenerating. Same for NaN.
-        @test_throws "not finite" ModelManager._acceptFirstGeneration(proposals,
+        # `Inf` is a distance like any other, not a failure signal: it is accepted, and ε for the
+        # generation is simply infinite. Generation 2 then accepts every proposal — a second
+        # uniform draw in CDF space — after which the usual quantile rule pulls ε back down.
+        @test length(ModelManager._acceptFirstGeneration(proposals,
                         Tuple{Union{Float64,Missing},Int}[
-                            (1.0, 11), (Inf, 12), (2.0, 13), (3.0, 14)])
-        @test_throws "not finite" ModelManager._acceptFirstGeneration(proposals,
-                        Tuple{Union{Float64,Missing},Int}[
-                            (1.0, 11), (NaN, 12), (2.0, 13), (3.0, 14)])
+                            (1.0, 11), (Inf, 12), (2.0, 13), (3.0, 14)])) == 4
 
         # No monad succeeded → error rather than an all-rejected generation.
         @test_throws "had a successful simulation" ModelManager._acceptFirstGeneration(proposals,
@@ -1495,49 +1491,6 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         end
     end
 
-    @testset "CDF-grid snapping integration: no duplicate snap keys per generation" begin
-        Random.seed!(42)
-        # k=3 gives grid {j/8 : j=1..7} in 1D — 7 unique points.
-        # population_size=5 < 7, so we expect 5 unique snap keys with no collisions.
-        method = ABCSMC(population_size=5, max_nr_populations=3,
-                        minimum_epsilon=0.0, cdf_grid_k=3)
-
-        # Mock get_monad_id: returns a consistent unique ID per unique snap value.
-        snap_id_map = Dict{Float64, Int}()
-        mid_counter = Ref(0)
-        get_monad_id_fn = function(params)
-            v = params["x"]
-            if !haskey(snap_id_map, v)
-                mid_counter[] += 1
-                snap_id_map[v] = mid_counter[]
-            end
-            return snap_id_map[v]
-        end
-        # evaluate_batch: for known-mid proposals reuse the mid; for new snaps assign a
-        # consistent ID via get_monad_id_fn so grid-alignment checks remain valid.
-        evaluate_batch = (t, proposals) -> [(rand(), isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
-                                             for (cdfs, mid) in proposals]
-
-        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
-                                        evaluate_batch, g -> nothing)
-
-        for g in gens
-            @test nrow(g.particles) == 5
-            # All particles' x values should be on the grid {j/2^k_eff : j=1..2^k_eff-1}
-            k_eff = ModelManager._effectiveK(3, g.t)
-            n     = 2^k_eff
-            for i in 1:nrow(g.particles)
-                u = g.particles[i, :x]
-                j = round(Int, u * n)
-                @test j ∈ 1:(n-1)
-                @test isapprox(u, j / n; atol=1e-10)
-            end
-            # Duplicate snap keys are now allowed (discrete-SMC design)
-            keys = [round(Int, g.particles[i, :x] * 2^k_eff) for i in 1:nrow(g.particles)]
-            @test length(unique(keys)) >= 1   # at least one distinct snap point
-        end
-    end
-
     @testset "CDF-grid snapping disabled when cdf_grid_k=nothing" begin
         # Without snapping, particles are NOT constrained to grid points.
         Random.seed!(42)
@@ -1621,43 +1574,6 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             open(toml_nil, "w") do io; TOML.print(io, d_nil); end
             loaded_nil = TOML.parsefile(toml_nil)
             @test !haskey(loaded_nil, "max_evaluations")
-        end
-    end
-
-    @testset "k_base_eff correction: coarse cdf_grid_k raised for population_size" begin
-        # k=1, d=1: (2^1-1)^1 = 1 interior point. For N=5 we need k_min=3
-        # since (2^3-1)^1=7≥5 but (2^2-1)^1=3<5... wait, 3>=5 is false; let us check:
-        # k=2: (2^2-1)^1=3<5 → not enough. k=3: (2^3-1)^1=7≥5 → ok. So k_min=3.
-        # With k=1 supplied, _runABCSMC should raise k_base_eff to 3.
-        # All snapped particles in gen-1 must lie on the k=3 grid.
-        Random.seed!(17)
-        snap_id_map = Dict{Float64, Int}()
-        id_counter  = Ref(0)
-        get_monad_id_fn = function(params)
-            v = params["x"]
-            if !haskey(snap_id_map, v)
-                id_counter[] += 1
-                snap_id_map[v] = id_counter[]
-            end
-            return snap_id_map[v]
-        end
-        evaluate_batch = (t, proposals) -> [(0.1, isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
-                                             for (cdfs, mid) in proposals]
-
-        method = ABCSMC(population_size=5, max_nr_populations=1,
-                        minimum_epsilon=0.0, cdf_grid_k=1)
-        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
-                                        evaluate_batch, g -> nothing)
-        @test length(gens) == 1
-        @test nrow(gens[1].particles) == 5
-        # k_base_eff should have been raised to 3; gen-1 k_eff = 3
-        k_eff_expected = 3
-        n = 2^k_eff_expected
-        for i in 1:nrow(gens[1].particles)
-            u = gens[1].particles[i, :x]
-            j = round(Int, u * n)
-            @test j ∈ 1:(n-1)
-            @test isapprox(u, j / n; atol=1e-10)
         end
     end
 
@@ -2670,7 +2586,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             # throws (_test_monad_ss) or returns missing, which throws inside `distance`
             # (_test_missing_ss). ModelManager now detects the empty monad before calling user
             # code at all. `_fail_sim_predicate` forces the failures.
-            @testset "on_evaluation_failure=:reject" begin
+            @testset "on_monad_failure=:reject" begin
                 dv       = DistributedVariation(:config, xp_x, Uniform(10.0, 12.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed,
@@ -2715,7 +2631,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 end
             end
 
-            @testset "on_evaluation_failure=:reject — user statistic never sees a dead monad" begin
+            @testset "on_monad_failure=:reject — user statistic never sees a dead monad" begin
                 # _test_missing_ss would return `missing` for a deleted monad, which used to
                 # blow up inside mseDistance. The dead monad is now rejected before user code.
                 dv       = DistributedVariation(:config, xp_x, Uniform(13.0, 15.0))
@@ -2739,7 +2655,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test all(isfinite, result.generations[1].distances)
             end
 
-            @testset "on_evaluation_failure=:error" begin
+            @testset "on_monad_failure=:error" begin
                 dv       = DistributedVariation(:config, xp_x, Uniform(16.0, 18.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed,
@@ -2752,7 +2668,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 try
                     # Fails fast instead of rejecting the particle, pointing at the failure files.
                     @test_throws "has no successful simulation" runCalibration(prob, method;
-                        description="error on failure", on_evaluation_failure=:error)
+                        description="error on failure", on_monad_failure=:error)
                 finally
                     _fail_sim_predicate[] = nothing
                 end
@@ -2761,7 +2677,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # An unrecognized policy is rejected before any work begins.
                 @test_throws ArgumentError runCalibration(prob,
                     ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
-                    on_evaluation_failure=:ignore)
+                    on_monad_failure=:ignore)
             end
 
             @testset "every generation-1 particle failing is fatal" begin
@@ -2895,6 +2811,92 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test unrun.id ∉ built.monad_ids
             end
 
+            # These two exercise the snapping/bank machinery through _runABCSMC with mock
+            # monad IDs. They live here, inside the initialized project, because the bank's
+            # reusability filter queries simulation statuses — with no database there is
+            # nothing to consult. Mock IDs that match a real monad are reusable; ones that do
+            # not are simply skipped. Either way the assertions below are about grid
+            # alignment and population size, which the filter does not affect.
+            @testset "CDF-grid snapping integration: no duplicate snap keys per generation" begin
+                Random.seed!(42)
+                # k=3 gives grid {j/8 : j=1..7} in 1D — 7 unique points.
+                # population_size=5 < 7, so we expect 5 unique snap keys with no collisions.
+                method = ABCSMC(population_size=5, max_nr_populations=3,
+                                minimum_epsilon=0.0, cdf_grid_k=3)
+
+                # Mock get_monad_id: returns a consistent unique ID per unique snap value.
+                snap_id_map = Dict{Float64, Int}()
+                mid_counter = Ref(0)
+                get_monad_id_fn = function(params)
+                    v = params["x"]
+                    if !haskey(snap_id_map, v)
+                        mid_counter[] += 1
+                        snap_id_map[v] = mid_counter[]
+                    end
+                    return snap_id_map[v]
+                end
+                # evaluate_batch: for known-mid proposals reuse the mid; for new snaps assign a
+                # consistent ID via get_monad_id_fn so grid-alignment checks remain valid.
+                evaluate_batch = (t, proposals) -> [(rand(), isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
+                                                     for (cdfs, mid) in proposals]
+
+                gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                                evaluate_batch, g -> nothing)
+
+                for g in gens
+                    @test nrow(g.particles) == 5
+                    # All particles' x values should be on the grid {j/2^k_eff : j=1..2^k_eff-1}
+                    k_eff = ModelManager._effectiveK(3, g.t)
+                    n     = 2^k_eff
+                    for i in 1:nrow(g.particles)
+                        u = g.particles[i, :x]
+                        j = round(Int, u * n)
+                        @test j ∈ 1:(n-1)
+                        @test isapprox(u, j / n; atol=1e-10)
+                    end
+                    # Duplicate snap keys are now allowed (discrete-SMC design)
+                    keys = [round(Int, g.particles[i, :x] * 2^k_eff) for i in 1:nrow(g.particles)]
+                    @test length(unique(keys)) >= 1   # at least one distinct snap point
+                end
+            end
+
+            @testset "k_base_eff correction: coarse cdf_grid_k raised for population_size" begin
+                # k=1, d=1: (2^1-1)^1 = 1 interior point. For N=5 we need k_min=3
+                # since (2^3-1)^1=7≥5 but (2^2-1)^1=3<5... wait, 3>=5 is false; let us check:
+                # k=2: (2^2-1)^1=3<5 → not enough. k=3: (2^3-1)^1=7≥5 → ok. So k_min=3.
+                # With k=1 supplied, _runABCSMC should raise k_base_eff to 3.
+                # All snapped particles in gen-1 must lie on the k=3 grid.
+                Random.seed!(17)
+                snap_id_map = Dict{Float64, Int}()
+                id_counter  = Ref(0)
+                get_monad_id_fn = function(params)
+                    v = params["x"]
+                    if !haskey(snap_id_map, v)
+                        id_counter[] += 1
+                        snap_id_map[v] = id_counter[]
+                    end
+                    return snap_id_map[v]
+                end
+                evaluate_batch = (t, proposals) -> [(0.1, isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
+                                                     for (cdfs, mid) in proposals]
+
+                method = ABCSMC(population_size=5, max_nr_populations=1,
+                                minimum_epsilon=0.0, cdf_grid_k=1)
+                gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                                evaluate_batch, g -> nothing)
+                @test length(gens) == 1
+                @test nrow(gens[1].particles) == 5
+                # k_base_eff should have been raised to 3; gen-1 k_eff = 3
+                k_eff_expected = 3
+                n = 2^k_eff_expected
+                for i in 1:nrow(gens[1].particles)
+                    u = gens[1].particles[i, :x]
+                    j = round(Int, u * n)
+                    @test j ∈ 1:(n-1)
+                    @test isapprox(u, j / n; atol=1e-10)
+                end
+            end
+
             @testset "_batchOutcome classifies a batch" begin
                 # Build a monad with two simulations, run it, then mark them by hand: the
                 # classification reads status codes, so it needs no real failures here.
@@ -2928,9 +2930,10 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test failed_sims == sort(sids)
                 @test no_success == [m.id]
 
-                # A monad whose simulations are unknown to the database has no successes.
-                _, _, no_success = ModelManager._batchOutcome(Dict(-1 => [999999]))
-                @test no_success == [-1]
+                # A constituent simulation with no database row means the records and the DB
+                # disagree — that is a bug to surface, not a status to guess at.
+                @test_throws "no row in the `simulations` table" ModelManager._batchOutcome(
+                    Dict(-1 => [999999]))
                 @test isempty(ModelManager._simulationStatusIDs(Int[]))
 
                 # Restore the statuses so later testsets see a healthy project.

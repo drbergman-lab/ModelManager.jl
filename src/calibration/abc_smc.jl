@@ -543,9 +543,9 @@ cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` 
 generation. Errors when no particle survives — a whole generation of failed monads is a broken
 model, not sampling noise.
 
-Also errors when the surviving particles give a non-finite `epsilon`. That is not a failure
-signal but a property of the user's `distance` function: with `ε = Inf` every later proposal
-passes `distance <= epsilon`, so the run would silently degenerate into accepting everything.
+The generation therefore holds **fewer than `population_size` particles** when any monad failed;
+the uniform weights are renormalized over the survivors. Generation 1 proposes exactly
+`population_size` particles and does not top up to replace failures.
 """
 function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Union{Nothing,Int}}},
                                 results::Vector{<:Tuple})
@@ -560,7 +560,7 @@ function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Uni
         ABC-SMC generation 1: none of the $(length(proposals)) proposed monads had a successful \
         simulation, so no particles could be accepted.
         Check the generation's failure files and the failed simulations' output folders, and \
-        re-run with `on_evaluation_failure=:error` to stop at the first failure.
+        re-run with `on_monad_failure=:error` to stop at the first failure.
         """)
     end
     n_dropped = length(proposals) - length(accepted)
@@ -568,14 +568,6 @@ function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Uni
                            "$(length(proposals)) proposals whose monads had no successful " *
                            "simulation; ε and the particle weights are set from the " *
                            "$(length(accepted)) surviving particles."
-    if !isfinite(maximum(p.distance for p in accepted))
-        error("""
-        ABC-SMC generation 1: the largest accepted distance is not finite, so ε would be infinite \
-        and every later proposal would be accepted regardless of fit.
-        This comes from the `distance` function rather than from a failed simulation — have it \
-        return a finite value (capped, if need be) for every parameter set in the prior support.
-        """)
-    end
     return accepted
 end
 

@@ -52,22 +52,39 @@ Returns three sorted ID vectors: every simulation now marked `Failed`, every mon
 least one such simulation, and every monad with **no** `Completed` simulation. The last is what
 matters for evaluation: a monad with no successful simulation has no output for
 `summary_statistic` to read, so it is rejected (or fatal) rather than handed to user code.
+
+Every snapshotted simulation must have a row in the `simulations` table — they were listed by a
+monad's constituent record moments earlier, and the runner only ever *updates* their status.
+A missing row means the constituent records and the database disagree, so this errors rather than
+guessing a status: silently treating an absent simulation as "not completed" would reject a
+healthy particle, and as "not failed" would hide a real failure.
 """
 function _batchOutcome(sim_ids_by_monad::AbstractDict{Int,<:AbstractVector{<:Integer}})
-    all_sim_ids = reduce(vcat, values(sim_ids_by_monad); init=Int[])
+    all_sim_ids  = reduce(vcat, values(sim_ids_by_monad); init=Int[])
     statuses     = _simulationStatusIDs(all_sim_ids)
     completed_id = statusCodeID("Completed")
     failed_id    = statusCodeID("Failed")
+
+    unknown = setdiff(all_sim_ids, keys(statuses))
+    isempty(unknown) || error("""
+    Calibration cannot classify this batch: simulation(s) $(_compressedIDStr(sort(unknown))) are \
+    listed as constituents of monad(s) \
+    $(_compressedIDStr(sort([mid for (mid, sids) in sim_ids_by_monad
+                             if any(in(unknown), sids)]))) but have no row in the `simulations` \
+    table.
+    The constituent records and the database disagree; run \
+    `ModelManager.databaseDiagnostics()` (or inspect the monads' constituent CSVs) before \
+    continuing.
+    """)
 
     failed_simulations = Int[]
     failed_monads      = Int[]
     without_success    = Int[]
     for (monad_id, sim_ids) in sim_ids_by_monad
-        failed = [sid for sid in sim_ids if get(statuses, sid, -1) == failed_id]
+        failed = [sid for sid in sim_ids if statuses[sid] == failed_id]
         append!(failed_simulations, failed)
         isempty(failed) || push!(failed_monads, monad_id)
-        any(sid -> get(statuses, sid, -1) == completed_id, sim_ids) ||
-            push!(without_success, monad_id)
+        any(sid -> statuses[sid] == completed_id, sim_ids) || push!(without_success, monad_id)
     end
     return sort!(failed_simulations), sort!(failed_monads), sort!(without_success)
 end
@@ -103,7 +120,7 @@ counter is maintained across calls so batch milestones can be numbered within ea
 # Monads with no successful simulation
 A monad whose simulations all fail has no output for `summary_statistic` to read — and the
 runner has by then deleted the emptied monad, so even `Monad(monad_id)` throws. Such monads are
-detected from the database *before* any user code runs, and `on_evaluation_failure` decides:
+detected from the database *before* any user code runs, and `on_monad_failure` decides:
 
 - `:reject` (default) — the particle's distance is `missing`, which ABC-SMC treats as "never
   accept", and the run continues. `missing` rather than a sentinel like `Inf` so that a failed
@@ -117,8 +134,8 @@ deliberately not attempted.
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
                               max_nr_populations::Int, run_kwargs::NamedTuple=(;);
                               verbosity::Symbol=:generation,
-                              on_evaluation_failure::Symbol=:reject)
-    _validateEvaluationFailurePolicy(on_evaluation_failure)
+                              on_monad_failure::Symbol=:reject)
+    _validateEvaluationFailurePolicy(on_monad_failure)
     batch_counts       = Dict{Int,Int}()
     warned_generations = Set{Int}()
 
@@ -157,7 +174,7 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
 
         return Tuple{Union{Float64,Missing},Int}[
             if monad.id in no_success
-                on_evaluation_failure === :error &&
+                on_monad_failure === :error &&
                     _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad.id,
                                                   sim_ids_before[monad.id])
                 (missing, monad.id)
@@ -215,7 +232,7 @@ begins so a typo fails immediately rather than on the first failed particle.
 """
 function _validateEvaluationFailurePolicy(policy::Symbol)
     policy in (:reject, :error) || throw(ArgumentError(
-        "Unknown on_evaluation_failure setting :$policy. Expected :reject or :error."))
+        "Unknown on_monad_failure setting :$policy. Expected :reject or :error."))
     return nothing
 end
 
@@ -223,7 +240,7 @@ end
     _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad_id, sim_ids)
 
 Stop the run because monad `monad_id` has no successful simulation, under
-`on_evaluation_failure=:error`. Points at the generation's failure files and at the simulations'
+`on_monad_failure=:error`. Points at the generation's failure files and at the simulations'
 own output folders, which survive even when their monad does not.
 """
 function _throwNoSuccessfulSimulations(calibration::Calibration, t::Int, max_nr_populations::Int,
@@ -237,7 +254,7 @@ function _throwNoSuccessfulSimulations(calibration::Calibration, t::Int, max_nr_
     Failed simulation and monad IDs for generation $t are recorded in
       - $(_failedSimulationsPath(calibration, t, max_nr_populations))
       - $(_failedMonadsPath(calibration, t, max_nr_populations))$folders
-    Pass `on_evaluation_failure=:reject` to reject such particles and continue the run instead.
+    Pass `on_monad_failure=:reject` to reject such particles and continue the run instead.
     """)
 end
 
@@ -260,7 +277,7 @@ saved in two forms:
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise. See [`_resolveVerbosity`](@ref).
-- `on_evaluation_failure::Symbol=:reject`: what to do when a proposed monad has no successful
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
   simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
   which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
   simulation and monad IDs are recorded per generation. See [`_buildEvaluateBatch`](@ref).
@@ -275,9 +292,9 @@ df, weights = posterior(result)
 function runCalibration(problem::CalibrationProblem, method::ABCSMC;
                         description::String="", run_kwargs::NamedTuple=(;),
                         progress::Symbol=:auto,
-                        on_evaluation_failure::Symbol=:reject)
+                        on_monad_failure::Symbol=:reject)
     verbosity = _resolveVerbosity(progress)
-    _validateEvaluationFailurePolicy(on_evaluation_failure)
+    _validateEvaluationFailurePolicy(on_monad_failure)
     calibration = createCalibration("ABC-SMC"; description=description)
     _saveMethod(calibration, method)
     _saveProblem(calibration, problem)
@@ -290,7 +307,7 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
     bank           = _buildSimulationBank(problem)
     evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations,
                                          run_kwargs; verbosity=verbosity,
-                                         on_evaluation_failure=on_evaluation_failure)
+                                         on_monad_failure=on_monad_failure)
     on_generation  = gen -> _saveGeneration(calibration, gen, method.max_nr_populations, cps)
 
     generations = _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
@@ -331,7 +348,7 @@ The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`,
   `:batch`, `:bar`). `:auto` shows a live progress bar on an interactive terminal and
   per-generation milestones otherwise.
-- `on_evaluation_failure::Symbol=:reject`: what to do when a proposed monad has no successful
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
   simulation. `:reject` records its distance as `missing` (so the particle is never accepted) and
   continues; `:error` stops the run. Failed simulation and monad IDs are recorded per generation
   either way. See [`_buildEvaluateBatch`](@ref).
@@ -360,7 +377,7 @@ function runABC(problem::CalibrationProblem;
                 run_kwargs::NamedTuple=(;),
                 description::String="",
                 progress::Symbol=:auto,
-                on_evaluation_failure::Symbol=:reject)
+                on_monad_failure::Symbol=:reject)
     method = ABCSMC(; population_size=population_size,
                       max_nr_populations=max_nr_populations,
                       minimum_epsilon=minimum_epsilon,
@@ -375,7 +392,7 @@ function runABC(problem::CalibrationProblem;
                       max_evaluations=max_evaluations)
     return runCalibration(problem, method; description=description, run_kwargs=run_kwargs,
                           progress=progress,
-                          on_evaluation_failure=on_evaluation_failure)
+                          on_monad_failure=on_monad_failure)
 end
 
 ################## Method Persistence ##################
@@ -984,7 +1001,7 @@ new definition is used silently. Passing `problem=` in this case forces full val
 - `run_kwargs`: Forwarded to each `run(sampling; ...)` call.
 - `progress`: Console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`, `:bar`);
   same semantics as in [`runABC`](@ref).
-- `on_evaluation_failure`: `:reject` (default) or `:error`; same semantics as in
+- `on_monad_failure`: `:reject` (default) or `:error`; same semantics as in
   [`runABC`](@ref).
 
 # Examples
@@ -1004,9 +1021,9 @@ function resumeABC(calibration::Calibration;
                    method::Union{Nothing,ABCSMC}=nothing,
                    run_kwargs::NamedTuple=(;),
                    progress::Symbol=:auto,
-                   on_evaluation_failure::Symbol=:reject)
+                   on_monad_failure::Symbol=:reject)
     verbosity = _resolveVerbosity(progress)
-    _validateEvaluationFailurePolicy(on_evaluation_failure)
+    _validateEvaluationFailurePolicy(on_monad_failure)
     manifest = _loadProblem(calibration)
     active_problem = _resolveResumeProblem(manifest, problem, calibration)
 
@@ -1030,7 +1047,7 @@ function resumeABC(calibration::Calibration;
     bank           = _buildSimulationBank(active_problem)
     evaluate_batch = _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations,
                                          run_kwargs; verbosity=verbosity,
-                                         on_evaluation_failure=on_evaluation_failure)
+                                         on_monad_failure=on_monad_failure)
     on_generation  = gen -> _saveGeneration(calibration, gen, m.max_nr_populations, cps)
 
     generations = _runABCSMC(m, param_names, priors, evaluate_batch, on_generation;

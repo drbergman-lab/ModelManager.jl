@@ -1156,7 +1156,7 @@ criterion later) plus a runner-level `keep_failed_monads` opt-out to stop
 `deleteMonad(…; delete_supers=true)` from rewriting *other* samplings' constituent lists mid-run.
 
 **Two failure classes, two dispositions.** Simulation failure (no successful simulation) is
-infrastructure: `on_evaluation_failure=:reject` → `Inf`, `:error` → stop, pointing at the failure
+infrastructure: `on_monad_failure=:reject` → `Inf`, `:error` → stop, pointing at the failure
 files. A `summary_statistic`/`distance` failure on a monad that *does* have output is a bug in
 user code and is always fatal, including a `distance` return value that is not `<:Real`. That
 non-`Real` check is what actually stops trace 1's `missing` from travelling into the ABC-SMC
@@ -1183,13 +1183,14 @@ rate stays unbiased. No backstop for an all-failed batch in later generations (c
 rejected by drbergman): the adaptive batching loop keeps proposing under `max_evaluations`, and
 throwing would let one bad monad in a small batch kill a healthy run.
 
-**Non-finite ε is a separate failure from a failed monad.** Once `missing` handles failures, an
-`Inf`/`NaN` distance in gen 1 is purely the user's `distance` function — but since ε is the
-largest accepted distance, one of them makes ε infinite and every later proposal passes
-`distance <= ε`. Previously (and on `main`) that produced a silent garbage posterior.
-`_acceptFirstGeneration` now errors with that spelled out, which is strictly better than either
-silently accepting everything or quietly dropping the particle as if it had failed. Note the
-consequence: an `Inf` anywhere in gen 1 is fatal, because `Inf` is always the maximum.
+**A non-finite ε is left alone** (considered, then removed at drbergman's direction). I had added
+an error for it, on the theory that ε = `Inf` in gen 1 silently accepts everything thereafter.
+That overstated the harm: gen 2 accepting every proposal is just a second uniform draw in CDF
+space, after which the usual quantile rule pulls ε back to a finite median and the run proceeds
+normally. It only matters if the run stops at gen 2. `Inf` also round-trips through TOML as
+`+inf` (verified), so persistence and resume are unaffected. Erroring would have converted a
+self-correcting inefficiency into a hard failure, and `Inf` is the user's `distance` function's
+business. Net effect: less code than the version before it.
 
 **One reusability rule for monad IDs, keyed on the monad's own state.** A deleted monad's ID was
 being absorbed into the `SimulationBank`, from where a later generation could hand it back as a
@@ -1212,6 +1213,22 @@ This was also forced by the algorithm-level tests, which drive `_runABCSMC` with
 and no database; the predicate additionally treats every ID as reusable when
 `isInitialized()` is false, since there are no statuses to consult.
 
+**`_batchOutcome` throws on a constituent simulation with no database row** rather than defaulting
+its status. The IDs come from a monad's constituent record moments earlier and the runner only
+ever *updates* their status, so an absent row means the records and the database disagree.
+Guessing either way is wrong in a specific direction: "not completed" rejects a healthy particle,
+"not failed" hides a real failure. The error names the simulations, the monads that list them, and
+`databaseDiagnostics()`.
+
+**No `isInitialized()` fudge in `_monadsWithStartedSimulations`.** The first version returned "all
+reusable" when uninitialized, purely so the algorithm-level tests could keep driving `_runABCSMC`
+with mock monad IDs and no database. That is test scaffolding leaking into production semantics —
+both call sites are only reachable inside a calibration run against a live project, so a live
+database is a precondition. The two affected testsets (CDF-grid snapping integration, k_base_eff
+correction) moved into the DB-backed section instead; mock IDs that happen to match a real monad
+are reusable there and ones that do not are skipped, neither of which affects what they assert
+(grid alignment and population size).
+
 ### Gotcha for future tests
 `createTrial(inputs, [dv]; n_replicates=1)` returns a **`Simulation`**, not a `Monad` (see
 `_createTrial`), so `.id` is a simulation ID — use `n_replicates=2` when a monad is wanted. And
@@ -1228,7 +1245,7 @@ other testset touches.
 - `src/calibration/abc.jl` — `_simulationStatusIDs`, `_batchOutcome`, `_evaluateParticle`,
   `_validateEvaluationFailurePolicy`, `_throwNoSuccessfulSimulations`, `_failedSimulationsPath`,
   `_failedMonadsPath`, `_appendCompressedIDs`, `_recordBatchFailures`; `_buildEvaluateBatch`
-  reworked; `on_evaluation_failure` threaded through `runCalibration`/`runABC`/`resumeABC`
+  reworked; `on_monad_failure` threaded through `runCalibration`/`runABC`/`resumeABC`
 - `src/calibration/progress.jl` — `_warnFailuresRecorded` (one warning per generation)
 - `src/calibration/abc_smc.jl` — `_acceptFirstGeneration`; `_updateMidGenAdditions!` filters on
   reusability and is called only when snapping is active

@@ -102,7 +102,7 @@ function _warnFailuresRecorded(verbosity::Symbol, t::Int, warned_generations::Se
       - $monad_path
     Later failures in this generation are added to those files without another warning. \
     Monads left with no successful simulation have no distance, so their particles are \
-    rejected — unless `on_evaluation_failure=:error`, which stops the run instead.
+    rejected — unless `on_monad_failure=:error`, which stops the run instead.
     """
     return nothing
 end

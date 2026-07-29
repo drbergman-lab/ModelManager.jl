@@ -340,13 +340,9 @@ output, or will have it shortly. Three cases are excluded —
 
 Used to filter [`_buildSimulationBank`](@ref) at load time and
 [`_updateMidGenAdditions!`](@ref) for monads evaluated during the run.
-
-Without an initialized project there are no statuses to consult, so every ID is treated as
-reusable — the algorithm-level tests drive `_runABCSMC` with mock monad IDs and no database.
 """
 function _monadsWithStartedSimulations(monad_ids::AbstractVector{<:Integer})
     isempty(monad_ids) && return Set{Int}()
-    isInitialized() || return Set{Int}(Int(mid) for mid in monad_ids)
     sim_ids_by_monad = Dict{Int,Vector{Int}}(Int(mid) => constituentIDs(Monad, Int(mid))
                                              for mid in unique(monad_ids))
     statuses = _simulationStatusIDs(reduce(vcat, values(sim_ids_by_monad); init=Int[]))
