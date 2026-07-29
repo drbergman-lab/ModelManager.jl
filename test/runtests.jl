@@ -102,16 +102,25 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 _gsa_fA(mid) = 0.0
 _gsa_fB(mid) = 0.0
 
-# Summary statistics that reproduce the two reported calibration failure modes.
-# _test_monad_ss touches the monad, so it throws "Monad N not in the database" once every
-# simulation in that monad has failed and the emptied monad has been deleted.
+# Summary statistics that reproduce the reported calibration failure modes.
+# _test_monad_ss touches the monad, so it would throw "Monad N not in the database" once every
+# simulation in that monad has failed and the emptied monad has been deleted — the failure the
+# calibration loop must now catch before user code is reached.
 function _test_monad_ss(mid)
     monad = Monad(mid)
     return Dict{String,Any}("x" => Float64(length(ModelManager.simulationIDs(monad))))
 end
-# _test_missing_ss returns `missing` for a deleted monad instead of throwing; the failure
+# _test_missing_ss returns `missing` for a monad that is gone instead of throwing; the failure
 # then surfaces one frame later, inside `distance` (the originally reported MethodError).
-_test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" => 1.0) : missing
+function _test_missing_ss(mid)
+    df = ModelManager.constructSelectQuery("monads", "WHERE monad_id=$(mid);";
+                                           selection="monad_id") |> ModelManager.queryToDataFrame
+    return isempty(df) ? missing : Dict{String,Any}("x" => 1.0)
+end
+# Broken user functions used to check that a healthy monad fails fast rather than silently:
+# a distance that is not a Real, and a summary statistic that throws.
+_test_dict_dist(sim, obs)  = Dict("not" => "a real")
+_test_throwing_ss(mid)     = error("summary statistic boom")
 
 @testset "ModelManager.jl" begin
 
@@ -1076,20 +1085,6 @@ _test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" =>
         @test nrow(gens[1].particles) == 4
         @test gens[1].n_evaluations == 6
         @test gens[1].acceptance_rate ≈ 4/6
-    end
-
-    @testset "_updateMidGenAdditions! skips non-finite results" begin
-        bank = ModelManager.SimulationBank(Int[], Matrix{Float64}(undef, 0, 0), ["x"])
-        proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
-            (Dict("x" => 0.1), nothing), (Dict("x" => 0.2), nothing),
-            (Dict("x" => 0.3), 99)]
-        # Monad 21 was rejected (Inf) — its monad has been deleted, so banking the ID would
-        # hand back an unloadable known_mid in a later generation. Monad 99 was a reuse
-        # (proposal_mid non-nothing), which is skipped as before.
-        results = [(1.0, 20), (Inf, 21), (2.0, 99)]
-        additions = Tuple{Vector{Float64},Int}[]
-        ModelManager._updateMidGenAdditions!(additions, proposals, results, bank, ["x"])
-        @test [mid for (_, mid) in additions] == [20]
     end
 
     @testset "_validateEvaluationFailurePolicy" begin
@@ -2637,12 +2632,13 @@ _test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" =>
                     progress=:verbose)
             end
 
-            # ---------- failed particle evaluation ----------
+            # ---------- failed simulations during calibration ----------
             #
-            # Reproduces the reported bug: when every simulation in a proposed monad fails,
-            # the runner deletes the emptied monad, and the user's summary_statistic then
-            # either throws (_test_monad_ss) or returns missing, which throws inside
-            # `distance` (_test_missing_ss). `_fail_sim_predicate` forces the failures.
+            # Reproduces the reported bug: when every simulation in a proposed monad fails, the
+            # runner deletes the emptied monad, and the user's summary_statistic then either
+            # throws (_test_monad_ss) or returns missing, which throws inside `distance`
+            # (_test_missing_ss). ModelManager now detects the empty monad before calling user
+            # code at all. `_fail_sim_predicate` forces the failures.
             @testset "on_evaluation_failure=:reject" begin
                 dv       = DistributedVariation(:config, xp_x, Uniform(10.0, 12.0))
                 observed = Dict{String,Any}("x" => 1.0)
@@ -2672,14 +2668,25 @@ _test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" =>
                 @test result.generations[1].n_evaluations == 6
                 @test isfinite(result.generations[1].epsilon)
 
-                # A monad was genuinely deleted (that is what made the evaluation fail).
-                monad_ids = ModelManager.calibrationMonadIDs(result.calibration)
-                @test any(!ModelManager._monadExists, monad_ids)
+                # Failures are recorded to the generation's failure files.
+                sim_path = ModelManager._failedSimulationsPath(result.calibration, 1,
+                                                               method.max_nr_populations)
+                monad_path = ModelManager._failedMonadsPath(result.calibration, 1,
+                                                             method.max_nr_populations)
+                @test isfile(sim_path)
+                @test isfile(monad_path)
+                @test length(ModelManager.constituentIDs(sim_path)) == 2
+                @test length(ModelManager.constituentIDs(monad_path)) == 2
+                # Every recorded monad really did lose all of its simulations, so it is gone.
+                @test all(ModelManager.constituentIDs(monad_path)) do mid
+                    isempty(ModelManager.constructSelectQuery("monads", "WHERE monad_id=$mid;";
+                            selection="monad_id") |> ModelManager.queryToDataFrame)
+                end
             end
 
-            @testset "on_evaluation_failure=:reject — missing summary statistic" begin
-                # Same failure, but surfacing inside `distance` rather than in the summary
-                # statistic: mseDistance(missing, observed) raises a MethodError.
+            @testset "on_evaluation_failure=:reject — user statistic never sees a dead monad" begin
+                # _test_missing_ss would return `missing` for a deleted monad, which used to
+                # blow up inside mseDistance. The dead monad is now rejected before user code.
                 dv       = DistributedVariation(:config, xp_x, Uniform(13.0, 15.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed,
@@ -2712,8 +2719,8 @@ _test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" =>
                 n_dispatched = Ref(0)
                 _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
                 try
-                    # The original exception surfaces rather than being turned into Inf.
-                    @test_throws ErrorException runCalibration(prob, method;
+                    # Fails fast instead of rejecting the particle, pointing at the failure files.
+                    @test_throws "has no successful simulation" runCalibration(prob, method;
                         description="error on failure", on_evaluation_failure=:error)
                 finally
                     _fail_sim_predicate[] = nothing
@@ -2737,7 +2744,7 @@ _test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" =>
                 _fail_sim_predicate[] = spec -> true
                 try
                     # Nothing survives generation 1 → error instead of a degenerate ε=Inf run.
-                    @test_throws ErrorException runCalibration(prob, method;
+                    @test_throws "non-finite distance" runCalibration(prob, method;
                         description="all particles fail")
                 finally
                     _fail_sim_predicate[] = nothing
@@ -2745,40 +2752,161 @@ _test_missing_ss(mid) = ModelManager._monadExists(mid) ? Dict{String,Any}("x" =>
                 waitForDiagnostics()
             end
 
-            @testset "failure-reporting helpers" begin
-                err = ErrorException("boom")
+            @testset "broken user functions fail fast on a healthy monad" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(22.0, 24.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                method = ABCSMC(population_size=3, max_nr_populations=1, minimum_epsilon=0.0)
 
-                # Deleted monad: diagnosis names the failed simulations' output folders.
-                @test_logs (:warn, r"all 2 of its simulations failed") match_mode=:any begin
-                    ModelManager._warnParticleRejected(:generation, 3, 1, 77, [4, 5], true, err)
-                end
-                # Intact monad: diagnosis points at the user's own functions instead.
-                @test_logs (:warn, r"still in the database") match_mode=:any begin
-                    ModelManager._warnParticleRejected(:generation, 3, 1, 77, [4], false, err)
-                end
-                # The throttle note appears exactly at the cap.
-                @test_logs (:warn, r"Further rejection warnings") match_mode=:any begin
-                    ModelManager._warnParticleRejected(:generation, 3,
-                        ModelManager._MAX_REJECTION_WARNINGS, 77, [4], true, err)
-                end
+                # distance returns a Dict rather than a Real: caught immediately, not
+                # propagated into the ABC-SMC internals. Not affected by :reject.
+                prob_bad_type = CalibrationProblem(inputs, [dv], observed,
+                                                   _test_named_ss, _test_dict_dist)
+                @test_throws "a `Real` is required" runCalibration(prob_bad_type, method;
+                    description="non-Real distance")
 
-                # Past the cap, and at progress=:none, nothing is emitted.
+                # A throwing summary_statistic on a healthy monad is also fatal, and the
+                # original exception is what surfaces.
+                prob_throws = CalibrationProblem(inputs, [dv], observed,
+                                                 _test_throwing_ss, mseDistance)
+                @test_throws "summary statistic boom" runCalibration(prob_throws, method;
+                    description="throwing summary statistic")
+                waitForDiagnostics()
+            end
+
+            @testset "failure recording and reporting" begin
+                # One warning per generation, naming both files; silent at progress=:none and
+                # on generations already reported.
+                warned = Set{Int}()
+                @test_logs (:warn, r"generation 3: some simulations failed") match_mode=:any begin
+                    ModelManager._warnFailuresRecorded(:generation, 3, warned, "sims.csv",
+                                                       "monads.csv")
+                end
+                @test 3 in warned
                 logs, _ = Test.collect_test_logs() do
-                    ModelManager._warnParticleRejected(:generation, 3,
-                        ModelManager._MAX_REJECTION_WARNINGS + 1, 77, [4], true, err)
-                    ModelManager._warnParticleRejected(:none, 3, 1, 77, [4], true, err)
-                    ModelManager._logGenerationRejections(:generation, 3, 0)  # zero → silent
-                    ModelManager._logGenerationRejections(:none, 3, 5)
-                    ModelManager._warnBatchSimulationFailures(:generation, 3, 1, 4, 4)  # none failed
-                    ModelManager._warnBatchSimulationFailures(:none, 3, 1, 1, 4)
+                    ModelManager._warnFailuresRecorded(:generation, 3, warned, "s.csv", "m.csv")
+                    ModelManager._warnFailuresRecorded(:none, 4, warned, "s.csv", "m.csv")
                 end
                 @test isempty(logs)
 
-                @test_logs (:warn, r"2 particles rejected") match_mode=:any begin
-                    ModelManager._logGenerationRejections(:generation, 3, 2)
-                end
-                @test_logs (:warn, r"only 1 of 4 scheduled") match_mode=:any begin
-                    ModelManager._warnBatchSimulationFailures(:generation, 3, 1, 1, 4)
+                # A batch with no failures writes nothing at all.
+                cal = ModelManager.createCalibration("ABC-SMC"; description="failure files")
+                @test ModelManager._recordBatchFailures(cal, 2, 10, :none, Set{Int}(),
+                                                        Int[], Int[]) === nothing
+                @test !isfile(ModelManager._failedSimulationsPath(cal, 2, 10))
+
+                # Successive batches accumulate into one compressed record per generation.
+                ModelManager._recordBatchFailures(cal, 2, 10, :none, Set{Int}(), [5, 6], [11])
+                ModelManager._recordBatchFailures(cal, 2, 10, :none, Set{Int}(), [7], [12])
+                @test ModelManager.constituentIDs(
+                    ModelManager._failedSimulationsPath(cal, 2, 10)) == [5, 6, 7]
+                @test ModelManager.constituentIDs(
+                    ModelManager._failedMonadsPath(cal, 2, 10)) == [11, 12]
+                # Zero-padded generation tag, alongside the existing monads record.
+                @test basename(ModelManager._failedSimulationsPath(cal, 2, 100)) ==
+                      "generation_002_failed_simulations.csv"
+                @test basename(ModelManager._failedMonadsPath(cal, 2, 100)) ==
+                      "generation_002_failed_monads.csv"
+            end
+
+            @testset "reusability filter — started or completed simulations" begin
+                # A monad that has run is reusable; one whose simulations have not started is
+                # not (nothing to snap onto), and neither is a monad that does not exist.
+                # n_replicates=2 so createTrial returns a Monad rather than a Simulation.
+                ran   = createTrial(inputs, [DiscreteVariation(:config, xp_x, 41.0)];
+                                    n_replicates=2)
+                run(ran)
+                # 43.0 is used by no other testset: `use_previous=true` would otherwise reuse an
+                # existing monad that already has completed simulations.
+                unrun = createTrial(inputs, [DiscreteVariation(:config, xp_x, 43.0)];
+                                    n_replicates=2)
+                @test ran isa Monad && unrun isa Monad
+
+                reusable = ModelManager._monadsWithStartedSimulations([ran.id, unrun.id, -7])
+                @test ran.id in reusable
+                @test unrun.id ∉ reusable
+                @test -7 ∉ reusable
+                @test isempty(ModelManager._monadsWithStartedSimulations(Int[]))
+
+                # A `Running` simulation counts: the output is on its way.
+                unrun_sid = ModelManager.simulationIDs(unrun)[1]
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET " *
+                    "status_code_id=$(ModelManager.statusCodeID("Running")) " *
+                    "WHERE simulation_id=$unrun_sid;")
+                @test unrun.id in ModelManager._monadsWithStartedSimulations([unrun.id])
+
+                # Same rule gates bank additions mid-run, keyed on the monad's own state
+                # rather than on the particle's distance — so an infinite distance from a
+                # user's `distance` function does not bar a good monad from reuse.
+                bank = ModelManager.SimulationBank(Int[], Matrix{Float64}(undef, 1, 0), ["x"])
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET " *
+                    "status_code_id=$(ModelManager.statusCodeID("Not Started")) " *
+                    "WHERE simulation_id=$unrun_sid;")
+                proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
+                    (Dict("x" => 0.1), nothing),   # ran → added despite Inf distance
+                    (Dict("x" => 0.2), nothing),   # never started → skipped
+                    (Dict("x" => 0.3), 99)]        # a reuse (proposal_mid given) → skipped
+                results   = [(Inf, ran.id), (1.0, unrun.id), (2.0, 99)]
+                additions = Tuple{Vector{Float64},Int}[]
+                ModelManager._updateMidGenAdditions!(additions, proposals, results, bank, ["x"])
+                @test [mid for (_, mid) in additions] == [ran.id]
+
+                # And the same rule filters the bank at load time. Both monads sit strictly
+                # inside this prior (CDF 0.2 and 0.6), so only the started/completed test
+                # separates them.
+                prob_bank = CalibrationProblem(inputs,
+                    [DistributedVariation(:config, xp_x, Uniform(40.0, 45.0))],
+                    Dict{String,Any}("x" => 1.0), _test_named_ss, mseDistance)
+                built = ModelManager._buildSimulationBank(prob_bank)
+                @test ran.id in built.monad_ids
+                @test unrun.id ∉ built.monad_ids
+            end
+
+            @testset "_batchOutcome classifies a batch" begin
+                # Build a monad with two simulations, run it, then mark them by hand: the
+                # classification reads status codes, so it needs no real failures here.
+                dv   = DiscreteVariation(:config, xp_x, 31.0)
+                m    = createTrial(inputs, [dv]; n_replicates=2)
+                run(m)
+                sids = ModelManager.simulationIDs(m)
+                @test length(sids) == 2
+
+                # Both completed → no failures, monad has successes.
+                failed_sims, failed_monads, no_success =
+                    ModelManager._batchOutcome(Dict(m.id => sids))
+                @test isempty(failed_sims) && isempty(failed_monads) && isempty(no_success)
+
+                # One failed, one completed → recorded as a failure, but still evaluable.
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET status_code_id=$(ModelManager.statusCodeID("Failed")) " *
+                    "WHERE simulation_id=$(sids[1]);")
+                failed_sims, failed_monads, no_success =
+                    ModelManager._batchOutcome(Dict(m.id => sids))
+                @test failed_sims == [sids[1]]
+                @test failed_monads == [m.id]
+                @test isempty(no_success)
+
+                # Both failed → no successful simulation, so the particle is unevaluable.
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET status_code_id=$(ModelManager.statusCodeID("Failed")) " *
+                    "WHERE simulation_id=$(sids[2]);")
+                failed_sims, failed_monads, no_success =
+                    ModelManager._batchOutcome(Dict(m.id => sids))
+                @test failed_sims == sort(sids)
+                @test no_success == [m.id]
+
+                # A monad whose simulations are unknown to the database has no successes.
+                _, _, no_success = ModelManager._batchOutcome(Dict(-1 => [999999]))
+                @test no_success == [-1]
+                @test isempty(ModelManager._simulationStatusIDs(Int[]))
+
+                # Restore the statuses so later testsets see a healthy project.
+                for sid in sids
+                    ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                        "UPDATE simulations SET " *
+                        "status_code_id=$(ModelManager.statusCodeID("Completed")) " *
+                        "WHERE simulation_id=$sid;")
                 end
             end
 

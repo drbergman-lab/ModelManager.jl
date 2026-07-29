@@ -114,31 +114,48 @@ otherwise), `:none`, `:generation`, `:batch`, or `:bar`. Particle evaluations ru
 ordinary [parallel runner](@ref "Running simulations"), so calibration benefits from
 [`setNumberOfParallelSims`](@ref) and [HPC](@ref "HPC support") just like any other trial.
 
-### When a particle's evaluation fails
+### When simulations fail
 
-`summary_statistic` and `distance` are your code, run against a monad whose simulations may
-have failed. When *every* simulation in a proposed monad fails, the runner deletes the emptied
-monad — after which a statistic that touches it throws (`Monad N not in the database`) or
-returns `missing`, which then throws inside `distance`.
+Simulators do fail on parameter values drawn from the tails of a prior, so calibration treats
+this as expected rather than exceptional.
 
-`on_evaluation_failure` chooses what happens:
+Every generation's failures are recorded in the calibration folder, alongside the monad record:
+
+```
+generations/generation_{NNN}_failed_simulations.csv   # simulation IDs that failed
+generations/generation_{NNN}_failed_monads.csv        # monads with at least one failure
+```
+
+Both use the same compressed-ID format as `generation_{NNN}_monads.csv`, and you get one warning
+per generation pointing at them — not one per failure.
+
+A monad that keeps at least one successful simulation is evaluated normally, from whatever
+succeeded; calibration does not re-run to replace the lost replicates. A monad whose simulations
+*all* fail has no output for `summary_statistic` to read at all — the runner deletes the emptied
+monad, so even `Monad(monad_id)` would throw — so `on_evaluation_failure` decides what to do:
 
 ```julia
 result = runABC(problem; on_evaluation_failure=:reject)   # default
-result = runABC(problem; on_evaluation_failure=:error)    # debugging
+result = runABC(problem; on_evaluation_failure=:error)    # stop on the first one
 ```
 
-- `:reject` assigns the particle a distance of `Inf`, so ABC-SMC rejects it and the run
-  continues. A warning names the monad and the failed simulations' output folders; warnings are
-  capped at five per generation, with the generation's total reported when it finishes.
-- `:error` rethrows the original exception (backtrace intact) after logging which monad was
-  being evaluated. Use this when every particle is being rejected — that usually means a bug in
-  `summary_statistic`/`distance` rather than a failing simulator.
+- `:reject` gives the particle a distance of `Inf`, so ABC-SMC rejects it and the run continues.
+- `:error` stops the run, naming the monad, the two failure files, and the output folders of its
+  failed simulations (those survive even though their monad does not).
 
-A generation whose particles all fail keeps proposing until `max_evaluations` is reached, so a
-single bad monad never ends a run. The one exception is generation 1, which has no acceptance
-threshold: if nothing there survives, the run errors out rather than continue with a degenerate
-`ε = Inf`.
+A later generation in which every particle fails keeps proposing until `max_evaluations` is
+reached, so one bad monad never ends a run. Generation 1 is the exception — it has no acceptance
+threshold, so if nothing there survives the run errors out rather than continuing with a
+degenerate `ε = Inf`.
+
+### Your functions must produce a real distance
+
+For a monad that *does* have output, `summary_statistic` and `distance` are expected to work. If
+either raises, or `distance` returns something that is not a `Real`, the run stops immediately
+with the monad ID named — regardless of `on_evaluation_failure`, which governs simulation
+failures rather than bugs in your own functions. This is deliberate: a `missing` returned from a
+summary statistic used to travel a long way into the ABC-SMC internals before surfacing as an
+unrelated `MethodError`.
 
 ## The simulation bank and CDF-grid reuse
 
@@ -147,6 +164,10 @@ Setting `cdf_grid_k` on the method snaps proposals onto a dyadic grid in CDF spa
 previously evaluated monads within a small box (the [`SimulationBank`](@ref)), avoiding
 redundant simulations. The grid refines each generation, so early generations are cheap and
 later ones precise. See the [`ABCSMC`](@ref) docstring for the exact semantics.
+
+Only monads with at least one simulation that is running or completed are eligible for reuse —
+there is nothing to gain from snapping onto a monad whose simulations have not started, and a
+monad whose simulations all failed no longer exists.
 
 ## Results and resuming
 

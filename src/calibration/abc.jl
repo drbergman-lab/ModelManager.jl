@@ -28,23 +28,54 @@ function _createMonadForParams(problem::CalibrationProblem, latent_cdfs::Dict{St
 end
 
 """
-    _monadExists(monad_id) → Bool
+    _simulationStatusIDs(simulation_ids) → Dict{Int,Int}
 
-Whether `monad_id` still has a row in the `monads` table. A monad is deleted by the runner
-when every one of its simulations fails (see `simulationFailed`), which is the usual reason
-a particle's evaluation raises mid-calibration.
+Map each of `simulation_ids` to its `status_code_id` in the `simulations` table, in one query.
+Simulations absent from the table are absent from the result.
 """
-_monadExists(monad_id::Integer) =
-    !isempty(constructSelectQuery("monads", "WHERE monad_id=$(monad_id);";
-                                  selection="monad_id") |> queryToDataFrame)
+function _simulationStatusIDs(simulation_ids::AbstractVector{<:Integer})
+    isempty(simulation_ids) && return Dict{Int,Int}()
+    df = constructSelectQuery("simulations",
+                              "WHERE simulation_id IN ($(join(unique(simulation_ids), ",")))";
+                              selection="simulation_id, status_code_id") |> queryToDataFrame
+    return Dict{Int,Int}(Int(row.simulation_id) => Int(row.status_code_id) for row in eachrow(df))
+end
 
 """
-    _buildEvaluateBatch(problem, calibration, max_nr_populations, run_kwargs)
-        → (Function, Dict{Int,Int})
+    _batchOutcome(sim_ids_by_monad) → (failed_simulations, failed_monads, without_success)
 
-Build the `evaluate_batch` callback expected by `_runABCSMC`, plus the per-generation
-rejection tally it accumulates (generation index → number of particles rejected because
-their evaluation failed). The returned function:
+Classify a batch's simulations after it has run. `sim_ids_by_monad` maps each monad ID to its
+simulation IDs as snapshotted *before* the batch ran — the snapshot is essential, since a monad
+whose every simulation fails is deleted along with the constituent CSV that lists them.
+
+Returns three sorted ID vectors: every simulation now marked `Failed`, every monad with at
+least one such simulation, and every monad with **no** `Completed` simulation. The last is what
+matters for evaluation: a monad with no successful simulation has no output for
+`summary_statistic` to read, so it is rejected (or fatal) rather than handed to user code.
+"""
+function _batchOutcome(sim_ids_by_monad::AbstractDict{Int,<:AbstractVector{<:Integer}})
+    all_sim_ids = reduce(vcat, values(sim_ids_by_monad); init=Int[])
+    statuses     = _simulationStatusIDs(all_sim_ids)
+    completed_id = statusCodeID("Completed")
+    failed_id    = statusCodeID("Failed")
+
+    failed_simulations = Int[]
+    failed_monads      = Int[]
+    without_success    = Int[]
+    for (monad_id, sim_ids) in sim_ids_by_monad
+        failed = [sid for sid in sim_ids if get(statuses, sid, -1) == failed_id]
+        append!(failed_simulations, failed)
+        isempty(failed) || push!(failed_monads, monad_id)
+        any(sid -> get(statuses, sid, -1) == completed_id, sim_ids) ||
+            push!(without_success, monad_id)
+    end
+    return sort!(failed_simulations), sort!(failed_monads), sort!(without_success)
+end
+
+"""
+    _buildEvaluateBatch(problem, calibration, max_nr_populations, run_kwargs) → Function
+
+Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned function:
 
 1. Takes `(t::Int, proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}})` —
    generation index and one `(latent_cdfs, known_mid)` pair per proposed particle.
@@ -60,41 +91,33 @@ their evaluation failed). The returned function:
 4. Assembles all monads into a `Sampling` and calls `run(sampling; quiet=true, run_kwargs...)`.
    When `verbosity` is `:batch` or higher a batch-start line is logged; when it is `:bar`
    a live per-simulation progress bar is rendered via the runner's `on_progress` hook.
-5. Returns a `Vector{Tuple{Float64,Int}}` (distance, monad_id) in proposal order.
+5. Classifies the outcome (see [`_batchOutcome`](@ref)) and records any failed simulation and
+   monad IDs to the generation's failure files (see [`_recordBatchFailures`](@ref)).
+6. Returns a `Vector{Tuple{Float64,Int}}` (distance, monad_id) in proposal order.
 
 `verbosity` is a resolved level (see [`_resolveVerbosity`](@ref)); a per-generation batch
 counter is maintained across calls so batch milestones can be numbered within each generation.
 
-# Failed evaluations
-`summary_statistic` and `distance` are user code run against a monad whose simulations may
-have failed. When every simulation in a monad fails, the runner deletes the emptied monad,
-after which the user's statistic typically throws (`Monad N not in the database`) or returns
-`missing` — which then throws inside `distance`. `on_evaluation_failure` selects the
-disposition:
+# Monads with no successful simulation
+A monad whose simulations all fail has no output for `summary_statistic` to read — and the
+runner has by then deleted the emptied monad, so even `Monad(monad_id)` throws. Such monads are
+detected from the database *before* any user code runs, and `on_evaluation_failure` decides:
 
-- `:reject` (default) — the particle's distance becomes `Inf` (so ABC-SMC rejects it), a
-  throttled warning is emitted (see [`_warnParticleRejected`](@ref)), and the run continues.
-- `:error` — the original exception is rethrown, annotated with the monad ID.
+- `:reject` (default) — the particle's distance is `Inf`, so ABC-SMC rejects it and the run
+  continues.
+- `:error` — the run stops with a message pointing at the generation's failure files.
 
-Monad construction itself is guarded the same way, so a stale `known_mid` (a bank entry for
-a monad deleted since) rejects rather than aborting the run.
+Partially failed monads (at least one success) are evaluated normally from whatever succeeded;
+their failed simulations are still recorded. Re-running to "top off" the missing replicates is
+deliberately not attempted.
 """
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
                               max_nr_populations::Int, run_kwargs::NamedTuple=(;);
                               verbosity::Symbol=:generation,
                               on_evaluation_failure::Symbol=:reject)
     _validateEvaluationFailurePolicy(on_evaluation_failure)
-    batch_counts    = Dict{Int,Int}()
-    rejection_counts = Dict{Int,Int}()
-
-    # Record a rejection and warn (throttled); always returns Inf for the caller's use.
-    function reject(t::Int, monad_id::Int, sim_ids::AbstractVector{<:Integer},
-                    monad_deleted::Bool, err)
-        n = get(rejection_counts, t, 0) + 1
-        rejection_counts[t] = n
-        _warnParticleRejected(verbosity, t, n, monad_id, sim_ids, monad_deleted, err)
-        return Inf
-    end
+    batch_counts       = Dict{Int,Int}()
+    warned_generations = Set{Int}()
 
     function evaluate_batch(t::Int,
                              proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}})
@@ -102,71 +125,83 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         batch_counts[t] = batch_index
         _logBatchStart(verbosity, t, batch_index, length(proposals))
 
-        #! `nothing` marks a proposal whose monad could not even be constructed (a stale
-        #! known_mid). Those slots are skipped by the run and rejected in the results pass.
         monads = map(proposals) do (latent_cdfs, known_mid)
             if isnothing(known_mid)
                 _createMonadForParams(problem, latent_cdfs)
             else
-                try
-                    Monad(known_mid; n_replicates=problem.n_replicates, use_previous=true)
-                catch
-                    if on_evaluation_failure === :error
-                        _logEvaluationFailure(known_mid)
-                        rethrow()
-                    end
-                    nothing
-                end
+                Monad(known_mid; n_replicates=problem.n_replicates, use_previous=true)
             end
         end
-        live_monads = Monad[monad for monad in monads if !isnothing(monad)]
 
-        monad_path = _generationMonadsPath(calibration, t, max_nr_populations)
-        mkpath(dirname(monad_path))
-        prior_ids = constituentIDs(monad_path)
-        new_ids   = [monad.id for monad in live_monads]
-        CSV.write(monad_path, Tables.table(compressIDs(vcat(prior_ids, new_ids))); header=false)
+        _appendCompressedIDs(_generationMonadsPath(calibration, t, max_nr_populations),
+                             [monad.id for monad in monads])
 
         #! Snapshot each monad's simulation IDs *before* running: a monad whose every
         #! simulation fails is deleted along with its constituent CSV, after which its
         #! simulation IDs — the only pointer to the output folders holding the failure
         #! diagnostics — cannot be recovered.
-        sim_ids_before = Dict(monad.id => simulationIDs(monad) for monad in live_monads)
+        sim_ids_before = Dict(monad.id => simulationIDs(monad) for monad in monads)
 
-        if !isempty(live_monads)
-            sampling = Sampling(live_monads, problem.inputs)
-            on_progress = _batchProgressCallback(verbosity, "  gen $t batch $batch_index ")
-            output = run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
-            _warnBatchSimulationFailures(verbosity, t, batch_index,
-                                         output.n_success, output.n_scheduled)
-        end
+        sampling = Sampling(monads, problem.inputs)
+        on_progress = _batchProgressCallback(verbosity, "  gen $t batch $batch_index ")
+        run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
 
-        results = Tuple{Float64,Int}[]
-        for ((_, known_mid), monad) in zip(proposals, monads)
-            if isnothing(monad)
-                #! Monad construction already failed; known_mid is non-nothing here.
-                mid = known_mid::Int
-                push!(results, (reject(t, mid, Int[], !_monadExists(mid),
-                                       ErrorException("Monad $mid could not be loaded.")), mid))
-                continue
+        failed_simulations, failed_monads, without_success = _batchOutcome(sim_ids_before)
+        _recordBatchFailures(calibration, t, max_nr_populations, verbosity, warned_generations,
+                             failed_simulations, failed_monads)
+        failed_set = Set(failed_simulations)
+        no_success = Set(without_success)
+
+        return map(monads) do monad
+            if monad.id in no_success
+                on_evaluation_failure === :error &&
+                    _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad.id,
+                                                  sim_ids_before[monad.id])
+                (Inf, monad.id)
+            else
+                (_evaluateParticle(problem, monad.id,
+                                   count(in(failed_set), sim_ids_before[monad.id])),
+                 monad.id)
             end
-            distance = try
-                simulated = problem.summary_statistic(monad.id)
-                Float64(problem.distance(simulated, problem.observed_data))
-            catch err
-                if on_evaluation_failure === :error
-                    _logEvaluationFailure(monad.id)
-                    rethrow()
-                end
-                reject(t, monad.id, get(sim_ids_before, monad.id, Int[]),
-                       !_monadExists(monad.id), err)
-            end
-            push!(results, (distance, monad.id))
         end
-
-        return results
     end
-    return evaluate_batch, rejection_counts
+    return evaluate_batch
+end
+
+"""
+    _evaluateParticle(problem, monad_id, n_failed_simulations) → Float64
+
+Compute one particle's distance by calling the user's `summary_statistic` and `distance` on a
+monad that has at least one successful simulation.
+
+Both calls are user code, so both are guarded — but neither failure is recoverable: the monad
+*does* have output, so an exception (or a `distance` return value that is not a `Real`) is a
+fault in the user's functions, not a simulation failure. Either way the run stops with the monad
+ID named, rather than propagating a `missing`/`nothing` into the ABC-SMC internals where it
+surfaces much later as an unrelated `MethodError`. `n_failed_simulations` is reported when
+non-zero, since a partially failed monad is the likeliest reason otherwise-correct user code
+trips here.
+"""
+function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int)
+    partial_note = n_failed_simulations == 0 ? "" :
+        "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
+        "they would have produced is missing."
+    distance = try
+        simulated = problem.summary_statistic(monad_id)
+        problem.distance(simulated, problem.observed_data)
+    catch
+        @error """
+        Calibration failed while evaluating monad $monad_id: `summary_statistic` or `distance` \
+        raised. This monad has at least one successful simulation, so the fault is in those \
+        functions rather than in the simulations.$partial_note
+        """
+        rethrow()
+    end
+    distance isa Real || error("""
+    Calibration failed while evaluating monad $monad_id: `distance` returned a \
+    $(typeof(distance)), but a `Real` is required.$partial_note
+    """)
+    return Float64(distance)
 end
 
 """
@@ -182,22 +217,26 @@ function _validateEvaluationFailurePolicy(policy::Symbol)
 end
 
 """
-    _logEvaluationFailure(monad_id)
+    _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad_id, sim_ids)
 
-Log the calibration context for a failed particle evaluation immediately before the original
-exception is rethrown under `on_evaluation_failure=:error`. Emitted separately rather than
-wrapped into a new exception so the rethrow preserves the original backtrace.
+Stop the run because monad `monad_id` has no successful simulation, under
+`on_evaluation_failure=:error`. Points at the generation's failure files and at the simulations'
+own output folders, which survive even when their monad does not.
 """
-function _logEvaluationFailure(monad_id::Integer)
-    exists_note = _monadExists(monad_id) ? "" :
-        "\nMonad $monad_id is no longer in the database — all of its simulations failed and " *
-        "the emptied monad was deleted."
-    @error """
-    Evaluating monad $monad_id failed during calibration.$exists_note
-    Pass `on_evaluation_failure=:reject` to reject such particles (distance = Inf) and \
-    continue the run instead.
-    """
-    return nothing
+function _throwNoSuccessfulSimulations(calibration::Calibration, t::Int, max_nr_populations::Int,
+                                       monad_id::Int, sim_ids::AbstractVector{<:Integer})
+    folders = isempty(sim_ids) ? "" :
+        "\nSimulation output folders:\n" *
+        join(["  - $(trialFolder(Simulation, sid))" for sid in sim_ids], "\n")
+    error("""
+    Calibration stopped: monad $monad_id has no successful simulation, so there is no output for \
+    `summary_statistic` to read.
+    Failed simulation and monad IDs for generation $t are recorded in
+      - $(_failedSimulationsPath(calibration, t, max_nr_populations))
+      - $(_failedMonadsPath(calibration, t, max_nr_populations))$folders
+    Pass `on_evaluation_failure=:reject` to give such particles a distance of `Inf` and continue \
+    the run instead.
+    """)
 end
 
 ################## Public API ##################
@@ -246,15 +285,11 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
     priors      = vcat([cp.lv.latent_parameters      for cp in problem.parameters]...)
     cps         = problem.parameters
 
-    bank = _buildSimulationBank(problem)
-    evaluate_batch, rejection_counts =
-        _buildEvaluateBatch(problem, calibration, method.max_nr_populations, run_kwargs;
-                            verbosity=verbosity,
-                            on_evaluation_failure=on_evaluation_failure)
-    on_generation = gen -> begin
-        _saveGeneration(calibration, gen, method.max_nr_populations, cps)
-        _logGenerationRejections(verbosity, gen.t, get(rejection_counts, gen.t, 0))
-    end
+    bank           = _buildSimulationBank(problem)
+    evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations,
+                                         run_kwargs; verbosity=verbosity,
+                                         on_evaluation_failure=on_evaluation_failure)
+    on_generation  = gen -> _saveGeneration(calibration, gen, method.max_nr_populations, cps)
 
     generations = _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
                               bank=bank, verbosity=verbosity)
@@ -989,15 +1024,11 @@ function resumeABC(calibration::Calibration;
         end
     end
 
-    bank = _buildSimulationBank(active_problem)
-    evaluate_batch, rejection_counts =
-        _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations, run_kwargs;
-                            verbosity=verbosity,
-                            on_evaluation_failure=on_evaluation_failure)
-    on_generation = gen -> begin
-        _saveGeneration(calibration, gen, m.max_nr_populations, cps)
-        _logGenerationRejections(verbosity, gen.t, get(rejection_counts, gen.t, 0))
-    end
+    bank           = _buildSimulationBank(active_problem)
+    evaluate_batch = _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations,
+                                         run_kwargs; verbosity=verbosity,
+                                         on_evaluation_failure=on_evaluation_failure)
+    on_generation  = gen -> _saveGeneration(calibration, gen, m.max_nr_populations, cps)
 
     generations = _runABCSMC(m, param_names, priors, evaluate_batch, on_generation;
                               bank=bank, start_generations=start_generations, verbosity=verbosity)
@@ -1053,6 +1084,68 @@ Path to the monad-ID record for generation `t`: `generations/generation_{NNN}_mo
 function _generationMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
     tag = _generationTag(t, max_nr_populations)
     return joinpath(calibrationFolder(calibration), "generations", "generation_$(tag)_monads.csv")
+end
+
+"""
+    _failedSimulationsPath(calibration, t, max_nr_populations) → String
+
+Path to the failed-simulation record for generation `t`:
+`generations/generation_{NNN}_failed_simulations.csv`.
+"""
+function _failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
+    tag = _generationTag(t, max_nr_populations)
+    return joinpath(calibrationFolder(calibration), "generations",
+                    "generation_$(tag)_failed_simulations.csv")
+end
+
+"""
+    _failedMonadsPath(calibration, t, max_nr_populations) → String
+
+Path to the record of monads with at least one failed simulation in generation `t`:
+`generations/generation_{NNN}_failed_monads.csv`.
+"""
+function _failedMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
+    tag = _generationTag(t, max_nr_populations)
+    return joinpath(calibrationFolder(calibration), "generations",
+                    "generation_$(tag)_failed_monads.csv")
+end
+
+"""
+    _appendCompressedIDs(path, new_ids) → String
+
+Merge `new_ids` into the compressed-ID CSV at `path` (creating it if absent) and return `path`.
+Existing entries are read back with `constituentIDs`, so the file always holds a single
+fully-compressed, deduplicated, sorted ID list spanning every call — the format shared by the
+per-generation monad and failure records.
+"""
+function _appendCompressedIDs(path::String, new_ids::AbstractVector{<:Integer})
+    mkpath(dirname(path))
+    ids = vcat(constituentIDs(path), new_ids)
+    CSV.write(path, Tables.table(compressIDs(ids)); header=false)
+    return path
+end
+
+"""
+    _recordBatchFailures(calibration, t, max_nr_populations, verbosity, warned_generations,
+                         failed_simulations, failed_monads)
+
+Record a batch's failed simulation IDs and the IDs of monads with at least one failed simulation
+to the generation's failure files, and warn about them **once per generation** (tracked in
+`warned_generations`). Later batches in the same generation add to the same files silently.
+
+Does nothing when the batch had no failures.
+"""
+function _recordBatchFailures(calibration::Calibration, t::Int, max_nr_populations::Int,
+                              verbosity::Symbol, warned_generations::Set{Int},
+                              failed_simulations::AbstractVector{<:Integer},
+                              failed_monads::AbstractVector{<:Integer})
+    isempty(failed_simulations) && isempty(failed_monads) && return nothing
+    sim_path   = _appendCompressedIDs(_failedSimulationsPath(calibration, t, max_nr_populations),
+                                      failed_simulations)
+    monad_path = _appendCompressedIDs(_failedMonadsPath(calibration, t, max_nr_populations),
+                                      failed_monads)
+    _warnFailuresRecorded(verbosity, t, warned_generations, sim_path, monad_path)
+    return nothing
 end
 
 """

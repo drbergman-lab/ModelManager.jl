@@ -1103,7 +1103,8 @@ Full suite 1037/1037.
 
 ---
 
-## Session: Reject particles whose evaluation fails (2026-07-28)
+
+## Session: Handle failed simulations in calibration (2026-07-28)
 
 ### Goal
 Bug handoff from a PCMM calibration run on a cluster. Two traces, same root cause:
@@ -1113,94 +1114,115 @@ Bug handoff from a PCMM calibration run on a cluster. Two traces, same root caus
 [2] my_sum_stat(m_id::Int64)                                   # ERROR: Monad 248 not in the database
 ```
 
-Both die at `abc.jl`'s `simulated = problem.summary_statistic(monad.id)` / `problem.distance(...)`. The
-console around trace 2 gives it away: `WARNING: Simulation 688 failed.` A simulation fails → the runner
-marks it `Failed` and erases it from its monad's constituent list → the monad is now empty → `deleteMonad`
-removes its row, folder, and constituent CSV. The user's summary statistic then queries a monad that no
-longer exists and either throws or returns `missing` (which throws one frame later, inside `distance`).
-A single bad parameter set killed a multi-day run.
+Both die at `abc.jl`'s `simulated = problem.summary_statistic(monad.id)` / `problem.distance(...)`.
+The console around trace 2 gives it away: `WARNING: Simulation 688 failed.` A simulation fails →
+the runner marks it `Failed` and erases it from its monad's constituent list → the monad is now
+empty → `deleteMonad` removes its row, folder, and constituent CSV. The user's summary statistic
+then queries a monad that no longer exists and either throws or returns `missing` (which throws
+one frame later, inside `distance`). A single bad parameter set killed a multi-day run.
 
 ### Design decisions
 
-**`on_evaluation_failure::Symbol=:reject` on `runABC`/`runCalibration`/`resumeABC`, not on `CalibrationProblem`.**
-It is an operational policy, not part of the problem definition — and keeping it off the struct avoids
-touching `_ProblemManifest`, whose field list is baked into every existing `problem.jld2` (adding a field
-there breaks reading old files). Validated up front via `_validateEvaluationFailurePolicy` so a typo fails
-before any simulations run, mirroring how `progress` is validated.
+**Detect the unusable monad instead of catching the user's failure.** The first cut wrapped the
+user's `summary_statistic`/`distance` in a `try` and inferred what had gone wrong from whether
+the monad still existed. Reworked on review (drbergman): the condition that actually matters —
+*this monad has no successful simulation* — is knowable from the database before user code runs,
+so ask directly. That removed the tiered warning text, the `_monadExists` probe inside a `catch`,
+and the guard around `Monad(known_mid)`, and made the two Copilot review findings on PR #22 moot
+(a "all 0 of its simulations failed" message when no snapshot existed, and a bare `catch` that
+discarded the original exception).
+
+**`_batchOutcome` compares a pre-run snapshot against post-run status codes.** One
+`_simulationStatusIDs` query per batch returns three vectors: failed simulations, monads with ≥1
+failure, monads with no `Completed` simulation. The snapshot must be taken before the batch runs
+— a deleted monad takes its constituent CSV with it, and that CSV is the *only* monad→simulation
+mapping (the `simulations` table stores input/variation IDs, not monad membership). Status codes
+rather than "which IDs disappeared from the constituent list" because that also correctly covers
+a monad whose simulations never ran (setup failure leaves them `Not Started`, not erased).
+
+**Failures are recorded per generation, warned once per generation.** Two files mirroring
+`generation_{NNN}_monads.csv`: `_failed_simulations.csv` and `_failed_monads.csv`, both written
+via a new `_appendCompressedIDs` (also now used for the monads record, deduplicating that logic).
+This replaced the previous throttle-to-5-warnings machinery, the `rejection_counts` dict threaded
+out of `_buildEvaluateBatch`, and the wrapped `on_generation` callbacks in
+`runCalibration`/`resumeABC` — a population of hundreds against a broken region should write a
+file and mention it once, not emit N warnings. `_buildEvaluateBatch` is back to returning just
+the closure.
+
+**No top-off re-runs for partially failed monads** (drbergman): evaluate from whatever succeeded.
+Chasing the last few successes risks spinning for a long time. Designed and dropped: an
+`AbstractMonadCompletion` extension point (with `FixedReplicates` now and a standard-error
+criterion later) plus a runner-level `keep_failed_monads` opt-out to stop
+`deleteMonad(…; delete_supers=true)` from rewriting *other* samplings' constituent lists mid-run.
+
+**Two failure classes, two dispositions.** Simulation failure (no successful simulation) is
+infrastructure: `on_evaluation_failure=:reject` → `Inf`, `:error` → stop, pointing at the failure
+files. A `summary_statistic`/`distance` failure on a monad that *does* have output is a bug in
+user code and is always fatal, including a `distance` return value that is not `<:Real`. That
+non-`Real` check is what actually stops trace 1's `missing` from travelling into the ABC-SMC
+internals. `_evaluateParticle` logs the monad ID (plus the count of that monad's failed
+simulations when non-zero — the likeliest reason otherwise-correct code trips) and then
+`rethrow()`s, so the original backtrace survives; deliberately not wrapped in a new exception.
 
 **`Inf` as the rejection distance, not `nothing`/`missing`.** `evaluate_batch`'s contract is
-`Vector{Tuple{Float64,Int}}` and `_runSubsequentGeneration`'s `distance <= epsilon` rejects `Inf` for free.
-`nothing` would widen that tuple type and ripple through the accepted-particle path, the weights
-computation, and `GenerationResult`. Documented consequence: a user `distance` that legitimately returns
-`Inf` is indistinguishable from a rejection.
+`Vector{Tuple{Float64,Int}}` and `_runSubsequentGeneration`'s `distance <= epsilon` rejects `Inf`
+for free. `nothing` would widen that tuple type and ripple through the accepted-particle path,
+the weights computation, and `GenerationResult`.
 
-**Generation 1 needed a real fix, later generations did not.** Gen 1 accepts everything and sets
-`epsilon = maximum(distances)`, so one `Inf` makes ε infinite and *every* subsequent proposal passes —
-a silent degeneration far worse than the original crash. `_acceptFirstGeneration` filters non-finite
-distances, warns, renormalizes the uniform weights over survivors, and errors when none survive.
-`n_evaluations` still counts all proposals while `n_accepted` counts survivors, so the acceptance rate
-stays unbiased.
+**Generation 1 needed a real fix; later generations did not.** Gen 1 accepts everything and sets
+`epsilon = maximum(distances)`, so one `Inf` makes ε infinite and *every* subsequent proposal
+passes — a silent degeneration worse than the original crash. `_acceptFirstGeneration` filters
+non-finite distances, warns, renormalizes the uniform weights over survivors, and errors when
+none survive. `n_evaluations` still counts all proposals while `n_accepted` counts survivors, so
+the acceptance rate stays unbiased. No backstop for an all-failed batch in later generations
+(considered, rejected by drbergman): the adaptive batching loop keeps proposing under
+`max_evaluations`, and throwing would let one bad monad in a small batch kill a healthy run.
 
-**No backstop for an all-failed batch in later generations** (considered, rejected by drbergman): the
-adaptive batching loop keeps proposing until `population_size` particles are accepted, bounded by
-`max_evaluations`. Throwing on an all-`Inf` batch would let one bad monad in a small batch kill an
-otherwise healthy calibration. Let it spin.
+**One reusability rule for monad IDs, keyed on the monad's own state.** A deleted monad's ID was
+being absorbed into the `SimulationBank`, from where a later generation could hand it back as a
+`known_mid` — reproducing `Monad N not in the database` *inside* ModelManager. (The reported run
+had `k_base_eff=nothing`, snapping off, so it never hit this, but it was live for any snapping
+run.) First cut filtered on `isfinite(distance)`; reworked on review (drbergman) because using
+the distance to decide bank membership conflates two things — a user's `distance` may legitimately
+return `Inf` for a perfectly good monad. `_monadsWithStartedSimulations` asks the database
+instead: keep monads with ≥1 simulation that is `Running` or `Completed`. Deletedness falls out
+for free (`constituentIDs` reports nothing for a deleted monad, so no separate existence check),
+and the same predicate now gates `_buildSimulationBank` at load time — which closes a hazard
+drbergman spotted: a bank monad whose only simulation was `Not Started` could be scheduled, fail,
+and be deleted *mid-generation*, leaving a later batch in that same generation holding a dangling
+`known_mid`. `Running` counts as reusable (the output is on its way), matching the bank's purpose
+of snapping onto nearby, already-(partly)-done work.
 
-**`_updateMidGenAdditions!` skips non-finite results.** Found while tracing the second failure mode: a
-deleted monad's ID was being recorded and absorbed into the `SimulationBank`, from where a later
-generation could hand it back as a `known_mid` — reproducing `Monad N not in the database` *inside*
-ModelManager instead of user code. The reported run had `k_base_eff=nothing` (snapping off) so it never
-hit this, but it was live for any snapping run. `Monad(known_mid; …)` construction is now guarded the same
-way as the user calls, so a stale bank entry rejects instead of aborting.
+`_updateMidGenAdditions!` is now called only when `snap_active` — `mid_gen_additions` feeds the
+bank, which is consulted only then, so the non-snapping path skips a per-batch query entirely.
+This was also forced by the algorithm-level tests, which drive `_runABCSMC` with mock monad IDs
+and no database; the predicate additionally treats every ID as reusable when
+`isInitialized()` is false, since there are no statuses to consult.
 
-**Simulation IDs snapshotted before the batch runs.** A deleted monad takes its constituent CSV with it,
-and that CSV is the only monad→simulation mapping (the `simulations` table stores input/variation IDs, not
-monad membership). Without the pre-run snapshot the warning cannot name the failed simulations, whose
-output folders survive (`deleteMonad` uses `delete_subs=false`) and hold the actual diagnostics.
-
-**Warning throttle: 5 per generation + a total.** A population of 200 in a systematically-broken region
-would otherwise emit 200 warnings. The tally lives in a `Dict{Int,Int}` owned by the `_buildEvaluateBatch`
-closure, which now returns `(evaluate_batch, rejection_counts)`; `runCalibration`/`resumeABC` wrap their
-`on_generation` callback to report the generation's total after saving it. `on_generation` is already
-called exactly once per generation with `gen.t`, so no new plumbing into `_runABCSMC` was needed.
-
-**`:error` logs context then `rethrow()`s** rather than throwing a wrapper `ErrorException`. The point of
-`:error` is the original backtrace; wrapping would replace it with one rooted at the wrapper. First cut did
-wrap — changed on writing the docstring, which promised "the full backtrace".
-
-**Diagnosis is tiered by whether the monad still exists**, so one policy knob covers both failure modes:
-gone ⇒ all simulations failed, here are their output folders; still present ⇒ missing output or a bug in
-your `summary_statistic`/`distance`, re-run with `:error`. The sim-1/125 `final.xml` lines in the reported
-console output are the second kind (reused monads whose output was pruned), and they were what produced
-the `missing` in trace 1.
-
-**Also surfaced run-level failures:** `evaluate_batch` passes `quiet=true`, which suppresses the runner's
-own "some simulations did not complete successfully" notice, and it discarded the returned `MMOutput`
-entirely. It now warns when `n_success < n_scheduled` — the earliest available signal, and the one that
-was missing from the reported run.
-
-### Rejected / considered
-- **Refilling partially-failed monads** (top up with fresh replicates until `n_replicates` successes, with
-  an `AbstractMonadCompletion` extension point for a future standard-error criterion) — designed, then
-  dropped at drbergman's direction: take what ran, warn, move on. Would also have required a runner-level
-  `keep_failed_monads` opt-out to stop `deleteMonad(…; delete_supers=true)` from rewriting *other*
-  samplings' constituent lists mid-run.
-- **A second knob to distinguish "simulation failure" from "user-code bug"** — impossible to tell apart
-  from ModelManager's side; solved by tiering the warning text instead.
-
-### Files changed
-- `src/calibration/abc.jl` — `_monadExists`, `_validateEvaluationFailurePolicy`, `_logEvaluationFailure`;
-  `_buildEvaluateBatch` returns `(closure, rejection_counts)`, guards monad construction and user calls,
-  snapshots simulation IDs, checks `MMOutput`; `on_evaluation_failure` threaded through
-  `runCalibration`/`runABC`/`resumeABC`
-- `src/calibration/progress.jl` — `_MAX_REJECTION_WARNINGS`, `_warnParticleRejected`,
-  `_logGenerationRejections`, `_warnBatchSimulationFailures`
-- `src/calibration/abc_smc.jl` — `_acceptFirstGeneration`; `_updateMidGenAdditions!` skips non-finite
-- `test/runtests.jl` — `_fail_sim_predicate` hook on TestSimulator; new testsets
-- `CLAUDE.md` — to-do: preserve failed-simulation artifacts for post-hoc inspection
-- `PRD.md`, `README.md`
+### Gotcha for future tests
+`createTrial(inputs, [dv]; n_replicates=1)` returns a **`Simulation`**, not a `Monad` (see
+`_createTrial`), so `.id` is a simulation ID — use `n_replicates=2` when a monad is wanted. And
+`use_previous=true` means a `DiscreteVariation` value already used by an earlier testset silently
+reuses that monad, completed simulations and all; the "never started" fixture needs a value no
+other testset touches.
 
 ### Open questions
-- The failed-simulation artifact store is deferred (see the `CLAUDE.md` to-do). Until it exists, a
-  rejection can only point at output folders snapshotted before the run — nothing records which variation
-  a failed simulation came from once its monad is deleted.
+- The failed-simulation artifact store is deferred (see the `CLAUDE.md` to-do): the failure files
+  give IDs, but nothing records which variation a failed simulation came from once its monad is
+  deleted.
+
+### Files changed
+- `src/calibration/abc.jl` — `_simulationStatusIDs`, `_batchOutcome`, `_evaluateParticle`,
+  `_validateEvaluationFailurePolicy`, `_throwNoSuccessfulSimulations`, `_failedSimulationsPath`,
+  `_failedMonadsPath`, `_appendCompressedIDs`, `_recordBatchFailures`; `_buildEvaluateBatch`
+  reworked; `on_evaluation_failure` threaded through `runCalibration`/`runABC`/`resumeABC`
+- `src/calibration/progress.jl` — `_warnFailuresRecorded` (one warning per generation)
+- `src/calibration/abc_smc.jl` — `_acceptFirstGeneration`; `_updateMidGenAdditions!` filters on
+  reusability and is called only when snapping is active
+- `src/calibration/bank.jl` — `_monadsWithStartedSimulations`; `_buildSimulationBank` Phase 4
+- `src/calibration/problem.jl` — `Calibration` docstring lists the failure files
+- `test/runtests.jl` — `_fail_sim_predicate` hook on TestSimulator; new testsets
+- `CLAUDE.md` — to-do: preserve failed-simulation artifacts for post-hoc inspection
+- `PRD.md`, `README.md`, `docs/src/man/calibration.md`
+
+Full suite 1107/1107.

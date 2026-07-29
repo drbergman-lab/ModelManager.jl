@@ -635,7 +635,10 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
 
         results = evaluate_batch(t, proposals)
         n_evaluations += length(proposals)
-        _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
+        #! Only tracked when snapping is active — `mid_gen_additions` feeds the bank, which is
+        #! only consulted then, and the reusability test behind it costs a database query.
+        snap_active &&
+            _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
         _updateBudget!(budget, budget_hit, length(proposals), method.max_evaluations)
 
         n_accepted_this_round = 0
@@ -879,19 +882,25 @@ recorded alongside the proposal's CDF coordinates. Monads already in the bank or
 already tracked in `mid_gen_additions` are skipped to maintain the invariant that
 entries are unique and not in the bank.
 
-Proposals with a non-finite distance are also skipped: those are rejections from a failed
-evaluation (see [`_buildEvaluateBatch`](@ref)), and a monad whose every simulation failed has
-been deleted from the database. Banking its ID would hand it back as a `known_mid` reuse in a
-later generation, where reconstructing it fails.
+Monads with no started or completed simulation are also skipped, using the same reusability
+test [`_buildSimulationBank`](@ref) applies at load time (see
+[`_monadsWithStartedSimulations`](@ref)). This is what keeps a monad whose every simulation
+failed out of the bank: the runner deletes such a monad, so banking its ID would hand back an
+unloadable `known_mid` in a later generation. The test is on the monad's own state rather than
+on the particle's distance, so a legitimately infinite distance from the user's `distance`
+function does not silently bar a perfectly good monad from reuse.
 """
 function _updateMidGenAdditions!(mid_gen_additions::Vector{Tuple{Vector{Float64},Int}},
                                   proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}},
                                   results::Vector{<:Tuple},
                                   bank::SimulationBank,
                                   param_names::Vector{String})
-    tracked = Set(mid for (_, mid) in mid_gen_additions)
-    for ((eff_cdfs, proposal_mid), (distance, result_mid)) in zip(proposals, results)
-        if isnothing(proposal_mid) && isfinite(distance) &&
+    tracked  = Set(mid for (_, mid) in mid_gen_additions)
+    reusable = _monadsWithStartedSimulations(
+        [result_mid for ((_, proposal_mid), (_, result_mid)) in zip(proposals, results)
+         if isnothing(proposal_mid)])
+    for ((eff_cdfs, proposal_mid), (_, result_mid)) in zip(proposals, results)
+        if isnothing(proposal_mid) && result_mid ∈ reusable &&
            result_mid ∉ bank.monad_ids && result_mid ∉ tracked
             push!(mid_gen_additions, ([eff_cdfs[name] for name in param_names], result_mid))
             push!(tracked, result_mid)
