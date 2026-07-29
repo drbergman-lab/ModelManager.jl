@@ -285,10 +285,17 @@ unbiased prior sample while still avoiding redundant simulation work.
 - `param_names::Vector{String}`: Parameter names (column order in results).
 - `priors::Vector{<:Distribution}`: Prior distributions, one per parameter.
 - `evaluate_batch::Function`: `(t::Int, proposals::Vector{Tuple{Dict{String,Float64},Union{Nothing,Int}}}) →
-  Vector{Tuple{Float64,Any}}`. Each proposal is `(latent_cdfs, known_mid)` where `known_mid`
-  is an `Int` for bank/mid-generation reuses and `nothing` for fresh grid snaps.
+  Vector{Tuple{Union{Float64,Missing},Any}}`. Each proposal is `(latent_cdfs, known_mid)` where
+  `known_mid` is an `Int` for bank/mid-generation reuses and `nothing` for fresh grid snaps.
   Returns `(distance, monad_id)` for each in the same order. Receiving `t` allows the
   caller to route provenance records to a per-generation file.
+
+  A `missing` distance means no distance could be computed for that particle — for the
+  ModelManager implementation, that its monad had no successful simulation (see
+  [`_buildEvaluateBatch`](@ref)). Such particles are never accepted: generation 1 drops them
+  before setting ε, and later generations reject them without comparing against ε. `missing`
+  rather than a sentinel value keeps the signal distinct from any distance a user's `distance`
+  function might legitimately return, `Inf` included.
 - `on_generation::Function`: `(gen::GenerationResult) → nothing`.
   Called after each completed generation (for persistence / logging).
 - `bank::SimulationBank`: Pre-built registry of existing monads in CDF space, built once
@@ -496,10 +503,10 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
         proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
         M         = length(proposals)
         results   = evaluate_batch(1, proposals)
-        accepted  = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:M]
-        weights   = fill(1.0 / M, M)
+        accepted  = _acceptFirstGeneration(proposals, results)
+        weights   = fill(1.0 / length(accepted), length(accepted))
         _updateBudget!(budget, budget_hit, M, method.max_evaluations)
-        return _buildGenerationResult(1, accepted, weights, M, M, param_names)
+        return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names)
     end
 
     # ── CDF-grid snapping: snap each Sobol point, accumulate N proposals. ───────
@@ -517,11 +524,51 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
     proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
     M        = length(proposals)
     results  = evaluate_batch(1, proposals)
-    accepted = [_ParticleResult(proposals[i][1], results[i][1], results[i][2]) for i in 1:M]
+    accepted = _acceptFirstGeneration(proposals, results)
     _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
     _updateBudget!(budget, budget_hit, M, method.max_evaluations)
-    weights = fill(1.0 / M, M)
-    return _buildGenerationResult(1, accepted, weights, M, M, param_names)
+    weights = fill(1.0 / length(accepted), length(accepted))
+    return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names)
+end
+
+"""
+    _acceptFirstGeneration(proposals, results) → Vector{_ParticleResult}
+
+Build generation 1's accepted set. Generation 1 has no epsilon threshold and accepts every
+proposal — *except* those whose distance is `missing`, which are dropped here.
+
+`missing` means the particle has no distance at all: its monad had no successful simulation, so
+the summary statistic was never computed (see [`_buildEvaluateBatch`](@ref)). Such a particle
+cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` for the whole
+generation. Errors when no particle survives — a whole generation of failed monads is a broken
+model, not sampling noise.
+
+The generation therefore holds **fewer than `population_size` particles** when any monad failed;
+the uniform weights are renormalized over the survivors. Generation 1 proposes exactly
+`population_size` particles and does not top up to replace failures.
+"""
+function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Union{Nothing,Int}}},
+                                results::Vector{<:Tuple})
+    if isempty(proposals)
+        error("ABC-SMC generation 1: received an empty batch of proposals, so no particles " *
+              "could be accepted.")
+    end
+    accepted = _ParticleResult[_ParticleResult(proposals[i][1], results[i][1], results[i][2])
+                               for i in eachindex(proposals) if !ismissing(results[i][1])]
+    if isempty(accepted)
+        error("""
+        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads had a successful \
+        simulation, so no particles could be accepted.
+        Check the generation's failure files and the failed simulations' output folders, and \
+        re-run with `on_monad_failure=:error` to stop at the first failure.
+        """)
+    end
+    n_dropped = length(proposals) - length(accepted)
+    n_dropped > 0 && @warn "ABC-SMC generation 1: dropped $n_dropped of " *
+                           "$(length(proposals)) proposals whose monads had no successful " *
+                           "simulation; ε and the particle weights are set from the " *
+                           "$(length(accepted)) surviving particles."
+    return accepted
 end
 
 """
@@ -597,12 +644,17 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
 
         results = evaluate_batch(t, proposals)
         n_evaluations += length(proposals)
-        _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
+        #! Only tracked when snapping is active — `mid_gen_additions` feeds the bank, which is
+        #! only consulted then, and the reusability test behind it costs a database query.
+        snap_active &&
+            _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
         _updateBudget!(budget, budget_hit, length(proposals), method.max_evaluations)
 
         n_accepted_this_round = 0
         for (i, (distance, metadata)) in enumerate(results)
-            if distance <= epsilon
+            #! A `missing` distance means the monad had no successful simulation, so there is
+            #! nothing to compare against ε — the particle is rejected outright.
+            if !ismissing(distance) && distance <= epsilon
                 n_accepted_this_round += 1
                 can_add = method.accept_overflow || length(accepted) < method.population_size
                 can_add && push!(accepted, _ParticleResult(proposals[i][1], distance, metadata))
@@ -840,15 +892,27 @@ monad ID was `nothing` (a fresh grid snap), the resolved monad ID from `results`
 recorded alongside the proposal's CDF coordinates. Monads already in the bank or
 already tracked in `mid_gen_additions` are skipped to maintain the invariant that
 entries are unique and not in the bank.
+
+Monads with no started or completed simulation are also skipped, using the same reusability
+test [`_buildSimulationBank`](@ref) applies at load time (see
+[`_monadsWithStartedSimulations`](@ref)). This is what keeps a monad whose every simulation
+failed out of the bank: the runner deletes such a monad, so banking its ID would hand back an
+unloadable `known_mid` in a later generation. The test is on the monad's own state rather than
+on the particle's distance, so a legitimately infinite distance from the user's `distance`
+function does not silently bar a perfectly good monad from reuse.
 """
 function _updateMidGenAdditions!(mid_gen_additions::Vector{Tuple{Vector{Float64},Int}},
                                   proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}},
                                   results::Vector{<:Tuple},
                                   bank::SimulationBank,
                                   param_names::Vector{String})
-    tracked = Set(mid for (_, mid) in mid_gen_additions)
+    tracked  = Set(mid for (_, mid) in mid_gen_additions)
+    reusable = _monadsWithStartedSimulations(
+        [result_mid for ((_, proposal_mid), (_, result_mid)) in zip(proposals, results)
+         if isnothing(proposal_mid)])
     for ((eff_cdfs, proposal_mid), (_, result_mid)) in zip(proposals, results)
-        if isnothing(proposal_mid) && result_mid ∉ bank.monad_ids && result_mid ∉ tracked
+        if isnothing(proposal_mid) && result_mid ∈ reusable &&
+           result_mid ∉ bank.monad_ids && result_mid ∉ tracked
             push!(mid_gen_additions, ([eff_cdfs[name] for name in param_names], result_mid))
             push!(tracked, result_mid)
         end

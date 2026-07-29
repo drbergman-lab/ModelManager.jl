@@ -66,6 +66,10 @@ parameters lie strictly within `(0,1)^d` in CDF space.
      forward-map back to all other targets within relative tolerance 1e-8. Monads that do
      not lie on the co-variation curve are excluded.
 4. All CDF coordinates are strictly in `(0, 1)`.
+5. At least one of the monad's simulations has started or completed (see
+   [`_monadsWithStartedSimulations`](@ref)). The point of the bank is to snap onto nearby
+   work that is already (partly) done; a monad whose simulations have not started yet has
+   nothing to reuse.
 
 `LVSource` parameters without `inverse_maps` disable the bank (returns empty, informational
 log emitted). `LVSource` parameters with `inverse_maps` are supported: target-space bounds
@@ -300,12 +304,51 @@ function _buildSimulationBank(problem::CalibrationProblem)
         push!(valid_cdf_cols, cdf_coords)
     end
 
+    # ── Phase 4: require at least one started or completed simulation ─────────
+    started = _monadsWithStartedSimulations(valid_monad_ids)
+    if length(started) < length(valid_monad_ids)
+        keep            = [mid in started for mid in valid_monad_ids]
+        valid_monad_ids = valid_monad_ids[keep]
+        valid_cdf_cols  = valid_cdf_cols[keep]
+    end
+
     n_valid = length(valid_monad_ids)
     cdf_mat = n_valid > 0 ?
         reduce(hcat, valid_cdf_cols) :
         Matrix{Float64}(undef, n_dims, 0)
 
     return SimulationBank(valid_monad_ids, cdf_mat, param_names)
+end
+
+################## Reusability filter ##################
+
+"""
+    _monadsWithStartedSimulations(monad_ids) → Set{Int}
+
+Those of `monad_ids` with at least one simulation whose status is `Running` or `Completed`,
+determined in a single status query.
+
+This is the reusability test for monad IDs: reuse is only worth anything if the monad has
+output, or will have it shortly. Three cases are excluded —
+
+- a monad whose simulations are all `Not Started` (created by an interrupted run, say) has
+  nothing to reuse, and would be pointlessly re-proposed every generation;
+- a monad whose simulations all **failed** likewise has no output — and the runner deletes
+  such a monad, so its ID would not even load. `constituentIDs` returns no simulations for
+  a deleted monad, so it fails this test without a separate existence check;
+- a monad that no longer exists for any other reason, for the same reason.
+
+Used to filter [`_buildSimulationBank`](@ref) at load time and
+[`_updateMidGenAdditions!`](@ref) for monads evaluated during the run.
+"""
+function _monadsWithStartedSimulations(monad_ids::AbstractVector{<:Integer})
+    isempty(monad_ids) && return Set{Int}()
+    sim_ids_by_monad = Dict{Int,Vector{Int}}(Int(mid) => constituentIDs(Monad, Int(mid))
+                                             for mid in unique(monad_ids))
+    statuses = _simulationStatusIDs(reduce(vcat, values(sim_ids_by_monad); init=Int[]))
+    usable   = Set{Int}(statusCodeID(code) for code in ("Running", "Completed"))
+    return Set{Int}(mid for (mid, sim_ids) in sim_ids_by_monad
+                    if any(sid -> get(statuses, sid, -1) in usable, sim_ids))
 end
 
 ################## Per-column distribution helper ##################

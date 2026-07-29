@@ -74,6 +74,39 @@ function _logBatchStart(verbosity::Symbol, t::Int, batch_index::Int, n_proposals
     return nothing
 end
 
+################## Simulation-Failure Reporting ##################
+#
+# Calibration runs each batch with `quiet=true`, which suppresses the runner's own
+# low-success notice, so failed simulations would otherwise pass unmentioned. Every
+# generation's failed simulation IDs — and the IDs of monads with at least one failure —
+# are written to the calibration folder instead, and reported here once per generation:
+# a population of hundreds proposed against a broken parameter region should not emit
+# hundreds of warnings.
+
+"""
+    _warnFailuresRecorded(verbosity, t, warned_generations, sim_path, monad_path)
+
+Warn, at most once per generation, that failed simulation and monad IDs for generation `t`
+have been recorded to `sim_path` and `monad_path`. Generations already reported are tracked
+in `warned_generations`. Silent when `verbosity` is `:none`.
+"""
+function _warnFailuresRecorded(verbosity::Symbol, t::Int, warned_generations::Set{Int},
+                               sim_path::AbstractString, monad_path::AbstractString)
+    _verbosityRank(verbosity) >= _verbosityRank(:generation) || return nothing
+    t in warned_generations && return nothing
+    push!(warned_generations, t)
+    @warn """
+    ABC-SMC generation $t: some simulations failed. Their IDs, and the IDs of the monads \
+    they belong to, are recorded in
+      - $sim_path
+      - $monad_path
+    Later failures in this generation are added to those files without another warning. \
+    Monads left with no successful simulation have no distance, so their particles are \
+    rejected — unless `on_monad_failure=:error`, which stops the run instead.
+    """
+    return nothing
+end
+
 """
     _batchProgressCallback(verbosity, desc) → Union{Nothing,Function}
 

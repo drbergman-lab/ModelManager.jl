@@ -28,6 +28,68 @@ function _createMonadForParams(problem::CalibrationProblem, latent_cdfs::Dict{St
 end
 
 """
+    _simulationStatusIDs(simulation_ids) → Dict{Int,Int}
+
+Map each of `simulation_ids` to its `status_code_id` in the `simulations` table, in one query.
+Simulations absent from the table are absent from the result.
+"""
+function _simulationStatusIDs(simulation_ids::AbstractVector{<:Integer})
+    isempty(simulation_ids) && return Dict{Int,Int}()
+    df = constructSelectQuery("simulations",
+                              "WHERE simulation_id IN ($(join(unique(simulation_ids), ",")))";
+                              selection="simulation_id, status_code_id") |> queryToDataFrame
+    return Dict{Int,Int}(Int(row.simulation_id) => Int(row.status_code_id) for row in eachrow(df))
+end
+
+"""
+    _batchOutcome(sim_ids_by_monad) → (failed_simulations, failed_monads, without_success)
+
+Classify a batch's simulations after it has run. `sim_ids_by_monad` maps each monad ID to its
+simulation IDs as snapshotted *before* the batch ran — the snapshot is essential, since a monad
+whose every simulation fails is deleted along with the constituent CSV that lists them.
+
+Returns three sorted ID vectors: every simulation now marked `Failed`, every monad with at
+least one such simulation, and every monad with **no** `Completed` simulation. The last is what
+matters for evaluation: a monad with no successful simulation has no output for
+`summary_statistic` to read, so it is rejected (or fatal) rather than handed to user code.
+
+Every snapshotted simulation must have a row in the `simulations` table — they were listed by a
+monad's constituent record moments earlier, and the runner only ever *updates* their status.
+A missing row means the constituent records and the database disagree, so this errors rather than
+guessing a status: silently treating an absent simulation as "not completed" would reject a
+healthy particle, and as "not failed" would hide a real failure.
+"""
+function _batchOutcome(sim_ids_by_monad::AbstractDict{Int,<:AbstractVector{<:Integer}})
+    all_sim_ids  = reduce(vcat, values(sim_ids_by_monad); init=Int[])
+    statuses     = _simulationStatusIDs(all_sim_ids)
+    completed_id = statusCodeID("Completed")
+    failed_id    = statusCodeID("Failed")
+
+    unknown = setdiff(all_sim_ids, keys(statuses))
+    isempty(unknown) || error("""
+    Calibration cannot classify this batch: simulation(s) $(_compressedIDStr(sort(unknown))) are \
+    listed as constituents of monad(s) \
+    $(_compressedIDStr(sort([mid for (mid, sids) in sim_ids_by_monad
+                             if any(in(unknown), sids)]))) but have no row in the `simulations` \
+    table.
+    The constituent records and the database disagree; run \
+    `ModelManager.databaseDiagnostics()` (or inspect the monads' constituent CSVs) before \
+    continuing.
+    """)
+
+    failed_simulations = Int[]
+    failed_monads      = Int[]
+    without_success    = Int[]
+    for (monad_id, sim_ids) in sim_ids_by_monad
+        failed = [sid for sid in sim_ids if statuses[sid] == failed_id]
+        append!(failed_simulations, failed)
+        isempty(failed) || push!(failed_monads, monad_id)
+        any(sid -> statuses[sid] == completed_id, sim_ids) || push!(without_success, monad_id)
+    end
+    return sort!(failed_simulations), sort!(failed_monads), sort!(without_success)
+end
+
+"""
     _buildEvaluateBatch(problem, calibration, max_nr_populations, run_kwargs) → Function
 
 Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned function:
@@ -46,15 +108,37 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
 4. Assembles all monads into a `Sampling` and calls `run(sampling; quiet=true, run_kwargs...)`.
    When `verbosity` is `:batch` or higher a batch-start line is logged; when it is `:bar`
    a live per-simulation progress bar is rendered via the runner's `on_progress` hook.
-5. Returns a `Vector{Tuple{Float64,Int}}` (distance, monad_id) in proposal order.
+5. Classifies the outcome (see [`_batchOutcome`](@ref)) and records any failed simulation and
+   monad IDs to the generation's failure files (see [`_recordBatchFailures`](@ref)).
+6. Returns a `Vector{Tuple{Union{Float64,Missing},Int}}` (distance, monad_id) in proposal order.
+   A `missing` distance means the monad had no successful simulation, so no distance exists —
+   distinct from any value the user's `distance` function could return.
 
 `verbosity` is a resolved level (see [`_resolveVerbosity`](@ref)); a per-generation batch
 counter is maintained across calls so batch milestones can be numbered within each generation.
+
+# Monads with no successful simulation
+A monad whose simulations all fail has no output for `summary_statistic` to read — and the
+runner has by then deleted the emptied monad, so even `Monad(monad_id)` throws. Such monads are
+detected from the database *before* any user code runs, and `on_monad_failure` decides:
+
+- `:reject` (default) — the particle's distance is `missing`, which ABC-SMC treats as "never
+  accept", and the run continues. `missing` rather than a sentinel like `Inf` so that a failed
+  monad is unambiguous: `Inf` is a value a user's `distance` may legitimately return.
+- `:error` — the run stops with a message pointing at the generation's failure files.
+
+Partially failed monads (at least one success) are evaluated normally from whatever succeeded;
+their failed simulations are still recorded. Re-running to "top off" the missing replicates is
+deliberately not attempted.
 """
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
                               max_nr_populations::Int, run_kwargs::NamedTuple=(;);
-                              verbosity::Symbol=:generation)
-    batch_counts = Dict{Int,Int}()
+                              verbosity::Symbol=:generation,
+                              on_monad_failure::Symbol=:reject)
+    _validateEvaluationFailurePolicy(on_monad_failure)
+    batch_counts       = Dict{Int,Int}()
+    warned_generations = Set{Int}()
+
     function evaluate_batch(t::Int,
                              proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}})
         batch_index = get(batch_counts, t, 0) + 1
@@ -69,25 +153,109 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
             end
         end
 
-        monad_path = _generationMonadsPath(calibration, t, max_nr_populations)
-        mkpath(dirname(monad_path))
-        prior_ids = constituentIDs(monad_path)
-        new_ids   = [monad.id for monad in monads]
-        CSV.write(monad_path, Tables.table(compressIDs(vcat(prior_ids, new_ids))); header=false)
+        _appendCompressedIDs(_generationMonadsPath(calibration, t, max_nr_populations),
+                             [monad.id for monad in monads])
+
+        #! Snapshot each monad's simulation IDs *before* running: a monad whose every
+        #! simulation fails is deleted along with its constituent CSV, after which its
+        #! simulation IDs — the only pointer to the output folders holding the failure
+        #! diagnostics — cannot be recovered.
+        sim_ids_before = Dict(monad.id => simulationIDs(monad) for monad in monads)
 
         sampling = Sampling(monads, problem.inputs)
         on_progress = _batchProgressCallback(verbosity, "  gen $t batch $batch_index ")
         run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
 
-        results = map(monads) do monad
-            simulated = problem.summary_statistic(monad.id)
-            distance = problem.distance(simulated, problem.observed_data)
-            (Float64(distance), monad.id)
-        end
+        failed_simulations, failed_monads, without_success = _batchOutcome(sim_ids_before)
+        _recordBatchFailures(calibration, t, max_nr_populations, verbosity, warned_generations,
+                             failed_simulations, failed_monads)
+        failed_set = Set(failed_simulations)
+        no_success = Set(without_success)
 
-        return results
+        return Tuple{Union{Float64,Missing},Int}[
+            if monad.id in no_success
+                on_monad_failure === :error &&
+                    _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad.id,
+                                                  sim_ids_before[monad.id])
+                (missing, monad.id)
+            else
+                (_evaluateParticle(problem, monad.id,
+                                   count(in(failed_set), sim_ids_before[monad.id])),
+                 monad.id)
+            end
+            for monad in monads]
     end
     return evaluate_batch
+end
+
+"""
+    _evaluateParticle(problem, monad_id, n_failed_simulations) → Float64
+
+Compute one particle's distance by calling the user's `summary_statistic` and `distance` on a
+monad that has at least one successful simulation.
+
+Both calls are user code, so both are guarded — but neither failure is recoverable: the monad
+*does* have output, so an exception (or a `distance` return value that is not a `Real`) is a
+fault in the user's functions, not a simulation failure. Either way the run stops with the monad
+ID named, rather than propagating a `missing`/`nothing` into the ABC-SMC internals where it
+surfaces much later as an unrelated `MethodError`. `n_failed_simulations` is reported when
+non-zero, since a partially failed monad is the likeliest reason otherwise-correct user code
+trips here.
+"""
+function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int)
+    partial_note = n_failed_simulations == 0 ? "" :
+        "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
+        "they would have produced is missing."
+    distance = try
+        simulated = problem.summary_statistic(monad_id)
+        problem.distance(simulated, problem.observed_data)
+    catch
+        @error """
+        Calibration failed while evaluating monad $monad_id: `summary_statistic` or `distance` \
+        raised. This monad has at least one successful simulation, so the fault is in those \
+        functions rather than in the simulations.$partial_note
+        """
+        rethrow()
+    end
+    distance isa Real || error("""
+    Calibration failed while evaluating monad $monad_id: `distance` returned a \
+    $(typeof(distance)), but a `Real` is required.$partial_note
+    """)
+    return Float64(distance)
+end
+
+"""
+    _validateEvaluationFailurePolicy(policy::Symbol)
+
+Throw an `ArgumentError` unless `policy` is `:reject` or `:error`. Called before any work
+begins so a typo fails immediately rather than on the first failed particle.
+"""
+function _validateEvaluationFailurePolicy(policy::Symbol)
+    policy in (:reject, :error) || throw(ArgumentError(
+        "Unknown on_monad_failure setting :$policy. Expected :reject or :error."))
+    return nothing
+end
+
+"""
+    _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad_id, sim_ids)
+
+Stop the run because monad `monad_id` has no successful simulation, under
+`on_monad_failure=:error`. Points at the generation's failure files and at the simulations'
+own output folders, which survive even when their monad does not.
+"""
+function _throwNoSuccessfulSimulations(calibration::Calibration, t::Int, max_nr_populations::Int,
+                                       monad_id::Int, sim_ids::AbstractVector{<:Integer})
+    folders = isempty(sim_ids) ? "" :
+        "\nSimulation output folders:\n" *
+        join(["  - $(trialFolder(Simulation, sid))" for sid in sim_ids], "\n")
+    error("""
+    Calibration stopped: monad $monad_id has no successful simulation, so there is no output for \
+    `summary_statistic` to read.
+    Failed simulation and monad IDs for generation $t are recorded in
+      - $(_failedSimulationsPath(calibration, t, max_nr_populations))
+      - $(_failedMonadsPath(calibration, t, max_nr_populations))$folders
+    Pass `on_monad_failure=:reject` to reject such particles and continue the run instead.
+    """)
 end
 
 ################## Public API ##################
@@ -109,6 +277,10 @@ saved in two forms:
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise. See [`_resolveVerbosity`](@ref).
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
+  simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
+  which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
+  simulation and monad IDs are recorded per generation. See [`_buildEvaluateBatch`](@ref).
 
 # Examples
 ```julia
@@ -119,8 +291,10 @@ df, weights = posterior(result)
 """
 function runCalibration(problem::CalibrationProblem, method::ABCSMC;
                         description::String="", run_kwargs::NamedTuple=(;),
-                        progress::Symbol=:auto)
+                        progress::Symbol=:auto,
+                        on_monad_failure::Symbol=:reject)
     verbosity = _resolveVerbosity(progress)
+    _validateEvaluationFailurePolicy(on_monad_failure)
     calibration = createCalibration("ABC-SMC"; description=description)
     _saveMethod(calibration, method)
     _saveProblem(calibration, problem)
@@ -132,7 +306,8 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
 
     bank           = _buildSimulationBank(problem)
     evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations,
-                                         run_kwargs; verbosity=verbosity)
+                                         run_kwargs; verbosity=verbosity,
+                                         on_monad_failure=on_monad_failure)
     on_generation  = gen -> _saveGeneration(calibration, gen, method.max_nr_populations, cps)
 
     generations = _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
@@ -173,6 +348,10 @@ The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`,
   `:batch`, `:bar`). `:auto` shows a live progress bar on an interactive terminal and
   per-generation milestones otherwise.
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
+  simulation. `:reject` records its distance as `missing` (so the particle is never accepted) and
+  continues; `:error` stops the run. Failed simulation and monad IDs are recorded per generation
+  either way. See [`_buildEvaluateBatch`](@ref).
 
 # Examples
 ```julia
@@ -197,7 +376,8 @@ function runABC(problem::CalibrationProblem;
                 max_evaluations::Union{Nothing,Int}=nothing,
                 run_kwargs::NamedTuple=(;),
                 description::String="",
-                progress::Symbol=:auto)
+                progress::Symbol=:auto,
+                on_monad_failure::Symbol=:reject)
     method = ABCSMC(; population_size=population_size,
                       max_nr_populations=max_nr_populations,
                       minimum_epsilon=minimum_epsilon,
@@ -211,7 +391,8 @@ function runABC(problem::CalibrationProblem;
                       cdf_grid_k=cdf_grid_k,
                       max_evaluations=max_evaluations)
     return runCalibration(problem, method; description=description, run_kwargs=run_kwargs,
-                          progress=progress)
+                          progress=progress,
+                          on_monad_failure=on_monad_failure)
 end
 
 ################## Method Persistence ##################
@@ -820,6 +1001,8 @@ new definition is used silently. Passing `problem=` in this case forces full val
 - `run_kwargs`: Forwarded to each `run(sampling; ...)` call.
 - `progress`: Console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`, `:bar`);
   same semantics as in [`runABC`](@ref).
+- `on_monad_failure`: `:reject` (default) or `:error`; same semantics as in
+  [`runABC`](@ref).
 
 # Examples
 ```julia
@@ -837,8 +1020,10 @@ function resumeABC(calibration::Calibration;
                    problem::Union{Nothing,CalibrationProblem}=nothing,
                    method::Union{Nothing,ABCSMC}=nothing,
                    run_kwargs::NamedTuple=(;),
-                   progress::Symbol=:auto)
+                   progress::Symbol=:auto,
+                   on_monad_failure::Symbol=:reject)
     verbosity = _resolveVerbosity(progress)
+    _validateEvaluationFailurePolicy(on_monad_failure)
     manifest = _loadProblem(calibration)
     active_problem = _resolveResumeProblem(manifest, problem, calibration)
 
@@ -861,7 +1046,8 @@ function resumeABC(calibration::Calibration;
 
     bank           = _buildSimulationBank(active_problem)
     evaluate_batch = _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations,
-                                         run_kwargs; verbosity=verbosity)
+                                         run_kwargs; verbosity=verbosity,
+                                         on_monad_failure=on_monad_failure)
     on_generation  = gen -> _saveGeneration(calibration, gen, m.max_nr_populations, cps)
 
     generations = _runABCSMC(m, param_names, priors, evaluate_batch, on_generation;
@@ -918,6 +1104,68 @@ Path to the monad-ID record for generation `t`: `generations/generation_{NNN}_mo
 function _generationMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
     tag = _generationTag(t, max_nr_populations)
     return joinpath(calibrationFolder(calibration), "generations", "generation_$(tag)_monads.csv")
+end
+
+"""
+    _failedSimulationsPath(calibration, t, max_nr_populations) → String
+
+Path to the failed-simulation record for generation `t`:
+`generations/generation_{NNN}_failed_simulations.csv`.
+"""
+function _failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
+    tag = _generationTag(t, max_nr_populations)
+    return joinpath(calibrationFolder(calibration), "generations",
+                    "generation_$(tag)_failed_simulations.csv")
+end
+
+"""
+    _failedMonadsPath(calibration, t, max_nr_populations) → String
+
+Path to the record of monads with at least one failed simulation in generation `t`:
+`generations/generation_{NNN}_failed_monads.csv`.
+"""
+function _failedMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
+    tag = _generationTag(t, max_nr_populations)
+    return joinpath(calibrationFolder(calibration), "generations",
+                    "generation_$(tag)_failed_monads.csv")
+end
+
+"""
+    _appendCompressedIDs(path, new_ids) → String
+
+Merge `new_ids` into the compressed-ID CSV at `path` (creating it if absent) and return `path`.
+Existing entries are read back with `constituentIDs`, so the file always holds a single
+fully-compressed, deduplicated, sorted ID list spanning every call — the format shared by the
+per-generation monad and failure records.
+"""
+function _appendCompressedIDs(path::String, new_ids::AbstractVector{<:Integer})
+    mkpath(dirname(path))
+    ids = vcat(constituentIDs(path), new_ids)
+    CSV.write(path, Tables.table(compressIDs(ids)); header=false)
+    return path
+end
+
+"""
+    _recordBatchFailures(calibration, t, max_nr_populations, verbosity, warned_generations,
+                         failed_simulations, failed_monads)
+
+Record a batch's failed simulation IDs and the IDs of monads with at least one failed simulation
+to the generation's failure files, and warn about them **once per generation** (tracked in
+`warned_generations`). Later batches in the same generation add to the same files silently.
+
+Does nothing when the batch had no failures.
+"""
+function _recordBatchFailures(calibration::Calibration, t::Int, max_nr_populations::Int,
+                              verbosity::Symbol, warned_generations::Set{Int},
+                              failed_simulations::AbstractVector{<:Integer},
+                              failed_monads::AbstractVector{<:Integer})
+    isempty(failed_simulations) && isempty(failed_monads) && return nothing
+    sim_path   = _appendCompressedIDs(_failedSimulationsPath(calibration, t, max_nr_populations),
+                                      failed_simulations)
+    monad_path = _appendCompressedIDs(_failedMonadsPath(calibration, t, max_nr_populations),
+                                      failed_monads)
+    _warnFailuresRecorded(verbosity, t, warned_generations, sim_path, monad_path)
+    return nothing
 end
 
 """

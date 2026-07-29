@@ -59,9 +59,15 @@ ModelManager.upgradeToMilestone(::TestSimulator, args...) = true
 ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
 ModelManager.setupMonad(::TestSimulator,    args...; kwargs...) = true
 
+# When set, `runSimulation` reports failure for any spec the predicate accepts — used by the
+# calibration failure-handling tests to make specific monads lose all of their simulations
+# (which makes the runner delete the emptied monad, exactly as in the reported bug).
+const _fail_sim_predicate = Ref{Union{Nothing,Function}}(nothing)
+
 function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.SimulationSpec)
     # No-op: immediately report success without launching any process.
-    return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, true)
+    should_fail = !isnothing(_fail_sim_predicate[]) && _fail_sim_predicate[](spec)
+    return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, !should_fail)
 end
 
 # Records the per-simulation post-step call order so the ordering test below can assert
@@ -95,6 +101,26 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 # are stable strings ("_gsa_fA", "_gsa_fB") rather than gensym closure names.
 _gsa_fA(mid) = 0.0
 _gsa_fB(mid) = 0.0
+
+# Summary statistics that reproduce the reported calibration failure modes.
+# _test_monad_ss touches the monad, so it would throw "Monad N not in the database" once every
+# simulation in that monad has failed and the emptied monad has been deleted — the failure the
+# calibration loop must now catch before user code is reached.
+function _test_monad_ss(mid)
+    monad = Monad(mid)
+    return Dict{String,Any}("x" => Float64(length(ModelManager.simulationIDs(monad))))
+end
+# _test_missing_ss returns `missing` for a monad that is gone instead of throwing; the failure
+# then surfaces one frame later, inside `distance` (the originally reported MethodError).
+function _test_missing_ss(mid)
+    df = ModelManager.constructSelectQuery("monads", "WHERE monad_id=$(mid);";
+                                           selection="monad_id") |> ModelManager.queryToDataFrame
+    return isempty(df) ? missing : Dict{String,Any}("x" => 1.0)
+end
+# Broken user functions used to check that a healthy monad fails fast rather than silently:
+# a distance that is not a Real, and a summary statistic that throws.
+_test_dict_dist(sim, obs)  = Dict("not" => "a real")
+_test_throwing_ss(mid)     = error("summary statistic boom")
 
 @testset "ModelManager.jl" begin
 
@@ -1005,6 +1031,95 @@ _gsa_fB(mid) = 0.0
         @test gens[2].acceptance_rate ≈ 1.0
     end
 
+    ################## missing distances (monads with no successful sim) ##################
+
+    @testset "_acceptFirstGeneration drops missing distances" begin
+        proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
+            (Dict("x" => 0.1), nothing), (Dict("x" => 0.2), nothing),
+            (Dict("x" => 0.3), nothing), (Dict("x" => 0.4), nothing)]
+
+        # Two failed monads among four proposals: only those with a distance are accepted,
+        # in order, carrying their monad IDs through as metadata.
+        results = Tuple{Union{Float64,Missing},Int}[
+            (1.0, 11), (missing, 12), (2.0, 13), (missing, 14)]
+        accepted = ModelManager._acceptFirstGeneration(proposals, results)
+        @test length(accepted) == 2
+        @test [p.distance for p in accepted] == [1.0, 2.0]
+        @test [p.metadata for p in accepted] == [11, 13]
+        @test [p.latent_cdfs["x"] for p in accepted] == [0.1, 0.3]
+
+        # `Inf` is a distance like any other, not a failure signal: it is accepted, and ε for the
+        # generation is simply infinite. Generation 2 then accepts every proposal — a second
+        # uniform draw in CDF space — after which the usual quantile rule pulls ε back down.
+        @test length(ModelManager._acceptFirstGeneration(proposals,
+                        Tuple{Union{Float64,Missing},Int}[
+                            (1.0, 11), (Inf, 12), (2.0, 13), (3.0, 14)])) == 4
+
+        # No monad succeeded → error rather than an all-rejected generation.
+        @test_throws "had a successful simulation" ModelManager._acceptFirstGeneration(proposals,
+                        Tuple{Union{Float64,Missing},Int}[
+                            (missing, 11), (missing, 12), (missing, 13), (missing, 14)])
+
+        # An empty batch is reported as such, not as "none of the 0 monads succeeded".
+        empty_proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[]
+        @test_throws "empty batch" ModelManager._acceptFirstGeneration(empty_proposals,
+                        Tuple{Union{Float64,Missing},Int}[])
+    end
+
+    @testset "generation 1 epsilon and weights ignore failed monads" begin
+        # Without filtering, one missing would corrupt gen-1 epsilon = maximum(distances).
+        Random.seed!(11)
+        n_seen = Ref(0)
+        # Fail the 2nd and 4th monad of generation 1; everything else scores 0.5.
+        evaluate_flaky = function (t, proposals)
+            map(proposals) do _
+                n_seen[] += 1
+                (t == 1 && n_seen[] in (2, 4)) ? (missing, 0) : (0.5, 0)
+            end
+        end
+        method = ABCSMC(population_size=6, max_nr_populations=2, minimum_epsilon=0.0)
+        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                        evaluate_flaky, g -> nothing)
+
+        @test isfinite(gens[1].epsilon)
+        @test gens[1].epsilon ≈ 0.5
+        # 4 of 6 survive; weights renormalized over survivors, n_evaluations unchanged.
+        @test length(gens[1].weights) == 4
+        @test sum(gens[1].weights) ≈ 1.0
+        @test nrow(gens[1].particles) == 4
+        @test gens[1].n_evaluations == 6
+        @test gens[1].acceptance_rate ≈ 4/6
+    end
+
+    @testset "later generations reject missing distances without comparing to epsilon" begin
+        # `missing <= epsilon` is `missing`, not `false`, so an unguarded comparison would
+        # throw when used as a condition. Every 3rd monad in generation 2 fails.
+        Random.seed!(13)
+        n_seen = Ref(0)
+        evaluate_flaky = function (t, proposals)
+            map(proposals) do _
+                n_seen[] += 1
+                (t > 1 && n_seen[] % 3 == 0) ? (missing, 0) : (0.25, 0)
+            end
+        end
+        method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                        evaluate_flaky, g -> nothing)
+        @test length(gens) == 2
+        # Failed monads are never accepted, so the target population is still filled from the
+        # rest, and more proposals were needed than were accepted.
+        @test nrow(gens[2].particles) == 4
+        @test all(isfinite, gens[2].distances)
+        @test gens[2].n_evaluations > 4
+        @test gens[2].acceptance_rate < 1.0
+    end
+
+    @testset "_validateEvaluationFailurePolicy" begin
+        @test ModelManager._validateEvaluationFailurePolicy(:reject) === nothing
+        @test ModelManager._validateEvaluationFailurePolicy(:error)  === nothing
+        @test_throws ArgumentError ModelManager._validateEvaluationFailurePolicy(:ignore)
+    end
+
     ################## accept_overflow ##################
 
     @testset "accept_overflow keeps all epsilon-passing particles" begin
@@ -1376,49 +1491,6 @@ _gsa_fB(mid) = 0.0
         end
     end
 
-    @testset "CDF-grid snapping integration: no duplicate snap keys per generation" begin
-        Random.seed!(42)
-        # k=3 gives grid {j/8 : j=1..7} in 1D — 7 unique points.
-        # population_size=5 < 7, so we expect 5 unique snap keys with no collisions.
-        method = ABCSMC(population_size=5, max_nr_populations=3,
-                        minimum_epsilon=0.0, cdf_grid_k=3)
-
-        # Mock get_monad_id: returns a consistent unique ID per unique snap value.
-        snap_id_map = Dict{Float64, Int}()
-        mid_counter = Ref(0)
-        get_monad_id_fn = function(params)
-            v = params["x"]
-            if !haskey(snap_id_map, v)
-                mid_counter[] += 1
-                snap_id_map[v] = mid_counter[]
-            end
-            return snap_id_map[v]
-        end
-        # evaluate_batch: for known-mid proposals reuse the mid; for new snaps assign a
-        # consistent ID via get_monad_id_fn so grid-alignment checks remain valid.
-        evaluate_batch = (t, proposals) -> [(rand(), isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
-                                             for (cdfs, mid) in proposals]
-
-        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
-                                        evaluate_batch, g -> nothing)
-
-        for g in gens
-            @test nrow(g.particles) == 5
-            # All particles' x values should be on the grid {j/2^k_eff : j=1..2^k_eff-1}
-            k_eff = ModelManager._effectiveK(3, g.t)
-            n     = 2^k_eff
-            for i in 1:nrow(g.particles)
-                u = g.particles[i, :x]
-                j = round(Int, u * n)
-                @test j ∈ 1:(n-1)
-                @test isapprox(u, j / n; atol=1e-10)
-            end
-            # Duplicate snap keys are now allowed (discrete-SMC design)
-            keys = [round(Int, g.particles[i, :x] * 2^k_eff) for i in 1:nrow(g.particles)]
-            @test length(unique(keys)) >= 1   # at least one distinct snap point
-        end
-    end
-
     @testset "CDF-grid snapping disabled when cdf_grid_k=nothing" begin
         # Without snapping, particles are NOT constrained to grid points.
         Random.seed!(42)
@@ -1502,43 +1574,6 @@ _gsa_fB(mid) = 0.0
             open(toml_nil, "w") do io; TOML.print(io, d_nil); end
             loaded_nil = TOML.parsefile(toml_nil)
             @test !haskey(loaded_nil, "max_evaluations")
-        end
-    end
-
-    @testset "k_base_eff correction: coarse cdf_grid_k raised for population_size" begin
-        # k=1, d=1: (2^1-1)^1 = 1 interior point. For N=5 we need k_min=3
-        # since (2^3-1)^1=7≥5 but (2^2-1)^1=3<5... wait, 3>=5 is false; let us check:
-        # k=2: (2^2-1)^1=3<5 → not enough. k=3: (2^3-1)^1=7≥5 → ok. So k_min=3.
-        # With k=1 supplied, _runABCSMC should raise k_base_eff to 3.
-        # All snapped particles in gen-1 must lie on the k=3 grid.
-        Random.seed!(17)
-        snap_id_map = Dict{Float64, Int}()
-        id_counter  = Ref(0)
-        get_monad_id_fn = function(params)
-            v = params["x"]
-            if !haskey(snap_id_map, v)
-                id_counter[] += 1
-                snap_id_map[v] = id_counter[]
-            end
-            return snap_id_map[v]
-        end
-        evaluate_batch = (t, proposals) -> [(0.1, isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
-                                             for (cdfs, mid) in proposals]
-
-        method = ABCSMC(population_size=5, max_nr_populations=1,
-                        minimum_epsilon=0.0, cdf_grid_k=1)
-        gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
-                                        evaluate_batch, g -> nothing)
-        @test length(gens) == 1
-        @test nrow(gens[1].particles) == 5
-        # k_base_eff should have been raised to 3; gen-1 k_eff = 3
-        k_eff_expected = 3
-        n = 2^k_eff_expected
-        for i in 1:nrow(gens[1].particles)
-            u = gens[1].particles[i, :x]
-            j = round(Int, u * n)
-            @test j ∈ 1:(n-1)
-            @test isapprox(u, j / n; atol=1e-10)
         end
     end
 
@@ -2542,6 +2577,372 @@ _gsa_fB(mid) = 0.0
                 @test_throws ArgumentError runCalibration(prob,
                     ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
                     progress=:verbose)
+            end
+
+            # ---------- failed simulations during calibration ----------
+            #
+            # Reproduces the reported bug: when every simulation in a proposed monad fails, the
+            # runner deletes the emptied monad, and the user's summary_statistic then either
+            # throws (_test_monad_ss) or returns missing, which throws inside `distance`
+            # (_test_missing_ss). ModelManager now detects the empty monad before calling user
+            # code at all. `_fail_sim_predicate` forces the failures.
+            @testset "on_monad_failure=:reject" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(10.0, 12.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_monad_ss, mseDistance)
+                method = ABCSMC(population_size=6, max_nr_populations=2,
+                                minimum_epsilon=0.0)
+
+                # Fail the first two simulations dispatched; with n_replicates=1 that empties
+                # (and so deletes) exactly two monads. The runner's workers are async tasks,
+                # not threads, so this counter needs no lock.
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) <= 2
+                result = try
+                    runCalibration(prob, method; description="reject failures")
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                # The run survives: healthy particles give x=1 → distance 0 → gen-1 ε=0.
+                @test result isa ABCResult
+                @test length(result.generations) >= 1
+                @test all(isfinite, result.generations[1].distances)
+                # Two of six proposals were rejected, so four particles remain.
+                @test nrow(result.generations[1].particles) == 4
+                @test result.generations[1].n_evaluations == 6
+                @test isfinite(result.generations[1].epsilon)
+
+                # Failures are recorded to the generation's failure files.
+                sim_path = ModelManager._failedSimulationsPath(result.calibration, 1,
+                                                               method.max_nr_populations)
+                monad_path = ModelManager._failedMonadsPath(result.calibration, 1,
+                                                             method.max_nr_populations)
+                @test isfile(sim_path)
+                @test isfile(monad_path)
+                @test length(ModelManager.constituentIDs(sim_path)) == 2
+                @test length(ModelManager.constituentIDs(monad_path)) == 2
+                # Every recorded monad really did lose all of its simulations, so it is gone.
+                @test all(ModelManager.constituentIDs(monad_path)) do mid
+                    isempty(ModelManager.constructSelectQuery("monads", "WHERE monad_id=$mid;";
+                            selection="monad_id") |> ModelManager.queryToDataFrame)
+                end
+            end
+
+            @testset "on_monad_failure=:reject — user statistic never sees a dead monad" begin
+                # _test_missing_ss would return `missing` for a deleted monad, which used to
+                # blow up inside mseDistance. The dead monad is now rejected before user code.
+                dv       = DistributedVariation(:config, xp_x, Uniform(13.0, 15.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_missing_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1,
+                                minimum_epsilon=0.0)
+
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
+                result = try
+                    runCalibration(prob, method; description="reject missing stat")
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                @test result isa ABCResult
+                @test nrow(result.generations[1].particles) == 3
+                @test all(isfinite, result.generations[1].distances)
+            end
+
+            @testset "on_monad_failure=:error" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(16.0, 18.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_monad_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1,
+                                minimum_epsilon=0.0)
+
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
+                try
+                    # Fails fast instead of rejecting the particle, pointing at the failure files.
+                    @test_throws "has no successful simulation" runCalibration(prob, method;
+                        description="error on failure", on_monad_failure=:error)
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                # An unrecognized policy is rejected before any work begins.
+                @test_throws ArgumentError runCalibration(prob,
+                    ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
+                    on_monad_failure=:ignore)
+            end
+
+            @testset "every generation-1 particle failing is fatal" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(19.0, 21.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed,
+                                          _test_monad_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1,
+                                minimum_epsilon=0.0)
+
+                _fail_sim_predicate[] = spec -> true
+                try
+                    # Nothing survives generation 1 → error instead of an empty population.
+                    @test_throws "had a successful simulation" runCalibration(prob, method;
+                        description="all particles fail")
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+            end
+
+            @testset "broken user functions fail fast on a healthy monad" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(22.0, 24.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                method = ABCSMC(population_size=3, max_nr_populations=1, minimum_epsilon=0.0)
+
+                # distance returns a Dict rather than a Real: caught immediately, not
+                # propagated into the ABC-SMC internals. Not affected by :reject.
+                prob_bad_type = CalibrationProblem(inputs, [dv], observed,
+                                                   _test_named_ss, _test_dict_dist)
+                @test_throws "a `Real` is required" runCalibration(prob_bad_type, method;
+                    description="non-Real distance")
+
+                # A throwing summary_statistic on a healthy monad is also fatal, and the
+                # original exception is what surfaces.
+                prob_throws = CalibrationProblem(inputs, [dv], observed,
+                                                 _test_throwing_ss, mseDistance)
+                @test_throws "summary statistic boom" runCalibration(prob_throws, method;
+                    description="throwing summary statistic")
+                waitForDiagnostics()
+            end
+
+            @testset "failure recording and reporting" begin
+                # One warning per generation, naming both files; silent at progress=:none and
+                # on generations already reported.
+                warned = Set{Int}()
+                @test_logs (:warn, r"generation 3: some simulations failed") match_mode=:any begin
+                    ModelManager._warnFailuresRecorded(:generation, 3, warned, "sims.csv",
+                                                       "monads.csv")
+                end
+                @test 3 in warned
+                logs, _ = Test.collect_test_logs() do
+                    ModelManager._warnFailuresRecorded(:generation, 3, warned, "s.csv", "m.csv")
+                    ModelManager._warnFailuresRecorded(:none, 4, warned, "s.csv", "m.csv")
+                end
+                @test isempty(logs)
+
+                # A batch with no failures writes nothing at all.
+                cal = ModelManager.createCalibration("ABC-SMC"; description="failure files")
+                @test ModelManager._recordBatchFailures(cal, 2, 10, :none, Set{Int}(),
+                                                        Int[], Int[]) === nothing
+                @test !isfile(ModelManager._failedSimulationsPath(cal, 2, 10))
+
+                # Successive batches accumulate into one compressed record per generation.
+                ModelManager._recordBatchFailures(cal, 2, 10, :none, Set{Int}(), [5, 6], [11])
+                ModelManager._recordBatchFailures(cal, 2, 10, :none, Set{Int}(), [7], [12])
+                @test ModelManager.constituentIDs(
+                    ModelManager._failedSimulationsPath(cal, 2, 10)) == [5, 6, 7]
+                @test ModelManager.constituentIDs(
+                    ModelManager._failedMonadsPath(cal, 2, 10)) == [11, 12]
+                # Zero-padded generation tag, alongside the existing monads record.
+                @test basename(ModelManager._failedSimulationsPath(cal, 2, 100)) ==
+                      "generation_002_failed_simulations.csv"
+                @test basename(ModelManager._failedMonadsPath(cal, 2, 100)) ==
+                      "generation_002_failed_monads.csv"
+            end
+
+            @testset "reusability filter — started or completed simulations" begin
+                # A monad that has run is reusable; one whose simulations have not started is
+                # not (nothing to snap onto), and neither is a monad that does not exist.
+                # n_replicates=2 so createTrial returns a Monad rather than a Simulation.
+                ran   = createTrial(inputs, [DiscreteVariation(:config, xp_x, 41.0)];
+                                    n_replicates=2)
+                run(ran)
+                # 43.0 is used by no other testset: `use_previous=true` would otherwise reuse an
+                # existing monad that already has completed simulations.
+                unrun = createTrial(inputs, [DiscreteVariation(:config, xp_x, 43.0)];
+                                    n_replicates=2)
+                @test ran isa Monad && unrun isa Monad
+
+                reusable = ModelManager._monadsWithStartedSimulations([ran.id, unrun.id, -7])
+                @test ran.id in reusable
+                @test unrun.id ∉ reusable
+                @test -7 ∉ reusable
+                @test isempty(ModelManager._monadsWithStartedSimulations(Int[]))
+
+                # A `Running` simulation counts: the output is on its way.
+                unrun_sid = ModelManager.simulationIDs(unrun)[1]
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET " *
+                    "status_code_id=$(ModelManager.statusCodeID("Running")) " *
+                    "WHERE simulation_id=$unrun_sid;")
+                @test unrun.id in ModelManager._monadsWithStartedSimulations([unrun.id])
+
+                # Same rule gates bank additions mid-run, keyed on the monad's own state rather
+                # than on the particle's distance — so an unusual but legitimate distance from
+                # a user's `distance` function does not bar a good monad from reuse.
+                bank = ModelManager.SimulationBank(Int[], Matrix{Float64}(undef, 1, 0), ["x"])
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET " *
+                    "status_code_id=$(ModelManager.statusCodeID("Not Started")) " *
+                    "WHERE simulation_id=$unrun_sid;")
+                proposals = Tuple{Dict{String,Float64}, Union{Nothing,Int}}[
+                    (Dict("x" => 0.1), nothing),   # ran → added despite its Inf distance
+                    (Dict("x" => 0.2), nothing),   # never started → skipped
+                    (Dict("x" => 0.3), 99)]        # a reuse (proposal_mid given) → skipped
+                results   = Tuple{Union{Float64,Missing},Int}[
+                    (Inf, ran.id), (1.0, unrun.id), (2.0, 99)]
+                additions = Tuple{Vector{Float64},Int}[]
+                ModelManager._updateMidGenAdditions!(additions, proposals, results, bank, ["x"])
+                @test [mid for (_, mid) in additions] == [ran.id]
+
+                # And the same rule filters the bank at load time. Both monads sit strictly
+                # inside this prior (CDF 0.2 and 0.6), so only the started/completed test
+                # separates them.
+                prob_bank = CalibrationProblem(inputs,
+                    [DistributedVariation(:config, xp_x, Uniform(40.0, 45.0))],
+                    Dict{String,Any}("x" => 1.0), _test_named_ss, mseDistance)
+                built = ModelManager._buildSimulationBank(prob_bank)
+                @test ran.id in built.monad_ids
+                @test unrun.id ∉ built.monad_ids
+            end
+
+            # These two exercise the snapping/bank machinery through _runABCSMC with mock
+            # monad IDs. They live here, inside the initialized project, because the bank's
+            # reusability filter queries simulation statuses — with no database there is
+            # nothing to consult. Mock IDs that match a real monad are reusable; ones that do
+            # not are simply skipped. Either way the assertions below are about grid
+            # alignment and population size, which the filter does not affect.
+            @testset "CDF-grid snapping integration: no duplicate snap keys per generation" begin
+                Random.seed!(42)
+                # k=3 gives grid {j/8 : j=1..7} in 1D — 7 unique points.
+                # population_size=5 < 7, so we expect 5 unique snap keys with no collisions.
+                method = ABCSMC(population_size=5, max_nr_populations=3,
+                                minimum_epsilon=0.0, cdf_grid_k=3)
+
+                # Mock get_monad_id: returns a consistent unique ID per unique snap value.
+                snap_id_map = Dict{Float64, Int}()
+                mid_counter = Ref(0)
+                get_monad_id_fn = function(params)
+                    v = params["x"]
+                    if !haskey(snap_id_map, v)
+                        mid_counter[] += 1
+                        snap_id_map[v] = mid_counter[]
+                    end
+                    return snap_id_map[v]
+                end
+                # evaluate_batch: for known-mid proposals reuse the mid; for new snaps assign a
+                # consistent ID via get_monad_id_fn so grid-alignment checks remain valid.
+                evaluate_batch = (t, proposals) -> [(rand(), isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
+                                                     for (cdfs, mid) in proposals]
+
+                gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                                evaluate_batch, g -> nothing)
+
+                for g in gens
+                    @test nrow(g.particles) == 5
+                    # All particles' x values should be on the grid {j/2^k_eff : j=1..2^k_eff-1}
+                    k_eff = ModelManager._effectiveK(3, g.t)
+                    n     = 2^k_eff
+                    for i in 1:nrow(g.particles)
+                        u = g.particles[i, :x]
+                        j = round(Int, u * n)
+                        @test j ∈ 1:(n-1)
+                        @test isapprox(u, j / n; atol=1e-10)
+                    end
+                    # Duplicate snap keys are now allowed (discrete-SMC design)
+                    keys = [round(Int, g.particles[i, :x] * 2^k_eff) for i in 1:nrow(g.particles)]
+                    @test length(unique(keys)) >= 1   # at least one distinct snap point
+                end
+            end
+
+            @testset "k_base_eff correction: coarse cdf_grid_k raised for population_size" begin
+                # k=1, d=1: (2^1-1)^1 = 1 interior point. For N=5 we need k_min=3
+                # since (2^3-1)^1=7≥5 but (2^2-1)^1=3<5... wait, 3>=5 is false; let us check:
+                # k=2: (2^2-1)^1=3<5 → not enough. k=3: (2^3-1)^1=7≥5 → ok. So k_min=3.
+                # With k=1 supplied, _runABCSMC should raise k_base_eff to 3.
+                # All snapped particles in gen-1 must lie on the k=3 grid.
+                Random.seed!(17)
+                snap_id_map = Dict{Float64, Int}()
+                id_counter  = Ref(0)
+                get_monad_id_fn = function(params)
+                    v = params["x"]
+                    if !haskey(snap_id_map, v)
+                        id_counter[] += 1
+                        snap_id_map[v] = id_counter[]
+                    end
+                    return snap_id_map[v]
+                end
+                evaluate_batch = (t, proposals) -> [(0.1, isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
+                                                     for (cdfs, mid) in proposals]
+
+                method = ABCSMC(population_size=5, max_nr_populations=1,
+                                minimum_epsilon=0.0, cdf_grid_k=1)
+                gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
+                                                evaluate_batch, g -> nothing)
+                @test length(gens) == 1
+                @test nrow(gens[1].particles) == 5
+                # k_base_eff should have been raised to 3; gen-1 k_eff = 3
+                k_eff_expected = 3
+                n = 2^k_eff_expected
+                for i in 1:nrow(gens[1].particles)
+                    u = gens[1].particles[i, :x]
+                    j = round(Int, u * n)
+                    @test j ∈ 1:(n-1)
+                    @test isapprox(u, j / n; atol=1e-10)
+                end
+            end
+
+            @testset "_batchOutcome classifies a batch" begin
+                # Build a monad with two simulations, run it, then mark them by hand: the
+                # classification reads status codes, so it needs no real failures here.
+                dv   = DiscreteVariation(:config, xp_x, 31.0)
+                m    = createTrial(inputs, [dv]; n_replicates=2)
+                run(m)
+                sids = ModelManager.simulationIDs(m)
+                @test length(sids) == 2
+
+                # Both completed → no failures, monad has successes.
+                failed_sims, failed_monads, no_success =
+                    ModelManager._batchOutcome(Dict(m.id => sids))
+                @test isempty(failed_sims) && isempty(failed_monads) && isempty(no_success)
+
+                # One failed, one completed → recorded as a failure, but still evaluable.
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET status_code_id=$(ModelManager.statusCodeID("Failed")) " *
+                    "WHERE simulation_id=$(sids[1]);")
+                failed_sims, failed_monads, no_success =
+                    ModelManager._batchOutcome(Dict(m.id => sids))
+                @test failed_sims == [sids[1]]
+                @test failed_monads == [m.id]
+                @test isempty(no_success)
+
+                # Both failed → no successful simulation, so the particle is unevaluable.
+                ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                    "UPDATE simulations SET status_code_id=$(ModelManager.statusCodeID("Failed")) " *
+                    "WHERE simulation_id=$(sids[2]);")
+                failed_sims, failed_monads, no_success =
+                    ModelManager._batchOutcome(Dict(m.id => sids))
+                @test failed_sims == sort(sids)
+                @test no_success == [m.id]
+
+                # A constituent simulation with no database row means the records and the DB
+                # disagree — that is a bug to surface, not a status to guess at.
+                @test_throws "no row in the `simulations` table" ModelManager._batchOutcome(
+                    Dict(-1 => [999999]))
+                @test isempty(ModelManager._simulationStatusIDs(Int[]))
+
+                # Restore the statuses so later testsets see a healthy project.
+                for sid in sids
+                    ModelManager.DBInterface.execute(ModelManager.centralDB(),
+                        "UPDATE simulations SET " *
+                        "status_code_id=$(ModelManager.statusCodeID("Completed")) " *
+                        "WHERE simulation_id=$sid;")
+                end
             end
 
             @testset "resumeABC" begin

@@ -94,6 +94,9 @@ Created automatically by [`runABC`](@ref). The associated output folder at
 `data/outputs/calibrations/{id}/` contains:
 - `generations/generation_{NNN}_monads.csv`: monad IDs evaluated per generation (written
   before each batch for crash safety).
+- `generations/generation_{NNN}_failed_simulations.csv` and
+  `generations/generation_{NNN}_failed_monads.csv`: IDs of simulations that failed in that
+  generation and of the monads they belong to. Written only when something failed.
 - `generations/generation_{NNN}.csv`: human-readable per-generation results — target
   parameter values (and latent parameter samples for user-supplied `LatentVariation`s),
   weights, distances, and monad IDs.
