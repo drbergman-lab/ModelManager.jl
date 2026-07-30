@@ -74,6 +74,18 @@ That reframing produced two consequences:
 - `docs/src/man/tagging.md` — new manual page
 - `README.md`, `PRD.md` — feature documented
 
+### Copilot review on PR #23
+
+Seven comments (four inline, three suppressed as low confidence). **Six were correct**, including one genuine bug the local test suite could not have caught.
+
+**Provenance was back-filled onto reused objects.** `applyCreationTags` ran on the reuse branch of `Monad`, `Sampling`, and `trialID`, relying on `WHERE provenance_id IS NULL` to make it a no-op. That guard holds for objects created since this feature — but an object from a project that *predates* the provenance columns has a legitimately null `provenance_id`, so re-creating its configuration stamped today's session, script, and git state onto an object created months earlier, and `mm:created` reported today. Now stamped only on the branch that actually inserts.
+
+Why the suite missed it: the upgrade test checked a legacy *simulation*, and simulations are never reused — every one is a fresh `INSERT`. Only monads, samplings, and trials take a reuse path, and no test combined "legacy null provenance" with "reused". Both conditions are now covered.
+
+**Three stale PRD bullets**, all self-inflicted: one referenced `applyRunTags` and one `withTags`, functions deleted two revisions earlier, and a third read "The accessor is `tags`, not `tags`" — the blanket `trialTags` → `tags` revert regex rewrote both halves of the contrast. A reminder that a mechanical rename needs a read-through afterwards, not just a passing test suite.
+
+**One comment was wrong.** It claimed `_reservedTagKey("mm:")` throws `BoundsError` by slicing past the end of the string. Julia's `"mm:"[4:end]` is a valid empty slice returning `""`, which flows into `_validateTagKeyBody` and raises the intended `ArgumentError`; verified across `"mm:"`, `"MM:"`, `"mm: "`, and `"mm:."`. The assumption is reasonable if you expect Python- or Rust-like slicing semantics, so the behavior is now pinned by a test rather than left to be re-litigated.
+
 ### Critic pass over the finished change
 
 A deliberate review of the whole diff at the end, rather than trusting the incremental one. Eight issues found, all in code added this session; all fixed.

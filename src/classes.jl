@@ -408,17 +408,22 @@ struct Monad <: AbstractMonad
             INSERT OR IGNORE INTO monads $feature_str VALUES $value_str RETURNING monad_id;
             """
         ) |> DataFrame |> x -> x.monad_id
-        monad_id = isempty(inserted) ? constructSelectQuery(
-            "monads",
-            """
-            WHERE $feature_str=$value_str
-            """;
-            selection="monad_id"
-        ) |> queryToDataFrame |> x -> x.monad_id[1] : inserted[1]
-        #! Runs whether the INSERT fired or an existing row was reused. It is a no-op in the
-        #! latter case — provenance is only written when still unset — so a monad keeps the
-        #! context that created it.
-        applyCreationTags(Monad, monad_id)
+        if isempty(inserted)
+            #! Row already existed, so this is a reuse, not a creation — no provenance is
+            #! stamped. Guarding on the branch rather than on `provenance_id IS NULL` also
+            #! covers monads from a project that predates the provenance columns, whose
+            #! provenance is legitimately null and must not be back-filled with today's.
+            monad_id = constructSelectQuery(
+                "monads",
+                """
+                WHERE $feature_str=$value_str
+                """;
+                selection="monad_id"
+            ) |> queryToDataFrame |> x -> x.monad_id[1]
+        else
+            monad_id = inserted[1]
+            applyCreationTags(Monad, monad_id)
+        end
         return Monad(monad_id, inputs, variation_id, n_replicates, use_previous)
     end
 
@@ -550,8 +555,8 @@ struct Sampling <: AbstractSampling
                 """
             ) |> DataFrame |> x -> x.sampling_id[1]
             recordConstituentIDs(Sampling, id, monad_ids)
+            applyCreationTags(Sampling, id)
         end
-        applyCreationTags(Sampling, id)
         return Sampling(id, inputs, monads)
     end
 
@@ -687,8 +692,8 @@ function trialID(samplings::Vector{Sampling})
     if id == -1
         id = DBInterface.execute(centralDB(), "INSERT INTO trials (datetime) VALUES($(Dates.format(now(),"yymmddHHMM"))) RETURNING trial_id;") |> DataFrame |> x -> x.trial_id[1]
         recordConstituentIDs(Trial, id, sampling_ids)
+        applyCreationTags(Trial, id)
     end
-    applyCreationTags(Trial, id)
     return id
 end
 

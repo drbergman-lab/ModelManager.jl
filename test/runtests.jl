@@ -3326,6 +3326,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             sim = createTrial(inputs, [DiscreteVariation(:config, XMLPath(["data", "x"]), 5.0)]; n_replicates=1)
             @test_throws ArgumentError tag!(sim, "mm:created" => "yesterday")
             @test_throws ArgumentError tag!(sim, "mm:script" => "evil.jl")
+
+            # The bare prefix has an empty body. Julia's `"mm:"[4:end]` is a valid empty
+            # slice, so this fails as a clean ArgumentError rather than a BoundsError —
+            # pinned because the opposite is a reasonable thing to assume.
+            @test ModelManager.MM_TAG_PREFIX[4:end] == ""
+            @test_throws ArgumentError ModelManager._reservedTagKey("mm:")
+            @test_throws ArgumentError hasTag(sim, "mm:")
+            @test_throws ArgumentError findSimulationIDs(tags=("mm:",))
+            @test_throws ArgumentError tagValues("mm:")
         end
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end
@@ -3732,6 +3741,25 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test monad_b.id == monad_a.id
             new_sims = setdiff(sort(simulationIDs(monad_b)), sims_a)
             @test length(new_sims) == 3
+
+            # A monad from a project predating the provenance columns has null provenance.
+            # Reusing it must not back-fill today's context onto an object created long ago,
+            # so provenance is stamped on the branch that actually inserts, not merely when
+            # `provenance_id IS NULL`.
+            ModelManager.DBInterface.execute(centralDB(),
+                "UPDATE monads SET provenance_id=NULL, datetime=NULL WHERE monad_id=$(monad_a.id);")
+            mm_globals().provenance_id = ctx("scriptC")
+            reused = Monad(inputs, vid; n_replicates=2, use_previous=true)
+            @test reused.id == monad_a.id
+            legacy_row = ModelManager.queryToDataFrame(
+                "SELECT provenance_id, datetime FROM monads WHERE monad_id=$(monad_a.id);")
+            @test ismissing(legacy_row.provenance_id[1])
+            @test ismissing(legacy_row.datetime[1])
+            @test isempty(tags(Monad, monad_a.id))
+
+            # Restore so the assertions below describe the ordinary case.
+            ModelManager.DBInterface.execute(centralDB(),
+                "UPDATE monads SET provenance_id=$(ctx("scriptA")) WHERE monad_id=$(monad_a.id);")
 
             # The monad reports when *it* was created, not the last script to touch it.
             @test scriptOf(provOf("monads", "monad_id", monad_a.id)) == "/tmp/scriptA.jl"

@@ -251,7 +251,7 @@ target location's file type.
 - The same reasoning applies one level down: batching objects below `Sampling` wraps each in a single-object `Sampling` so the `Trial` can hold it, and those wrappers are containers too, so they go untagged. `findTrials(Sampling; ...)` therefore returns nothing for such a batch, while `findSimulationIDs` and `findMonads` return everything expected.
 - Tags are written before any simulation is dispatched, so they survive an interrupted run and are queryable while it is in flight.
 - Framework-generated `mm:` tags use the same path via `tagReserved!`, which accepts the reserved namespace `tag!` rejects.
-- The accessor is `tags`, not `tags`: a bare `tags` is too easily masked by a user variable of the same name, and Julia allows that shadowing silently. The name matches the existing `trialID`/`trialType`/`trialFolder` accessors.
+- The accessor is `tags`. Renaming it to `trialTags` was considered, because a bare `tags` is easily masked by a user variable of the same name and Julia allows that shadowing silently, but the shorter name won; `ModelManager.tags(sim)` is the workaround if it ever bites.
 
 *Automatic provenance*
 - Every created object records its creation time and creation context, surfaced as `mm:created`, `mm:session`, `mm:script`, `mm:git`, `mm:git.branch`, and `mm:git.dirty`.
@@ -291,7 +291,7 @@ target location's file type.
 *Integrity*
 - Tag rows are deleted at all four deletion choke points (`deleteSimulations`, `deleteMonad`, `deleteSampling`, `deleteTrial`). `resetDatabase` needs no hook — it deletes the central database file.
 - `orphanedTagCounts()` reports tag rows per class whose object no longer exists; `databaseDiagnostics` warns when any are found. It does not assert the table's existence, so databases predating tagging degrade gracefully.
-- Tag writes never take down a run: `applyCreationTags` and `applyRunTags` swallow and `@debug` their errors.
+- Tag writes never take down a run: `applyCreationTags`, `tagReserved!`, and provenance resolution route through `_quietly`, which swallows and `@debug`s their errors.
 
 **Acceptance criteria:**
 - Tagging and retrieving round-trips for all four classes; re-tagging is idempotent; a key may hold multiple values; bare labels dedupe.
@@ -301,7 +301,7 @@ target location's file type.
 - `findSimulationIDs(tags = ("mm:session" => id,))` and `("mm:script" => "sweep.jl",)` both resolve through the columns.
 - Object-returning finders throw above `limit`; `simulationsFromIDs` agrees with `Simulation.(ids)` and skips missing IDs.
 - `tag!(sim, "mm:created" => ...)` throws `ArgumentError`.
-- `withTags` tags everything created inside, nests, and unwinds on exception; objects created outside are unaffected.
+- `createTrial(...; tags=...)` and `run(...; tags=...)` tag the object returned or handed in; objects created outside the call are unaffected.
 - A tag on a `Sampling` matches its simulations with `inherit=true` and none with `inherit=false`.
 - Inherited and direct tags compose under AND; `any_of` composes under OR.
 - Deleting an object removes its tag rows; deleted objects never surface from a tag query; `orphanedTagCounts()` stays at zero.
