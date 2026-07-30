@@ -163,6 +163,10 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         sim_ids_before = Dict(monad.id => simulationIDs(monad) for monad in monads)
 
         sampling = Sampling(monads, problem.inputs)
+        #! Labels the batch so a monad can be traced back to the calibration and generation
+        #! that proposed it without consulting the per-generation CSVs — which do not
+        #! survive a monad deletion. Its monads match through inheritance.
+        tagReserved!(sampling, ["mm:calibration" => string(calibration.id), "mm:generation" => string(t)])
         on_progress = _batchProgressCallback(verbosity, "  gen $t batch $batch_index ")
         run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
 

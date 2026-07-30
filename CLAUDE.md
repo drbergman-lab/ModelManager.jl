@@ -165,6 +165,13 @@ ModelManager is **simulator-agnostic** infrastructure. Therefore:
 - Always run Julia with `--project=.`
 - Do not edit `Manifest.toml` or add dependencies without explicit approval.
 
+## Known Trade-offs
+
+Deliberate decisions whose symptoms would otherwise look like bugs. Check here before "fixing" one.
+
+- **Concurrent trial creation is unsupported** — in one session or across sessions. Two Julia sessions cannot corrupt the SQLite file (SQLite serializes writers), but `Sampling(monads, inputs)` and `trialID(samplings)` in `src/classes.jl` scan for a matching row before inserting, with no `UNIQUE` constraint to fall back on, so each could insert a duplicate. They also race on the constituent-ID CSVs, which no database lock covers.
+  **If duplicate or inconsistent rows show up in `samplings` or `trials`, that is the cause.** The fix is to wrap those two find-or-insert blocks in `withTransaction(mode="EXCLUSIVE")` and add `PRAGMA busy_timeout` where the central connection is opened — without the timeout the losing session fails immediately with `"database is locked"` rather than waiting. `withTransaction`'s `mode` keyword exists for exactly this. See `progress.md` for the measurements behind why it is off by default.
+
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
 - Wire the `post_processor` QoI builders (e.g. `populationCountQoI`) into sensitivity analysis and calibration workflows, so a builder's output can feed `runSensitivity`/`CalibrationProblem` directly instead of only landing in the post-processing sink. Not yet done — these builders currently only target `run(...; post_processor=...)`.

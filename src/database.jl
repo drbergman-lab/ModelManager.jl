@@ -41,6 +41,51 @@ function reinitializeDatabase()
 end
 
 """
+    withTransaction(f; mode="DEFERRED", db::SQLite.DB=centralDB())
+
+Run `f` inside a transaction on `db`, and return its value.
+
+Batches several statements into one commit. Nested calls join the enclosing
+transaction rather than starting their own, so it is safe to call from a function
+that may itself be invoked inside one.
+
+`mode` is passed to `BEGIN`. ModelManager uses the default everywhere: a single
+statement is already atomic, and an `INSERT OR IGNORE` against a `UNIQUE`
+constraint is self-correcting, since a losing racer's lookup finds the winner's
+row. `"EXCLUSIVE"` exists as an escape hatch for a find-or-insert that has no such
+constraint to fall back on — see the note in `progress.md` on duplicate `samplings`
+or `trials` rows.
+
+!!! note
+    SQLite holds locks per *connection*, and ModelManager uses one per session, so
+    this serializes against other Julia sessions sharing the project — not against
+    tasks inside one session.
+
+# Example
+```julia
+withTransaction() do
+    for row in rows
+        insert(row)
+    end
+end
+```
+"""
+function withTransaction(f::Function; mode::AbstractString="DEFERRED", db::SQLite.DB=centralDB())
+    #! Already inside one: the outer transaction covers us, and committing here would
+    #! end the caller's transaction early.
+    SQLite.intransaction(db) && return f()
+    SQLite.transaction(db, mode)
+    try
+        result = f()
+        SQLite.commit(db)
+        return result
+    catch
+        SQLite.rollback(db)
+        rethrow()
+    end
+end
+
+"""
     createSchema()
 
 Create all tables in the central database.
@@ -95,6 +140,13 @@ function createSchema()
 
     createDefaultStatusCodesTable()
     createMMTable("calibrations", calibrationsSchema())
+
+    #! Purely additive, so `CREATE TABLE IF NOT EXISTS` brings existing databases
+    #! up to date on the next `initializeModelManager` with no migration milestone.
+    createMMTable("tags", tagsSchema())
+    createMMTable("provenances", provenancesSchema())
+    createTagIndices()
+    ensureProvenanceColumns()
 end
 
 """
@@ -653,6 +705,21 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
         You can also use `deleteSimulationsByStatus($arg_string; user_check=false)` to remove all simulations with these status codes.
         """
     end
+
+    #! Not asserted like the four core tables: a database opened by an older ModelManager
+    #! has no `tags` table until `initializeDatabase` recreates the schema.
+    if tableExists("tags")
+        orphans = orphanedTagCounts()
+        total_orphans = sum(values(orphans); init=0)
+        if total_orphans > 0
+            detail = join(["$(n) $(class)" for (class, n) in sort(collect(orphans)) if n > 0], ", ")
+            @warn """
+            Found $(total_orphans) tag rows pointing at objects that no longer exist ($(detail)).
+            This usually means a deletion was interrupted. They are harmless — `findTrials` filters
+            them out — but you can clear them by deleting the affected objects again.
+            """
+        end
+    end
 end
 
 ########### Summarizing functions (generic) ###########
@@ -806,11 +873,14 @@ function simulationsTableFromQuery(query::String;
                                    sort_by=String[],
                                    sort_ignore=String[],
                                    short_names::Bool=true,
-                                   post_processing::Bool=false)
+                                   post_processing::Bool=false,
+                                   tags::Bool=false,
+                                   include_auto_tags::Bool=false)
     df = _variationsTableFromQuery(query, :simulation_id, :SimID;
                                    remove_constants=remove_constants, sort_by=sort_by,
                                    sort_ignore=sort_ignore, short_names=short_names)
     post_processing && _appendPostProcessing!(df)
+    tags && appendTags!(df, Simulation, :SimID; include_auto=include_auto_tags)
     return df
 end
 
@@ -827,10 +897,14 @@ function monadsTableFromQuery(query::String;
                               remove_constants::Bool=true,
                               sort_by=String[],
                               sort_ignore=String[],
-                              short_names::Bool=true)
-    return _variationsTableFromQuery(query, :monad_id, :MonadID;
-                                     remove_constants=remove_constants, sort_by=sort_by,
-                                     sort_ignore=sort_ignore, short_names=short_names)
+                              short_names::Bool=true,
+                              tags::Bool=false,
+                              include_auto_tags::Bool=false)
+    df = _variationsTableFromQuery(query, :monad_id, :MonadID;
+                                   remove_constants=remove_constants, sort_by=sort_by,
+                                   sort_ignore=sort_ignore, short_names=short_names)
+    tags && appendTags!(df, Monad, :MonadID; include_auto=include_auto_tags)
+    return df
 end
 
 """

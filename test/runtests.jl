@@ -3206,4 +3206,707 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         end
     end
 
+    ################## Tagging ##################
+
+    @testset "tag key and value normalization" begin
+        # Keys are identifiers: lowercased, whitespace-stripped, restricted charset.
+        @test ModelManager.normalizeTagKey("Project") == "project"
+        @test ModelManager.normalizeTagKey("  arm  ") == "arm"
+        @test ModelManager.normalizeTagKey(:figure) == "figure"
+        @test ModelManager.normalizeTagKey("fig-3.b_2") == "fig-3.b_2"
+
+        @test_throws ArgumentError ModelManager.normalizeTagKey("")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("   ")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("has space")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("bad!char")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("_leading")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("a"^65)
+
+        # The reserved namespace is unforgeable: `:` is not in the legal key charset.
+        @test_throws ArgumentError ModelManager.normalizeTagKey("mm:created")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("MM:created")
+        @test_throws ArgumentError ModelManager.normalizeTagKey("has:colon")
+
+        # Values are data: case, spaces, punctuation and unicode all survive.
+        pairs = ModelManager.normalizeTagPairs(("Arm" => "High Dose µ!", "baseline", :note => 3))
+        @test pairs == [("arm", "High Dose µ!"), ("baseline", ""), ("note", "3")]
+
+        # Duplicates collapse; surrounding whitespace on values is trimmed.
+        @test ModelManager.normalizeTagPairs(("a" => " x ", "a" => "x")) == [("a", "x")]
+    end
+
+    @testset "tagging round-trip and retrieval" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            @test ModelManager.tableExists("tags")
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [10.0, 20.0])]; n_replicates=2)
+            @test sampling isa Sampling
+            sim_ids = simulationIDs(sampling)
+            @test length(sim_ids) == 4
+
+            # --- automatic provenance ------------------------------------------------
+            auto = tags(Simulation, sim_ids[1])
+            @test haskey(auto, "mm:created")
+            @test haskey(auto, "mm:session")
+            @test isempty(tags(Simulation, sim_ids[1]; include_auto=false))
+
+            # --- direct tagging ------------------------------------------------------
+            tag!(Simulation, sim_ids[1], "arm" => "control")
+            @test tags(Simulation, sim_ids[1]; include_auto=false) == Dict("arm" => ["control"])
+            @test hasTag(Simulation, sim_ids[1], "arm" => "control")
+            @test hasTag(Simulation, sim_ids[1], "arm")
+            @test !hasTag(Simulation, sim_ids[1], "arm" => "treated")
+
+            # Re-applying is idempotent.
+            tag!(Simulation, sim_ids[1], "arm" => "control")
+            @test tags(Simulation, sim_ids[1]; include_auto=false)["arm"] == ["control"]
+
+            # A key may carry several values.
+            tag!(Simulation, sim_ids[1], "cohort" => "pilot", "cohort" => "paper")
+            @test tags(Simulation, sim_ids[1]; include_auto=false)["cohort"] == ["paper", "pilot"]
+
+            # Bare labels store an empty value and dedupe.
+            tag!(Simulation, sim_ids[2], "baseline")
+            tag!(Simulation, sim_ids[2], "baseline")
+            @test tags(Simulation, sim_ids[2]; include_auto=false) == Dict("baseline" => [""])
+
+            # --- untagging -----------------------------------------------------------
+            tag!(Simulation, sim_ids[3], "arm" => "x", "verdict" => "good")
+            untag!(Simulation, sim_ids[3], "arm" => "x")
+            @test !hasTag(Simulation, sim_ids[3], "arm")
+            @test hasTag(Simulation, sim_ids[3], "verdict")
+
+            tag!(Simulation, sim_ids[3], "cohort" => "a", "cohort" => "b")
+            untag!(Simulation, sim_ids[3], "cohort")        # bare key drops every value
+            @test !hasTag(Simulation, sim_ids[3], "cohort")
+
+            untag!(Simulation, sim_ids[3])                  # all user tags…
+            @test isempty(tags(Simulation, sim_ids[3]; include_auto=false))
+            @test haskey(tags(Simulation, sim_ids[3]), "mm:created")   # …but provenance survives
+
+            # --- tagging other classes ----------------------------------------------
+            tag!(sampling, "project" => "immune-escape")
+            @test hasTag(sampling, "project" => "immune-escape")
+            monad = Monad(monadIDs(sampling)[1])
+            tag!(monad, "verdict" => "suspect")
+            @test hasTag(monad, "verdict" => "suspect")
+
+            # --- vocabulary discovery ------------------------------------------------
+            @test "project" in tagKeys()
+            @test !any(startswith.(tagKeys(), "mm:"))
+            @test "immune-escape" in tagValues("project")
+            @test recommendedTagKeys() == ("project", "purpose", "figure", "arm", "verdict", "note")
+
+            # --- tagsTable -----------------------------------------------------------
+            all_tags = tagsTable()
+            @test all(c -> c in names(all_tags), ["Class", "ID", "Key", "Value", "DateTime"])
+            user_tags = tagsTable(include_auto=false)
+            @test !any(startswith.(user_tags.Key, "mm:"))
+            @test nrow(tagsTable(sampling)) > 0
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "tag! rejects reserved keys" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            sim = createTrial(inputs, [DiscreteVariation(:config, XMLPath(["data", "x"]), 5.0)]; n_replicates=1)
+            @test_throws ArgumentError tag!(sim, "mm:created" => "yesterday")
+            @test_throws ArgumentError tag!(sim, "mm:script" => "evil.jl")
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "tags keyword on createTrial and run" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            # Tags land on the object createTrial returns; constituents match by inheritance.
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [31.0, 32.0])];
+                                   n_replicates=1, tags=("project" => "kw", "purpose" => "figure"))
+            @test sampling isa Sampling
+            @test hasTag(sampling, "project" => "kw")
+            @test hasTag(sampling, "purpose" => "figure")
+            @test sort(findSimulationIDs(tags=("project" => "kw",))) == sort(simulationIDs(sampling))
+            # Not copied down onto the simulations themselves.
+            @test isempty(findSimulationIDs(tags=("project" => "kw",), inherit=false))
+
+            # Objects created without tags stay untagged.
+            plain = createTrial(inputs, [DiscreteVariation(:config, xp, 33.0)]; n_replicates=1)
+            @test !hasTag(plain, "project" => "kw")
+
+            # `run` accepts the same keyword, applied before dispatch.
+            out = run(inputs, DiscreteVariation(:config, xp, 34.0);
+                      n_replicates=1, quiet=true, tags=("project" => "run-kw",))
+            @test !isempty(findSimulationIDs(tags=("project" => "run-kw",)))
+
+            # Tagging an already-built trial at run time.
+            built = createTrial(inputs, [DiscreteVariation(:config, xp, 35.0)]; n_replicates=1)
+            run(built; quiet=true, tags=("project" => "late",))
+            @test hasTag(built, "project" => "late")
+
+            # A single pair, a bare label, and a symbol key are all accepted.
+            s = createTrial(inputs, [DiscreteVariation(:config, xp, 36.0)]; n_replicates=1,
+                            tags=("baseline", :arm => "control"))
+            @test hasTag(s, "baseline")
+            @test hasTag(s, "arm" => "control")
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "tags keyword covers pre-built trials batched into one run" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            # Built first (untagged), then batched into one run for parallelism.
+            t1 = createTrial(inputs, [DiscreteVariation(:config, xp, 41.0)]; n_replicates=1)
+            t2 = createTrial(inputs, [DiscreteVariation(:config, xp, 42.0)]; n_replicates=1)
+            @test !hasTag(t1, "project" => "batched")
+
+            out = run([t1, t2]; quiet=true, tags=("project" => "batched",))
+
+            # The tag lands on the trials handed to `run`...
+            @test hasTag(t1, "project" => "batched")
+            @test hasTag(t2, "project" => "batched")
+            # ...and deliberately not on the umbrella Trial built to hold the batch, which
+            # exists to schedule work rather than to mean anything.
+            @test !hasTag(out.trial, "project" => "batched")
+            # Every simulation in the batch is still recoverable, through inheritance.
+            @test sort(findSimulationIDs(tags=("project" => "batched",))) == sort(simulationIDs(out.trial))
+
+            # Batching objects below Sampling level wraps each in a single-object Sampling
+            # so the Trial can hold it. Those wrappers are containers too, so they are not
+            # tagged — while the monads handed in, and all their simulations, still are.
+            m1 = createTrial(inputs, [DiscreteVariation(:config, xp, 51.0)]; n_replicates=2)
+            m2 = createTrial(inputs, [DiscreteVariation(:config, xp, 52.0)]; n_replicates=2)
+            @test m1 isa Monad && m2 isa Monad
+            monad_out = run([m1, m2]; quiet=true, tags=("project" => "monad-batch",))
+            @test hasTag(m1, "project" => "monad-batch")
+            @test hasTag(m2, "project" => "monad-batch")
+            @test all(!hasTag(s, "project" => "monad-batch") for s in monad_out.trial.samplings)
+            @test sort([m.id for m in findMonads(tags=("project" => "monad-batch",))]) == sort([m1.id, m2.id])
+            @test isempty(findTrials(Sampling; tags=("project" => "monad-batch",)))
+            @test sort(findSimulationIDs(tags=("project" => "monad-batch",))) == sort(simulationIDs(monad_out.trial))
+
+            # Tagging the constituents rather than the umbrella is about durability, not
+            # reachability: inheritance would reach them either way, but the umbrella is
+            # deduplicated plumbing that can be deleted on its own. If it held the only
+            # copy, deleting it would make these simulations unfindable.
+            batch_sims = sort(simulationIDs(monad_out.trial))
+            deleteTrial(monad_out.trial.id; delete_subs=false)
+            @test sort(findSimulationIDs(tags=("project" => "monad-batch",))) == batch_sims
+            @test hasTag(m1, "project" => "monad-batch")
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+    @testset "findTrials inheritance and filter composition" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [51.0, 52.0])]; n_replicates=2)
+            sim_ids = sort(simulationIDs(sampling))
+            @test length(sim_ids) == 4
+
+            tag!(sampling, "project" => "inherit-test")
+
+            # A tag on the sampling reaches its simulations only with inherit=true.
+            @test sort(findSimulationIDs(tags=("project" => "inherit-test",), inherit=true)) == sim_ids
+            @test isempty(findSimulationIDs(tags=("project" => "inherit-test",), inherit=false))
+
+            # Inherited and direct tags compose under AND.
+            tag!(Simulation, sim_ids[1], "arm" => "a")
+            tag!(Simulation, sim_ids[2], "arm" => "b")
+            @test findSimulationIDs(tags=("project" => "inherit-test", "arm" => "a")) == [sim_ids[1]]
+
+            # OR across any_of.
+            @test sort(findSimulationIDs(any_of=("arm" => "a", "arm" => "b"))) == sim_ids[1:2]
+
+            # AND and OR intersect when both are given.
+            @test findSimulationIDs(tags=("arm" => "a",), any_of=("arm" => "a", "arm" => "b")) == [sim_ids[1]]
+
+            # A bare key in a query matches any value for that key.
+            @test sort(findSimulationIDs(tags=("arm",))) == sim_ids[1:2]
+
+            # No filters at all returns every simulation.
+            @test sort(findSimulationIDs()) == sort(simulationIDs())
+
+            # A tag nobody applied matches nothing.
+            @test isempty(findSimulationIDs(tags=("project" => "nonexistent",)))
+
+            # Object-returning forms.
+            sims = findSimulations(tags=("arm" => "a",))
+            @test length(sims) == 1 && sims[1] isa Simulation && sims[1].id == sim_ids[1]
+
+            # Monad-level search: a sampling tag inherits down to its monads, and a
+            # simulation tag never propagates upward.
+            monads = findMonads(tags=("project" => "inherit-test",))
+            @test sort([m.id for m in monads]) == sort(monadIDs(sampling))
+            @test isempty(findMonads(tags=("arm" => "a",)))
+
+            # Sampling-level search is direct-only.
+            found = findTrials(Sampling; tags=("project" => "inherit-test",))
+            @test [s.id for s in found] == [sampling.id]
+            @test_throws ArgumentError findTrials(Sampling; status="Completed")
+
+            # Status filtering.
+            run(sampling; quiet=true)
+            @test sort(findSimulationIDs(tags=("project" => "inherit-test",), status="Completed")) == sim_ids
+            @test isempty(findSimulationIDs(tags=("project" => "inherit-test",), status="Failed"))
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "tag cleanup on deletion" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [61.0, 62.0])]; n_replicates=2)
+            sim_ids = sort(simulationIDs(sampling))
+            monad_ids = sort(monadIDs(sampling))
+            tag!(sampling, "project" => "deleteme")
+            tag!(Monad, monad_ids[1], "verdict" => "suspect")
+            tag!(Simulation, sim_ids[1], "arm" => "a")
+
+            @test orphanedTagCounts() == Dict("simulation" => 0, "monad" => 0, "sampling" => 0, "trial" => 0)
+
+            # Deleting a simulation removes its tag rows.
+            deleteSimulations([sim_ids[1]]; delete_supers=false)
+            @test isempty(tags(Simulation, sim_ids[1]))
+            @test !hasTag(Simulation, sim_ids[1], "arm")
+
+            # Cascading deletion cleans monad, sampling and simulation tags alike.
+            deleteSampling(sampling.id; delete_subs=true, delete_supers=true)
+            @test isempty(tags(Sampling, sampling.id))
+            @test isempty(tags(Monad, monad_ids[1]))
+            for sid in sim_ids
+                @test isempty(tags(Simulation, sid))
+            end
+
+            @test sum(values(orphanedTagCounts())) == 0
+            # Deleted objects never surface from a tag query.
+            @test isempty(findSimulationIDs(tags=("project" => "deleteme",)))
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "tag columns in simulationsTable" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [71.0, 72.0])]; n_replicates=1)
+            sim_ids = sort(simulationIDs(sampling))
+            tag!(Simulation, sim_ids[1], "arm" => "control")
+            tag!(Simulation, sim_ids[1], "cohort" => "a", "cohort" => "b")
+
+            # Off by default — no new columns.
+            plain = simulationsTable(sim_ids)
+            @test !any(startswith.(names(plain), "tag:"))
+
+            df = simulationsTable(sim_ids; tags=true)
+            @test "tag:arm" in names(df)
+            @test "tag:cohort" in names(df)
+            # Namespaced so a tag key can never collide with an ID/folder/parameter column.
+            @test !("arm" in names(df))
+
+            row = df[df.SimID .== sim_ids[1], :]
+            @test row[1, "tag:arm"] == "control"
+            @test row[1, "tag:cohort"] == "a|b"          # multi-valued keys join with |
+            other = df[df.SimID .== sim_ids[2], :]
+            @test ismissing(other[1, "tag:arm"])          # untagged simulations get missing
+
+            # Provenance stays out unless asked for.
+            @test !any(startswith.(names(df), "tag:mm:"))
+            df_auto = simulationsTable(sim_ids; tags=true, include_auto_tags=true)
+            @test "tag:mm:created" in names(df_auto)
+
+            # A parent's tag shows up on its constituents' rows, matching findSimulationIDs:
+            # a simulation recovered *by* a sampling tag must show a column for it.
+            tag!(sampling, "project" => "pivot-test")
+            @test findSimulationIDs(tags=("project" => "pivot-test",)) == sim_ids
+            inherited = simulationsTable(sim_ids; tags=true)
+            @test "tag:project" in names(inherited)
+            @test all(inherited[!, "tag:project"] .== "pivot-test")
+
+            # ...and can be turned off, leaving only tags placed directly on simulations.
+            direct_only = appendTags!(simulationsTable(sim_ids), Simulation, :SimID; inherit=false)
+            @test !("tag:project" in names(direct_only))
+            @test "tag:arm" in names(direct_only)
+
+            # Monad-level pivot.
+            mdf = monadsTable(sampling; tags=true)
+            @test mdf isa DataFrame
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "provenance lives in object columns, not tag rows" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            @test ModelManager.tableExists("provenances")
+            for table in ("simulations", "monads", "samplings", "trials")
+                @test ModelManager.columnsExist(["datetime", "provenance_id"], table)
+            end
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [95.0, 96.0])]; n_replicates=2)
+            sim_ids = simulationIDs(sampling)
+
+            # Storage: provenance costs no tag rows at all.
+            n_auto_rows = ModelManager.queryToDataFrame(
+                "SELECT COUNT(*) AS n FROM tags WHERE tag_key LIKE 'mm:%';").n[1]
+            @test n_auto_rows == 0
+
+            # Each simulation carries its own datetime and provenance pointer.
+            df = ModelManager.queryToDataFrame(
+                "SELECT simulation_id, datetime, provenance_id FROM simulations;")
+            @test all(.!ismissing.(df.datetime))
+            @test all(.!ismissing.(df.provenance_id))
+            # All objects created in one session share a single provenance row.
+            @test length(unique(df.provenance_id)) == 1
+            @test ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM provenances;").n[1] == 1
+
+            # Presentation: the columns surface as mm: keys.
+            t = tags(Simulation, sim_ids[1])
+            @test haskey(t, "mm:created")
+            @test haskey(t, "mm:session")
+            @test t["mm:session"] == [mm_globals().session_id]
+            @test isempty(tags(Simulation, sim_ids[1]; include_auto=false))
+            @test hasTag(Simulation, sim_ids[1], "mm:session" => mm_globals().session_id)
+
+            # Queries on a synthetic key resolve through the columns.
+            @test sort(findSimulationIDs(tags=("mm:session" => mm_globals().session_id,))) == sort(sim_ids)
+            @test isempty(findSimulationIDs(tags=("mm:session" => "nope",)))
+            @test sort(findSimulationIDs(tags=("mm:created",))) == sort(sim_ids)
+
+            # Discovery surfaces the synthetic keys.
+            keys_auto = tagKeys(include_auto=true)
+            @test "mm:session" in keys_auto
+            @test "mm:created" in keys_auto
+            @test isempty(tagKeys())                       # no user tags yet
+            @test mm_globals().session_id in tagValues("mm:session")
+
+            # Long-format table includes them.
+            tt = tagsTable()
+            @test "mm:session" in tt.Key
+            # The whole-store view synthesizes a row per object per mm: key, so it refuses
+            # rather than materializing millions on a large project.
+            @test_throws ArgumentError tagsTable(limit=1)
+            # ...and the guard does not apply without them, however low the limit.
+            @test isempty(tagsTable(include_auto=false, limit=1))
+            @test "mm:created" in tt.Key
+            @test isempty(tagsTable(include_auto=false))
+            @test "mm:session" in tagsTable(sampling).Key
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "provenance records script and git state" begin
+        # Repo detection: the package directory is a git repo; a temp dir is not.
+        state = gitState(pkgdir(ModelManager))
+        @test length(state.commit) == 40 || isempty(state.commit)
+        mktempdir() do d
+            outside = gitState(d)
+            @test outside.commit == "" && outside.dirty == ""
+        end
+        @test gitState(joinpath("this", "does", "not", "exist")).commit == ""
+
+        # Under `julia runtests.jl` this resolves to a file; otherwise it is empty. The
+        # session mode is recorded separately, not encoded into this field.
+        script = ModelManager.launchingScript()
+        @test isempty(script) || isfile(script)
+
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            id1 = ModelManager.currentProvenanceID()
+            @test id1 isa Int
+            # Re-resolving with nothing changed reuses the row rather than adding one.
+            @test ModelManager.currentProvenanceID() == id1
+            @test ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM provenances;").n[1] == 1
+
+            expanded = ModelManager.provenanceFor(id1)
+            @test expanded["mm:session"] == mm_globals().session_id
+            @test !haskey(expanded, "mm:script.path")     # one script field, not two
+            # The interactive flag is present only when it applies, like mm:git.dirty.
+            @test haskey(expanded, "mm:interactive") == isinteractive()
+
+            # The same script run interactively and non-interactively are distinct contexts.
+            base = (session="s", script="/tmp/x.jl", git_commit="", git_branch="", git_dirty="")
+            batch_id = ModelManager._resolveProvenanceID((; base..., interactive=""))
+            repl_id  = ModelManager._resolveProvenanceID((; base..., interactive="true"))
+            @test batch_id != repl_id
+            @test !haskey(ModelManager.provenanceFor(batch_id), "mm:interactive")
+            @test ModelManager.provenanceFor(repl_id)["mm:interactive"] == "true"
+
+            # A distinct context adds a row; an identical one does not.
+            countRows() = ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM provenances;").n[1]
+            other = (session="other", script="/tmp/other.jl", interactive="",
+                     git_commit="", git_branch="", git_dirty="")
+            n_before = countRows()
+            ModelManager._resolveProvenanceID(other)
+            @test countRows() == n_before + 1
+            ModelManager._resolveProvenanceID(other)
+            @test countRows() == n_before + 1
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "a reused monad keeps its original provenance" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+            ctx(name) = ModelManager._resolveProvenanceID((session="s", script="/tmp/$(name).jl",
+                            interactive="", git_commit="", git_branch="", git_dirty=""))
+            scriptOf(id) = get(ModelManager.provenanceFor(id), "mm:script", "")
+            provOf(table, col, id) = ModelManager.queryToDataFrame(
+                "SELECT provenance_id FROM $(table) WHERE $(col)=$(id);").provenance_id[1]
+
+            # Script A creates the monad with two replicates. `Monad` is used directly so
+            # the synthetic context survives — `createTrial` re-resolves the real one.
+            mm_globals().provenance_id = ctx("scriptA")
+            vid = ModelManager.addVariations(GridVariation(), inputs,
+                    [DiscreteVariation(:config, xp, 7.0)], VariationID(inputs)).variation_ids[1]
+            monad_a = Monad(inputs, vid; n_replicates=2, use_previous=true)
+            sims_a = sort(simulationIDs(monad_a))
+            @test length(sims_a) == 2
+
+            # Script B reuses the same monad and grows it.
+            mm_globals().provenance_id = ctx("scriptB")
+            monad_b = Monad(monad_a.id; n_replicates=5, use_previous=true)
+            @test monad_b.id == monad_a.id
+            new_sims = setdiff(sort(simulationIDs(monad_b)), sims_a)
+            @test length(new_sims) == 3
+
+            # The monad reports when *it* was created, not the last script to touch it.
+            @test scriptOf(provOf("monads", "monad_id", monad_a.id)) == "/tmp/scriptA.jl"
+            # Each simulation reports its own creation, so B's work is not lost either.
+            for s in sims_a
+                @test scriptOf(provOf("simulations", "simulation_id", s)) == "/tmp/scriptA.jl"
+            end
+            for s in new_sims
+                @test scriptOf(provOf("simulations", "simulation_id", s)) == "/tmp/scriptB.jl"
+            end
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "transactions and find-or-insert reuse" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            # Returns the body's value, and nests without ending the outer transaction.
+            @test withTransaction(() -> 42) == 42
+            @test withTransaction(() -> withTransaction(() -> 7)) == 7
+            @test !ModelManager.SQLite.intransaction(centralDB())   # unwound cleanly
+
+            # A throwing body rolls back and leaves no open transaction.
+            @test_throws ErrorException withTransaction(() -> error("boom"))
+            @test !ModelManager.SQLite.intransaction(centralDB())
+
+            # The EXCLUSIVE escape hatch still works, though nothing uses it by default.
+            @test withTransaction(() -> 1; mode="EXCLUSIVE") == 1
+            @test !ModelManager.SQLite.intransaction(centralDB())
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [101.0, 102.0])]; n_replicates=2)
+            sim_ids = sort(simulationIDs(sampling))
+
+            # Creating the same configuration twice must reuse rows, not duplicate them.
+            # These find-or-insert paths run without a transaction; see progress.md if
+            # duplicates ever show up in samplings/trials.
+            n_samplings = ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM samplings;").n[1]
+            n_monads = ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM monads;").n[1]
+            again = createTrial(inputs, [DiscreteVariation(:config, xp, [101.0, 102.0])]; n_replicates=2)
+            @test again.id == sampling.id
+            @test ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM samplings;").n[1] == n_samplings
+            @test ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM monads;").n[1] == n_monads
+
+            # Provenance resolution is also insert-or-look-up.
+            pid = ModelManager.currentProvenanceID()
+            @test ModelManager.currentProvenanceID() == pid
+            @test ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM provenances;").n[1] == 1
+
+            for (i, sid) in enumerate(sim_ids)
+                tag!(Simulation, sid, "arm" => "a$(i)")
+                @test hasTag(Simulation, sid, "arm" => "a$(i)")
+            end
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "legacy trial datetime reads back as ISO-8601" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+            a = createTrial(inputs, [DiscreteVariation(:config, xp, 111.0)]; n_replicates=1)
+            b = createTrial(inputs, [DiscreteVariation(:config, xp, 112.0)]; n_replicates=1)
+            trial = createTrial([a, b])
+
+            # `trials.datetime` predates tagging and stores yymmddHHMM. The stored value is
+            # left alone so existing readers are unaffected...
+            raw = ModelManager.queryToDataFrame("SELECT datetime FROM trials;").datetime[1]
+            @test occursin(r"^\d{10}$", String(raw))
+
+            # ...but mm:created reads consistently across classes.
+            iso = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$"
+            @test occursin(iso, tags(trial)["mm:created"][1])
+            @test occursin(iso, tags(a)["mm:created"][1])
+
+            @test ModelManager._normalizeStamp("2607301056") == "2026-07-30T10:56:00"
+            @test ModelManager._normalizeStamp("2026-07-30T10:56:34") == "2026-07-30T10:56:34"
+            @test ModelManager._normalizeStamp("9999999999") == "9999999999"   # unparseable, passed through
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "materialization guard and bulk construction" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [97.0, 98.0])]; n_replicates=2)
+            sim_ids = sort(simulationIDs(sampling))
+            tag!(sampling, "project" => "guard")
+
+            # Bulk construction returns the same objects as one-at-a-time, in order.
+            bulk = simulationsFromIDs(sim_ids)
+            @test [s.id for s in bulk] == sim_ids
+            @test bulk == Simulation.(sim_ids)
+            @test isempty(simulationsFromIDs(Int[]))
+            @test [s.id for s in simulationsFromIDs([sim_ids[1], -999])] == [sim_ids[1]]
+
+            # The ID form is unbounded; the object form refuses an oversized result set.
+            @test length(findSimulationIDs(tags=("project" => "guard",))) == 4
+            @test_throws ArgumentError findSimulations(tags=("project" => "guard",), limit=2)
+            @test length(findSimulations(tags=("project" => "guard",), limit=4)) == 4
+            @test_throws ArgumentError findMonads(tags=("project" => "guard",), limit=1)
+            @test_throws ArgumentError findTrials(Sampling; tags=("project" => "guard",), limit=0)
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+    @testset "tags table is created on an existing database" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+
+            # An object that exists before the upgrade, to check it survives it.
+            legacy = createTrial(inputs, [DiscreteVariation(:config, xp, 80.0)]; n_replicates=1)
+
+            # Simulate a database written by a ModelManager version predating tagging:
+            # both new tables gone, and the added columns stripped from every trial table.
+            for stmt in ("DROP TABLE tags;", "DROP TABLE provenances;",
+                         "ALTER TABLE simulations DROP COLUMN provenance_id;",
+                         "ALTER TABLE simulations DROP COLUMN datetime;",
+                         "ALTER TABLE monads DROP COLUMN provenance_id;",
+                         "ALTER TABLE monads DROP COLUMN datetime;")
+                ModelManager.DBInterface.execute(centralDB(), stmt)
+            end
+            @test !ModelManager.tableExists("tags")
+            @test !ModelManager.tableExists("provenances")
+            @test !ModelManager.columnsExist(["provenance_id"], "simulations")
+
+            # No migration milestone needed: createSchema creates tables with IF NOT EXISTS
+            # and adds columns guarded by columnsExist, so both are additive and idempotent.
+            @test ModelManager.reinitializeDatabase()
+            @test ModelManager.tableExists("tags")
+            @test ModelManager.tableExists("provenances")
+            for table in ("simulations", "monads", "samplings", "trials")
+                @test ModelManager.columnsExist(["datetime", "provenance_id"], table)
+            end
+
+            # A second pass must not duplicate columns or fail.
+            @test ModelManager.reinitializeDatabase()
+            @test ModelManager.columnsExist(["datetime", "provenance_id"], "simulations")
+
+            # Objects that predate the upgrade have no provenance, and must not break the
+            # read paths — they simply report no mm: keys.
+            legacy_sim = simulationIDs(legacy)[1]
+            @test isempty(tags(Simulation, legacy_sim))
+            @test !isempty(findSimulationIDs())              # still queryable
+            @test isempty(findSimulationIDs(tags=("mm:session",)))
+
+            # New objects created after the upgrade are tagged normally.
+            sim = createTrial(inputs, [DiscreteVariation(:config, xp, 81.0)]; n_replicates=1)
+            tag!(sim, "project" => "post-upgrade")
+            @test hasTag(sim, "project" => "post-upgrade")
+            @test haskey(tags(sim), "mm:created")
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
 end

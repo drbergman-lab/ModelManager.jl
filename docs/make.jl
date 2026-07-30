@@ -22,6 +22,7 @@ makedocs(;
             "The trial hierarchy" => "man/trial_hierarchy.md",
             "Project configuration" => "man/project_configuration.md",
             "The database" => "man/database.md",
+            "Tagging and recovery" => "man/tagging.md",
             "Running simulations" => "man/running_simulations.md",
             "HPC support" => "man/hpc.md",
         ],
@@ -55,7 +56,7 @@ makedocs(;
                 "sensitivity.md", "calibration.md",
             ]),
             "Management & maintenance" => map(s -> "lib/$(s)", [
-                "database.md", "deletion.md", "up.md", "package_version.md",
+                "database.md", "tags.md", "deletion.md", "up.md", "package_version.md",
             ]),
             "Alphabetical index" => "lib/index.md",
         ],

@@ -242,7 +242,11 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
 """
 function run(T::AbstractTrial; quiet::Bool=false,
              on_progress::Union{Nothing,Function}=nothing,
-             post_processor::Union{Nothing,Function}=nothing, kwargs...)
+             post_processor::Union{Nothing,Function}=nothing, tags=(), kwargs...)
+    #! Applied before anything is dispatched, so tags survive an interrupted run and the
+    #! trial is queryable by tag while its simulations are still in flight.
+    refreshProvenance!()
+    isempty(tags) || tag!(T, tags...)
     setup_success = prepareTrialHierarchy(T; kwargs...)
     specs = setup_success ? pendingSimulationSpecs(T) : SimulationSpec[]
     n_simulation_tasks = length(specs)

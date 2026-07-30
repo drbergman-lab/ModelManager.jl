@@ -310,18 +310,45 @@ function Simulation(inputs::InputFolders, variation_id::VariationID=VariationID(
     RETURNING simulation_id;
     """
     ) |> DataFrame |> x -> x.simulation_id[1]
+    applyCreationTags(Simulation, simulation_id)
     return Simulation(simulation_id, inputs, variation_id)
 end
 
 function Simulation(simulation_id::Int)
-    assertInitialized()
-    df = constructSelectQuery("simulations", "WHERE simulation_id=$(simulation_id);") |> queryToDataFrame
-    if isempty(df)
+    simulations = simulationsFromIDs([simulation_id])
+    if isempty(simulations)
         error("Simulation $(simulation_id) not in the database.")
     end
-    inputs = [loc => df[1, locationIDName(loc)] for loc in projectLocations().all] |> InputFolders
-    variation_id = [loc => df[1, locationVariationIDName(loc)] for loc in projectLocations().varied] |> VariationID
-    return Simulation(simulation_id, inputs, variation_id)
+    return only(simulations)
+end
+
+"""
+    simulationsFromIDs(simulation_ids) -> Vector{Simulation}
+
+Construct many [`Simulation`](@ref)s in one database query. Prefer this over
+`Simulation.(ids)`, which issues one query per simulation.
+
+Missing IDs are skipped rather than throwing, and the result follows the order of
+`simulation_ids`.
+
+# Example
+```julia
+sims = simulationsFromIDs([1, 2, 3])
+```
+"""
+function simulationsFromIDs(simulation_ids::AbstractVector{<:Integer})
+    assertInitialized()
+    isempty(simulation_ids) && return Simulation[]
+    df = constructSelectQuery("simulations", "WHERE simulation_id IN ($(join(Int.(simulation_ids), ",")));") |> queryToDataFrame
+    by_id = Dict(Int(row.simulation_id) => _simulationFromRow(row) for row in eachrow(df))
+    return [by_id[Int(id)] for id in simulation_ids if haskey(by_id, Int(id))]
+end
+
+#! Single place that knows how a `simulations` row maps onto the struct.
+function _simulationFromRow(row)
+    inputs = [loc => row[locationIDName(loc)] for loc in projectLocations().all] |> InputFolders
+    variation_id = [loc => row[locationVariationIDName(loc)] for loc in projectLocations().varied] |> VariationID
+    return Simulation(Int(row.simulation_id), inputs, variation_id)
 end
 
 Base.length(::Simulation) = 1
@@ -374,22 +401,24 @@ struct Monad <: AbstractMonad
         $(join([variation_id[loc] for loc in projectLocations().varied],","))\
         ) \
         """
-        monad_id = DBInterface.execute(centralDB(),
+        #! No transaction: the write comes first and is atomic, and `UNIQUE` makes it
+        #! self-correcting — a losing racer's lookup finds the winner's row.
+        inserted = DBInterface.execute(centralDB(),
             """
             INSERT OR IGNORE INTO monads $feature_str VALUES $value_str RETURNING monad_id;
             """
         ) |> DataFrame |> x -> x.monad_id
-        if isempty(monad_id)
-            monad_id = constructSelectQuery(
-                "monads",
-                """
-                WHERE $feature_str=$value_str
-                """;
-                selection="monad_id"
-            ) |> queryToDataFrame |> x -> x.monad_id[1]
-        else
-            monad_id = monad_id[1]
-        end
+        monad_id = isempty(inserted) ? constructSelectQuery(
+            "monads",
+            """
+            WHERE $feature_str=$value_str
+            """;
+            selection="monad_id"
+        ) |> queryToDataFrame |> x -> x.monad_id[1] : inserted[1]
+        #! Runs whether the INSERT fired or an existing row was reused. It is a no-op in the
+        #! latter case — provenance is only written when still unset — so a monad keeps the
+        #! context that created it.
+        applyCreationTags(Monad, monad_id)
         return Monad(monad_id, inputs, variation_id, n_replicates, use_previous)
     end
 
@@ -498,13 +527,11 @@ struct Sampling <: AbstractSampling
         ) |> queryToDataFrame |> x -> x.sampling_id
 
         monad_ids = [monad.id for monad in monads]
-        if !isempty(sampling_ids)
-            for sampling_id in sampling_ids
-                monad_ids_in_sampling = constituentIDs(Sampling, sampling_id)
-                if symdiff(monad_ids_in_sampling, monad_ids) |> isempty
-                    id = sampling_id
-                    break
-                end
+        for sampling_id in sampling_ids
+            monad_ids_in_sampling = constituentIDs(Sampling, sampling_id)
+            if symdiff(monad_ids_in_sampling, monad_ids) |> isempty
+                id = sampling_id
+                break
             end
         end
 
@@ -524,6 +551,7 @@ struct Sampling <: AbstractSampling
             ) |> DataFrame |> x -> x.sampling_id[1]
             recordConstituentIDs(Sampling, id, monad_ids)
         end
+        applyCreationTags(Sampling, id)
         return Sampling(id, inputs, monads)
     end
 
@@ -648,13 +676,11 @@ function trialID(samplings::Vector{Sampling})
     sampling_ids = [sampling.id for sampling in samplings]
     id = -1
     trial_ids = constructSelectQuery("trials"; selection="trial_id") |> queryToDataFrame |> x -> x.trial_id
-    if !isempty(trial_ids)
-        for trial_id in trial_ids
-            sampling_ids_in_db = constituentIDs(Trial, trial_id)
-            if symdiff(sampling_ids_in_db, sampling_ids) |> isempty
-                id = trial_id
-                break
-            end
+    for trial_id in trial_ids
+        sampling_ids_in_db = constituentIDs(Trial, trial_id)
+        if symdiff(sampling_ids_in_db, sampling_ids) |> isempty
+            id = trial_id
+            break
         end
     end
 
@@ -662,6 +688,7 @@ function trialID(samplings::Vector{Sampling})
         id = DBInterface.execute(centralDB(), "INSERT INTO trials (datetime) VALUES($(Dates.format(now(),"yymmddHHMM"))) RETURNING trial_id;") |> DataFrame |> x -> x.trial_id[1]
         recordConstituentIDs(Trial, id, sampling_ids)
     end
+    applyCreationTags(Trial, id)
     return id
 end
 

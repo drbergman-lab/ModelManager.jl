@@ -15,6 +15,7 @@ export tableExists, tableColumns
 export locationVariationsDatabase
 export ModelManagerGlobals, mm_globals_ref, mm_globals, assertInitialized
 export centralDB, dataDir, isInitialized, projectLocations, inputsDict
+export withTransaction
 export initializeModelManager
 export setNumberOfParallelSims
 export isRunningOnHPC, useHPC, setJobOptions, rm_hpc_safe
@@ -38,6 +39,11 @@ export shortLocationVariationID
 export simulationsTable, printSimulationsTable
 export monadsTable, printMonadsTable
 export postProcessingTable, printPostProcessingTable, postProcessingDBPath
+export tag!, untag!, tags, hasTag
+export findTrials, findSimulations, findSimulationIDs, findMonads
+export tagsTable, printTagsTable, tagKeys, tagValues, recommendedTagKeys
+export setTagHints!, gitState, appendTags!, orphanedTagCounts
+export simulationsFromIDs
 export XMLPath
 export AbstractVariation, ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation
@@ -66,6 +72,7 @@ include("globals.jl")
 include("classes.jl")
 include("recorder.jl")
 include("database.jl")
+include("tags.jl")
 include("runner.jl")
 include("deletion.jl")
 include("xml_utilities.jl")

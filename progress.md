@@ -5,6 +5,200 @@
 
 ---
 
+## Session: Trial tagging and feature-based recovery (2026-07-29)
+
+### Goal
+Users need to recover past simulations by *what they were for*, not by ID or parameter value. Scripts that record simulation IDs drift out of sync with the database and are the current, fragile answer.
+
+### Framing decision that shaped everything else
+The root problem is not "there is no tag table" — it is that **nothing in the schema records why a simulation exists**. Every stored fact is identity (`simulation_id`), configuration (input/variation IDs), or execution state (`status_code_id`). Intent lived only in the user's script.
+
+That reframing produced two consequences:
+1. A tag table users must remember to populate has the *same* failure mode as a script that records IDs. So the highest-value tags had to be **automatic**.
+2. Front-loading tags is what users won't sustain, because at creation time you often don't know what will turn out to be interesting. So **retroactive tagging is the primary user-facing path**, not a nice-to-have — `tag!` accepts whatever a query hands back, and labeling happens at the moment of discovery.
+
+### Design decisions
+
+**One denormalized `tags` table, not a `tags`/`taggings` pair.** Normalizing into a vocabulary table plus a junction table buys a canonical key list, but `SELECT DISTINCT tag_key` gives that for free at this scale. Revisit only at millions of rows.
+
+**Polymorphic `trial_class` TEXT column rather than four per-class tables.** Matches the existing generic `for T in (Simulation, Monad, Sampling, Trial)` idiom (`_snapshotMaxIDs`, `databaseDiagnostics`) and `lowerClassString`. Cost: SQLite cannot foreign-key it, so integrity rests on the deletion hooks plus `orphanedTagCounts` in diagnostics.
+
+**Key/value, not bare labels.** A bare label cannot answer "show me every high-dose run". Bare labels remain as the degenerate case with an empty value. `tag_value` is inside the `UNIQUE` constraint, so a key can be multi-valued (one simulation in two cohorts).
+
+**`tag_value` defaults to `''`, never `NULL`.** SQLite treats `NULL`s as distinct in a `UNIQUE` constraint, so `NULL` would have silently permitted duplicate bare labels. Non-obvious and worth remembering.
+
+**Keys are identifiers; values are data.** Keys become DataFrame column headers, CSV headers, and potentially filter tokens, so they are lowercased, whitespace-stripped, and restricted to `[a-z0-9][a-z0-9_.-]*`. Values only ever land in cells, so they stay free-form. Lowercasing kills the invisible-duplicate bug (`"Cohort"` vs `"cohort"` are distinct under SQLite's case-sensitive `=`).
+
+**The reserved `mm:` namespace enforces itself.** Since `:` is not in the legal key charset, `tag!` cannot write a provenance key — no separate reserved-word check exists. This fell out of the charset restriction rather than being designed in, and is the tidiest part of the schema.
+
+**No migration needed.** `createSchema()` runs on every `initializeDatabase()` using `CREATE TABLE IF NOT EXISTS`, so a purely additive table appears on existing databases automatically. No `up.jl` change and — importantly — no new `upgradeMilestones` entry required in PCMM. Verified by a test that drops the table and reinitializes.
+
+**Tags are stored once, on the object they are placed on; inheritance is resolved at query time.** Fanning a sampling's tag out to 200 simulation rows would go stale the moment a replicate is added to one of its monads. The cost is that inheritance cannot be a single SQL query — parent/child edges live in CSVs (`recordConstituentIDs`), not SQL — so `findSimulationIDs` expands matches through `constituentIDs`/`samplingSimulationIDs`/`trialSimulationIDs`. Only objects matching a requested filter are expanded, which keeps this cheap.
+
+**Ambient scope reads at row-insert time, so it works around `createTrial` *and* `run`.** An earlier draft claimed `createTrial` was the only correct place; that was wrong — `run(inputs, variations)` constructs internally, so the scope is live either way. But `run([t1, t2])` (the batching-for-parallelism workflow) constructs only the umbrella `Trial`, so `run` *also* applies ambient tags to the objects it is handed. Otherwise wrapping that `run` would tag the least semantically meaningful object in the hierarchy — the batch container exists for scheduling, not meaning.
+
+**Tags are written before dispatch, never after completion.** Consequences: a crashed run keeps its tags; failed simulations (which `simulationFailed` erases from their monad) are still labeled; and an in-flight multi-day HPC job is queryable by tag while running.
+
+**Simulator version is deliberately not tagged.** It is already a foreign-keyed column on every `simulations`/`monads`/`samplings` row via the `simulatorVersionTableName`/`resolveSimulatorVersionID` interface, which the downstream package owns (PCMM stores the PhysiCell hash there). `mm:git` therefore means unambiguously "the user's own repo" — specifically the repo containing the calling script, since that path is already resolved for `mm:script`.
+
+**Shelling out to `git` rather than using `LibGit2`.** `LibGit2` is a stdlib but would still need a `Project.toml` entry, and CLAUDE.md forbids adding dependencies without approval. Shelling out also respects the user's git config and worktree setup. Cached per session per directory; stderr routed to `devnull` so a non-repo directory is silent.
+
+**Provenance is cached, not recomputed per object.** Resolving the calling script walks the stacktrace, which is far too slow to repeat for every simulation in a sweep. `PROGRAM_FILE` covers `julia script.jl` cheaply; the stacktrace walk is the REPL/`include` fallback and runs once, refreshed by `withTags` (a rare call) via `refreshTagProvenance!`.
+
+**Pivoted tag columns are namespaced `tag:<key>`.** `simulationsTable` already generates columns from folder names, XML parameter paths, and `SimID`/`MonadID`; a tag key like `simid` would otherwise collide. The prefix also makes it visually obvious which columns are assertions versus configuration.
+
+### Decisions made without confirmation (user was away)
+- **`inherit=true` is the default for `findTrials`.** Asked but not answered before implementation began. Defaulting to inheritance makes "find everything in project X" do the obvious thing; the risk flagged earlier — a trial tag silently expanding to thousands of simulations — is mitigated by `findSimulationIDs` returning plain IDs (no per-object DB query) and by `inherit=false` being one keyword away.
+- **Values have surrounding whitespace trimmed**, a small deviation from the "values preserved exactly" line in the design brief. `"high "` vs `"high"` reading as two different tags is a real footgun and the whitespace is invisible in every printout. Internal whitespace, case, and unicode are still preserved.
+- **`mm:` stayed a string prefix rather than also getting a boolean column.** A column would make "only my tags" a cleaner `WHERE`, but `LIKE 'mm:%'` is adequate and the prefix is self-documenting in printed output.
+
+### Rejected / considered
+- **Copying parent tags down onto simulations** — rejected; goes stale when replicates are added later.
+- **Storing computed outcomes as tags** — rejected. Outcomes belong in the existing `post_processing` sink (dynamic columns, keyed by `simulation_id`), which already works and supports numeric columns. Tags have no type and no range-query story. Recovery queries join the two on `simulation_id`.
+- **Tagging only at `createTrial`** — rejected after the user pointed out that `run` legitimately operates on upstream inputs.
+- **A registered tag vocabulary with allowed values per key** — deferred. `tagKeys()`/`tagValues()` give discovery, which catches typos in practice; enforcement can be added later without a schema change.
+- **`LibGit2`** — rejected to avoid a `Project.toml` change (see above).
+
+### Files changed
+- `src/tags.jl` — new file: schema, key/value normalization, `tag!`/`untag!`/`tags`/`hasTag`, `withTags` + `_withReservedTags`, provenance capture, `applyCreationTags`/`applyRunTags`, `findSimulationIDs`/`findSimulations`/`findMonads`/`findTrials`, `tagsTable`/`tagKeys`/`tagValues`, `appendTags!`, hints, `deleteTagsFor`, `orphanedTagCounts`
+- `src/ModelManager.jl` — `include("tags.jl")` after `database.jl`; exports
+- `src/globals.jl` — `tag_scope`, `tag_provenance`, `session_id`, `tag_hints`, and two hint latches on `ModelManagerGlobals` (all defaulted, so PCMM needs no change); reset on `initializeModelManager`
+- `src/database.jl` — `tags` table + index in `createSchema`; `tags`/`include_auto_tags` kwargs on `simulationsTableFromQuery`/`monadsTableFromQuery`; orphan check in `databaseDiagnostics`
+- `src/classes.jl` — `applyCreationTags` at the four insert sites (Monad tags on both the INSERT and the reuse path)
+- `src/user_api.jl` — `tags` kwarg on `createTrial`/`run`; `_withOptionalTags`; `createTrial(::AbstractVector)` tags constituents
+- `src/runner.jl` — `applyRunTags` before dispatch
+- `src/deletion.jl` — `deleteTagsFor` at the four choke points
+- `src/sensitivity.jl` — `mm:method`
+- `src/calibration/abc.jl` — `mm:calibration`, `mm:generation` per batch
+- `test/runtests.jl` — 8 new testsets (~100 assertions)
+- `docs/src/man/tagging.md` — new manual page
+- `README.md`, `PRD.md` — feature documented
+
+### Critic pass over the finished change
+
+A deliberate review of the whole diff at the end, rather than trusting the incremental one. Eight issues found, all in code added this session; all fixed.
+
+**Scale bugs in the query paths.** These would not show up in a test project and would have bitten only at the 10⁵–10⁶ sizes the design was written for:
+- `findSimulationIDs` ran `Set(simulationIDs())` on every call — a full `SELECT` of every simulation id, just to intersect a handful of matches against it. Replaced with one query bounded by the match. It also folds in the `status` filter, which was a second full scan.
+- `tagsTable()` (default `include_auto=true`) synthesizes one row per object per `mm:` key, so a million-simulation project would build ~5M `NamedTuple`s. Now guarded by `MAX_MATERIALIZED_TRIALS`, with the per-object form and `include_auto=false` left unbounded.
+- `_maybeShowRecoveryHint` ran `COUNT(*)` with a `LIKE` over the whole `tags` table on *every* `findSimulationIDs` call, forever: it only latched when it decided to show the hint, so the common case (user has tags) never stopped probing. Now latches before deciding and uses `LIMIT 1`.
+- `appendTags!` walked a parent's constituent CSVs once per tag row rather than once per parent, so a sampling with ten tags read its CSVs ten times. Memoized.
+
+**Leftovers from the reverts.** A `let` block in `Sampling` that existed only to scope the removed transaction closure; a comment on `applyCreationTags(Monad, …)` still explaining behavior in terms of "a new ambient scope", a concept deleted two revisions earlier; and `_tagClassType`, dead since the query layer stopped mapping class strings back to types.
+
+**Test gap.** The "no migration milestone" claim was only tested for the `tags` *table*. The `ALTER TABLE` path — the harder half — was not. Extended to drop both new tables *and* the added columns, reinitialize, assert everything returns, run it twice for idempotence, and check that objects predating the upgrade (null provenance) still read and query correctly rather than throwing.
+
+**Definition of Done.** `appendTags!` was exported without a usage example.
+
+Also verified rather than assumed: every concrete claim in `docs/src/man/tagging.md` was executed against a live project — basename and full-path `mm:script` matching, key lowercasing, value trimming, length and namespace rejection, multi-valued keys, bare labels, idempotent re-tagging, inheritance on and off, AND/OR composition, the `tag:` column prefix, `|`-joined multi-values, `missing` for untagged rows, and the `limit` guard. All 22 passed.
+
+### Third revision after design review (same session)
+
+**The accessor stays `tags`.** It was briefly renamed to `trialTags` over a masking concern and reverted on preference for the shorter name. The concern was real and is recorded so it is not rediscovered from scratch: Julia 1.12 lets a top-level assignment shadow a `using`-imported binding *silently* — verified, including after the function has already been called — so a user writing `tags = [...]` gets no error, just "objects of type Vector are not callable" from every later `tags(sim)`. The workaround if it ever bites is `ModelManager.tags(sim)`. No other export carries comparable risk: the rest are compound (`tagsTable`, `tagKeys`, `findSimulationIDs`) or end in `!`.
+
+**`_withOptionalTags` folded into `_createTrial`.** It wrapped exactly the two call sites that immediately invoked `_createTrial`, so it was a layer with no second consumer. `_createTrial` now takes `tags`, resolves provenance, delegates construction to `_buildTrial`, and tags the result — one entry point for every `createTrial` overload.
+
+**Provenance is first-writer-wins, deliberately.** `applyCreationTags` sets `datetime`/`provenance_id` only `WHERE provenance_id IS NULL`, so an object records the context that *created* it, not the last one to touch it. Verified end to end: script A creates a monad with 2 replicates, script B later grows it to 5 — the monad and the first two simulations keep A, the three new simulations get B. Later work is therefore not lost, it is attributed to the objects that were actually created; this only works because provenance is per-object rather than inherited from the monad (the design rejected in the second revision). Locked in by a regression test.
+
+**Batched `run` tags the constituents, not the container — a durability choice.** Reviewed on the observation that inheritance would carry a tag on the umbrella `Trial` down to everything beneath it, making per-constituent tagging look redundant. It is not: the umbrella is deduplicated plumbing, and `deleteTrial(id; delete_subs=false)` removes it without touching its constituents. Measured both ways — with the tag on the constituents, the query still returns all four simulations after the umbrella is deleted; with it on the umbrella alone, the query returns nothing. `hasTag(lo, ...)` is also false in the umbrella case, right after the caller "tagged" `lo`. General rule: a container too ephemeral to be worth labelling is too ephemeral to be a label's only home. Both properties are now pinned by tests.
+
+**Sensitivity labelling moved before the run.** `mm:method` was being applied to `gsa_sampling.sampling` after `runSensitivitySampling` returned — after every simulation had already finished, which loses the label on an interrupted sweep and leaves an in-flight analysis unqueryable by method. All three GSA methods shared an identical `Sampling(...)` + `run(...)` pair, so that became `buildAndRunSensitivitySampling`, which labels between the two. One call site instead of three, and the tag now lands before dispatch like every other tag in the system.
+
+**`BEGIN EXCLUSIVE` replaces the ReentrantLock.** The lock added in the previous round was justified with a claim that turned out to be wrong: SQLite.jl's do-block `transaction(f, db)` issues a named **SAVEPOINT**, not `BEGIN`, so it nests fine and concurrent tag writes would not have thrown "cannot start a transaction within a transaction". (It also sets `PRAGMA synchronous = OFF` for the duration, which is a durability downgrade worth knowing about.) A real `BEGIN EXCLUSIVE` needs `SQLite.transaction(db, "EXCLUSIVE")` plus manual commit/rollback — the pattern `initializeDatabase` already used.
+
+`withExclusiveTransaction` checks `SQLite.intransaction` and joins an enclosing transaction rather than nesting, so committing inside a caller's transaction can't end it early.
+
+It was initially applied to every write, then narrowed to `Sampling`/`trialID`, and finally **removed entirely**. The full reasoning, because the end state looks like "we did nothing" and the next person should know it was a decision:
+
+| Site | Pattern | Outcome |
+|---|---|---|
+| `Sampling`, `trialID` | scan, then insert; **no `UNIQUE`** | **No transaction** — see below. |
+| `Monad` | `INSERT OR IGNORE` + lookup, `UNIQUE` | **No transaction.** The write comes first and is atomic; `UNIQUE` self-corrects. |
+| `_resolveProvenanceID` | `INSERT OR IGNORE` + lookup, `UNIQUE` | **No transaction.** Same, and nothing ever deletes from `provenances`. |
+| `_insertTagRows` | N × `INSERT OR IGNORE` | **Plain transaction**, for batching only — one commit instead of N on a large retroactive `tag!`. |
+
+`EXCLUSIVE` earns its place only when a *read decides a subsequent write* and must still hold when that write lands, since it takes the write lock at `BEGIN` rather than at first write. A single statement is already atomic, and `INSERT OR IGNORE` against a `UNIQUE` constraint is self-correcting — the loser's lookup finds the winner's row. `samplings` and `trials` are the only identity-defining tables without such a constraint, so they were the only genuine candidates.
+
+**Why they were dropped anyway.** Their critical section scans constituent-ID **CSV files on disk** before inserting. Holding the database write lock across that turns a microsecond window into a hundred-millisecond one, which then required a `busy_timeout` pragma (`openCentralDB`, `DB_BUSY_TIMEOUT_MS`) so a second session would wait rather than die with `"database is locked"` — verified experimentally: 0.1 s hard failure without it, 2 s wait-then-succeed with it. That is a lot of machinery, and a database lock held across file I/O, to protect a workflow we have already decided not to support. Reverting leaves the pre-existing behavior, which was working.
+
+**If duplicate or inconsistent rows ever appear in `samplings` or `trials`, this is the answer**: wrap the find-or-insert in `withTransaction(mode="EXCLUSIVE")` in `Sampling(monads, inputs)` (`classes.jl`) and `trialID(samplings)` (`classes.jl`), and add `PRAGMA busy_timeout` where the central connection is opened. The `mode` keyword on `withTransaction` was kept precisely so this is a one-word change.
+
+What this does and does not buy, stated plainly because the two are easy to conflate:
+- **Does**: serialize against other *processes* sharing the project — concurrent HPC array jobs, a second REPL. That is the realistic hazard for this package.
+- **Does not**: serialize *tasks within one session*. SQLite locks are per-connection and ModelManager shares one connection, so `BEGIN EXCLUSIVE` is invisible to sibling tasks.
+
+Concurrent trial creation in a session therefore remains unsupported, by decision rather than oversight: `recordConstituentIDs` is read-modify-write on a CSV file, entirely outside SQLite's reach, and guarding it would mean a coarse lock across all of creation for a workflow nobody needs (creation is cheap next to simulation). Documented as a warning instead of engineered around.
+
+### Second revision after design review (same session)
+
+Eight further issues raised; all addressed. The first two collapsed most of the machinery built in the first revision.
+
+**Ambient scope removed entirely — tags are a keyword argument.** The reviewer's question was simply "can't we pass the tags as a kwarg into `run` and `createTrial`?" and the answer is yes, which deletes `withTags`, `@tag`, task-local storage, `_withReservedTags`, the TTL clock, and every threading hazard along with them. `createTrial(...; tags=...)` now means "construct, then `tag!` the result", and inheritance already covers the constituents. The framework's own `mm:method`/`mm:calibration` tags work the same way via `tagReserved!` on the returned sampling. Two rounds of design were spent building a scope mechanism whose only advantage was reaching objects created inside a user's own helper function — which that helper can expose as its own `tags` kwarg.
+
+**Provenance moved from tag rows to columns.** With a migration accepted, `simulations`/`monads`/`samplings`/`trials` each gained `datetime` and `provenance_id`. Measured cost per object across the three designs:
+
+| Design | Bytes/object | 10⁶ sims |
+|---|---|---|
+| Six tag rows (v1) | 1139 | 1.14 GB |
+| Two tag rows, normalized (v2) | 290 | 290 MB |
+| Two columns (v3, current) | 21 | 21 MB |
+
+The reviewer suggested a `datetimes` lookup table; that does not help, because a pointer costs about as much as the timestamp it points at. What wins is that a column in an already-existing row carries no index and no per-fact row overhead. Still no migration milestone: `ensureProvenanceColumns` `ALTER TABLE`s from `createSchema` guarded by `columnsExist`, so PCMM implements nothing.
+
+**Terminology.** "Rows" was used throughout without ever explaining that `tags` is entity-attribute-value, so "`mm:created` costs one row per object" read as nonsense — a reader reasonably pictures a row as an object and a fact as a column. Recorded here because it is the crux of why the EAV design was expensive: each *fact* is a row plus two index entries, whereas a column is bytes in a row that already exists.
+
+**Other fixes in this round.**
+- `Simulation(::Int)` now delegates to `simulationsFromIDs`, with `_simulationFromRow` as the single place that decodes a row.
+- `mm:script` and `mm:script.path` collapsed to one field. The basename is derivable, and queries match either form.
+- The launching script is resolved per call rather than cached per session, so a session that `include`s several scripts attributes each correctly. Frame filtering relies on `isfile` alone rather than sniffing for `REPL[`: that rejects every front-end's pseudo-file — REPL inputs, IJulia `In[3]`, Pluto cell ids — without enumerating them. `isinteractive()` cannot substitute for this filter (it is session-level, the filter is frame-level) and must not short-circuit the walk, or an interactive session that `include`s a script would lose the attribution. With no attributable file it reports `"interactive"` or `"unknown"` from `isinteractive()`, rather than labelling every such case a REPL — `julia -e` and notebook kernels are not REPLs, and a false script attribution defeats the point of recording one.
+- Git state is read at each `createTrial`/`run` call. The TTL clock added in the previous round was unnecessary once the check moved off the per-object path.
+- `PROVENANCE_TTL_SECONDS` and `MAX_MATERIALIZED_TRIALS` are no longer exported. They had been exported only to satisfy a Documenter `@ref`, which is not a reason to widen the public API; the manual now states the number in prose instead.
+- Docstrings audited for design rationale that belongs in `#!` comments. Users do not need to know why `tag_value` defaults to `''` rather than `NULL`, or that a basename column was considered and rejected.
+
+### First revision after design review (same session)
+
+Six issues raised on review; all addressed. Two were mistakes on my part.
+
+**Corrected: the "4–6 rows per simulation" claim was wrong.** `mm:created` is *one* row per object, written once. The 4–6 was the whole provenance set (`mm:created`, `mm:session`, `mm:script`, `mm:script.path`, `mm:git`, `mm:git.dirty`) and I misattributed the total to `mm:created` alone. The correction matters because it hid the real problem: five of those six are **identical for every object in a session** and were being duplicated per simulation.
+
+**Corrected: the storage estimate was ~5× too low.** I said "~20 MB at 10⁵ simulations". Measured (SQLite file size after `VACUUM`, 10⁵ objects, realistic values):
+
+| Scheme | Bytes/object | 10⁵ sims | 10⁶ sims |
+|---|---|---|---|
+| Six provenance rows (original) | 1139 | 114 MB | 1.14 GB |
+| Two rows: timestamp + pointer (now) | 290 | 29 MB | 290 MB |
+| Pointer only (hypothetical) | 122 | 12 MB | 122 MB |
+
+The original estimate counted payload only and ignored that every tag row is stored three times — the table, the `UNIQUE` index, and the `(tag_key, tag_value)` lookup index.
+
+**Provenance is now normalized.** A `provenances` table holds one row per distinct creation context (session + script + script_path + git_commit + git_branch + git_dirty, `UNIQUE` across all six), and each object carries a single `mm:provenance => <id>` tag. The *presented* model is unchanged: the pointer is expanded back into the virtual `mm:script`/`mm:git`/… keys by `tags`, `tagsTable`, `appendTags!`, `tagKeys`, and `tagValues`, and `findTrials` translates a virtual-key filter into a provenance lookup. Every pre-existing test passed unmodified after the change, which is the evidence that the abstraction holds.
+
+Rejected: **attaching provenance to monads and letting simulations inherit it.** Proposed as the cheapest option (~25 MB at 10⁶), but it is wrong — simulations can be added to an existing monad in a later session, which would stamp the original session's script and git commit onto simulations created months afterwards. Provenance must attach at the moment of creation, which means per object.
+
+**Scope moved to task-local storage.** The scope stack was a field on `mm_globals()`; `Threads.@threads` over `withTags` blocks would interleave pushes and pops and mis-attribute tags. Task-local storage fixes that. It does *not* inherit into tasks spawned inside a scope, which is why the explicit keyword path matters — see below. Worth noting separately: `centralDB()` is a single shared handle, so concurrent `createTrial` may be unsound for reasons unrelated to tags; that was not investigated.
+
+**`@tag` macro added.** When it wraps a direct `createTrial`/`run` call it rewrites to the existing `tags=` keyword — no ambient state at all, correct under any threading. Anything else falls back to a `withTags` scope, which still reaches objects created inside functions the expression calls. The macro is not merely sugar for `withTags`: the rewriting branch is the thread-safe path. Hygiene detail: the generated code is escaped into the caller's scope, so internal helpers are referenced via `GlobalRef(@__MODULE__, …)`, which survives the escape.
+
+**Git state is now re-checked per command, not per session.** Files change constantly during a session, so a once-per-session resolution attached stale commits and dirty flags to everything created afterwards. `maybeRefreshProvenance!` runs on entry to `createTrial`/`run`/`withTags`, throttled by `PROVENANCE_TTL_SECONDS = 5`; the per-object path (`currentProvenanceID`) only reads the cache. A changed git state naturally produces a new `provenances` row via the `UNIQUE` constraint. Per-object re-checking was rejected outright — `LibGit2.isdirty` walks the working tree.
+
+**Switched to `LibGit2`** (explicitly approved, so the CLAUDE.md no-new-dependencies rule is satisfied). `LibGit2.GitRepoExt` discovers the repo from a subdirectory and works correctly inside a git worktree, which the shell-out version also did but less directly. Also now captures the branch (`mm:git.branch`).
+
+**Result-set guards.** `findSimulations` previously did `Simulation.(ids)`, one `SELECT` per object — a million-element result meant a million queries. Added `simulationsFromIDs` (one query) and a `MAX_MATERIALIZED_TRIALS = 10_000` guard on every object-returning finder, overridable via `limit`. The ID-returning forms stay unbounded, since a tag on a `Trial` legitimately expands to everything beneath it and IDs are cheap.
+
+### Open questions
+- **Orphaned `provenances` rows** are never cleaned up when the last object referencing them is deleted. Bounded by session count, so small, but `orphanedTagCounts` does not report them.
+- **Concurrent `createTrial` is unsupported, in-session or across sessions.** Two Julia sessions cannot corrupt the SQLite file — SQLite serializes writers itself — but they can produce duplicate `samplings`/`trials` rows, and they race on the constituent-ID CSVs, which no database lock covers. See the remedy noted above if it ever surfaces.
+- **Exact-value queries on `mm:created` compare the stored string**, so a `Trial` whose stored stamp is the legacy `yymmddHHMM` will not match an ISO-8601 filter even though `tags(trial)` displays ISO. Resolved by the v0.9.0 item below; range queries on the table are the better tool regardless.
+
+### Targeted for v0.9.0 (breaking-changes release)
+
+- **Move the `datetime` columns to INTEGER unix seconds** on `simulations`, `monads`, `samplings`, and `trials`, and normalize the legacy `trials.datetime` (`yymmddHHMM`) with them. Saves a few bytes per object and makes range queries natural, but any user code already reading `trials.datetime` as a string would break — which is why it waits for a release that permits that. Doing so also removes `_normalizeStamp` and the read-time special case it exists for.
+- **Calibration generation tagging covers the ABC-SMC batch path only.** `resumeABC` goes through the same `_buildEvaluateBatch`, so it is covered, but this was not explicitly tested.
+- **Should `reinitializeDatabase` be exported?** It is user-facing and documented but not in the export list; the new test had to qualify it. Pre-existing, unrelated to tagging.
+- Wiring tag-based selection into the calibration/GSA entry points (e.g. seeding a `SimulationBank` from a tag query) is not done.
+
+---
+
 ## Session: GSA sensitivity plot recipes (2026-06-17)
 
 ### Goal
