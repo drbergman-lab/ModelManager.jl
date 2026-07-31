@@ -41,6 +41,51 @@ function reinitializeDatabase()
 end
 
 """
+    withTransaction(f; mode="DEFERRED", db::SQLite.DB=centralDB())
+
+Run `f` inside a transaction on `db`, and return its value.
+
+Batches several statements into one commit. Nested calls join the enclosing
+transaction rather than starting their own, so it is safe to call from a function
+that may itself be invoked inside one.
+
+`mode` is passed to `BEGIN`. ModelManager uses the default everywhere: a single
+statement is already atomic, and an `INSERT OR IGNORE` against a `UNIQUE`
+constraint is self-correcting, since a losing racer's lookup finds the winner's
+row. `"EXCLUSIVE"` exists as an escape hatch for a find-or-insert that has no such
+constraint to fall back on — see the note in `progress.md` on duplicate `samplings`
+or `trials` rows.
+
+!!! note
+    SQLite holds locks per *connection*, and ModelManager uses one per session, so
+    this serializes against other Julia sessions sharing the project — not against
+    tasks inside one session.
+
+# Example
+```julia
+withTransaction() do
+    for row in rows
+        insert(row)
+    end
+end
+```
+"""
+function withTransaction(f::Function; mode::AbstractString="DEFERRED", db::SQLite.DB=centralDB())
+    #! Already inside one: the outer transaction covers us, and committing here would
+    #! end the caller's transaction early.
+    SQLite.intransaction(db) && return f()
+    SQLite.transaction(db, mode)
+    try
+        result = f()
+        SQLite.commit(db)
+        return result
+    catch
+        SQLite.rollback(db)
+        rethrow()
+    end
+end
+
+"""
     createSchema()
 
 Create all tables in the central database.
@@ -95,6 +140,13 @@ function createSchema()
 
     createDefaultStatusCodesTable()
     createMMTable("calibrations", calibrationsSchema())
+
+    #! Purely additive, so `CREATE TABLE IF NOT EXISTS` brings existing databases
+    #! up to date on the next `initializeModelManager` with no migration milestone.
+    createMMTable("tags", tagsSchema())
+    createMMTable("provenances", provenancesSchema())
+    createTagIndices()
+    ensureProvenanceColumns()
 end
 
 """
@@ -653,6 +705,21 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
         You can also use `deleteSimulationsByStatus($arg_string; user_check=false)` to remove all simulations with these status codes.
         """
     end
+
+    #! Not asserted like the four core tables: a database opened by an older ModelManager
+    #! has no `tags` table until `initializeDatabase` recreates the schema.
+    if tableExists("tags")
+        orphans = orphanedTagCounts()
+        total_orphans = sum(values(orphans); init=0)
+        if total_orphans > 0
+            detail = join(["$(n) $(class)" for (class, n) in sort(collect(orphans)) if n > 0], ", ")
+            @warn """
+            Found $(total_orphans) tag rows pointing at objects that no longer exist ($(detail)).
+            This usually means a deletion was interrupted. They are harmless — `findTrials` filters
+            them out — but you can clear them by deleting the affected objects again.
+            """
+        end
+    end
 end
 
 ########### Summarizing functions (generic) ###########
@@ -785,7 +852,7 @@ function appendVariations(location::Symbol, df::DataFrame; short_names::Bool=tru
 end
 
 """
-    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, post_processing::Bool=false)
+    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, post_processing::Bool=false, tags::Bool=false, include_auto_tags::Bool=false)
 
 Return a DataFrame for the given SQL query on the simulations table.
 
@@ -800,37 +867,49 @@ By default, constant columns and raw ID columns are removed.
 - `sort_ignore::Vector{String}`: Additional column names to exclude from sorting, on top of the always-excluded variation-ID columns. Defaults to none.
 - `short_names::Bool`: If true (default), column names are shortened via `shortVariationName`. Pass `false` to keep raw XML-path column names (e.g. for matching against `parameters.toml` `db_column` entries).
 - `post_processing::Bool`: If true, left-joins each simulation's stored post-processing quantities (see [`postProcessingTable`](@ref)) onto the table by `:SimID`, appending one column per quantity (`missing` where a quantity was not computed). Defaults to false. Post-processing columns are appended as-is and are not subject to `remove_constants` or sorting.
+- `tags::Bool`: If true, appends one `tag:<key>` column per tag key in use (see [`appendTags!`](@ref)), with `missing` where a simulation has no value for that key and multiple values joined by `|`. Defaults to false. A tag on a parent `Monad`, `Sampling`, or `Trial` contributes to its simulations' columns, matching [`findSimulationIDs`](@ref). Like post-processing columns, these are appended as-is and are not subject to `remove_constants` or sorting.
+- `include_auto_tags::Bool`: If true, the tag columns also include ModelManager's own `mm:` provenance (creation time, script, git state). Defaults to false, since those are rarely what you are comparing rows on. Has no effect unless `tags=true`.
 """
 function simulationsTableFromQuery(query::String;
                                    remove_constants::Bool=true,
                                    sort_by=String[],
                                    sort_ignore=String[],
                                    short_names::Bool=true,
-                                   post_processing::Bool=false)
+                                   post_processing::Bool=false,
+                                   tags::Bool=false,
+                                   include_auto_tags::Bool=false)
     df = _variationsTableFromQuery(query, :simulation_id, :SimID;
                                    remove_constants=remove_constants, sort_by=sort_by,
                                    sort_ignore=sort_ignore, short_names=short_names)
     post_processing && _appendPostProcessing!(df)
+    tags && appendTags!(df, Simulation, :SimID; include_auto=include_auto_tags)
     return df
 end
 
 """
-    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true)
+    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, tags::Bool=false, include_auto_tags::Bool=false)
 
 Return a DataFrame for the given SQL query on the `monads` table. This is the monad-level
 analogue of [`simulationsTableFromQuery`](@ref): one row per monad and its varied parameters.
 
-Keyword arguments match [`simulationsTableFromQuery`](@ref), except the display ID column
-excluded from the default sort is `:MonadID` (rather than `:SimID`).
+Keyword arguments match [`simulationsTableFromQuery`](@ref), with two differences: the
+display ID column excluded from the default sort is `:MonadID` (rather than `:SimID`), and
+there is no `post_processing` option, since the sink is keyed by simulation. `tags=true`
+appends `tag:<key>` columns as it does for simulations, inheriting from a parent `Sampling`
+or `Trial`.
 """
 function monadsTableFromQuery(query::String;
                               remove_constants::Bool=true,
                               sort_by=String[],
                               sort_ignore=String[],
-                              short_names::Bool=true)
-    return _variationsTableFromQuery(query, :monad_id, :MonadID;
-                                     remove_constants=remove_constants, sort_by=sort_by,
-                                     sort_ignore=sort_ignore, short_names=short_names)
+                              short_names::Bool=true,
+                              tags::Bool=false,
+                              include_auto_tags::Bool=false)
+    df = _variationsTableFromQuery(query, :monad_id, :MonadID;
+                                   remove_constants=remove_constants, sort_by=sort_by,
+                                   sort_ignore=sort_ignore, short_names=short_names)
+    tags && appendTags!(df, Monad, :MonadID; include_auto=include_auto_tags)
+    return df
 end
 
 """
@@ -918,11 +997,17 @@ Return a DataFrame with simulation data. See [`simulationsTableFromQuery`](@ref)
 - Omitted (returns data for all simulations)
 
 Pass `post_processing=true` to append each simulation's stored post-processing quantities
-(see [`postProcessingTable`](@ref)) as extra columns:
+(see [`postProcessingTable`](@ref)) as extra columns, and `tags=true` to append a
+`tag:<key>` column per tag key in use (see [`appendTags!`](@ref)):
 
 ```julia
 simulationsTable(sampling; post_processing=true)
+simulationsTable(sampling; tags=true)                        # what each run was for
+simulationsTable(sampling; tags=true, post_processing=true)  # intent and outcome together
 ```
+
+The two answer different questions and are often read side by side: tags record what a run
+was *for*, the post-processing sink records how it turned out.
 """
 function simulationsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
     query = constructSelectQuery("simulations", "WHERE simulation_id IN ($(join(simulationIDs(T),",")));")
@@ -988,6 +1073,9 @@ monadsTable(sampling)
 ```julia
 monad_ids = [1, 2, 3]
 monadsTable(monad_ids; remove_constants=false)
+```
+```julia
+monadsTable(sampling; tags=true)   # adds a tag:<key> column per tag key in use
 ```
 """
 function monadsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)

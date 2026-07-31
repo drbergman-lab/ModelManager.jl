@@ -205,12 +205,108 @@ target location's file type.
 - Both accept the same `args...` forms: `AbstractTrial` objects (or arrays), a vector of IDs (simulation IDs / monad IDs respectively), or no argument (all simulations / all monads). ID collection uses `simulationIDs` / `monadIDs`.
 - Both share keyword arguments (via `simulationsTableFromQuery` / `monadsTableFromQuery`): `remove_constants` (default `true`, drop columns constant across rows), `sort_by`, `sort_ignore` (defaults to the table's ID column plus variation-ID columns), and `short_names` (default `true`, shorten column names via `shortVariationName`; `false` keeps raw XML-path names).
 - The primary-key column is renamed for display: `:SimID` for simulations, `:MonadID` for monads.
+- `tags=true` (default `false`) pivots user tags into `tag:<key>` columns; `include_auto_tags=true` additionally pivots `mm:` provenance. See *Trial Tagging and Feature-Based Recovery*.
 
 **Acceptance criteria:**
 - For a `Sampling` of `m` monads with `r` replicates each, `monadsTable(sampling)` has `m` rows and `simulationsTable(sampling)` has `m·r` rows.
 - Varied parameters appear as columns; a parameter held constant is dropped when `remove_constants=true` and retained when `false`.
 - `short_names=false` yields raw `columnName` (XML-path) column names.
 - `monadsTable(monad_ids)`, `monadsTable(monad)`, and `monadsTable(trial)` agree with the underlying monad set.
+
+---
+
+## Feature: Trial Tagging and Feature-Based Recovery
+
+**One-line description:** Attach key/value tags to any trial object — automatically for provenance, manually for intent — so past work can be recovered by what it *was for* rather than by simulation ID or parameter value.
+
+**Priority:** Must-have
+
+**Motivation:** Nothing in the schema recorded *why* a simulation exists. Recovery therefore depended on a script's hard-coded ID list staying in sync with the database, which it does not.
+
+**Behavioral specification:**
+
+*Storage*
+- A `tags` table in the central database: `tag_id INTEGER PRIMARY KEY, trial_class TEXT, trial_id INTEGER, tag_key TEXT, tag_value TEXT DEFAULT '', datetime TEXT`, with `UNIQUE (trial_class, trial_id, tag_key, tag_value)`.
+- `trial_class` is `lowerClassString(T)` — one of `"simulation"`, `"monad"`, `"sampling"`, `"trial"`. SQLite cannot foreign-key a polymorphic column, so consistency is maintained by the deletion hooks plus a diagnostics check.
+- `tag_value` defaults to `''`, never `NULL`: SQLite treats `NULL`s as distinct in a `UNIQUE` constraint, which would permit duplicate bare labels.
+- Because the value is inside the `UNIQUE` constraint, one object may carry several values for one key.
+- Purely additive, so `createSchema`'s `CREATE TABLE IF NOT EXISTS` brings existing databases up to date on the next `initializeModelManager`. **No migration milestone is required.**
+- An index on `(tag_key, tag_value)` serves the `findTrials` direction; the `UNIQUE` constraint already indexes the "what tags does this object have?" direction.
+
+*Key and value rules*
+- Keys are identifiers: lowercased and whitespace-stripped on write, restricted to `[a-z0-9][a-z0-9_.-]*`, max 64 characters. Enforced by `normalizeTagKey`.
+- Values are data: stored as given apart from trimming surrounding whitespace. Case, internal whitespace, punctuation, and unicode all survive.
+- The `mm:` namespace is reserved for framework-generated tags. Because `:` is not in the legal key character set, the namespace is unforgeable through the public API — no separate reserved-word check exists.
+- `recommendedTagKeys()` returns the suggested vocabulary: `project`, `purpose`, `figure`, `arm`, `verdict`, `note`. Recommendations only; any legal key is accepted.
+
+*Writing*
+- `tag!(target, tags...)` accepts an `AbstractTrial`, a type plus ID(s), a vector of objects, a bare vector of integers (interpreted as simulation IDs), or an `MMOutput`. Each tag is a `Pair` or a bare key (stored with an empty value). Re-applying is idempotent.
+- `untag!(target, tags...)` removes a specific pair (`key => value`) or every value for a key (bare key). `untag!(target)` removes all user tags but never `mm:` provenance.
+- A tag on a `Monad`/`Sampling`/`Trial` is stored **once, on that object**. It is never copied onto constituent simulations — that would go stale when replicates are added later.
+
+*Applying tags at creation*
+- `createTrial(...; tags=(...))` and `run(...; tags=(...))` apply `tags` to the object they return. There is no ambient scope and no global mutable tag state: the tags travel in the call, so parallel trial creation cannot mis-attribute them.
+- Tags land on the returned object only. Its monads and simulations are matched through query-time inheritance rather than being tagged individually, which is what keeps the answer right when replicates are added later.
+- `run(Ts::AbstractVector; tags=...)` tags each trial it was handed and **not** the umbrella `Trial` built to batch them. Inheritance would reach the constituents from a tag on the `Trial`, so this is a durability choice rather than a reachability one: that `Trial` is deduplicated plumbing which `deleteTrial(id; delete_subs=false)` removes on its own, and if it held the only copy of the tag, deleting it would silently make those simulations unfindable. Tagging the constituents also makes `hasTag` true for the objects the caller actually passed.
+- The same reasoning applies one level down: batching objects below `Sampling` wraps each in a single-object `Sampling` so the `Trial` can hold it, and those wrappers are containers too, so they go untagged. `findTrials(Sampling; ...)` therefore returns nothing for such a batch, while `findSimulationIDs` and `findMonads` return everything expected.
+- Tags are written before any simulation is dispatched, so they survive an interrupted run and are queryable while it is in flight.
+- Framework-generated `mm:` tags use the same path via `tagReserved!`, which accepts the reserved namespace `tag!` rejects.
+- The accessor is `tags`. Renaming it to `trialTags` was considered, because a bare `tags` is easily masked by a user variable of the same name and Julia allows that shadowing silently, but the shorter name won; `ModelManager.tags(sim)` is the workaround if it ever bites.
+
+*Automatic provenance*
+- Every created object records its creation time and creation context, surfaced as `mm:created`, `mm:session`, `mm:script`, `mm:git`, `mm:git.branch`, and `mm:git.dirty`.
+- **Stored as columns, not tag rows.** `simulations`, `monads`, `samplings`, and `trials` each gain a `datetime` and a `provenance_id` column; the session-invariant facts live once in a `provenances` table (`UNIQUE` across all its columns). Measured at 10⁵ objects this costs 21 bytes/object — ~21 MB at 10⁶ simulations — against 1139 bytes/object (1.14 GB) for one tag row per fact. The `tags` table is entity-attribute-value and each row is stored three times (table, `UNIQUE` index, lookup index), which is what makes per-fact rows expensive; a column in an existing row costs neither.
+- **The presented model is unchanged.** The columns are synthesized back into `mm:` keys by `tags`, `tagsTable`, `appendTags!`, `tagKeys`, and `tagValues`, and `findTrials` translates such a filter into a column lookup. Callers never see a `provenance_id`.
+- Provenance attaches per object at creation, **not** per monad with inheritance: simulations may be added to an existing monad in a later session, which would otherwise stamp the original session's script and commit onto much later work.
+- **First writer wins.** An object that already carries provenance keeps it, so a monad reports the context that created it rather than the last one to touch it. Work done later is not lost: simulations added by a later script are new rows and carry that script's provenance, so a monad grown from 2 to 5 replicates by a second script has 2 simulations attributed to the first and 3 to the second.
+- `provenances.script` holds one path; queries match on either the bare filename or the full path, so no second column is needed.
+- The launching script comes from `PROGRAM_FILE`, falling back to a stacktrace walk, and is empty when the work cannot be attributed to a file. Frame filtering relies on `isfile` rather than matching `REPL[` by name, which rejects every front-end's pseudo-file (REPL inputs, IJulia `In[3]`, Pluto cell ids) uniformly.
+- The session mode is a **separate** field, `mm:interactive`, rather than a sentinel in the script field: `isinteractive()` is a property of the session while the script is a property of the frame, and an interactive session that `include`s a script must still be attributed to that script. Recording both means the attribution survives *and* carries its caveat — `mm:interactive` and `mm:git.dirty` are the two flags that say a run may not reproduce from the recorded commit and script alone.
+- Git state is read via `LibGit2` (`GitRepoExt` discovers the repo from a subdirectory and works inside worktrees).
+- Both are resolved on entry to `createTrial` and `run` — once per call, not once per object — so edits made during a long session are reflected in what is created next. A changed git state produces a new `provenances` row via the `UNIQUE` constraint.
+- **Columns are added without a migration milestone.** `ensureProvenanceColumns` runs from `createSchema` and `ALTER TABLE`s only what `columnsExist` reports missing, so existing projects gain them on the next `initializeModelManager` and simulator packages implement nothing.
+- Sensitivity analyses stamp `mm:method`; calibration batches stamp `mm:calibration` and `mm:generation`.
+- Simulator version is deliberately **not** tagged: it is already a foreign-keyed column on every row via `simulatorVersionTableName`/`resolveSimulatorVersionID`, which the downstream simulator package owns.
+
+*Retrieval*
+- `findSimulationIDs(; tags, any_of, status, inherit=true)` returns sorted IDs; `findSimulations` returns constructed objects; `findMonads` works one level up; `findTrials(T; ...)` dispatches on type.
+- The ID-returning form is unbounded — with `inherit=true` a tag on a `Trial` legitimately expands to every simulation beneath it. The **object**-returning forms build objects through `simulationsFromIDs` (a single query, not one `SELECT` per object) and refuse result sets above `MAX_MATERIALIZED_TRIALS` (10 000), overridable per call via `limit`.
+- `tags` filters combine with AND, `any_of` with OR; given both, the results intersect. A filter is a `key => value` pair (exact) or a bare key (any value).
+- `inherit=true` (default) makes a tag on a parent match its constituents, resolved at query time by walking `constituentIDs` — parent/child edges live in CSVs, not SQL, so this cannot be a single query. `inherit=false` matches only direct tags. Tags never propagate upward.
+- Results are always intersected with the objects that still exist, so orphaned tag rows never surface.
+- `simulationsTable(...; tags=true)` and `monadsTable(...; tags=true)` pivot tag keys into `tag:<key>` columns (namespaced so they cannot collide with ID, folder, or parameter columns). Multi-valued keys join with `|`; untagged objects get `missing`. `include_auto_tags=true` also pivots `mm:` tags.
+- `tagsTable`, `printTagsTable`, `tagKeys`, `tagValues` support discovery of the vocabulary actually in use.
+
+*Hints*
+- A one-time-per-session `@info` fires when a trial is created with no user tags, showing the provenance that was captured automatically and the syntax for adding more. A second fires when a recovery query runs against a database with no user tags.
+- Suppressed by `setTagHints!(false)` or `MODELMANAGER_TAG_HINTS=0`.
+
+*Concurrency*
+- `withTransaction(f; mode)` wraps a transaction and joins rather than nests when already inside one. It is used in exactly one place — batching tag inserts into a single commit — and always with the default mode.
+- No write path uses `EXCLUSIVE`. A single statement is already atomic, and an `INSERT OR IGNORE` against a `UNIQUE` constraint is self-correcting, since a losing racer's lookup finds the winner's row. That covers `Monad` and provenance resolution.
+- `Sampling` and `trialID` scan before inserting with no `UNIQUE` constraint to fall back on, so two *sessions* creating the same object could each insert a row. This is accepted: concurrent trial creation is unsupported, and protecting it would mean holding the database write lock across constituent-CSV file reads. The remedy, should duplicates ever appear, is recorded in `progress.md`; `withTransaction`'s `mode` keyword exists to make it a one-word change.
+- Two sessions cannot corrupt the database — SQLite serializes writers itself.
+- This serializes against **other processes** sharing the project (concurrent HPC jobs, a second REPL). It does not serialize tasks within one session, because SQLite locks are per-connection and ModelManager shares one. Concurrent trial creation in a session is unsupported by design; `recordConstituentIDs` is read-modify-write on a CSV outside SQLite's reach.
+
+*Integrity*
+- Tag rows are deleted at all four deletion choke points (`deleteSimulations`, `deleteMonad`, `deleteSampling`, `deleteTrial`). `resetDatabase` needs no hook — it deletes the central database file.
+- `orphanedTagCounts()` reports tag rows per class whose object no longer exists; `databaseDiagnostics` warns when any are found. It does not assert the table's existence, so databases predating tagging degrade gracefully.
+- Tag writes never take down a run: `applyCreationTags`, `tagReserved!`, and provenance resolution route through `_quietly`, which swallows and `@debug`s their errors.
+
+**Acceptance criteria:**
+- Tagging and retrieving round-trips for all four classes; re-tagging is idempotent; a key may hold multiple values; bare labels dedupe.
+- `createTrial(...; tags=...)` tags the returned object and nothing beneath it; those constituents still match the tag through inheritance.
+- `run([t1, t2]; tags=...)` tags both trials, not only the umbrella `Trial`.
+- Zero `mm:`-prefixed rows in `tags` after ordinary use; every created object has non-null `datetime` and `provenance_id`; all objects created in one session share a single `provenances` row.
+- `findSimulationIDs(tags = ("mm:session" => id,))` and `("mm:script" => "sweep.jl",)` both resolve through the columns.
+- Object-returning finders throw above `limit`; `simulationsFromIDs` agrees with `Simulation.(ids)` and skips missing IDs.
+- `tag!(sim, "mm:created" => ...)` throws `ArgumentError`.
+- `createTrial(...; tags=...)` and `run(...; tags=...)` tag the object returned or handed in; objects created outside the call are unaffected.
+- A tag on a `Sampling` matches its simulations with `inherit=true` and none with `inherit=false`.
+- Inherited and direct tags compose under AND; `any_of` composes under OR.
+- Deleting an object removes its tag rows; deleted objects never surface from a tag query; `orphanedTagCounts()` stays at zero.
+- `simulationsTable(ids; tags=true)` adds `tag:`-prefixed columns only, with `missing` for untagged rows.
+- Dropping the `tags` table and reinitializing recreates it with no migration.
 
 ---
 
@@ -225,6 +321,7 @@ target location's file type.
 - `deleteMonad`, `deleteSampling`, `deleteTrial` cascade up and down as appropriate.
 - `resetDatabase()` deletes all outputs, clears variation files, calls `clearSimulatorArtifacts(sim)`, and reinitializes the DB.
 - On HPC, file removal goes through `rm_hpc_safe` (staging in `.trash/`) to avoid NFS lock issues.
+- Each deletion routine also removes the deleted objects' rows from the `tags` table (see *Trial Tagging*), since SQLite cannot foreign-key the polymorphic `trial_class`/`trial_id` pair.
 
 **Acceptance criteria:**
 - After `deleteSimulations(ids)`, no rows remain in `simulations` for those IDs.

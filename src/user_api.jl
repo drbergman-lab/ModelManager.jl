@@ -19,8 +19,8 @@ createTrial(output_ref::MMOutput{<:AbstractMonad}, avs; ...)
 ```
 """
 function createTrial(method::AddVariationMethod, inputs::InputFolders, avs::Vector{<:AbstractVariation}=AbstractVariation[];
-    n_replicates::Integer=1, use_previous::Bool=true)
-    return _createTrial(method, inputs, VariationID(inputs), avs, n_replicates, use_previous)
+    n_replicates::Integer=1, use_previous::Bool=true, tags=())
+    return _createTrial(method, inputs, VariationID(inputs), avs, n_replicates, use_previous, tags)
 end
 
 function createTrial(method::AddVariationMethod, inputs::InputFolders, avs::Vararg{AbstractVariation}; kwargs...)
@@ -37,8 +37,8 @@ createTrial(method::AddVariationMethod, inputs::InputFolders, avs::Vararg; kwarg
 createTrial(inputs::InputFolders, args...; kwargs...) = createTrial(GridVariation(), inputs, args...; kwargs...)
 
 function createTrial(method::AddVariationMethod, reference::AbstractMonad, avs::Vector{<:AbstractVariation}=AbstractVariation[];
-                     n_replicates::Integer=1, use_previous::Bool=true)
-    return _createTrial(method, reference.inputs, reference.variation_id, avs, n_replicates, use_previous)
+                     n_replicates::Integer=1, use_previous::Bool=true, tags=())
+    return _createTrial(method, reference.inputs, reference.variation_id, avs, n_replicates, use_previous, tags)
 end
 
 function createTrial(method::AddVariationMethod, reference::AbstractMonad, avs::Vararg{AbstractVariation}; kwargs...)
@@ -75,7 +75,7 @@ constituent samplings). The vector may be loosely typed (`Vector{Any}`); its ele
 narrowed to [`AbstractTrial`](@ref), with a clear `ArgumentError` if any element is not one.
 Already-built trials are wrapped as-is — no new replicates are added.
 """
-function createTrial(Ts::AbstractVector)
+function createTrial(Ts::AbstractVector; tags=())
     trials = _toAbstractTrialVector(Ts)
     isempty(trials) && throw(ArgumentError("createTrial received an empty collection; nothing to run."))
     samplings = AbstractSampling[]
@@ -86,7 +86,22 @@ function createTrial(Ts::AbstractVector)
             append!(samplings, T.samplings)
         end
     end
-    return Trial(samplings)
+    #! Tag the objects we were handed, not the umbrella Trial. Inheritance *would* carry a
+    #! tag on the Trial down to everything beneath it, so this is not about reachability —
+    #! it is about durability. That Trial is deduplicated plumbing, and `deleteTrial(id;
+    #! delete_subs=false)` removes it without touching its constituents; if it held the only
+    #! copy of the tag, deleting it would silently make those simulations unfindable. A
+    #! container too ephemeral to be worth labelling is too ephemeral to be a label's only
+    #! home. Tagging the constituents also means `hasTag(lo, ...)` is true for the very
+    #! object the caller passed in.
+    refreshProvenance!()
+    trial = Trial(samplings)
+    if !isempty(tags)
+        for T in trials
+            tag!(T, tags...)
+        end
+    end
+    return trial
 end
 
 """
@@ -125,12 +140,26 @@ function convertToAbstractVariationVector(avs::Vector)
 end
 
 """
-    _createTrial(method, inputs, reference_variation_id, avs, n_replicates, use_previous)
+    _createTrial(method, inputs, reference_variation_id, avs, n_replicates, use_previous, tags)
 
 Internal implementation of [`createTrial`](@ref).
+
+Every `createTrial` overload funnels through here, so this is where the launching
+script and git state are resolved — once per call rather than once per object — and
+where `tags` are applied to whatever is returned.
 """
 function _createTrial(method::AddVariationMethod, inputs::InputFolders, reference_variation_id::VariationID,
-                      avs::Vector{<:AbstractVariation}, n_replicates::Integer, use_previous::Bool)
+                      avs::Vector{<:AbstractVariation}, n_replicates::Integer, use_previous::Bool, tags=())
+    #! Tags go on the returned object only; its constituents match through query-time
+    #! inheritance, which is what keeps them correct when replicates are added later.
+    refreshProvenance!()
+    trial = _buildTrial(method, inputs, reference_variation_id, avs, n_replicates, use_previous)
+    isempty(tags) || tag!(trial, tags...)
+    return trial
+end
+
+function _buildTrial(method::AddVariationMethod, inputs::InputFolders, reference_variation_id::VariationID,
+                     avs::Vector{<:AbstractVariation}, n_replicates::Integer, use_previous::Bool)
 
     add_variations_result = addVariations(method, inputs, avs, reference_variation_id)
     variation_ids = add_variations_result.variation_ids
@@ -159,8 +188,8 @@ Create a trial from `inputs_or_ref` and `avs`, then run it. `kwargs` are forward
 [`run`](@ref)`(::AbstractTrial; ...)`, which passes them through to
 `prepareTrialHierarchy` and the simulator hooks.
 """
-function run(method::AddVariationMethod, args...; n_replicates=1, use_previous=true, kwargs...)
-    trial = createTrial(method, args...; n_replicates=n_replicates, use_previous=use_previous)
+function run(method::AddVariationMethod, args...; n_replicates=1, use_previous=true, tags=(), kwargs...)
+    trial = createTrial(method, args...; n_replicates=n_replicates, use_previous=use_previous, tags=tags)
     return run(trial; kwargs...)
 end
 
@@ -182,4 +211,4 @@ sims = [createTrial(inputs, dv1), createTrial(inputs, dv2)]
 run(sims)
 ```
 """
-run(Ts::AbstractVector; kwargs...) = run(createTrial(Ts); kwargs...)
+run(Ts::AbstractVector; tags=(), kwargs...) = run(createTrial(Ts; tags=tags); kwargs...)

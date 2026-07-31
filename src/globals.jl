@@ -28,6 +28,15 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
   [`databaseDiagnostics`](@ref), set by [`initializeModelManager`](@ref).
   `nothing` before initialization or if diagnostics have not been launched.
   Use [`waitForDiagnostics`](@ref) to block until it completes.
+- `provenance_id::Union{Nothing,Int}`: Row in `provenances` describing the current
+  creation context (session, launching script, git state). Re-resolved on entry to
+  `createTrial` and `run`, and stamped onto the objects they create.
+- `session_id::String`: Random per-session identifier recorded as `mm:session`.
+  Assigned lazily on first use.
+- `tag_hints::Bool`: Whether to show the one-time tagging hints. See
+  [`setTagHints!`](@ref).
+- `tag_hint_shown::Bool`, `tag_recovery_hint_shown::Bool`: Once-per-session latches
+  for those hints.
 """
 @with_kw mutable struct ModelManagerGlobals
     initialized::Bool = false
@@ -46,6 +55,12 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
     max_number_of_parallel_simulations::Int = 1
 
     diagnostics_task::Union{Nothing,Task} = nothing
+
+    provenance_id::Union{Nothing,Int} = nothing
+    session_id::String = ""
+    tag_hints::Bool = true
+    tag_hint_shown::Bool = false
+    tag_recovery_hint_shown::Bool = false
 end
 
 """
@@ -180,6 +195,12 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
 
     mm_globals().simulator = simulator
     mm_globals().data_dir = abspath(normpath(data_dir))
+
+    #! Provenance and hint latches are per-project: a new project in the same
+    #! session should re-resolve its script/git context and hint again.
+    mm_globals().provenance_id = nothing
+    mm_globals().tag_hint_shown = false
+    mm_globals().tag_recovery_hint_shown = false
 
     try
         mm_globals().db = SQLite.DB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))

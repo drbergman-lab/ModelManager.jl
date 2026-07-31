@@ -140,6 +140,24 @@ function Base.show(io::IO, moat_sampling::MOATSampling)
 end
 
 """
+    buildAndRunSensitivitySampling(method, monads; n_replicates, use_previous, kwargs...)
+
+Assemble `monads` into a [`Sampling`](@ref), label it with the sensitivity method
+that produced it, and run it. Returns the `Sampling`.
+
+The label is written before any simulation is dispatched, so an interrupted sweep
+keeps it and the sampling is queryable by method while it is still running.
+"""
+function buildAndRunSensitivitySampling(method::GSAMethod, monads;
+                                        n_replicates::Integer, use_previous::Bool, kwargs...)
+    sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
+    #! Constituents match through inheritance, so only the sampling itself is labelled.
+    tagReserved!(sampling, ["mm:method" => string(nameof(typeof(method)))])
+    run(sampling; kwargs...)
+    return sampling
+end
+
+"""
     runSensitivitySampling(method, inputs, pv; kwargs...)
 
 Internal dispatch: create the sampling design, run simulations, and return a `GSASampling`.
@@ -170,8 +188,8 @@ function runSensitivitySampling(method::MOAT, inputs::InputFolders, pv::ParsedVa
     perturb_headers = mapreduce(lv -> lv.latent_parameter_names, vcat, pv.latent_variations)
     header_line = ["base"; perturb_headers]
     monad_ids_df = DataFrame(monad_ids, header_line)
-    sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
-    run(sampling; kwargs...)
+    sampling = buildAndRunSensitivitySampling(method, monads;
+                                              n_replicates=n_replicates, use_previous=use_previous, kwargs...)
     return MOATSampling(sampling, monad_ids_df)
 end
 
@@ -294,8 +312,8 @@ function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::Parse
     perturb_headers = all_latent_names[focus_indices]
     header_line = ["A"; "B"; perturb_headers]
     monad_ids_df = DataFrame(monad_ids, header_line)
-    sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
-    run(sampling; kwargs...)
+    sampling = buildAndRunSensitivitySampling(method, monads;
+                                              n_replicates=n_replicates, use_previous=use_previous, kwargs...)
     return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods)
 end
 
@@ -405,8 +423,8 @@ function runSensitivitySampling(method::RBD, inputs::InputFolders, pv::ParsedVar
     monad_ids = [monad.id for monad in monads]
     header_line = mapreduce(lv -> lv.latent_parameter_names, vcat, pv.latent_variations)
     monad_ids_df = DataFrame(monad_ids, header_line)
-    sampling = Sampling(unique(monads); n_replicates=n_replicates, use_previous=use_previous)
-    run(sampling; kwargs...)
+    sampling = buildAndRunSensitivitySampling(method, monads;
+                                              n_replicates=n_replicates, use_previous=use_previous, kwargs...)
     return RBDSampling(sampling, monad_ids_df, method.rbd_variation.num_cycles; num_harmonics=method.num_harmonics)
 end
 

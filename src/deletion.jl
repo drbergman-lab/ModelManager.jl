@@ -40,6 +40,10 @@ function deleteSimulations(simulation_ids::AbstractVector{<:Union{Integer,Missin
     # removal through here, so this one call covers them all.
     _deletePostProcessingRows(simulation_ids)
 
+    # SQLite cannot foreign-key the polymorphic (trial_class, trial_id) pair in `tags`,
+    # so tag cleanup rides along here, at the same single choke point.
+    deleteTagsFor(Simulation, simulation_ids)
+
     for row in eachrow(sim_df)
         rm_hpc_safe(trialFolder(Simulation, row.simulation_id); force=true, recursive=true)
 
@@ -111,6 +115,7 @@ samplings/trials above them.
 """
 function deleteMonad(monad_ids::AbstractVector{<:Integer}; delete_subs::Bool=true, delete_supers::Bool=true)
     DBInterface.execute(centralDB(), "DELETE FROM monads WHERE monad_id IN ($(join(monad_ids, ",")));")
+    deleteTagsFor(Monad, monad_ids)
     simulation_ids_to_delete = Int[]
     for monad_id in monad_ids
         if delete_subs
@@ -155,6 +160,7 @@ Delete samplings by ID, optionally cascading.
 """
 function deleteSampling(sampling_ids::AbstractVector{<:Integer}; delete_subs::Bool=true, delete_supers::Bool=true)
     DBInterface.execute(centralDB(), "DELETE FROM samplings WHERE sampling_id IN ($(join(sampling_ids, ",")));")
+    deleteTagsFor(Sampling, sampling_ids)
     monad_ids_to_delete = Int[]
     for sampling_id in sampling_ids
         if delete_subs
@@ -207,6 +213,7 @@ Delete trials by ID, optionally cascading to their samplings.
 """
 function deleteTrial(trial_ids::AbstractVector{<:Integer}; delete_subs::Bool=true)
     DBInterface.execute(centralDB(), "DELETE FROM trials WHERE trial_id IN ($(join(trial_ids, ",")));")
+    deleteTagsFor(Trial, trial_ids)
     sampling_ids_to_delete = Int[]
     for trial_id in trial_ids
         if delete_subs
