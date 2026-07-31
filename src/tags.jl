@@ -12,14 +12,14 @@ export setTagHints!, gitState, appendTags!, orphanedTagCounts
 ############   Constants and schema   ##################
 ########################################################
 
+#! Enforced for free by the key charset: `:` is not a legal character in a user key,
+#! so no separate reserved-word check is needed.
 """
     MM_TAG_PREFIX
 
 Prefix marking a tag as ModelManager-generated rather than a user assertion.
 Keys in this namespace cannot be written through [`tag!`](@ref).
 """
-#! Enforced for free by the key charset: `:` is not a legal character in a user key,
-#! so no separate reserved-word check is needed.
 const MM_TAG_PREFIX = "mm:"
 
 const MAX_TAG_KEY_LENGTH = 64
@@ -34,17 +34,17 @@ const TAG_CLASSES = ("simulation", "monad", "sampling", "trial")
 
 const MM_CREATED_KEY = "mm:created"
 
+#! Provenance is kept out of the `tags` table on purpose. That table is
+#! entity-attribute-value — one row per fact — so recording five session-invariant facts
+#! on every object would cost five rows plus their index entries, ~1 KB per object
+#! (measured). Objects instead carry a `provenance_id` column, and these keys are
+#! synthesized on read so the public API is unchanged.
 """
     PROVENANCE_COLUMNS
 
 Mapping from the `mm:` keys a user queries with to the `provenances` column each
 is stored in.
 """
-#! Provenance is kept out of the `tags` table on purpose. That table is
-#! entity-attribute-value — one row per fact — so recording five session-invariant facts
-#! on every object would cost five rows plus their index entries, ~1 KB per object
-#! (measured). Objects instead carry a `provenance_id` column, and these keys are
-#! synthesized on read so the public API is unchanged.
 const PROVENANCE_COLUMNS = (
     "mm:session"     => "session",
     "mm:script"      => "script",
@@ -77,9 +77,9 @@ lowercased type name (`"simulation"`, `"monad"`, `"sampling"`, `"trial"`) and
 `trial_id` is that object's primary key. The `UNIQUE` constraint spans the value
 as well as the key, so a single object may carry several values for one key.
 """
-#! `tag_value` defaults to `''` rather than `NULL`: SQLite treats `NULL`s as distinct in a
-#! `UNIQUE` constraint, which would silently permit duplicate bare labels.
 function tagsSchema()
+    #! `tag_value` defaults to `''` rather than `NULL`: SQLite treats `NULL`s as distinct in a
+    #! `UNIQUE` constraint, which would silently permit duplicate bare labels.
     return """
     tag_id INTEGER PRIMARY KEY,
     trial_class TEXT NOT NULL,
@@ -99,9 +99,9 @@ Return the SQL schema string for the `provenances` table.
 One row per distinct creation context: session, launching script, session mode, and
 git state.
 """
-#! Every column is `NOT NULL DEFAULT ''` so the `UNIQUE` constraint dedupes: SQLite treats
-#! `NULL`s as distinct, which would mint a fresh row on every insert.
 function provenancesSchema()
+    #! Every column is `NOT NULL DEFAULT ''` so the `UNIQUE` constraint dedupes: SQLite treats
+    #! `NULL`s as distinct, which would mint a fresh row on every insert.
     return """
     provenance_id INTEGER PRIMARY KEY,
     session TEXT NOT NULL DEFAULT '',
@@ -120,10 +120,10 @@ end
 
 Create the lookup indices for the `tags` table.
 """
-#! The `UNIQUE` constraint already indexes `(trial_class, trial_id, …)`, which serves
-#! "what tags does this object have?". This is the reverse direction, which `findTrials`
-#! queries: "which objects carry this tag?".
 function createTagIndices(; db::SQLite.DB=centralDB())
+    #! The `UNIQUE` constraint already indexes `(trial_class, trial_id, …)`, which serves
+    #! "what tags does this object have?". This is the reverse direction, which `findTrials`
+    #! queries: "which objects carry this tag?".
     SQLite.execute(db, "CREATE INDEX IF NOT EXISTS idx_tags_lookup ON tags (tag_key, tag_value);")
     return nothing
 end
@@ -293,6 +293,7 @@ tag!(Simulation, 42, "verdict" => "suspect")  # type + id
 tag!(Simulation, [1, 2, 3], "project" => "x") # type + ids
 tag!([sim_a, sim_b], "project" => "x")        # vector of objects
 tag!([1, 2, 3], "project" => "x")             # bare ids are interpreted as simulations
+tag!(df.SimID, "project" => "x")              # a column straight out of `simulationsTable`
 tag!(output, "project" => "x")                # an MMOutput from `run`
 ```
 
@@ -310,8 +311,12 @@ tag!(findSimulationIDs(tags = ("project" => "immune-escape",)), "verdict" => "go
 
 See also [`untag!`](@ref), [`tags`](@ref), [`findTrials`](@ref).
 """
-function tag!(::Type{T}, ids::AbstractVector{<:Integer}, ps...) where {T<:AbstractTrial}
-    _insertTagRows(_tagClass(T), ids, normalizeTagPairs(ps))
+function tag!(::Type{T}, ids::AbstractVector{<:Union{Integer,Missing}}, ps...) where {T<:AbstractTrial}
+    _insertTagRows(_tagClass(T), collect(skipmissing(ids)), normalizeTagPairs(ps))
+    #! `Union{Integer,Missing}` rather than `Integer`: a column pulled out of
+    #! `simulationsTable` is `Vector{Union{Missing,Int64}}`, and feeding one straight to
+    #! `tag!` is the documented way to label results after the fact. `deleteSimulations`
+    #! accommodates the same thing the same way.
     return ids
 end
 
@@ -332,7 +337,7 @@ end
 
 #! A bare vector of integers is by far most often a column of simulation IDs
 #! (e.g. `simulationsTable().SimID`), so that is the documented interpretation.
-tag!(ids::AbstractVector{<:Integer}, ps...) = tag!(Simulation, ids, ps...)
+tag!(ids::AbstractVector{<:Union{Integer,Missing}}, ps...) = tag!(Simulation, ids, ps...)
 
 tag!(output::MMOutput, ps...) = (tag!(output.trial, ps...); output)
 
@@ -375,11 +380,12 @@ untag!(sim)                           # drop all user tags, keep mm: provenance
 
 See also [`tag!`](@ref).
 """
-function untag!(::Type{T}, ids::AbstractVector{<:Integer}, ps...) where {T<:AbstractTrial}
+function untag!(::Type{T}, ids::AbstractVector{<:Union{Integer,Missing}}, ps...) where {T<:AbstractTrial}
     assertInitialized()
-    isempty(ids) && return ids
+    present = collect(skipmissing(ids))
+    isempty(present) && return ids
     class = _tagClass(T)
-    id_list = join(Int.(ids), ",")
+    id_list = join(Int.(present), ",")
     if isempty(ps)
         DBInterface.execute(centralDB(),
             "DELETE FROM tags WHERE trial_class='$(class)' AND trial_id IN ($(id_list)) AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%';")
@@ -401,7 +407,7 @@ end
 
 untag!(::Type{T}, id::Integer, ps...) where {T<:AbstractTrial} = (untag!(T, [id], ps...); id)
 untag!(target::AbstractTrial, ps...) = (untag!(typeof(target), [target.id], ps...); target)
-untag!(ids::AbstractVector{<:Integer}, ps...) = untag!(Simulation, ids, ps...)
+untag!(ids::AbstractVector{<:Union{Integer,Missing}}, ps...) = untag!(Simulation, ids, ps...)
 
 function untag!(targets::AbstractVector{<:AbstractTrial}, ps...)
     for target in targets
@@ -465,11 +471,17 @@ end
     launchingScript() -> String
 
 Return the absolute path of the script that launched or is driving this session,
-or `""` when the work cannot be attributed to a file.
+or `""` when there is neither.
 
 A session that `include`s several scripts in turn attributes each one to the
 objects it created. Whether that happened inside an interactive session is
 recorded separately, as `mm:interactive`.
+
+In an interactive session a script `include`d from the project takes precedence;
+failing that, the session's launcher is recorded. That launcher may belong to an
+editor — VS Code starts Julia as `julia .../terminalserver.jl` — so treat
+`mm:script` from an interactive session as "how this session started", not "what
+produced this result". `mm:interactive` marks exactly that distinction.
 
 # Example
 ```julia
@@ -478,12 +490,19 @@ launchingScript()
 ```
 """
 function launchingScript()
-    #! `PROGRAM_FILE` covers `julia script.jl`; otherwise walk the stacktrace for the
-    #! outermost frame outside this package, which lands on the file being `include`d.
+    program = ""
     if !isempty(PROGRAM_FILE)
-        p = abspath(PROGRAM_FILE)
-        isfile(p) && return p
+        candidate = abspath(PROGRAM_FILE)
+        isfile(candidate) && (program = candidate)
     end
+    #! Non-interactive: `PROGRAM_FILE` is the script being run, and is authoritative.
+    !isinteractive() && !isempty(program) && return program
+    #! Interactive: `PROGRAM_FILE` is whatever opened the prompt — an editor launches its
+    #! REPL as `julia .../terminalserver.jl` — so prefer a frame from the user's own code,
+    #! which is what an `include`d script produces. Fall back to the launcher below rather
+    #! than recording nothing: it is a truthful answer to how the session started, and it
+    #! identifies the front-end. `mm:interactive` is the flag that says not to trust either
+    #! for reproduction.
     for frame in stacktrace()
         file = String(frame.file)
         isempty(file) && continue
@@ -497,9 +516,28 @@ function launchingScript()
         #! Rejects every pseudo-file a front-end can put in a frame — `REPL[3]`, IJulia's
         #! `In[3]`, Pluto cell ids — without sniffing for any of them by name.
         isfile(p) || continue
+        #! ...but a real file is not enough. In an interactive session the outermost frame
+        #! is whatever drives the REPL — VS Code's `terminalserver.jl`, for instance — which
+        #! is a real file that has nothing to do with the user's work. Requiring the frame
+        #! to live under the project or working directory keeps genuine `include`d scripts
+        #! and drops tooling, without maintaining a denylist of every front-end.
+        _isUnderUserRoots(p) || continue
         return p
     end
-    return ""
+    return program
+end
+
+#! Positive test rather than a denylist: user scripts live in the project they are running,
+#! editor and depot machinery does not.
+function _isUnderUserRoots(path::AbstractString)
+    roots = String[]
+    project = Base.active_project()
+    isnothing(project) || push!(roots, dirname(abspath(project)))
+    try
+        push!(roots, pwd())
+    catch
+    end
+    return any(r -> path == r || startswith(path, rstrip(r, '/') * "/"), roots)
 end
 
 function _resolveProvenanceID(fields)

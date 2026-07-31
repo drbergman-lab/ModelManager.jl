@@ -29,7 +29,7 @@ Even if you never write a single tag, ModelManager records where each object cam
 |-----|---------------|
 | `mm:created` | ISO-8601 creation timestamp |
 | `mm:session` | Random per-session ID, grouping one session's work |
-| `mm:script` | Absolute path of the script that created the object. Absent when the work cannot be attributed to a file |
+| `mm:script` | Script that created the object. In an interactive session, the script you `include`d or else the launcher that opened the prompt — read together with `mm:interactive` |
 | `mm:interactive` | Present when the session was interactive |
 | `mm:git`, `mm:git.branch`, `mm:git.dirty` | Commit and branch of the script's repository, and whether the tree had uncommitted changes |
 | `mm:method` | The sensitivity method (`MOAT`, `Sobolʼ`, `RBD`) that produced a sweep |
@@ -41,7 +41,14 @@ So this works on a database you never tagged by hand:
 findSimulationIDs(tags = ("mm:script" => "fig3_sweep.jl",))
 ```
 
-`mm:script` matches on either the bare filename or the full path. The git state is read at
+`mm:script` matches on either the bare filename or the full path.
+
+Read it differently depending on `mm:interactive`. For a script run — `julia sweep.jl` —
+it is the script that produced the result. In an interactive session it means "how this
+session started": a script you `include`d from the project if there is one, otherwise
+whatever launched the REPL, which in VS Code is the extension's own
+`scripts/terminalserver/terminalserver.jl`. That still tells you which front-end the work
+came from; it just is not a file you can re-run. The git state is read at
 each `createTrial`/`run` call, so edits you make partway through a session are reflected in
 whatever you create next.
 

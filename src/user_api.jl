@@ -148,10 +148,10 @@ Every `createTrial` overload funnels through here, so this is where the launchin
 script and git state are resolved — once per call rather than once per object — and
 where `tags` are applied to whatever is returned.
 """
-#! Tags go on the returned object only; its constituents match through query-time
-#! inheritance, which is what keeps them correct when replicates are added later.
 function _createTrial(method::AddVariationMethod, inputs::InputFolders, reference_variation_id::VariationID,
                       avs::Vector{<:AbstractVariation}, n_replicates::Integer, use_previous::Bool, tags=())
+    #! Tags go on the returned object only; its constituents match through query-time
+    #! inheritance, which is what keeps them correct when replicates are added later.
     refreshProvenance!()
     trial = _buildTrial(method, inputs, reference_variation_id, avs, n_replicates, use_previous)
     isempty(tags) || tag!(trial, tags...)

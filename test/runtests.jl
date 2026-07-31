@@ -3535,6 +3535,39 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end
 
+    @testset "tag! accepts a nullable ID column from simulationsTable" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            setTagHints!(false)
+
+            inputs = InputFolders(config="default")
+            xp = XMLPath(["data", "x"])
+            sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [61.0, 62.0])]; n_replicates=1)
+
+            # `simulationsTable` yields a nullable ID column, and feeding it straight to
+            # `tag!` is the documented way to label results after the fact.
+            df = simulationsTable(sampling)
+            @test eltype(df.SimID) == Union{Missing,Int}
+            @test !(df.SimID isa AbstractVector{<:Integer})   # would not match a stricter signature
+
+            tag!(df.SimID, "verdict" => "good")
+            @test sort(findSimulationIDs(tags=("verdict" => "good",))) == sort(simulationIDs(sampling))
+
+            untag!(df.SimID, "verdict" => "good")
+            @test isempty(findSimulationIDs(tags=("verdict" => "good",)))
+
+            # Missing entries are skipped rather than throwing, matching deleteSimulations.
+            with_missing = Union{Missing,Int}[simulationIDs(sampling)[1], missing]
+            tag!(with_missing, "verdict" => "partial")
+            @test findSimulationIDs(tags=("verdict" => "partial",)) == [simulationIDs(sampling)[1]]
+            @test tag!(Union{Missing,Int}[missing], "verdict" => "none") !== nothing
+            @test isempty(findSimulationIDs(tags=("verdict" => "none",)))
+        end
+        ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
     @testset "tag columns in simulationsTable" begin
         mktempdir() do project_dir
             _make_test_project(project_dir)
@@ -3671,6 +3704,51 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         # session mode is recorded separately, not encoded into this field.
         script = ModelManager.launchingScript()
         @test isempty(script) || isfile(script)
+
+        # Frames are filtered to the project or working directory, so an interactive
+        # session prefers the user's own `include`d script over the editor internals that
+        # sit further out on the stack (VS Code's `VSCodeServer/src/repl.jl` and friends).
+        @test ModelManager._isUnderUserRoots(joinpath(pwd(), "anything.jl"))
+        @test ModelManager._isUnderUserRoots(abspath(joinpath(dirname(Base.active_project()), "x.jl")))
+        @test !ModelManager._isUnderUserRoots("/Users/someone/.vscode/extensions/julia/scripts/terminalserver/terminalserver.jl")
+        @test !ModelManager._isUnderUserRoots("/opt/some/tool/driver.jl")
+        # A path that merely shares a prefix with a root must not slip through.
+        @test !ModelManager._isUnderUserRoots(rstrip(pwd(), '/') * "-not-mine/x.jl")
+
+        # End-to-end version of the same thing, in the shape that actually bit: an
+        # interactive session where a real file outside the project — an editor's REPL
+        # driver — is the *caller*, so its frame sits on the stack when provenance is
+        # resolved. Needs a subprocess because it depends on `isinteractive()` and on the
+        # caller living outside this project.
+        mktempdir() do outside
+            driver = joinpath(outside, "terminalserver.jl")
+            write(driver, """
+                using ModelManager
+                f() = println("SCRIPT=", ModelManager.launchingScript())
+                f()
+                """)
+            proj = dirname(Base.active_project())
+            jl = Base.julia_cmd()
+
+            # (a) driver `include`d from an interactive session with no PROGRAM_FILE: the
+            # driver is outside the project, so it is not attributed and there is no
+            # launcher to fall back to.
+            out = read(pipeline(`$(jl) --project=$(proj) --startup-file=no -i -q -e "include(\"$(escape_string(driver))\"); exit()"`; stderr=devnull), String)
+            @test occursin(r"SCRIPT=\s*$"m, out)
+
+            # (b) the shape editors actually use: the session is *launched as* the driver,
+            # so `PROGRAM_FILE` names it. With no user frame on the stack there is nothing
+            # better to report, so the launcher is recorded rather than nothing — a truthful
+            # answer to how the session started. `mm:interactive` is what marks it as not
+            # reproducible.
+            out = read(pipeline(`$(jl) --project=$(proj) --startup-file=no -i -q $(driver)`; stderr=devnull, stdin=devnull), String)
+            @test occursin("terminalserver.jl", split(out, "SCRIPT=")[end])
+
+            # (c) the same driver run non-interactively is ordinary user work, even though
+            # it lives outside the project — it must still be attributed.
+            out = read(pipeline(`$(jl) --project=$(proj) --startup-file=no $(driver)`; stderr=devnull), String)
+            @test occursin("terminalserver.jl", split(out, "SCRIPT=")[end])
+        end
 
         mktempdir() do project_dir
             _make_test_project(project_dir)

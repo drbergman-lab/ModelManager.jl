@@ -74,6 +74,64 @@ That reframing produced two consequences:
 - `docs/src/man/tagging.md` — new manual page
 - `README.md`, `PRD.md` — feature documented
 
+### Seven docstrings were silently detached
+
+Surfaced when the docs build suddenly could not resolve `[`tag!`](@ref)`. Julia does **not** attach a docstring across an intervening comment — the `#!` blocks moved between a docstring and its definition (the earlier "put rationale in comments, not docs" pass) orphaned every one of them.
+
+Seven cases: `MM_TAG_PREFIX`, `PROVENANCE_COLUMNS`, `tagsSchema`, `provenancesSchema`, `createTagIndices`, `tag!`, and `_createTrial`. Only `tag!` produced an error, because it is the only one cross-referenced from another page; the rest were simply absent from the rendered docs and from `?tag!` at the REPL, with nothing to indicate it.
+
+Fixed by moving each comment inside the function body — where implementation rationale belongs anyway — and, for the two `const`s that have no body, above the docstring. A scan now confirms none remain, and a runtime check confirms every exported tagging name resolves a docstring.
+
+Worth remembering as a general rule: a comment between a docstring and its definition breaks the attachment silently, and a green test suite will not catch it. Only an `@ref` from elsewhere, or checking `@doc` directly, will.
+
+### VS Code REPL mis-attributed `mm:script`
+
+Reported from a real editor session: an object created at the VS Code Julia REPL recorded
+
+    mm:script => ".../julialang.language-julia-1.189.2/scripts/terminalserver/terminalserver.jl"
+
+— the extension's REPL driver, not anything the user wrote. Worse than an absent script: identical for every VS Code user, and it pollutes `tagValues("mm:script")`.
+
+`launchingScript` walked the stack for the outermost frame outside ModelManager. The existing filters reject pseudo-files (`REPL[3]`, IJulia `In[3]`, Pluto cells) via `isfile`, and stdlib via the share path — but `terminalserver.jl` is a real file in a real directory, so it passed everything. `mm:interactive` was correctly `true`; only the attribution was wrong.
+
+Two separate causes, and the first fix addressed only one.
+
+**Cause 1 — the stack walk.** A frame is attributed only if it lives under the active project or working directory: a positive test, not a denylist of front-ends. That is what makes an `include`d script win over the `VSCodeServer` internals sitting further out on the stack.
+
+**Cause 2 — `PROGRAM_FILE`, the real culprit.** The first fix appeared not to work, and the initial diagnosis ("stale REPL — restart it") was **wrong**. A diagnostic dump from the live session showed it *was* running current code and the walk *was* dropping every `VSCodeServer` frame — but `launchingScript` consults `PROGRAM_FILE` before walking, and VS Code launches its REPL as `julia .../terminalserver.jl`. Julia is not wrong here: `PROGRAM_FILE` faithfully reports the script the session was launched with. It answers a different question than "what is doing this work", and the two diverge whenever a tool opens the session for you.
+
+**Resolution (user's call).** Interactive sessions prefer a frame from the user's own code and fall back to the launcher rather than recording nothing — a launcher path is a truthful answer to how the session started and identifies the front-end, which is more useful than silence. `mm:interactive` is the flag that says not to trust either for reproduction. Final tree:
+
+| Session | Result |
+|---|---|
+| not interactive, `PROGRAM_FILE` set | that script — authoritative |
+| interactive, user frame on the stack | that file — an `include`d script wins |
+| interactive, no user frame | the launcher (`terminalserver.jl` under VS Code) |
+| interactive, no launcher either | `""` |
+
+Verified across all five shapes; three are covered by a subprocess regression test. Note that containment could not have separated launcher from user script, because `julia /tmp/analysis.jl` is legitimate work outside the project — only interactivity distinguishes them, and only for choosing *precedence*, not for rejecting outright.
+
+Only a real editor could have surfaced this — every prior check ran `julia script.jl`, `julia -e`, or bare `julia -i`, none of which put third-party tooling on the stack.
+
+Two reproduction attempts were themselves wrong before one was right. The first `include`d the fake driver *before* the probe rather than *around* it, so its frame had already popped and the test passed for the wrong reason. The second nested it correctly but ran the driver via `-e "include(...)"`, which leaves `PROGRAM_FILE` empty — exercising the stack walk and never the path that was actually failing. Only passing the driver as the script argument, the way an editor does, reproduced it. The lesson is that "I reproduced it" needs the same scrutiny as "I fixed it". The regression test now spawns an interactive subprocess whose caller is a file outside the project, which is the shape that actually fails. Related discovery while building it: `Base` stack frames report bare filenames (`boot.jl`, `client.jl`), which `abspath` resolves against `pwd()` into paths that do not exist — so they are dropped by the `isfile` check, not by the stdlib path check, which never fires. The `isfile` test must therefore stay *before* the containment test, or a Base frame resolved under `pwd()` would be accepted.
+
+### Sandbox, and the bug it found
+
+Added `sandbox/` — a `ToySimulator` implementing `AbstractSimulator` over closed-form logistic growth, plus four numbered scripts meant to be run in *separate* sessions so recovery-without-IDs is demonstrated rather than described. Nothing spawns a subprocess, but every real code path runs against a real SQLite database.
+
+It found a bug on first use, in the exact snippet the manual documents:
+
+```julia
+df = simulationsTable()
+tag!(df[df.final_population .> 1_000, :SimID], "verdict" => "runaway_growth")   # MethodError
+```
+
+`simulationsTable` yields `SimID` as `Vector{Union{Missing,Int64}}`, which does not match `AbstractVector{<:Integer}`, so `tag!` had no applicable method. Retroactive tagging off a query result is the *primary* user-facing path for this feature — and the whole test suite missed it, because every test built ID vectors from `simulationIDs` (a clean `Vector{Int}`) rather than from a table.
+
+`deleteSimulations` had already solved this: it takes `AbstractVector{<:Union{Integer,Missing}}` and filters. `tag!`/`untag!` now do the same. Since `Vector{Int} <: AbstractVector{<:Union{Integer,Missing}}`, one signature covers both with no ambiguity.
+
+The lesson worth keeping: the docs example was right and the code was wrong, and no amount of reviewing either in isolation would have shown it. It took running the documented workflow against a real project.
+
 ### Copilot review on PR #23
 
 Seven comments (four inline, three suppressed as low confidence). **Six were correct**, including one genuine bug the local test suite could not have caught.

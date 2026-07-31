@@ -852,7 +852,7 @@ function appendVariations(location::Symbol, df::DataFrame; short_names::Bool=tru
 end
 
 """
-    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, post_processing::Bool=false)
+    simulationsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, post_processing::Bool=false, tags::Bool=false, include_auto_tags::Bool=false)
 
 Return a DataFrame for the given SQL query on the simulations table.
 
@@ -867,6 +867,8 @@ By default, constant columns and raw ID columns are removed.
 - `sort_ignore::Vector{String}`: Additional column names to exclude from sorting, on top of the always-excluded variation-ID columns. Defaults to none.
 - `short_names::Bool`: If true (default), column names are shortened via `shortVariationName`. Pass `false` to keep raw XML-path column names (e.g. for matching against `parameters.toml` `db_column` entries).
 - `post_processing::Bool`: If true, left-joins each simulation's stored post-processing quantities (see [`postProcessingTable`](@ref)) onto the table by `:SimID`, appending one column per quantity (`missing` where a quantity was not computed). Defaults to false. Post-processing columns are appended as-is and are not subject to `remove_constants` or sorting.
+- `tags::Bool`: If true, appends one `tag:<key>` column per tag key in use (see [`appendTags!`](@ref)), with `missing` where a simulation has no value for that key and multiple values joined by `|`. Defaults to false. A tag on a parent `Monad`, `Sampling`, or `Trial` contributes to its simulations' columns, matching [`findSimulationIDs`](@ref). Like post-processing columns, these are appended as-is and are not subject to `remove_constants` or sorting.
+- `include_auto_tags::Bool`: If true, the tag columns also include ModelManager's own `mm:` provenance (creation time, script, git state). Defaults to false, since those are rarely what you are comparing rows on. Has no effect unless `tags=true`.
 """
 function simulationsTableFromQuery(query::String;
                                    remove_constants::Bool=true,
@@ -885,13 +887,16 @@ function simulationsTableFromQuery(query::String;
 end
 
 """
-    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true)
+    monadsTableFromQuery(query::String; remove_constants::Bool=true, sort_by=String[], sort_ignore=String[], short_names::Bool=true, tags::Bool=false, include_auto_tags::Bool=false)
 
 Return a DataFrame for the given SQL query on the `monads` table. This is the monad-level
 analogue of [`simulationsTableFromQuery`](@ref): one row per monad and its varied parameters.
 
-Keyword arguments match [`simulationsTableFromQuery`](@ref), except the display ID column
-excluded from the default sort is `:MonadID` (rather than `:SimID`).
+Keyword arguments match [`simulationsTableFromQuery`](@ref), with two differences: the
+display ID column excluded from the default sort is `:MonadID` (rather than `:SimID`), and
+there is no `post_processing` option, since the sink is keyed by simulation. `tags=true`
+appends `tag:<key>` columns as it does for simulations, inheriting from a parent `Sampling`
+or `Trial`.
 """
 function monadsTableFromQuery(query::String;
                               remove_constants::Bool=true,
@@ -992,11 +997,17 @@ Return a DataFrame with simulation data. See [`simulationsTableFromQuery`](@ref)
 - Omitted (returns data for all simulations)
 
 Pass `post_processing=true` to append each simulation's stored post-processing quantities
-(see [`postProcessingTable`](@ref)) as extra columns:
+(see [`postProcessingTable`](@ref)) as extra columns, and `tags=true` to append a
+`tag:<key>` column per tag key in use (see [`appendTags!`](@ref)):
 
 ```julia
 simulationsTable(sampling; post_processing=true)
+simulationsTable(sampling; tags=true)                        # what each run was for
+simulationsTable(sampling; tags=true, post_processing=true)  # intent and outcome together
 ```
+
+The two answer different questions and are often read side by side: tags record what a run
+was *for*, the post-processing sink records how it turned out.
 """
 function simulationsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
     query = constructSelectQuery("simulations", "WHERE simulation_id IN ($(join(simulationIDs(T),",")));")
@@ -1062,6 +1073,9 @@ monadsTable(sampling)
 ```julia
 monad_ids = [1, 2, 3]
 monadsTable(monad_ids; remove_constants=false)
+```
+```julia
+monadsTable(sampling; tags=true)   # adds a tag:<key> column per tag key in use
 ```
 """
 function monadsTable(T::AbstractArray{<:AbstractTrial}; kwargs...)
