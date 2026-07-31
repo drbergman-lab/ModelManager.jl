@@ -170,7 +170,11 @@ ModelManager is **simulator-agnostic** infrastructure. Therefore:
 Deliberate decisions whose symptoms would otherwise look like bugs. Check here before "fixing" one.
 
 - **Concurrent trial creation is unsupported** — in one session or across sessions. Two Julia sessions cannot corrupt the SQLite file (SQLite serializes writers), but `Sampling(monads, inputs)` and `trialID(samplings)` in `src/classes.jl` scan for a matching row before inserting, with no `UNIQUE` constraint to fall back on, so each could insert a duplicate. They also race on the constituent-ID CSVs, which no database lock covers.
-  **If duplicate or inconsistent rows show up in `samplings` or `trials`, that is the cause.** The fix is to wrap those two find-or-insert blocks in `withTransaction(mode="EXCLUSIVE")` and add `PRAGMA busy_timeout` where the central connection is opened — without the timeout the losing session fails immediately with `"database is locked"` rather than waiting. `withTransaction`'s `mode` keyword exists for exactly this. See `progress.md` for the measurements behind why it is off by default.
+  **If duplicate or inconsistent rows show up in `samplings` or `trials`, that is the cause.** The fix is to wrap those two find-or-insert blocks in `withTransaction(mode="EXCLUSIVE")` — `withTransaction`'s `mode` keyword exists for exactly this — and to set `PRAGMA busy_timeout`, without which the losing session fails immediately with `"database is locked"` instead of waiting.
+
+  Setting that pragma has a trap worth reading before you try. `busy_timeout` lives in the connection handle, not the database file: it is not shared between connections to the same file and does not survive a close. ModelManager opens the central connection in **two** places — `initializeModelManager` (`src/globals.jl`) and `initializeDatabase` (`src/database.jl`) — and the second one **closes and reopens** the first, because `initializeModelManager` calls `initializeDatabase` right after opening. Set the pragma only in `initializeModelManager` and it is silently discarded a few lines later, with no error. Apply it through a single `openCentralDB(path)` wrapper used at both sites so it cannot be missed. The three other `SQLite.DB(...)` calls in `src/database.jl` are separate connections to separate files (per-location variations, the post-processing sink) and would each need their own.
+
+  See `progress.md` for the measurements behind why this is off by default.
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
