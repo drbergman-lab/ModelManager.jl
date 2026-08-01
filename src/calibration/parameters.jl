@@ -124,7 +124,7 @@ Return the column names used in human-readable generation CSVs for this paramete
   followed by `columnName.(lv.targets)` for the target columns.
 
 The mapping from display names back to DB column names is written to `parameters.toml`
-by [`_writeParametersTOML`](@ref).
+by `_writeParametersTOML`.
 """
 _displayColumns(cp::CalibrationParameter) = _displayColumns(cp.source, cp.lv)
 
@@ -160,7 +160,7 @@ end
 """
     _StrippedLVSource
 
-Serializable substitute for [`LVSource`](@ref) used when the associated
+Serializable substitute for `LVSource` used when the associated
 [`LatentVariation`](@ref) contains anonymous-function maps that JLD2 cannot serialize.
 Stores all data fields of the `LatentVariation` (distributions, names, targets, types)
 but omits `maps` and `inverse_maps`. Saved by `_saveProblem` when anonymous functions
@@ -205,7 +205,7 @@ Convert a row of CDF coordinates to human-readable display values.
 - `LVSource`: returns the latent parameter samples — i.e., `quantile(D_i, cdf_i)` for
   each latent dimension — followed by the target parameter values.
 
-The returned vector corresponds element-wise to [`_displayColumns`](@ref).
+The returned vector corresponds element-wise to `_displayColumns`.
 """
 _particleRowToDisplay(cp::CalibrationParameter, cdf_vals::Vector{Float64}) =
     _particleRowToDisplay(cp.source, cp.lv, cdf_vals)

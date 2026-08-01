@@ -292,7 +292,7 @@ unbiased prior sample while still avoiding redundant simulation work.
 
   A `missing` distance means no distance could be computed for that particle — for the
   ModelManager implementation, that its monad had no successful simulation (see
-  [`_buildEvaluateBatch`](@ref)). Such particles are never accepted: generation 1 drops them
+  `_buildEvaluateBatch`). Such particles are never accepted: generation 1 drops them
   before setting ε, and later generations reject them without comparing against ε. `missing`
   rather than a sentinel value keeps the signal distinct from any distance a user's `distance`
   function might legitimately return, `Inf` included.
@@ -304,7 +304,7 @@ unbiased prior sample while still avoiding redundant simulation work.
   (snapping disabled).
 - `start_generations::Vector{GenerationResult}`: Previously-completed generations to
   resume from (empty for a fresh run).
-- `verbosity::Symbol`: Resolved console-feedback level (see [`_resolveVerbosity`](@ref)).
+- `verbosity::Symbol`: Resolved console-feedback level (see `_resolveVerbosity`).
   `:generation` (the default) and higher emit the generation-start, generation-finish,
   and stopping-reason `@info` lines; `:none` suppresses them entirely.
 
@@ -477,7 +477,7 @@ The sequence naturally avoids 0 and 1.
 
 **Without CDF-grid snapping**: evaluates the Sobol points directly as a single batch.
 
-**With CDF-grid snapping**: each Sobol point is passed through [`_lookupAndSnap`](@ref).
+**With CDF-grid snapping**: each Sobol point is passed through `_lookupAndSnap`.
 Nearby bank or mid-generation monads are reused (mid known); otherwise the point snaps
 to the base grid (mid = nothing, resolved by `evaluate_batch`). `mid_gen_additions` is
 updated after the batch with newly resolved monads.
@@ -538,7 +538,7 @@ Build generation 1's accepted set. Generation 1 has no epsilon threshold and acc
 proposal — *except* those whose distance is `missing`, which are dropped here.
 
 `missing` means the particle has no distance at all: its monad had no successful simulation, so
-the summary statistic was never computed (see [`_buildEvaluateBatch`](@ref)). Such a particle
+the summary statistic was never computed (see `_buildEvaluateBatch`). Such a particle
 cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` for the whole
 generation. Errors when no particle survives — a whole generation of failed monads is a broken
 model, not sampling noise.
@@ -581,12 +581,12 @@ Proposals are batched and evaluated concurrently; batching repeats until `popula
 accepted particles are collected. Batch sizing: `ceil(n_needed / acceptance_rate_est)`,
 updated after each round.
 
-**With CDF-grid snapping**: each perturbed proposal is processed by [`_lookupAndSnap`](@ref).
+**With CDF-grid snapping**: each perturbed proposal is processed by `_lookupAndSnap`.
 Duplicate monad IDs are allowed within and across batches — the same monad may appear as
 multiple particles, each receiving its own weight. `mid_gen_additions` accumulates all new
 grid evaluations within this generation and is shared between batches (growing throughout).
 
-Budget accounting is delegated to [`_updateBudget!`](@ref). When `budget_hit` is set, the
+Budget accounting is delegated to `_updateBudget!`. When `budget_hit` is set, the
 completed portion of the generation is returned (possibly fewer than `population_size`).
 """
 function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
@@ -894,8 +894,8 @@ already tracked in `mid_gen_additions` are skipped to maintain the invariant tha
 entries are unique and not in the bank.
 
 Monads with no started or completed simulation are also skipped, using the same reusability
-test [`_buildSimulationBank`](@ref) applies at load time (see
-[`_monadsWithStartedSimulations`](@ref)). This is what keeps a monad whose every simulation
+test `_buildSimulationBank` applies at load time (see
+`_monadsWithStartedSimulations`). This is what keeps a monad whose every simulation
 failed out of the bank: the runner deletes such a monad, so banking its ID would hand back an
 unloadable `known_mid` in a later generation. The test is on the monad's own state rather than
 on the particle's distance, so a legitimately infinite distance from the user's `distance`

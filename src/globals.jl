@@ -25,7 +25,7 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
 - `max_number_of_parallel_simulations::Int`: Concurrency limit.
 - `diagnostics_task::Union{Nothing,Task}`: The background `Task` running
-  [`databaseDiagnostics`](@ref), set by [`initializeModelManager`](@ref).
+  `databaseDiagnostics`, set by [`initializeModelManager`](@ref).
   `nothing` before initialization or if diagnostics have not been launched.
   Use [`waitForDiagnostics`](@ref) to block until it completes.
 - `provenance_id::Union{Nothing,Int}`: Row in `provenances` describing the current
@@ -173,7 +173,7 @@ It performs all framework-agnostic initialization steps in order:
 4. Parse `inputs.toml`.
 5. Initialize the database schema (tables, folder registration).
 6. Call [`postInitDisplay`](@ref) to print startup information.
-7. Launch [`databaseDiagnostics`](@ref) as a background `@async` task.
+7. Launch `databaseDiagnostics` as a background `@async` task.
 
 Returns `true` on success, `false` on any initialization failure — including errors that
 would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are reset to
@@ -252,7 +252,7 @@ end
 """
     waitForDiagnostics()
 
-Block until the background [`databaseDiagnostics`](@ref) task launched during
+Block until the background `databaseDiagnostics` task launched during
 [`initializeModelManager`](@ref) completes. Returns immediately if diagnostics
 have already finished or were never started.
 

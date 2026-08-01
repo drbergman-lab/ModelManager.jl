@@ -21,6 +21,10 @@ Abstract type for global sensitivity analysis sampling results.
 """
 abstract type GSASampling end
 
+#! Public despite not being exported: it is the return type of the exported `runSensitivity`,
+#! so users hold one. See CLAUDE.md, "Docstring cross-references".
+@compat public GSASampling
+
 """
     getMonadIDDataFrame(gsa_sampling::GSASampling)
 

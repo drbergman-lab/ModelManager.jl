@@ -6,7 +6,7 @@
 Pre-built registry of existing monads whose calibrated parameters lie strictly
 within the prior support `(0,1)^d` in CDF space.
 
-Built once at calibration start by [`_buildSimulationBank`](@ref) and reused across
+Built once at calibration start by `_buildSimulationBank` and reused across
 all generations for approximate simulation reuse (CDF-grid snapping).
 
 # Fields
@@ -57,7 +57,7 @@ parameters lie strictly within `(0,1)^d` in CDF space.
    - **Calibrated columns** (parameters that already have a column in the DB): the row
      value must lie in `[minimum(dist), maximum(dist)]` of the prior.
    - **Calibrated parameters without a column yet** (never varied before): the base value
-     is read from the config file via [`getColumnDefaults`](@ref). Because no variation
+     is read from the config file via `getColumnDefaults`. Because no variation
      row can give a different value, any failure to read or parse the value, or a value
      outside the prior support, means no monad anywhere is usable — an empty bank is
      returned immediately. If the value is within the support, all candidate variation IDs
@@ -67,7 +67,7 @@ parameters lie strictly within `(0,1)^d` in CDF space.
      not lie on the co-variation curve are excluded.
 4. All CDF coordinates are strictly in `(0, 1)`.
 5. At least one of the monad's simulations has started or completed (see
-   [`_monadsWithStartedSimulations`](@ref)). The point of the bank is to snap onto nearby
+   `_monadsWithStartedSimulations`). The point of the bank is to snap onto nearby
    work that is already (partly) done; a monad whose simulations have not started yet has
    nothing to reuse.
 
@@ -75,7 +75,7 @@ parameters lie strictly within `(0,1)^d` in CDF space.
 log emitted). `LVSource` parameters with `inverse_maps` are supported: target-space bounds
 checks are skipped for their columns (Phase 2) and Phase 3 CDF inversion filters via `0 < u < 1`.
 
-Returns a [`SimulationBank`](@ref) with zero columns when no compatible monads exist.
+Returns a `SimulationBank` with zero columns when no compatible monads exist.
 """
 function _buildSimulationBank(problem::CalibrationProblem)
     cps     = problem.parameters
@@ -338,8 +338,8 @@ output, or will have it shortly. Three cases are excluded —
   a deleted monad, so it fails this test without a separate existence check;
 - a monad that no longer exists for any other reason, for the same reason.
 
-Used to filter [`_buildSimulationBank`](@ref) at load time and
-[`_updateMidGenAdditions!`](@ref) for monads evaluated during the run.
+Used to filter `_buildSimulationBank` at load time and
+`_updateMidGenAdditions!` for monads evaluated during the run.
 """
 function _monadsWithStartedSimulations(monad_ids::AbstractVector{<:Integer})
     isempty(monad_ids) && return Set{Int}()
@@ -358,7 +358,7 @@ end
 
 Return the prior distribution associated with database column `col` for `cp`.
 
-Used in [`_buildSimulationBank`](@ref) to determine the prior support bounds for
+Used in `_buildSimulationBank` to determine the prior support bounds for
 pre-filtering candidate variation rows. Returns `nothing` for `LVSource` (no
 distribution over target space) or when `col` does not match any target of `cp`.
 """

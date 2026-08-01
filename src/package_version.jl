@@ -53,7 +53,7 @@ if needed.
 - If the database is *newer* than the package, prints an error and returns `false`
   (the user must upgrade their package).
 - If versions match, returns `true` immediately.
-- If the package is *newer*, calls [`upgradePackage`](@ref) and returns its result.
+- If the package is *newer*, calls `upgradePackage` and returns its result.
 """
 function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
                                auto_upgrade::Bool=false)::Bool
