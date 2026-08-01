@@ -41,22 +41,33 @@
 - `postInitDisplay(sim)` — print startup info
 - `setupMonad(sim, monad; force_recompile)` → `Bool`
 - `setupSampling(sim, sampling; force_recompile)` → `Bool`
-- `variationLocation(sim, target)` → `Symbol`
-- `addVariationRows(sim, inputs, reference_variation_id, loc_dicts)` → `Vector{VariationID}`
+
+Neither `variationLocation` nor `addVariationRows` is part of this interface. `variationLocation`
+dispatches on variation objects (the caller resolves targets to locations before constructing
+them), and `addVariationRows` takes no simulator argument. Both were listed here in error.
 
 **Optional interface methods (default no-ops):**
 - `postSimulationProcessing(sim, simulation_process; kwargs...)` — pruning, cleanup
+- `postSimulationCleanup(sim, simulation_process; kwargs...)` — post-processing cleanup
 - `initializeInputFolder(sim, input_folder)` — per-folder setup on insert
 - `getInputFolderDescription(sim, path)` → `String` (default `""`)
 - `clearSimulatorArtifacts(sim)` — remove build artifacts on database reset
+- `postVariationXMLProcessing(sim, location, path)` — after a variation XML file is written
+- `centralDBFileName(sim)` → `String` (default `"mm.db"`)
 - `packageName(sim)` → `String` — for version lookup via `Pkg`
 - `dbVersionTableName(sim)` → `String` — tracks migration state
 - `upgradeMilestones(sim)` → `Vector{VersionNumber}`
 - `upgradeToMilestone(sim, version, auto_upgrade)` → `Bool`
 
+**Visibility:** these methods are deliberately **not exported** — a simulator package implements
+`ModelManager.runSimulation`, it never calls an exported one — but they are public API and are
+declared `@compat public` so that downstream docs builds can resolve `@ref` links to them. See
+the "Docstring Cross-References" section of `CLAUDE.md`.
+
 **Acceptance criteria:**
 - A package implementing all required methods compiles and runs simulations end-to-end.
 - A package implementing only optional methods falls back gracefully to defaults.
+- Every interface method satisfies `Base.ispublic(ModelManager, name)` on Julia ≥ 1.11.
 
 ---
 

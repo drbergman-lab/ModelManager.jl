@@ -4016,3 +4016,30 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
     end
 
 end
+
+# A docstring that `@ref`s a non-public binding is unresolvable in any downstream docs
+# build that does not also render ModelManager's private API, which terminates `makedocs`
+# with a :cross_references error. ModelManager's own docs render everything, so its build
+# cannot catch this — hence the test. See CLAUDE.md, "Docstring cross-references".
+@testset "docstrings only @ref public bindings" begin
+    #! `[`foo`](@ref)` → `foo`; also handles `ModelManager.foo`, `foo(x)`, and `Foo{T}`.
+    refTarget(s) = replace(s, r"^ModelManager\." => "") |> t -> split(t, ('(', '{'))[1] |> strip
+
+    violations = Tuple{Symbol,String}[]
+    for (binding, multidoc) in Docs.meta(ModelManager)
+        for docstr in values(multidoc.docs)
+            text = join(Iterators.filter(x -> x isa AbstractString, docstr.text), "")
+            for m in eachmatch(r"\[`([^`]+)`\]\(@ref\)", text)
+                target = Symbol(refTarget(m.captures[1]))
+                Base.ispublic(ModelManager, target) && continue
+                push!(violations, (binding.var, m.captures[1]))
+            end
+        end
+    end
+
+    if !isempty(violations)
+        msg = join(["  $(owner) → [`$(target)`](@ref)" for (owner, target) in sort(violations)], "\n")
+        @info "Docstrings referencing non-public bindings:\n$msg"
+    end
+    @test isempty(violations)
+end

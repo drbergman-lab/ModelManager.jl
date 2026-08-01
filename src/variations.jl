@@ -391,7 +391,7 @@ Whereas [`CoVariation`](@ref)s enforce a 1D relationship between parameters,
 [`LatentVariation`](@ref)s allow multi-dimensional relationships via user-supplied maps.
 The latent parameters themselves are not stored in the database; only the derived target values are.
 
-Internally, [`ParsedVariations`](@ref) converts all variations to `LatentVariation`s for processing.
+Internally, `ParsedVariations` converts all variations to `LatentVariation`s for processing.
 
 # Fields
 - `latent_parameters`: Discrete value vectors or prior `Distribution`s, one per latent dimension.
@@ -407,7 +407,7 @@ Internally, [`ParsedVariations`](@ref) converts all variations to `LatentVariati
   the latent parameter value `lp_i` for latent dimension `i` from the full vector of target values (ordered
   by `targets`). The library applies `cdf(dist_i, lp_i)` internally to obtain the CDF coordinate. One
   inverse per latent dimension. Required for `SimulationBank` support with `LVSource` calibration parameters.
-  Auto-constructed for [`DVSource`](@ref)/[`CVSource`](@ref)-backed `LatentVariation`s. Supply via the
+  Auto-constructed for `DVSource`/`CVSource`-backed `LatentVariation`s. Supply via the
   `inverse_maps` keyword argument when constructing a user-defined `LatentVariation{<:Distribution}`.
   Monotonicity of the forward map is a user responsibility and is not validated at construction time beyond
   a round-trip accuracy check.
@@ -925,14 +925,14 @@ RBDVariation(n::Int; rng::AbstractRNG=Random.GLOBAL_RNG, use_sobol::Bool=true, p
 """
     AddVariationsResult
 
-Abstract type for the result of [`addVariations`](@ref).
+Abstract type for the result of `addVariations`.
 """
 abstract type AddVariationsResult end
 
 """
     AddGridVariationsResult <: AddVariationsResult
 
-Result of [`addVariations`](@ref) with [`GridVariation`](@ref): the full factorial grid.
+Result of `addVariations` with [`GridVariation`](@ref): the full factorial grid.
 
 # Fields
 - `variation_ids::AbstractArray{VariationID}`: One [`VariationID`](@ref) per grid point,
@@ -946,7 +946,7 @@ end
 """
     AddLHSVariationsResult <: AddVariationsResult
 
-Result of [`addVariations`](@ref) with [`LHSVariation`](@ref) (Latin Hypercube Sampling).
+Result of `addVariations` with [`LHSVariation`](@ref) (Latin Hypercube Sampling).
 
 # Fields
 - `cdfs::Matrix{Float64}`: The sampled CDF coordinates in `[0, 1]`, one row per latent
@@ -962,7 +962,7 @@ end
 """
     AddSobolVariationsResult <: AddVariationsResult
 
-Result of [`addVariations`](@ref) with [`SobolVariation`](@ref) (Sobol quasi-random sequence).
+Result of `addVariations` with [`SobolVariation`](@ref) (Sobol quasi-random sequence).
 
 # Fields
 - `cdfs::Array{Float64,3}`: The Sobol CDF coordinates in `[0, 1]`, indexed by latent
@@ -978,7 +978,7 @@ end
 """
     AddRBDVariationsResult <: AddVariationsResult
 
-Result of [`addVariations`](@ref) with [`RBDVariation`](@ref) (Random Balance Design).
+Result of `addVariations` with [`RBDVariation`](@ref) (Random Balance Design).
 
 # Fields
 - `variation_ids::AbstractArray{VariationID}`: One [`VariationID`](@ref) per sampled point,
@@ -998,7 +998,7 @@ end
     addVariations(method::AddVariationMethod, inputs::InputFolders, avs::Vector{<:AbstractVariation},
                   reference_variation_id::VariationID=VariationID(inputs))
 
-Add variations to `inputs` using `method` and return an [`AddVariationsResult`](@ref).
+Add variations to `inputs` using `method` and return an `AddVariationsResult`.
 """
 function addVariations(method::AddVariationMethod, inputs::InputFolders, avs::Vector{<:AbstractVariation}, reference_variation_id::VariationID=VariationID(inputs))
     pv = ParsedVariations(avs)
@@ -1343,7 +1343,7 @@ end
     getColumnDefaults(::AbstractSimulator, location::Symbol, folder_id::Int, loc_targets::Vector{XMLPath})
 
 Return the default values (as strings) for `loc_targets` columns when they are first added
-to the variation database for `location`/`folder_id`. Called by [`addColumns`](@ref).
+to the variation database for `location`/`folder_id`. Called by `addColumns`.
 
 Default implementation reads the base XML file for the location and extracts values via
 [`getSimpleContent`](@ref). Simulator packages may override for non-XML variation sources.
@@ -1477,7 +1477,7 @@ Add new rows to the per-location variation databases and return the resulting va
 `(values_matrix, types, targets)` where `values_matrix` is a `#targets × #samples`
 numeric matrix.
 
-Called by [`addVariations`](@ref) (Grid, LHS, Sobol, RBD) and [`addCDFVariations`](@ref)
+Called by `addVariations` (Grid, LHS, Sobol, RBD) and `addCDFVariations`
 after the generic sampling logic computes the parameter values.
 """
 function addVariationRows(inputs::InputFolders, reference_variation_id::VariationID, loc_dicts::Dict)

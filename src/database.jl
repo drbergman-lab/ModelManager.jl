@@ -547,7 +547,7 @@ end
 
 Capture the highest ID currently present for each trial type in both the database
 and the output folder tree. Called by [`initializeModelManager`](@ref) just before
-launching the background diagnostics task so that [`databaseDiagnostics`](@ref) only
+launching the background diagnostics task so that `databaseDiagnostics` only
 inspects entities that existed at initialization time and is not confused by
 in-progress runs started later in the same session.
 """
@@ -581,7 +581,7 @@ end
 Check consistency between the database and the output folders.
 Prints warnings for any discrepancies found.
 
-When `max_ids` is provided (as returned by [`_snapshotMaxIDs`](@ref)), each check is
+When `max_ids` is provided (as returned by `_snapshotMaxIDs`), each check is
 restricted to IDs ≤ the snapshot value for that type. This prevents false positives from
 simulations that were created or started after `initializeModelManager` returned.
 """
@@ -912,6 +912,11 @@ function monadsTableFromQuery(query::String;
     return df
 end
 
+#! Public despite not being exported: these are the raw-SQL escape hatch, and they are the
+#! documentation home for the keyword arguments of the exported `simulationsTable` /
+#! `monadsTable`. See CLAUDE.md, "Docstring cross-references".
+@compat public simulationsTableFromQuery, monadsTableFromQuery
+
 """
     _asSymbolVector(x) -> Vector{Symbol}
 
@@ -932,7 +937,7 @@ Shared implementation behind [`simulationsTableFromQuery`](@ref) and
 optionally drops constant columns and sorts.
 
 Both the `simulations` and `monads` tables carry the same input-ID and variation-ID columns,
-so the join logic ([`addFolderNameColumns!`](@ref) / [`appendVariations`](@ref)) is identical;
+so the join logic (`addFolderNameColumns!` / `appendVariations`) is identical;
 only the primary key column differs.
 """
 function _variationsTableFromQuery(query::String, id_column::Symbol, display_id_column::Symbol;
@@ -1137,7 +1142,7 @@ postProcessingDBPath() = joinpath(dataDir(), "outputs", "postprocessing.db")
 
 Open (creating if necessary) the post-processing sink database and ensure the
 `post_processing` table exists with `simulation_id` as its primary key. Additional
-columns are added on demand by [`_writePostProcessingRow`](@ref).
+columns are added on demand by `_writePostProcessingRow`.
 """
 function _openPostProcessingDB()
     assertInitialized()
@@ -1210,7 +1215,7 @@ _qIdent(name::AbstractString) = "\"" * replace(String(name), "\"" => "\"\"") * "
     _writePostProcessingRow(db::SQLite.DB, simulation_id::Integer, qoi)
 
 Upsert one row of quantities of interest for `simulation_id` into the post-processing sink.
-New quantities become new columns (typed via [`_postProcessingColumnSpec`](@ref)); an
+New quantities become new columns (typed via `_postProcessingColumnSpec`); an
 existing row for the same `simulation_id` is overwritten. Called only from the serial
 completion loop in [`run`](@ref), never from a worker task.
 """

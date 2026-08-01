@@ -108,13 +108,13 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
 4. Assembles all monads into a `Sampling` and calls `run(sampling; quiet=true, run_kwargs...)`.
    When `verbosity` is `:batch` or higher a batch-start line is logged; when it is `:bar`
    a live per-simulation progress bar is rendered via the runner's `on_progress` hook.
-5. Classifies the outcome (see [`_batchOutcome`](@ref)) and records any failed simulation and
-   monad IDs to the generation's failure files (see [`_recordBatchFailures`](@ref)).
+5. Classifies the outcome (see `_batchOutcome`) and records any failed simulation and
+   monad IDs to the generation's failure files (see `_recordBatchFailures`).
 6. Returns a `Vector{Tuple{Union{Float64,Missing},Int}}` (distance, monad_id) in proposal order.
    A `missing` distance means the monad had no successful simulation, so no distance exists —
    distinct from any value the user's `distance` function could return.
 
-`verbosity` is a resolved level (see [`_resolveVerbosity`](@ref)); a per-generation batch
+`verbosity` is a resolved level (see `_resolveVerbosity`); a per-generation batch
 counter is maintained across calls so batch milestones can be numbered within each generation.
 
 # Monads with no successful simulation
@@ -280,11 +280,13 @@ saved in two forms:
 - `description::String=""`: stored in the `calibrations` DB row.
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
-  and `:generation` otherwise. See [`_resolveVerbosity`](@ref).
+  and `:generation` otherwise.
 - `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
   simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
   which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
-  simulation and monad IDs are recorded per generation. See [`_buildEvaluateBatch`](@ref).
+  simulation and monad IDs are recorded per generation in
+  `generations/generation_{NNN}_failed_simulations.csv` and
+  `generations/generation_{NNN}_failed_monads.csv`.
 
 # Examples
 ```julia
@@ -355,7 +357,8 @@ The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
 - `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
   simulation. `:reject` records its distance as `missing` (so the particle is never accepted) and
   continues; `:error` stops the run. Failed simulation and monad IDs are recorded per generation
-  either way. See [`_buildEvaluateBatch`](@ref).
+  either way, in `generations/generation_{NNN}_failed_simulations.csv` and
+  `generations/generation_{NNN}_failed_monads.csv`.
 
 # Examples
 ```julia
@@ -479,7 +482,7 @@ across Julia sessions).
 
 Named `summary_statistic` and `distance` functions are stored directly (JLD2 saves the
 function name); anonymous ones become `nothing`. Named LVSource map functions are stored
-directly inside their `LVSource`; anonymous ones become [`_StrippedLVSource`](@ref).
+directly inside their `LVSource`; anonymous ones become `_StrippedLVSource`.
 DVSource and CVSource are always stored as-is (their closures are never serialized — maps
 are always reconstructed from source data at load time via `_manifestToProblem`).
 
@@ -600,7 +603,7 @@ end
 """
     _saveProblem(calibration::Calibration, problem::CalibrationProblem)
 
-Serialize the `CalibrationProblem` to `problem.jld2` as a [`_ProblemManifest`](@ref).
+Serialize the `CalibrationProblem` to `problem.jld2` as a `_ProblemManifest`.
 
 Always saves the manifest format — never the full `CalibrationProblem` directly — to
 avoid relying on session-specific compiler names for DVSource/CVSource closures.
@@ -634,7 +637,7 @@ end
 """
     _loadProblem(calibration::Calibration) → _ProblemManifest
 
-Load `problem.jld2` and return a [`_ProblemManifest`](@ref).
+Load `problem.jld2` and return a `_ProblemManifest`.
 """
 function _loadProblem(calibration::Calibration)
     path = joinpath(calibrationFolder(calibration), "problem.jld2")

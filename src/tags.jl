@@ -133,7 +133,7 @@ end
 
 Add the `datetime` and `provenance_id` columns to the trial tables when missing.
 
-Run from [`createSchema`](@ref), so an existing project gains the columns on its
+Run from `createSchema`, so an existing project gains the columns on its
 next `initializeModelManager`. No migration milestone is required, and a simulator
 package needs to implement nothing.
 """
@@ -1420,7 +1420,7 @@ end
     orphanedTagCounts() -> Dict{String,Int}
 
 Return, per trial class, the number of tag rows pointing at objects that no longer
-exist. Used by [`databaseDiagnostics`](@ref).
+exist. Used by `databaseDiagnostics`.
 
 A healthy database returns zeros for every class. Non-zero counts mean tag rows
 outlived their objects — usually an interrupted deletion.

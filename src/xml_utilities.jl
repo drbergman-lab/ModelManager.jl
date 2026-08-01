@@ -156,7 +156,7 @@ end
     postVariationXMLProcessing(location::Symbol, path_to_xml::String)
     postVariationXMLProcessing(::AbstractSimulator, location::Symbol, path_to_xml::String)
 
-Hook called immediately after [`createXMLFile`](@ref) writes a variation XML file at
+Hook called immediately after `createXMLFile` writes a variation XML file at
 `path_to_xml` for `location`. Default is a no-op.
 
 Simulator packages may override `postVariationXMLProcessing(::TheirSimulator, location, path)`
@@ -165,6 +165,11 @@ for location-specific post-processing (e.g. splitting out embedded SBML files).
 postVariationXMLProcessing(location::Symbol, path_to_xml::String) =
     postVariationXMLProcessing(simulator(), location, path_to_xml)
 postVariationXMLProcessing(::AbstractSimulator, ::Symbol, ::String) = nothing
+
+#! Public despite not being exported: an `AbstractSimulator`-dispatched override point, i.e.
+#! part of the simulator contract even though it lives outside `abstract_simulator.jl`.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public postVariationXMLProcessing
 
 """
     createXMLFile(location::Symbol, M::AbstractMonad)

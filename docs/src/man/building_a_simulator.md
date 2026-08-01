@@ -118,16 +118,6 @@ ModelManager.currentSimulatorVersionID(sim::MySimulator)::Int
 These let ModelManager build the database schema (one version table and one version-FK column
 per simulator) and stamp every simulation with the simulator version that produced it.
 
-### Variation row writing
-
-```julia
-ModelManager.addVariationRows(sim::MySimulator, inputs, reference_variation_id, loc_dicts)::Vector{VariationID}
-```
-
-Given the variation combinations ModelManager has computed, write them into the per-location
-variations databases and return the resulting [`VariationID`](@ref)s. This is where your
-backend's knowledge of the input-file format lives.
-
 ### Database migration interface
 
 To support schema upgrades as your package evolves:

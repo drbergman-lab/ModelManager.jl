@@ -97,8 +97,62 @@ Cautioned:
 - **Types / Structs:** `PascalCase` (e.g., `InputFolders`, `DiscreteVariation`, `ModelManagerGlobals`)
 - **Constants / globals:** `snake_case` for internal module globals (e.g., `mm_globals_ref`); `SCREAMING_SNAKE_CASE` for environment variables
 - **Files:** `snake_case.jl` for source files
-- **Interface methods:** defined as bare `function foo end` stubs in `abstract_simulator.jl`; concrete implementations live in the simulator package
+- **Interface methods:** defined as bare `function foo end` stubs in `abstract_simulator.jl`; concrete implementations live in the simulator package. Unexported but declared `@compat public` — see [Docstring Cross-References](#docstring-cross-references)
 - **Exported vs internal:** public API is exported from the relevant `src/*.jl` file; internal helpers are prefixed with `_`
+
+## Docstring Cross-References
+
+**Rule: a docstring may only `[`link`](@ref)` to a *public* binding — one that is either
+`export`ed or declared with `@compat public`. Never `@ref` an internal.**
+
+ModelManager's docstrings are rendered in *downstream* docs builds (PhysiCellModelManager
+and future simulator packages), not just its own. A downstream build renders only
+ModelManager's public API, so an `@ref` pointing at a private binding cannot be resolved
+there and terminates `makedocs` with a `:cross_references` error:
+
+```
+Error: Cannot resolve @ref for md"[`_buildEvaluateBatch`](@ref)" in docs/src/lib/calibration.md.
+- No docstring found in doc for binding `ModelManager._buildEvaluateBatch`.
+```
+
+**ModelManager's own docs build cannot catch this.** Every `docs/src/lib/*.md` page has both
+a `Private = false` and a `Public = false` `@autodocs` block, so locally *everything* is
+rendered and *every* `@ref` resolves. The failure only appears downstream. The guard is the
+`"docstrings only @ref public bindings"` testset in `test/runtests.jl`, which walks
+`Docs.meta(ModelManager)` and checks each `@ref` target with `Base.ispublic`.
+
+### Writing a new docstring
+
+- Referring to an internal? Use a plain code span — `` `_buildSimulationBank` `` — not a link.
+  Readers who need it are reading the source anyway.
+- Never leave a dangling `See `_someInternal`.` — a pointer the reader cannot follow is worse
+  than no pointer. State the substance inline instead. (When `runCalibration` said
+  "See [`_buildEvaluateBatch`](@ref)" for where failures are recorded, the fix was to name the
+  actual files, `generations/generation_{NNN}_failed_simulations.csv`.)
+- Never document an exported function's arguments *only* on a private function it delegates to.
+
+### When to declare something public instead
+
+If a name is genuinely part of the API but deliberately unexported, declare it rather than
+delinking. `@compat public foo` (Compat is already a dep; a no-op on the Julia 1.10 floor, a
+real `public` on 1.11+, which Documenter's `Private = false` honors). Add a `#!` comment saying
+why. This is correct for:
+
+- **`AbstractSimulator` interface methods** — a simulator package implements
+  `ModelManager.runSimulation`, it never calls an exported one, but these are the documented
+  contract in "Building a Simulator Backend". Declared in `src/abstract_simulator.jl`, plus
+  `postVariationXMLProcessing` in `src/xml_utilities.jl`.
+- **Types appearing in public signatures** — `SimulationSpec`, `SimulationProcess`,
+  `GSASampling` (the return type of the exported `runSensitivity`).
+- **The documentation home for an exported wrapper's keywords** — `simulationsTableFromQuery`
+  and `monadsTableFromQuery` carry the full keyword docs for `simulationsTable`/`monadsTable`.
+
+Two cautions. Julia **errors** if you declare an already-exported name public, so check first
+(`postInitDisplay` and `centralDBFileName` are exported and must stay out of those blocks).
+And `public` is an API commitment — default to delinking. Do not promote a name just to keep
+a hyperlink alive: `addVariationRows` looked like an interface method because two stale docs
+described it as `addVariationRows(sim::MySimulator, ...)`, but it takes no simulator argument
+and is internal. Verify against the actual signature.
 
 ## Required Workflow for Any Change
 1. Generate a **design brief** in the assistant response **before any code changes**.

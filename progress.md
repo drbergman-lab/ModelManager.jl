@@ -1522,3 +1522,97 @@ other testset touches.
 - `PRD.md`, `README.md`, `docs/src/man/calibration.md`
 
 Full suite 1113/1113.
+
+---
+
+## Session: Portable docstring cross-references (2026-07-31)
+
+### Goal
+PCMM's docs build was failing. ModelManager docstrings `@ref` ModelManager internals; a
+downstream build renders only ModelManager's *public* API, so those links cannot resolve and
+`makedocs` dies with `:cross_references`.
+
+```
+Error: Cannot resolve @ref for md"[`_buildEvaluateBatch`](@ref)" in docs/src/lib/calibration.md.
+- No docstring found in doc for binding `ModelManager._buildEvaluateBatch`.
+```
+
+### Why our own docs build never caught it
+Every `docs/src/lib/*.md` page carries **both** a `Private = false` and a `Public = false`
+`@autodocs` block, so locally everything renders and every `@ref` resolves. This class of bug
+is invisible from inside this repo — which is the whole reason a test now guards it.
+
+### Decision: the strong rule
+Adopted **no docstring `@ref`s a non-public binding, anywhere** — not the narrower "public
+docstrings only." The narrow rule leaves private→private links that still break in any
+downstream build mirroring our page structure (PCMM mirrors `lib/calibration.md`, which is how
+this surfaced). The strong rule is also trivially testable via `Base.ispublic`.
+
+Rejected: having PCMM set `warnonly = [:cross_references]`, which hides real breakage; and
+DocumenterInterLinks/`@extref`, which is the right long-term answer for *inbound* links from
+PCMM to our docs but does nothing about our own docstrings being unportable.
+
+### Scope: 310 `@ref`s, 142 unique targets, 61 non-public
+Split three ways rather than deleted wholesale:
+
+1. **Genuine internals** (~17 `_`-prefixed) → demoted to plain code spans.
+2. **`AbstractSimulator` interface methods** (19 in `abstract_simulator.jl` +
+   `postVariationXMLProcessing`) → declared `@compat public`. Unexported *by design* — a
+   simulator implements `ModelManager.runSimulation`, never calls an exported one — but they
+   are the documented contract, and `abstract_simulator.jl` had the repo's highest `@ref`
+   density (31). Delinking would have gutted the one page a PCMM developer needs.
+3. **Public-in-effect names** → `SimulationSpec`/`SimulationProcess` (appear in interface
+   signatures), `GSASampling` (return type of exported `runSensitivity`),
+   `simulationsTableFromQuery`/`monadsTableFromQuery` (they carry the *entire* keyword
+   documentation for the exported `simulationsTable`/`monadsTable` — delinking would have
+   stranded users).
+
+Deliberately **not** promoted, since `public` is a hard-to-reverse API commitment and delinking
+costs only a hyperlink: `SimulationBank`, `ParsedVariations`, `AddVariationsResult`,
+`CVSource`/`DVSource`/`LVSource`, `addVariations`, `databaseDiagnostics`.
+
+### `addVariationRows` — a stale-docs trap
+Initially promoted to public because the `AbstractSimulator` docstring *and*
+`docs/src/man/building_a_simulator.md` both described it as
+`addVariationRows(sim::MySimulator, inputs, ...)`. It takes no simulator argument and never
+has one dispatched — one method, two internal call sites. Both docs were wrong. Reverted to
+internal and **deleted both stale claims**, including the "Variation row writing" section that
+told simulator authors to implement a method ModelManager never calls. Generalized into
+CLAUDE.md: verify against the signature, never promote a name just to preserve a link.
+
+### Gotchas
+- Julia **errors** on declaring an already-exported name public (`cannot declare X public; it is
+  already declared exported`). `postInitDisplay` and `centralDBFileName` are exported and had to
+  come out of the `abstract_simulator.jl` block.
+- A mechanical regex sweep produces bad prose. `See [`_buildEvaluateBatch`](@ref).` becomes
+  `See `_buildEvaluateBatch`.` — a pointer the reader cannot follow. The three such sites in
+  exported docstrings (`runCalibration`, `runABC`) were hand-rewritten to name the actual
+  artifacts, `generations/generation_{NNN}_failed_{simulations,monads}.csv`. Script found the
+  sites; the fixes were by hand.
+- `@compat public` needs Compat ≥ 4.10; already a dep at 4.16. No-op on the Julia 1.10 floor,
+  real `public` on 1.11+. Docs CI must therefore run 1.11+ for `Private = false` to exclude
+  them correctly — it runs 1.12.
+
+### Verification
+Reproduced PCMM's failure locally with a scratch Documenter build rendering only
+`Private = false` autodocs. Confirmed it errors identically with one bad ref reintroduced as a
+control, and builds clean with it removed. This harness — not our own `docs/make.jl` — is what
+actually tests this class of bug.
+
+### Open questions
+- `prepareBaseFile` (`src/xml_utilities.jl`) is also an `AbstractSimulator`-dispatched override
+  point but was left private: no docstring `@ref`s it, so promoting it would be pure API
+  widening. Inconsistent with `postVariationXMLProcessing`; worth revisiting.
+- Inbound links (PCMM → our docs) are still unsolved. DocumenterInterLinks with `@extref` is
+  the durable fix, on PCMM's side.
+
+### Files changed
+- 12 `src/*.jl` files — 61 `@ref`s demoted to code spans
+- `src/abstract_simulator.jl` — `@compat public` block (19 interface methods); removed stale
+  `addVariationRows` interface bullet
+- `src/xml_utilities.jl`, `src/runner.jl`, `src/sensitivity.jl`, `src/database.jl` —
+  `@compat public` declarations with `#!` rationale
+- `src/calibration/abc.jl` — three dangling `See …` pointers rewritten
+- `test/runtests.jl` — `"docstrings only @ref public bindings"` testset
+- `docs/src/man/building_a_simulator.md` — removed stale "Variation row writing" section
+- `CLAUDE.md` — new "Docstring Cross-References" section

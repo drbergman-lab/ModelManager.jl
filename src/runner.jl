@@ -101,11 +101,11 @@ end
 """
     SimulationSpec
 
-A pending simulation to be launched. Produced by [`pendingSimulationSpecs`](@ref)
+A pending simulation to be launched. Produced by `pendingSimulationSpecs`
 and consumed by [`run`](@ref), which wraps each spec in a `@task` that calls
 [`runSimulation`](@ref) on the active simulator.
 
-`monad_id` is always a real monad ID — [`prepareTrialHierarchy`](@ref) always runs
+`monad_id` is always a real monad ID — `prepareTrialHierarchy` always runs
 before spec collection, so setup is guaranteed to have completed.
 
 # Fields
@@ -117,6 +117,12 @@ struct SimulationSpec
     simulation::Simulation
     monad_id::Int
 end
+
+#! Public despite not being exported: both appear in `AbstractSimulator` interface
+#! signatures (`runSimulation` takes a `SimulationSpec` and returns a `SimulationProcess`;
+#! `postSimulationProcessing` takes a `SimulationProcess`), so simulator authors need their
+#! docs. See CLAUDE.md, "Docstring cross-references".
+@compat public SimulationSpec, SimulationProcess
 
 """
     prepareTrialHierarchy(T::AbstractTrial; kwargs...) → Bool
@@ -170,7 +176,7 @@ end
 
 Return a [`SimulationSpec`](@ref) for every simulation in `T` that has not yet
 started, marking each as `"Queued"` in the database. Always called after
-[`prepareTrialHierarchy`](@ref) so all monad folders and input files are in place.
+`prepareTrialHierarchy` so all monad folders and input files are in place.
 
 Dispatch behaviour:
 - `Simulation`: returns one spec (against the enclosing monad) if not started.
@@ -234,7 +240,7 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   sink DB directly. `post_processor` is not forwarded to the simulator hooks. If the callback
   (or a simulator hook) throws, `run` **fails fast**: it rethrows a clear error naming the
   stage and simulation with the original stacktrace — it never hangs or swallows the exception.
-- All other `kwargs` flow through to [`prepareTrialHierarchy`](@ref) (which forwards
+- All other `kwargs` flow through to `prepareTrialHierarchy` (which forwards
   them to the simulator's [`setupSampling`](@ref) / [`setupMonad`](@ref) hooks) and to
   both [`postSimulationProcessing`](@ref) and [`postSimulationCleanup`](@ref) (e.g.
   `prune_options`). Any simulator-specific flags flow through this channel.
@@ -368,7 +374,7 @@ Internal pairing carried back from a worker task to the main completion loop: th
 [`SimulationProcess`](@ref) plus the value returned by the user `post_processor` (or
 `nothing` when there is no post-processor or the simulation failed). Kept private so the
 public `SimulationProcess` struct stays unchanged. Failures travel on the same channel as a
-[`_SimulationStageError`](@ref) instead.
+`_SimulationStageError` instead.
 """
 struct _PostProcessedResult
     process::SimulationProcess
@@ -408,7 +414,7 @@ end
 """
     _runStage(stage::Symbol, sim_id, thunk)
 
-Run `thunk()`, rethrowing any exception as a [`_SimulationStageError`](@ref) tagged with
+Run `thunk()`, rethrowing any exception as a `_SimulationStageError` tagged with
 `stage` and `sim_id` so [`run`](@ref) can report where a per-simulation failure occurred.
 """
 function _runStage(stage::Symbol, sim_id::Union{Nothing,Int}, thunk)
@@ -429,7 +435,7 @@ per-simulation post steps in order:
 3. [`postSimulationCleanup`](@ref) — destructive simulator cleanup (e.g. pruning), so the
    user callback always sees the intact output folder.
 
-A throwing stage surfaces as a [`_SimulationStageError`](@ref) naming the stage and
+A throwing stage surfaces as a `_SimulationStageError` naming the stage and
 simulation. The captured value (if any) is written to the post-processing sink by the
 caller's serial completion loop, not here, so this function never touches the sink DB.
 """
