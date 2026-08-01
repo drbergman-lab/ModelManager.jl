@@ -4021,25 +4021,33 @@ end
 # build that does not also render ModelManager's private API, which terminates `makedocs`
 # with a :cross_references error. ModelManager's own docs render everything, so its build
 # cannot catch this — hence the test. See CLAUDE.md, "Docstring cross-references".
-@testset "docstrings only @ref public bindings" begin
-    #! `[`foo`](@ref)` → `foo`; also handles `ModelManager.foo`, `foo(x)`, and `Foo{T}`.
-    refTarget(s) = replace(s, r"^ModelManager\." => "") |> t -> split(t, ('(', '{'))[1] |> strip
+#! Julia 1.10 (our compat floor) has neither `Base.ispublic` nor the `public` keyword, so
+#! `@compat public` is a no-op there and *every* name would look private. The check is only
+#! meaningful — and only runnable — on 1.11+. Docs CI must therefore run 1.11+ as well, or
+#! Documenter's `Private = false` will not classify the interface methods correctly.
+@static if isdefined(Base, :ispublic)
+    @testset "docstrings only @ref public bindings" begin
+        #! `[`foo`](@ref)` → `foo`; also handles `ModelManager.foo`, `foo(x)`, and `Foo{T}`.
+        refTarget(s) = strip(first(split(replace(s, r"^ModelManager\." => ""), r"[({]")))
 
-    violations = Tuple{Symbol,String}[]
-    for (binding, multidoc) in Docs.meta(ModelManager)
-        for docstr in values(multidoc.docs)
-            text = join(Iterators.filter(x -> x isa AbstractString, docstr.text), "")
-            for m in eachmatch(r"\[`([^`]+)`\]\(@ref\)", text)
-                target = Symbol(refTarget(m.captures[1]))
-                Base.ispublic(ModelManager, target) && continue
-                push!(violations, (binding.var, m.captures[1]))
+        violations = Tuple{Symbol,String}[]
+        for (binding, multidoc) in Docs.meta(ModelManager)
+            for docstr in values(multidoc.docs)
+                text = join(Iterators.filter(x -> x isa AbstractString, docstr.text), "")
+                for m in eachmatch(r"\[`([^`]+)`\]\(@ref\)", text)
+                    target = Symbol(refTarget(m.captures[1]))
+                    Base.ispublic(ModelManager, target) && continue
+                    push!(violations, (binding.var, m.captures[1]))
+                end
             end
         end
-    end
 
-    if !isempty(violations)
-        msg = join(["  $(owner) → [`$(target)`](@ref)" for (owner, target) in sort(violations)], "\n")
-        @info "Docstrings referencing non-public bindings:\n$msg"
+        if !isempty(violations)
+            msg = join(["  $(owner) → [`$(target)`](@ref)" for (owner, target) in sort(violations)], "\n")
+            @info "Docstrings referencing non-public bindings:\n$msg"
+        end
+        @test isempty(violations)
     end
-    @test isempty(violations)
+else
+    @info "Skipping \"docstrings only @ref public bindings\": needs Julia 1.11+ for Base.ispublic."
 end

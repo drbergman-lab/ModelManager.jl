@@ -147,7 +147,14 @@ why. This is correct for:
 - **The documentation home for an exported wrapper's keywords** — `simulationsTableFromQuery`
   and `monadsTableFromQuery` carry the full keyword docs for `simulationsTable`/`monadsTable`.
 
-Two cautions. Julia **errors** if you declare an already-exported name public, so check first
+**Julia version floor.** `Base.ispublic` and the `public` keyword are both 1.11+, while
+`Project.toml` declares `julia = "1.10"` and CI's matrix includes `lts`. The guard test is
+therefore wrapped in `@static if isdefined(Base, :ispublic)` — on 1.10 `@compat public` is inert,
+so every declared name would look private and the test would report false violations. For the
+same reason the **docs job must run Julia 1.11+** (it uses `version: '1'`); on `lts`, Documenter's
+`Private = false` would silently drop every interface method from the public API section.
+
+Two further cautions. Julia **errors** if you declare an already-exported name public, so check first
 (`postInitDisplay` and `centralDBFileName` are exported and must stay out of those blocks).
 And `public` is an API commitment — default to delinking. Do not promote a name just to keep
 a hyperlink alive: `addVariationRows` looked like an interface method because two stale docs

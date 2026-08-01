@@ -47,8 +47,8 @@ dispatches on variation objects (the caller resolves targets to locations before
 them), and `addVariationRows` takes no simulator argument. Both were listed here in error.
 
 **Optional interface methods (default no-ops):**
-- `postSimulationProcessing(sim, simulation_process; kwargs...)` — pruning, cleanup
-- `postSimulationCleanup(sim, simulation_process; kwargs...)` — post-processing cleanup
+- `postSimulationProcessing(sim, simulation_process; kwargs...)` — **non-destructive** processing, run *before* the user `post_processor`; must not delete output, or the user callback would be handed an incomplete folder
+- `postSimulationCleanup(sim, simulation_process; kwargs...)` — **destructive** cleanup (pruning/deleting output, removing error files), run *after* the user `post_processor` and regardless of success
 - `initializeInputFolder(sim, input_folder)` — per-folder setup on insert
 - `getInputFolderDescription(sim, path)` → `String` (default `""`)
 - `clearSimulatorArtifacts(sim)` — remove build artifacts on database reset

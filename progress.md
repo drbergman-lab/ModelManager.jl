@@ -1599,6 +1599,33 @@ Reproduced PCMM's failure locally with a scratch Documenter build rendering only
 control, and builds clean with it removed. This harness — not our own `docs/make.jl` — is what
 actually tests this class of bug.
 
+### PR #24 review — the version floor bites
+Copilot raised three points; two were right.
+
+**Real bug: the test broke the Julia 1.10 floor.** `Base.ispublic` landed in 1.11, and
+`Project.toml` declares `julia = "1.10"`. CI's matrix includes `lts` (currently 1.10), so the
+suite would have failed there — not hypothetically, on this PR. Guarded with
+`@static if isdefined(Base, :ispublic)`, using feature detection rather than a `VERSION`
+comparison. Skipping is the *correct* semantics, not a workaround: on 1.10 `@compat public` is a
+no-op, so every interface method would look private and the test would report ~25 false
+violations. Noted at the time that 1.10 makes `@compat public` inert and then failed to carry it
+into the test — the floor needs checking in the *test*, not just the prose.
+
+Confirmed the docs job runs `version: '1'` (1.12), so `Private = false` still classifies the
+interface methods correctly. Had it run `lts`, the published docs would have silently omitted
+every interface method from the public API section.
+
+**Real bug (pre-existing): PRD hook descriptions were reversed.** `postSimulationProcessing` was
+glossed "pruning, cleanup", which is `postSimulationCleanup`'s job. Source is unambiguous —
+`postSimulationProcessing` is non-destructive and runs *before* the user `post_processor`;
+`postSimulationCleanup` is destructive and runs *after*. Both bullets rewritten to state the
+ordering and the destructive/non-destructive split, since getting this backwards would have a
+simulator author delete output the user callback still needs.
+
+**Not a bug:** claim that `split(t, ('(', '{'))` throws a `MethodError` — Julia accepts any char
+collection as a delimiter, and the testset ran green. Switched to `split(..., r"[({]")` anyway
+for legibility, not correctness.
+
 ### Open questions
 - `prepareBaseFile` (`src/xml_utilities.jl`) is also an `AbstractSimulator`-dispatched override
   point but was left private: no docstring `@ref`s it, so promoting it would be pure API
