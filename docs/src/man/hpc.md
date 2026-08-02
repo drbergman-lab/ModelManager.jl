@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# HPC support
+# [HPC support](@id hpc)
 
 ModelManager can dispatch each simulation as a SLURM job instead of a local task, so the same
 script that runs on a laptop scales to a cluster without modification.
@@ -39,7 +39,7 @@ These options are applied to every job the runner submits for the current sessio
 ## How jobs are launched
 
 When HPC mode is active, the runner wraps each simulation command for `sbatch` submission
-(see [`prepareHPCCommand`](@ref) and [`prepCmdForWrap`](@ref) in the runner) instead of
+(`prepareHPCCommand` and `prepCmdForWrap` in the runner) instead of
 spawning a local process. From your script's perspective nothing changes — you still call
 [`run`](@ref) on a trial; the runner decides per-simulation whether to execute locally or
 submit a job.
@@ -49,6 +49,6 @@ submit a job.
 Some shared filesystems intermittently fail or delay `unlink`/`rm` operations. Use
 [`rm_hpc_safe`](@ref) instead of `rm` when removing files inside ModelManager workflows on
 HPC; it tolerates these transient failures. [`resetDatabase`](@ref) and the deletion helpers
-use it internally (see [Managing data](@ref)).
+use it internally (see [Managing data](@ref managing_data)).
 
-See the [HPC support](@ref) API reference for the full set of functions.
+See the [HPC & SLURM](@ref hpc_lib) API reference for the full set of functions.

@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# What ModelManager is
+# [What ModelManager is](@id overview)
 
 ModelManager.jl is the **generic, simulator-agnostic core** of a family of Julia packages
 for running large agent-based modeling (ABM) campaigns. It owns everything that does not
@@ -46,7 +46,7 @@ kernel — is immediately available to *every* backend without any simulator-spe
 
 - **Backend authors** building a new simulator package. Start with
   [Building a Simulator Backend](@ref building_a_simulator); the Core Concepts pages
-  (beginning with [The trial hierarchy](@ref)) explain the machinery you are plugging into.
+  (beginning with [The trial hierarchy](@ref trial_hierarchy)) explain the machinery you are plugging into.
 - **Advanced users** of a backend (e.g. PCMM) who want to understand the generic layer —
   how variations are stored, how the runner deduplicates work, what the database schema
   looks like. The concepts here are shared verbatim with the backend you use.
@@ -73,11 +73,11 @@ dv = DiscreteVariation(:config, XMLPath(["overall", "max_time"]), [60.0, 120.0, 
 output = run(inputs, dv; n_replicates=3)
 ```
 
-`run` builds the appropriate [trial hierarchy](@ref "The trial hierarchy") object, writes the
-variations to the [database](@ref "The database"), and dispatches each pending simulation to
-the [runner](@ref "Running simulations"). Re-running the same script is cheap: ModelManager
+`run` builds the appropriate [trial hierarchy](@ref trial_hierarchy) object, writes the
+variations to the [database](@ref database), and dispatches each pending simulation to
+the [runner](@ref running_simulations). Re-running the same script is cheap: ModelManager
 matches existing simulations and only runs what is missing.
 
-From there you can layer on [space-filling designs](@ref "Space-filling designs"),
-[sensitivity analysis](@ref "Sensitivity analysis"), or [calibration](@ref calibration_man) —
+From there you can layer on [space-filling designs](@ref space_filling),
+[sensitivity analysis](@ref sensitivity_analysis), or [calibration](@ref calibration_man) —
 all built on the same three steps.

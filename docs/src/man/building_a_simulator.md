@@ -85,7 +85,7 @@ Dispatch each on your concrete type.
 ModelManager.runSimulation(sim::MySimulator, spec::SimulationSpec)::SimulationProcess
 ```
 
-The workhorse. Called by the [runner](@ref "Running simulations") inside a task for each pending
+The workhorse. Called by the [runner](@ref running_simulations) inside a task for each pending
 simulation. Setup has already happened (see below), so everything you need is in the
 [`SimulationSpec`](@ref). Return a [`SimulationProcess`](@ref) describing the outcome. No
 keyword arguments — encode all per-simulation configuration in `spec`.
@@ -97,7 +97,7 @@ ModelManager.setupSampling(sim::MySimulator, S::AbstractSampling; kwargs...)::Bo
 ModelManager.setupMonad(sim::MySimulator, M::AbstractMonad; kwargs...)::Bool
 ```
 
-Called by [`prepareTrialHierarchy`](@ref) before any simulation runs. `setupSampling` runs
+Called during the runner's preparation phase, before any simulation runs. `setupSampling` runs
 once per unique input-folder group (typically: compile shared custom code); `setupMonad`
 prepares each monad's varied input folders. Both return `true`/`false` for success. They
 accept the abstract types so they work for a bare `Simulation` or `Monad` without a wrapping
@@ -129,7 +129,7 @@ ModelManager.upgradeMilestones(sim::MySimulator)::Vector{VersionNumber}
 ModelManager.upgradeToMilestone(sim::MySimulator, version, auto_upgrade)::Bool
 ```
 
-See [Database upgrades](@ref) for how these are orchestrated by [`upgradePackage`](@ref).
+See [Database upgrades](@ref database_upgrades) for how these are orchestrated by [`upgradePackage`](@ref).
 
 ## 5. Override optional hooks as needed
 
@@ -149,7 +149,7 @@ These have working defaults; override only when your simulator needs them.
 
 - **`location` is explicit.** ModelManager does not resolve a variation target to a project
   location — your package must pass `location` when constructing variations (or provide
-  convenience constructors that infer it). See [Variations](@ref).
+  convenience constructors that infer it). See [Variations](@ref variations).
 - **No simulator specifics leak into ModelManager.** If you find yourself wanting ModelManager
   to know something about your simulator, that knowledge belongs behind one of these interface
   methods — add or override a hook rather than special-casing the core.

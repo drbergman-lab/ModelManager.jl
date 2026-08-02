@@ -9,19 +9,11 @@ perturbation kernels, the simulation bank, distance functions, progress reportin
 posterior visualization. See the [Calibration](@ref calibration_man) manual page for a
 narrative walkthrough.
 
-The calibration code lives under `src/calibration/`; this page collects the docstrings
-from every file in that subdirectory.
+The calibration code lives under `src/calibration/`; this page collects the public
+docstrings from every file in that subdirectory. Internals are documented in the source.
 
-## Public API
 ```@autodocs
 Modules = [ModelManager]
 Pages = ["calibration.jl", "problem.jl", "parameters.jl", "methods.jl", "abc.jl", "abc_smc.jl", "bank.jl", "distance.jl", "progress.jl", "visualize.jl"]
 Private = false
-```
-
-## Private API
-```@autodocs
-Modules = [ModelManager]
-Pages = ["calibration.jl", "problem.jl", "parameters.jl", "methods.jl", "abc.jl", "abc_smc.jl", "bank.jl", "distance.jl", "progress.jl", "visualize.jl"]
-Public = false
 ```

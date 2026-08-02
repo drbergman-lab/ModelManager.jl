@@ -1,7 +1,5 @@
 using DataFrames
 
-# simulationsTable and printSimulationsTable are simulator-specific — exported by the simulator package
-
 ################## Database Initialization Functions ##################
 
 """
@@ -916,6 +914,17 @@ end
 #! documentation home for the keyword arguments of the exported `simulationsTable` /
 #! `monadsTable`. See CLAUDE.md, "Docstring cross-references".
 @compat public simulationsTableFromQuery, monadsTableFromQuery
+
+#! Public despite not being exported: `recognizedStatusCodes` is the status vocabulary every
+#! query against `simulations` is written against, `buildWhereClause` is listed in the manual
+#! as a query building block, and `initializeDatabase` / `databaseDiagnostics` are the schema
+#! and consistency entry points a backend calls. See CLAUDE.md, "Docstring cross-references".
+@compat public recognizedStatusCodes, buildWhereClause, initializeDatabase, databaseDiagnostics
+
+#! Public despite not being exported: PhysiCellModelManager depends on these from its own `src/`
+#! (`variations.jl`, `simulator_interface.jl`, `up.jl`, `import.jl`).
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public shortVariationName, calibrationsSchema, reinitializeDatabase
 
 """
     _asSymbolVector(x) -> Vector{Symbol}

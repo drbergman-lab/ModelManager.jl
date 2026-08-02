@@ -4019,8 +4019,10 @@ end
 
 # A docstring that `@ref`s a non-public binding is unresolvable in any downstream docs
 # build that does not also render ModelManager's private API, which terminates `makedocs`
-# with a :cross_references error. ModelManager's own docs render everything, so its build
-# cannot catch this — hence the test. See CLAUDE.md, "Docstring cross-references".
+# with a :cross_references error. Since the docs findability pass, `docs/src/lib/*.md` no
+# longer renders the private API either, so ModelManager's own build would catch this too —
+# but only in CI's `docs` job, and only for names that exist. This runs with the ordinary
+# test suite and needs no docs build. See CLAUDE.md, "Docstring cross-references".
 #! Julia 1.10 (our compat floor) has neither `Base.ispublic` nor the `public` keyword, so
 #! `@compat public` is a no-op there and *every* name would look private. The check is only
 #! meaningful — and only runnable — on 1.11+. Docs CI must therefore run 1.11+ as well, or

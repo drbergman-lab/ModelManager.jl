@@ -236,3 +236,11 @@ function prepareVariedInputFolder(location::Symbol, sampling::Sampling)
         prepareVariedInputFolder(location, monad)
     end
 end
+
+#! Public despite not being exported: PhysiCellModelManager depends on these from its own
+#! `src/` (`configuration.jl`, `export.jl`, `compilation.jl`, `simulator_interface.jl`), so they
+#! are part of the XML layer a simulator backend builds on, not internals.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public getChildByAttribute, getChildByChildContent, retrieveElementError,
+               elementIsTerminal, setSimpleContent, createXMLFile, prepareBaseFile,
+               prepareVariedInputFolder

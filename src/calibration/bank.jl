@@ -414,3 +414,7 @@ function _bankCdfCoords(lv::LatentVariation, vals::Dict{String, Float64})
     cdfs = [cdf(d, lp) for (d, lp) in zip(lv.latent_parameters, lp_vals)]
     return cdfs
 end
+
+#! Public despite not being exported: users reach one through a `Calibration` result and the
+#! manual documents its reuse semantics. See CLAUDE.md, "Docstring cross-references".
+@compat public SimulationBank

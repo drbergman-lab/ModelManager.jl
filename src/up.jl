@@ -87,3 +87,8 @@ function upgradePackage(sim::AbstractSimulator, db::SQLite.DB,
     end
     return success
 end
+
+#! Public despite not being exported: `upgradePackage` is the user-facing migration entry
+#! point, and the other two are the helpers a backend calls when writing its own milestone.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public upgradePackage, continueMilestoneUpgrade, populateTableOnFeatureSubset

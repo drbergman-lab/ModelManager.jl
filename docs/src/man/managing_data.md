@@ -2,11 +2,11 @@
 CurrentModule = ModelManager
 ```
 
-# Managing data
+# [Managing data](@id managing_data)
 
 Over a long campaign you accumulate simulations you no longer need — failed runs, abandoned
 sweeps, stale parameterizations. ModelManager provides targeted deletion at every level of the
-[trial hierarchy](@ref "The trial hierarchy") and a full project reset, all keeping the database
+[trial hierarchy](@ref trial_hierarchy) and a full project reset, all keeping the database
 and filesystem consistent.
 
 ## Deleting by level
@@ -31,7 +31,7 @@ The `delete_subs` / `delete_supers` keywords control how far the cascade reaches
 
 [`deleteSimulations`](@ref) additionally accepts `filters` to restrict which rows are removed.
 
-Deletions also keep the [post-processing sink](@ref "Post-processing each simulation")
+Deletions also keep the [post-processing sink](@ref post_processing)
 consistent: a deleted simulation's stored quantities are removed from
 `data/outputs/postprocessing.db` (cascading deletes route through `deleteSimulations`, so they
 are covered too).
@@ -68,6 +68,6 @@ touching the rest of the project.
 The deletion helpers remove output directories with [`rm_hpc_safe`](@ref) rather than `rm`, so
 they tolerate the transient `unlink` failures common on shared HPC filesystems. If you write
 your own cleanup code in a ModelManager workflow on a cluster, prefer `rm_hpc_safe` for the
-same reason (see [HPC support](@ref)).
+same reason (see [HPC support](@ref hpc)).
 
 See the [Deletion](@ref) API reference for full signatures.

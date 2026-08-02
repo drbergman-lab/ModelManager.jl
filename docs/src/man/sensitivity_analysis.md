@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# Sensitivity analysis
+# [Sensitivity analysis](@id sensitivity_analysis)
 
 Global sensitivity analysis (GSA) asks how much each input parameter contributes to the
 variability of a model output. ModelManager provides three generic GSA methods that work with
@@ -72,11 +72,11 @@ indices. Helpers include:
 - [`simulationIDs`](@ref) — the simulations that were run.
 - [`methodString`](@ref) — a label for the method/design.
 
-Because GSA is built on the same [space-filling designs](@ref "Space-filling designs") and the
-same [runner](@ref "Running simulations"), its simulations are deduplicated and reused like any
-other trial. See the [Sensitivity analysis](@ref) API reference for full details.
+Because GSA is built on the same [space-filling designs](@ref space_filling) and the
+same [runner](@ref running_simulations), its simulations are deduplicated and reused like any
+other trial. See the [Sensitivity analysis (GSA)](@ref sensitivity_lib) API reference for full details.
 
-## Visualizing
+## [Visualizing GSA results](@id gsa_plots)
 
 When a plotting backend is loaded, [RecipesBase](https://github.com/JuliaPlots/RecipesBase.jl)
 recipes turn each sampling result into a sensitivity chart. Every recipe draws one series per

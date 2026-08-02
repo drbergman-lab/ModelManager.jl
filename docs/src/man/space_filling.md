@@ -2,9 +2,9 @@
 CurrentModule = ModelManager
 ```
 
-# Space-filling designs
+# [Space-filling designs](@id space_filling)
 
-When you attach several [variations](@ref Variations) to a trial, the **sampling method**
+When you attach several [variations](@ref variations) to a trial, the **sampling method**
 decides *which combinations* of values are actually run. The default enumerates every
 combination; the space-filling designs sample the parameter space more efficiently for
 high-dimensional sweeps. The method is the optional first argument to [`createTrial`](@ref)
@@ -67,11 +67,11 @@ run(RBDVariation(100; use_sobol=false), inputs, dist1, dist2)   # random-sequenc
 | --- | --- | --- |
 | [`GridVariation`](@ref) | Small, exhaustive sweeps over discrete values | Count grows multiplicatively |
 | [`LHSVariation`](@ref) | General-purpose sampling of continuous ranges | Even 1-D coverage of each parameter |
-| [`SobolVariation`](@ref) | Variance-based [Sobol' sensitivity](@ref "Sensitivity analysis") | Deterministic, low discrepancy |
-| [`RBDVariation`](@ref) | [RBD-FAST sensitivity](@ref "Sensitivity analysis") | `n` near a power of two (Sobol mode) |
+| [`SobolVariation`](@ref) | Variance-based [Sobol' sensitivity](@ref sensitivity_analysis) | Deterministic, low discrepancy |
+| [`RBDVariation`](@ref) | [RBD-FAST sensitivity](@ref sensitivity_analysis) | `n` near a power of two (Sobol mode) |
 
 The space-filling methods pair naturally with [`DistributedVariation`](@ref)s, since they
 sample distributions rather than enumerate fixed values. For analyses built directly on these
-designs, see [Sensitivity analysis](@ref). For the result types
+designs, see [Sensitivity analysis](@ref sensitivity_analysis). For the result types
 ([`AddVariationsResult`](@ref) and its subtypes) and `orthogonalLHS`, see the
-[Variations](@ref) API reference.
+[Variations & designs](@ref variations_lib) API reference.

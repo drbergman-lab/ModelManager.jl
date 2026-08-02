@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# Installation
+# [Installation](@id installation)
 
 ModelManager.jl is the base layer of a simulator ecosystem. How you install it depends on
 whether you are *using* a backend or *building* one.

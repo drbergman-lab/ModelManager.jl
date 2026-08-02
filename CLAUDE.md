@@ -115,11 +115,23 @@ Error: Cannot resolve @ref for md"[`_buildEvaluateBatch`](@ref)" in docs/src/lib
 - No docstring found in doc for binding `ModelManager._buildEvaluateBatch`.
 ```
 
-**ModelManager's own docs build cannot catch this.** Every `docs/src/lib/*.md` page has both
-a `Private = false` and a `Public = false` `@autodocs` block, so locally *everything* is
-rendered and *every* `@ref` resolves. The failure only appears downstream. The guard is the
+**This used to be invisible locally.** Every `docs/src/lib/*.md` page once carried both a
+`Private = false` and a `Public = false` `@autodocs` block, so locally *everything* was
+rendered, *every* `@ref` resolved, and the failure appeared only downstream. As of the docs
+findability pass, the `Public = false` blocks are gone — private docstrings are no longer
+rendered on ModelManager's own site — so an `@ref` to an internal now breaks `makedocs` here
+too. (They were removed for a different reason: 86 underscore-prefixed entries were 16% of
+the search index and were outranking the prose pages that explain the features.)
+
+Do not rely on the docs build as the guard. It only runs in CI's `docs` job, and it does not
+cover a docstring whose `@ref` happens to point at a *nonexistent* name. The guard is the
 `"docstrings only @ref public bindings"` testset in `test/runtests.jl`, which walks
-`Docs.meta(ModelManager)` and checks each `@ref` target with `Base.ispublic`.
+`Docs.meta(ModelManager)` and checks each `@ref` target with `Base.ispublic`. It runs with
+the normal test suite, needs no docs build, and is the thing that will actually catch you.
+
+Note the testset scans **docstrings only** — `@ref`s written in `docs/src/**/*.md` manual
+pages are outside its loop. A manual page that `@ref`s an internal is caught by the docs
+build now, but was not before.
 
 ### Writing a new docstring
 
@@ -143,7 +155,7 @@ why. This is correct for:
   contract in "Building a Simulator Backend". Declared in `src/abstract_simulator.jl`, plus
   `postVariationXMLProcessing` in `src/xml_utilities.jl`.
 - **Types appearing in public signatures** — `SimulationSpec`, `SimulationProcess`,
-  `GSASampling` (the return type of the exported `runSensitivity`).
+  `GSASampling` (the return type of the exported `run(::GSAMethod, ...)`).
 - **The documentation home for an exported wrapper's keywords** — `simulationsTableFromQuery`
   and `monadsTableFromQuery` carry the full keyword docs for `simulationsTable`/`monadsTable`.
 
@@ -239,5 +251,5 @@ Deliberate decisions whose symptoms would otherwise look like bugs. Check here b
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
-- Wire the `post_processor` QoI builders (e.g. `populationCountQoI`) into sensitivity analysis and calibration workflows, so a builder's output can feed `runSensitivity`/`CalibrationProblem` directly instead of only landing in the post-processing sink. Not yet done — these builders currently only target `run(...; post_processor=...)`.
+- Wire the `post_processor` QoI builders (e.g. `populationCountQoI`) into sensitivity analysis and calibration workflows, so a builder's output can feed `run(::GSAMethod, ...)`/`CalibrationProblem` directly instead of only landing in the post-processing sink. Not yet done — these builders currently only target `run(...; post_processor=...)`.
 - Preserve failed-simulation artifacts for post-hoc inspection. When a simulation fails, `simulationFailed` erases it from its monad's constituent list and — if it was the monad's last simulation — deletes the monad row, folder, and constituent CSV (`src/runner.jl`). The simulation's own output folder survives, but nothing records *which* variation/spec it came from or which monad it belonged to, so a failed parameter set cannot be reproduced afterwards. Proposal: a `data/outputs/failed/` area (or a per-simulation manifest) capturing the variation IDs, target parameter values, and a pointer to the simulation's output folder for every failed simulation. Worth doing at the runner level for all failed sims, not just calibration. Motivated by calibration rejections (see the `on_monad_failure` handling in `src/calibration/abc.jl`), where the per-generation failure files record simulation and monad IDs but nothing ties a failed simulation back to the variation it came from once its monad is deleted.

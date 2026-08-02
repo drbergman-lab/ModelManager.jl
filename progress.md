@@ -5,6 +5,198 @@
 
 ---
 
+## Session: docs findability pass (2026-08-01)
+
+### Goal
+Users could not find things. The trigger case: **post-processing was undiscoverable.** It was
+96 of 185 lines of `man/running_simulations.md` — page-sized content wearing a `##` section's
+clothes — and Documenter surfaces a page's `##` headings in the sidebar only *once you are
+already on that page*. Someone asking "how do I compute a quantity of interest per simulation
+and store it?" would never open a page titled *Running simulations*, and no `index.md` routing
+row pointed there. Three other pages linked *into* that section: a hub reachable only sideways.
+
+Work started from a finished-but-unapplied patch (`docs-findability.patch`, base `3a5369c`)
+produced out of order relative to `CLAUDE.md` § *Required Workflow*, plus a handoff note listing
+four open questions. Two of the handoff's answers turned out to be wrong; see below.
+
+### What was done
+1. **Applied the patch.** New `man/post_processing.md` (retitled *Post-processing and quantities
+   of interest* — the old title contained only words a user would use if they already knew the
+   feature's name), `running_simulations.md` 185 → ~107 lines with a short *After each simulation*
+   pointer, `index.md` routing table rewritten as five task-grouped tables, `tagging.md` given
+   `@id tagging` and the `@meta CurrentModule` block it was the only man page missing.
+2. **Results & Analysis sidebar group.** New `man/tables.md` (`@id result_tables`) lifts the
+   analysis-table API out of `man/database.md` `## Querying`, where 12 lines had been the *only*
+   narrative documentation of `simulationsTable` / `monadsTable` / `postProcessingTable`, their
+   shared keywords, the `print…` variants and `sink`. `man/database.md` is now schema + raw SQL +
+   diagnostics, and its `## Querying` heading finally means only SQL.
+3. **Cross-reference correctness.** Five "See the *X* API reference" pointers resolved back to
+   the man page itself; `@id` anchors on all man/misc H1s plus the four lib pages they should
+   have pointed at; every heading-targeted `@ref` converted to anchor form.
+4. **Search-index cleanup.** Deleted the 18 `Public = false` `@autodocs` blocks and the
+   boilerplate `## Public API` / `## Private API` headings. 524 → **361** entries; 86 → **0**
+   underscore-prefixed; 34 → **0** duplicate section rows. Title matches for "post processing"
+   went 12 → 6, and the six are now the prose page plus five genuinely public functions.
+5. **19 bindings declared `@compat public`, 8 delinked** — see below.
+
+### Key decisions / gotchas
+
+**An explicit `@id` *replaces* a heading's title slug; it does not add an alias.**
+`expander_pipeline.jl:301-317` takes the id if the heading is `[…](@id x)`-wrapped and the
+plain text otherwise, then slugifies exactly one of them. So adding `@id` to a page H1 breaks
+every inbound bare `[Exact Title](@ref)`. Any future anchor addition must convert its inbound
+links in the same commit. The docs build catches this (no `warnonly` in `make.jl`), so a green
+build *is* the link check.
+
+**Consolidating internals into one `lib/internals.md` would not have reduced search noise.**
+The handoff proposed it. Documenter 1.17 pushes every section segment and every docstring into
+`search_index.js` unconditionally (`HTMLWriter.jl:1806`, `:1909`); there is no `Documenter.HTML`
+kwarg, no `@meta` key, and no `@autodocs` option that excludes anything from search — the only
+search-related option is `search_size_threshold_warn`, which merely warns on size. Consolidation
+relocates entries; it does not remove them. **Not rendering is the only lever.**
+
+**The `Public = false` blocks were never load-bearing.** `CLAUDE.md` described them as the
+reason the local build was *blind*, and the handoff read that as a dependency. The guard testset
+reads `Docs.meta(ModelManager)` — the runtime docsystem table, which Documenter itself consumes
+via `DocSystem.getmeta` — and never opens a file under `docs/`. Removing the blocks left it
+bit-for-bit identical (verified: 1346 tests, guard included). `checkdocs=:exports` does not
+care either; it only requires *exported* names to appear.
+
+**Removing them exposed 27 bindings the manual had been documenting as API that were never
+declared.** 32 broken links across 12 pages. None are `_`-prefixed, so by this repo's own
+naming convention (`_` = internal) they were never internals — they sat in an undeclared middle
+state that the `Public = false` blocks had been papering over. Resolved against the criteria
+`CLAUDE.md` already endorses rather than "keep the hyperlink alive":
+- **types/accessors in public signatures** (the existing rationale for `SimulationSpec`,
+  `GSASampling`) — `GSAMethod`, `MOATSampling`, `SobolSampling`, `RBDSampling`,
+  `getMonadIDDataFrame`, `methodString`, `AddVariationMethod`, `AddVariationsResult`,
+  `SimulationBank`
+- **backend contract** (the existing rationale for the `AbstractSimulator` interface methods) —
+  `upgradePackage`, `continueMilestoneUpgrade`, `populateTableOnFeatureSubset`,
+  `defaultJobOptions`
+- **functions the manual tells users to call** — `recognizedStatusCodes`, `initializeDatabase`,
+  `addVariations`, `databaseDiagnostics`, `buildWhereClause`, `resetFolder`
+- **delinked to plain code spans** (parenthetical "(see X)" implementation notes only) —
+  `compressIDs`, `recordConstituentIDs`, `sanitizePathElement`, `prepCmdForWrap`,
+  `prepareHPCCommand`, `updateDatabaseOnCompletion`. `sanitizePathElement`'s sentence was
+  rewritten to state the actual validation rules inline rather than leave a dead pointer.
+
+`prepareTrialHierarchy` and `pendingSimulationSpecs` were initially promoted under the backend
+-contract heading and then pulled back, on the grounds that `run` calls both internally.
+`pendingSimulationSpecs` stayed pulled; `prepareTrialHierarchy` was **restored** by the PCMM
+audit below. `man/running_simulations.md`'s two-phase description now names the phases without
+linking to their implementations, and `building_a_simulator.md` says "during the runner's
+preparation phase" instead of naming the function — that wording is fine either way and was
+left alone.
+
+### PCMM dependency audit (same session)
+Audited PhysiCellModelManager at `674785d3c` for everything it reaches into ModelManager for —
+qualified `ModelManager.x`, `import ModelManager: …`, and `using ModelManager: …`. **83 distinct
+bindings; 33 were neither exported nor `@compat public`.** Split by where they are used:
+
+- **16 used in PCMM's `src/` → promoted.** The XML layer a backend builds on
+  (`getChildByAttribute`, `getChildByChildContent`, `retrieveElementError`, `elementIsTerminal`,
+  `setSimpleContent`, `createXMLFile`, `prepareBaseFile`, `prepareVariedInputFolder`),
+  `defaultLatentParameterNames`, `shortVariationName`, `validateParsBytes`, `calibrationsSchema`,
+  `reinitializeDatabase`, `shellCommandExists`, `prepareHPCCommand`, and `prepareTrialHierarchy`.
+  All 77 bindings PCMM's `src/` touches are now public (verified with `Base.ispublic`).
+- **17 used only in PCMM's `test/` → left undeclared.** `ParsedVariations`, `calibrationFolder`,
+  `calibrationMonadIDs`, `constituentType`, `createCalibration`, `createSchema`,
+  `eraseSimulationIDFromConstituents`, `locationVariationsTable`, `lowerClassString`,
+  `nLatentDims`, `nTargetDims`, `runAbstractTrial`, `sanitizePathElement`, `variationIDs`,
+  `variationLocation`, `variationTarget`, `variationValues`. Julia does not enforce `public`, so
+  `PhysiCellModelManager.ModelManager.foo(...)` works regardless; tests poking internals is not an
+  API contract. `runAbstractTrial` in particular is a deprecation shim PCMM tests only to confirm
+  it still warns — promoting it would document a name on its way out.
+
+**`prepareTrialHierarchy` came back because of a docstring, not a call.** PCMM's
+`src/simulator_interface.jl:28` and `:192` write `` [`ModelManager.prepareTrialHierarchy`](@ref) ``
+in their own docstrings. That is the downstream `:cross_references` failure mode this repo already
+guards against, just pointing the other way.
+
+**Correction to a premise in `CLAUDE.md`.** It states "a downstream build renders only
+ModelManager's public API." That is **not true of PCMM at `674785d3c`**: its `docs/make.jl` sets
+`modules=[PhysiCellModelManager, ModelManager]` and its `docs/src/lib/*.md` pages carry
+`Public = false` blocks for `Modules = [ModelManager]`, so it renders our private API too — which
+is why `docs/src/lib/calibration.md:78` can reference `ModelManager._resolveVerbosity` and build.
+Nothing in PCMM is currently broken; the promotions declare a real dependency surface rather than
+repair a build. The rule still holds as written *if* PCMM ever drops those blocks, which is the
+cleanup this session just did here. Worth revisiting the wording once PCMM's side is settled.
+
+`prepareHPCCommand` and `sanitizePathElement` were both delinked to plain code spans earlier in
+this session as parenthetical implementation notes. `prepareHPCCommand` is now public and could be
+re-linked, but its sentence pairs it with `prepCmdForWrap`, which is not; linking one of the pair
+would read worse than linking neither. Left as prose.
+
+**The guard testset scans docstrings only.** `@ref`s in `docs/src/**/*.md` are outside its loop,
+which is why `man/variations.md` could carry `[`_validateInverseMaps`](@ref)` — a manual-page ref
+to a true internal — undetected. The docs build catches that class now; the testset still does
+not. Anchor-form refs (`[text](@ref some_id)`) are outside its regex too.
+
+**Deliberate small duplication kept.** `running_simulations.md` still names the three-hook order
+in two sentences so the runner page reads on its own; the details live only on the
+post-processing page. Do not re-expand it.
+
+**Bookkeeping deliberately scoped.** No `PRD.md` entry and no README Implementation Status row:
+`PRD.md` has never carried a documentation entry, and the June 2026 docs rework (`0b6114f`,
+41 files) added a progress.md entry and no README row. One factual correction to `README.md:84`
+and to the testset's leading comment, both of which asserted that ModelManager's own docs render
+the private API — no longer true.
+
+### Files changed
+- `docs/make.jl` — Results & Analysis group
+- `docs/src/index.md` — five task-grouped routing tables, plotting row
+- `docs/src/man/post_processing.md`, `docs/src/man/tables.md` — new
+- `docs/src/man/{running_simulations,database,tagging,managing_data,variations,space_filling,hpc,project_configuration,sensitivity_analysis,calibration,overview,trial_hierarchy,installation,building_a_simulator}.md`,
+  `docs/src/misc/database_upgrades.md` — anchors, ref conversion, delinks
+- `docs/src/lib/*.md` (18) — private blocks and boilerplate headings removed; `@id`s on four
+- `src/{sensitivity,runner,database,variations,up,hpc,deletion}.jl`, `src/calibration/bank.jl` —
+  `@compat public` declarations
+- `CLAUDE.md`, `README.md`, `test/runtests.jl` — corrected now-false claims
+
+### Absorbed: two stale ownership comments
+Spun off as a side task, then folded back into this branch rather than landing as a separate
+branch to rebase past.
+
+- **`src/database.jl:3` deleted.** "simulationsTable and printSimulationsTable are
+  simulator-specific — exported by the simulator package." Every clause was false: both are defined
+  in that file (~:1028, ~:1057) and exported at `src/ModelManager.jl:39`, and none of the four
+  `simulationsTable` methods takes an `AbstractSimulator`. Same trap `CLAUDE.md` documents for
+  `addVariationRows`. Nothing to salvage, so the comment is gone rather than corrected.
+- **`runSensitivity` does not exist and never did.** The exported GSA entry point is
+  `run(::GSAMethod, ...)` (`src/sensitivity.jl:62`); the only similarly named thing is the
+  unexported `runSensitivitySampling`. The phantom appeared in four places — `src/sensitivity.jl`,
+  `CLAUDE.md` twice, and `progress.md` — all corrected, since the substance of each claim was right
+  and only the name was wrong.
+
+  This one is worth remembering: **this session propagated it.** The `@compat public GSASampling`
+  comment already said `runSensitivity`, and expanding that block from 2 lines to 5 carried the
+  error forward into longer, more authoritative-looking text. Inheriting a neighbouring comment's
+  phrasing inherits its bugs.
+
+**Neither would have been caught by the guard testset**, which reads docstrings only and checks
+`Base.ispublic` — not whether a name exists. Both of these lived in `#!` comments. Nothing in the
+repo validates that a name mentioned in a comment is real.
+
+### Open questions
+- **22 backticked type refs land on headings, not docstrings.** `[`LHSVariation`](@ref)` hits
+  `## LHSVariation` on the same page while `[`GridVariation`](@ref)` reaches its docstring, purely
+  because that heading reads `## GridVariation (default)`. Documenter's `Header` resolver (order
+  1.0) precedes `Docs` (3.0). The "Choosing a design" table mixes both in adjacent rows. Clean fix
+  is renaming the colliding headings to the `## Qualifier: TypeName` pattern already used on those
+  same pages. Affects `space_filling.md`, `variations.md`, `trial_hierarchy.md`,
+  `project_configuration.md`.
+- **`## Building a backend`** (`installation.md:18-56`) duplicates steps 1–2 of
+  `building_a_simulator.md`, and the registry step exists *only* there.
+- **Shared-filesystem guidance duplicated** across `hpc.md:47` and `managing_data.md:66`, in two
+  sidebar groups, with no cross-link.
+- **`src/sensitivity_visualize.jl` is in no lib page's `Pages` list**, and `endswith` matching
+  means it would land on `lib/calibration.md` (via `"visualize.jl"`) if its recipes became
+  bindable. `lib/utilities.md`'s leading-slash `Pages = ["/utilities.jl"]` is the only defence
+  against this class anywhere, and it is undocumented.
+
+---
+
 ## Session: Trial tagging and feature-based recovery (2026-07-29)
 
 ### Goal
@@ -1562,7 +1754,7 @@ Split three ways rather than deleted wholesale:
    are the documented contract, and `abstract_simulator.jl` had the repo's highest `@ref`
    density (31). Delinking would have gutted the one page a PCMM developer needs.
 3. **Public-in-effect names** → `SimulationSpec`/`SimulationProcess` (appear in interface
-   signatures), `GSASampling` (return type of exported `runSensitivity`),
+   signatures), `GSASampling` (return type of exported `run(::GSAMethod, ...)`),
    `simulationsTableFromQuery`/`monadsTableFromQuery` (they carry the *entire* keyword
    documentation for the exported `simulationsTable`/`monadsTable` — delinking would have
    stranded users).

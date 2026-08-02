@@ -30,6 +30,10 @@ makedocs(;
             "Variations" => "man/variations.md",
             "Space-filling designs" => "man/space_filling.md",
         ],
+        "Results & Analysis" => Any[
+            "Post-processing and quantities of interest" => "man/post_processing.md",
+            "Result tables" => "man/tables.md",
+        ],
         "Uncertainty Quantification" => Any[
             "Sensitivity analysis" => "man/sensitivity_analysis.md",
             "Calibration" => "man/calibration.md",
