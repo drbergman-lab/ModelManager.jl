@@ -65,9 +65,18 @@ touching the rest of the project.
 
 ## Safe removal on shared filesystems
 
-The deletion helpers remove output directories with [`rm_hpc_safe`](@ref) rather than `rm`, so
-they tolerate the transient `unlink` failures common on shared HPC filesystems. If you write
-your own cleanup code in a ModelManager workflow on a cluster, prefer `rm_hpc_safe` for the
-same reason (see [HPC support](@ref hpc)).
+The deletion helpers remove output directories with [`rm_hpc_safe`](@ref) rather than `rm`. Off
+HPC that is exactly `rm`. On a cluster it first attempts the real removal, then *moves* anything
+the filesystem refuses to release — typically a directory some other node still has a file open
+in — into `data/.trash/`, and returns `:removed`, `:staged`, or `:unremoved` to say which
+happened. A failure is reported rather than thrown, so one stubborn folder cannot abandon a bulk
+deletion after its database rows are already gone.
+
+Staged paths **still occupy disk and quota**; `data/.trash/` is a staging area, not a backup, and
+nothing there is recoverable by design. ModelManager retries the removal in the background each
+time [`initializeModelManager`](@ref) runs, so it normally empties itself once the jobs holding
+those files exit. To reclaim it now, delete the directory from a shell. If you write your own
+cleanup code in a workflow on a cluster, prefer `rm_hpc_safe` for the same reason (see
+[HPC support](@ref hpc)).
 
 See the [Deletion](@ref) API reference for full signatures.

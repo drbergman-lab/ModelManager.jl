@@ -244,6 +244,10 @@ Reset the database after user confirmation: delete all output folders, remove th
 post-processing sink (`data/outputs/postprocessing.db`), clear all variation files,
 call [`clearSimulatorArtifacts`](@ref) on the active simulator, then reinitialize the
 database.
+
+On a shared filesystem some of what this removes may be staged in `data/.trash/` rather than
+deleted — see [`rm_hpc_safe`](@ref). That space is not reclaimed until the files are released
+and a later session retries them.
 """
 function resetDatabase(; force_reset::Bool=false, force_continue::Bool=false)
     assertInitialized()
@@ -285,7 +289,19 @@ function resetDatabase(; force_reset::Bool=false, force_continue::Bool=false)
 
     clearSimulatorArtifacts(mm_globals().simulator)
 
-    rm_hpc_safe("$(centralDB().file)"; force=true)
+    #! The one call site where a swallowed failure is corruption rather than a leak:
+    #! `initializeDatabase` below reopens by path, so a file we failed to remove would be built
+    #! on top of while this reports a successful reset. `:staged` is fine — the path is gone and
+    #! a fresh database is created.
+    if rm_hpc_safe("$(centralDB().file)"; force=true) === :unremoved
+        error("""
+        Could not remove the central database file
+            $(centralDB().file)
+        so the reset cannot finish — reinitializing now would build on top of the old database.
+        The warning above names the underlying filesystem error. Output folders have already been
+        removed or staged; rerun `resetDatabase` once the file can be deleted.
+        """)
+    end
     initializeDatabase()
     return nothing
 end
@@ -353,30 +369,220 @@ deleteSimulationsByStatus(status_code_to_delete::String; kwargs...) = deleteSimu
 """
     rm_hpc_safe(path::String; force, recursive)
 
-Remove `path`, using a `.trash/` staging area on HPC (NFS) filesystems to avoid
-lock issues.
+Remove `path`, tolerating shared cluster filesystems that refuse to release files.
+
+Off HPC — the default; see [`useHPC`](@ref) — this is exactly `rm(path; force, recursive)`,
+exceptions included.
+
+On HPC that same `rm` is attempted first, since removing is the only thing that actually frees
+disk space. A network filesystem routinely refuses to remove a directory that a process on
+another node still holds open, and `rm` throws. Whatever survives is then *moved* into
+`data/.trash/data-YYMMDD/`, mirroring its position under `data/`, which succeeds where removal
+does not because a rename never releases the file. A path outside `data/` is staged under
+`_external/`.
+
+Returns:
+
+- `:removed` — `rm` succeeded.
+- `:staged` — the residue was moved into `data/.trash/`. **Nothing staged there has had its
+  space reclaimed**, and the first time it happens in a project a warning says so and names the
+  directory. [`initializeModelManager`](@ref) retries the removal in the background at the start
+  of every later session, so staged paths clear themselves once the jobs holding them exit.
+- `:unremoved` — neither worked. `path` is left where it is and a warning names it.
+
+In HPC mode a filesystem failure does not throw: every caller deletes the corresponding database
+rows *before* calling this, and most call it inside a loop over many simulations, so an exception
+here would abandon a bulk deletion with the rows already gone. Check the return value where a
+removal must be guaranteed — [`resetDatabase`](@ref) does, for the central database file. A
+missing `path` with `force=false` still throws, exactly as `rm` does.
+
+# Examples
+```julia
+rm_hpc_safe(joinpath(dataDir(), "outputs", "simulations", "7"); force=true, recursive=true)
+
+if rm_hpc_safe(path_to_file; force=true) === :staged
+    @info "still on disk under \$(joinpath(dataDir(), ".trash"))"
+end
+```
 """
 function rm_hpc_safe(path::String; force::Bool=false, recursive::Bool=false)
     if !mm_globals().run_on_hpc
         rm(path; force=force, recursive=recursive)
-        return
+        return :removed
     end
-    if !ispath(path)
-        return
+    #! Try the real removal first. Staging alone never frees a byte, which is why a cluster
+    #! project has never reclaimed anything: every deletion relocated its output tree into
+    #! `data/.trash` and left it there, and `resetDatabase` roughly doubled disk usage.
+    try
+        rm(path; force=force, recursive=recursive)
+    catch rm_error
+        rm_error isa InterruptException && rethrow()
+        return _stageResidue(path, rm_error)
     end
-    src = path
-    path_rel_to_data = replace(path, "$(dataDir())/" => "")
-    date_time = Dates.format(now(), "yymmdd")
-    initial_dest = joinpath(dataDir(), ".trash", "data-$(date_time)", path_rel_to_data)
-    main_path, file_ext = splitext(initial_dest)
-    suffix = ""
-    path_to_dest(m, s, e) = s == "" ? "$(m)$(e)" : "$(m)-$(s)$(e)"
-    while ispath(path_to_dest(main_path, suffix, file_ext))
-        suffix = suffix == "" ? "1" : string(parse(Int, suffix) + 1)
+    return :removed
+end
+
+#! Move what `rm` could not remove out of the project tree; a rename succeeds where an unlink
+#! does not, precisely because it never releases the file. Never throws for a filesystem failure
+#! — see the `rm_hpc_safe` docstring for why a throw here is worse than a leak. The catch is
+#! deliberately broad (only `InterruptException` is re-raised) because the contract is "do not
+#! throw"; the caught exception is interpolated into the warning so a genuine bug stays visible.
+function _stageResidue(path::AbstractString, rm_error)
+    if !_existsQuietly(path)
+        #! `rm` threw but left nothing behind, or the path never existed. In the latter case the
+        #! error is the one the local branch would have raised (`force=false` on a missing path),
+        #! so preserve it rather than papering over the mistake only on a cluster.
+        throw(rm_error)
     end
-    dest = path_to_dest(main_path, suffix, file_ext)
-    mkpath(dirname(dest))
-    mv(src, dest; force=force)
+    local dest
+    try
+        dest = _trashDestination(path)
+        mkpath(dirname(dest))
+        #! No `force`: `dest` is unique by construction, so `force` would only license
+        #! clobbering something staged earlier.
+        mv(path, dest)
+    catch e
+        e isa InterruptException && rethrow()
+        _warnOnce(:unremoved, """
+        Could not remove
+            $(path)
+        and could not move it out of the way either.
+            `rm` failed with:    $(rm_error)
+            staging failed with: $(e)
+        Its database rows have already been deleted, so nothing tracks this path any more —
+        remove it yourself once the filesystem allows it. Deletion continued with the remaining
+        entries rather than stopping part-way. Only the first such path in this project is
+        reported.
+        """)
+        return :unremoved
+    end
+    _warnOnce(:staged, """
+    This filesystem would not let ModelManager finish removing a path, so what was left of it was
+    moved aside rather than deleted:
+        $(path)
+     -> $(dest)
+    That is expected on a cluster: a network filesystem keeps a file alive until every node has
+    released it. The path is out of the project tree and out of the database, but whatever is
+    staged still occupies disk and quota, and none of it is a backup.
+    ModelManager retries the removal in the background at the start of every session, so this
+    normally clears itself once the jobs holding those files exit. To check or clear it now:
+        du -sh $(_trashRoot())
+        rm -rf $(_trashRoot())
+    Only the first staged path in this project is reported.
+    """)
+    return :staged
+end
+
+_trashRoot() = joinpath(dataDir(), ".trash")
+
+#! `path` is normally inside `dataDir()`, but never assume it: `rm_hpc_safe` is exported and the
+#! manual tells users to prefer it in their own cleanup code. The old mapping was
+#! `replace(path, "$(dataDir())/" => "")`, which hardcoded `/` and, for anything outside `data/`,
+#! left the string absolute — `joinpath` discards everything before an absolute component, so
+#! `dest` came back equal to `path`, the collision loop bumped it to `<path>-1`, and the "move"
+#! silently renamed the target in place and never staged it, with no error at all. Plain
+#! `relpath` is not the fix either: it yields `../..` prefixes that escape the trash, and `.` for
+#! `dataDir()` itself, which would move `data/` into its own subtree.
+function _trashDestination(path::AbstractString)
+    #! Guard before `abspath`, which turns an empty `dataDir()` into the current working
+    #! directory — staging would then quietly create `.trash` wherever Julia happens to be
+    #! running. `_stageResidue` turns this into an `:unremoved` warning naming the reason.
+    isempty(dataDir()) && error("ModelManager is not initialized for a project, so there is " *
+                                "nowhere to stage `$(path)`.")
+    p = abspath(normpath(path))
+    root = abspath(normpath(dataDir()))
+    rel = _isStrictlyUnder(p, root) ? relpath(p, root) : joinpath("_external", basename(p))
+    base = joinpath(root, ".trash", "data-$(Dates.format(now(), "yymmdd"))", rel)
+    stem, ext = splitext(base)
+    dest = base
+    #! Never overwrite: the same folder created and deleted twice on one day must not clobber its
+    #! own earlier staging. Bounded so an unstattable destination cannot spin.
+    for n in 1:1_000
+        _existsQuietly(dest) || break
+        dest = "$(stem)-$(n)$(ext)"
+    end
+    return dest
+end
+
+#! Component-wise, so it is separator-agnostic and immune to the `"/a/bc"` starts-with `"/a/b"`
+#! trap. Strict: `p == root` is false, since staging `dataDir()` itself would move it into its
+#! own subtree.
+function _isStrictlyUnder(p::AbstractString, root::AbstractString)
+    isempty(root) && return false
+    pp = splitpath(p)
+    pr = splitpath(root)
+    length(pp) > length(pr) || return false
+    return all(i -> pp[i] == pr[i], eachindex(pr))
+end
+
+#! `ispath` follows symlinks, so a dangling one reads as absent even though `rm` can and should
+#! remove it; and it throws `Base.IOError` on an unreadable parent, inside a function whose
+#! contract is not to throw. An unanswerable question is treated as "something may be there", so
+#! the outcome is a reported staging failure rather than a silent claim of success.
+function _existsQuietly(path::AbstractString)
+    try
+        return ispath(path) || islink(path)
+    catch e
+        e isa InterruptException && rethrow()
+        return true
+    end
+end
+
+#! Same latch-on-globals idiom as `_maybeShowTagHint` in src/tags.jl: once per project, cleared
+#! by `initializeModelManager`. `maxlog=1` was the zero-field option and is wrong here — it is
+#! keyed per call site for the whole Julia session, so it never re-arms for a second project, and
+#! `Test.TestLogger` gets fresh `message_limits` for every `@test_logs` block, which makes a
+#! `maxlog` warn-once indistinguishable from warn-always under test.
+function _warnOnce(kind::Symbol, msg::AbstractString)
+    kind in mm_globals().trash_notices_shown && return nothing
+    push!(mm_globals().trash_notices_shown, kind)
+    @warn msg
+    return nothing
+end
+
+#! Retry what `rm_hpc_safe` had to stage. The handles that blocked the original removal belong to
+#! jobs that have since exited, so a later attempt usually just works — this, not the staging, is
+#! what actually reclaims the space. Runs in the background task launched by
+#! `initializeModelManager` and must never take initialization down with it.
+function _sweepTrash()
+    try
+        isempty(dataDir()) && return nothing
+        trash = _trashRoot()
+        isdir(trash) || return nothing
+        #! Two days, not one: the bucket label comes from `now()` in whichever session created
+        #! it, and with the UTC-12..UTC+14 spread a bucket a concurrent session is still staging
+        #! into can be dated a day either side of our local date. Sweeping one out from under it
+        #! would turn a healthy stage into a spurious `:unremoved`. Skipping anything dated after
+        #! two days ago covers a future-dated bucket for free.
+        cutoff = today() - Day(2)
+        for entry in readdir(trash)
+            d = _trashBucketDate(entry)
+            #! Only touch buckets this package created, and only once they are old enough.
+            (isnothing(d) || d > cutoff) && continue
+            try
+                rm(joinpath(trash, entry); force=true, recursive=true)
+            catch e
+                e isa InterruptException && rethrow()
+                #! Still held open somewhere; a later session gets it.
+            end
+        end
+        #! Remove the directory itself when empty, so its absence is the signal that nothing was
+        #! left behind.
+        isempty(readdir(trash)) && rm(trash)
+    catch e
+        e isa InterruptException && rethrow()
+        #! Housekeeping must never fail an initialization.
+    end
+    return nothing
+end
+
+#! `data-YYMMDD` -> `Date`, or `nothing` for anything this package did not create. Note that
+#! `Date("260803", "yymmdd")` parses the year as 26 rather than 2026, so build it from the digit
+#! pairs instead.
+function _trashBucketDate(entry::AbstractString)
+    m = match(r"^data-(\d{2})(\d{2})(\d{2})$", entry)
+    isnothing(m) && return nothing
+    return tryparse(Date, "20$(m[1])-$(m[2])-$(m[3])")
 end
 
 #! Public despite not being exported: the manual documents it as the targeted alternative to

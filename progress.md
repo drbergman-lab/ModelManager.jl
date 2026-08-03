@@ -5,6 +5,59 @@
 
 ---
 
+## Session: rm_hpc_safe try-then-stage, warning, and sweep (2026-08-03)
+
+### Goal
+`rm_hpc_safe` never called `rm` on HPC — it renamed the target into `data/.trash/` and returned, and nothing ever emptied that directory. A cluster project had therefore never reclaimed a byte, and `resetDatabase` roughly *doubled* disk usage by relocating every output tree plus the central database. Users were never told.
+
+### What was done
+1. **Try the removal first.** The HPC branch now attempts `rm(path; force, recursive)` and only stages what survives. This is the change that actually frees space.
+2. **Protected staging.** `mkpath`/`mv` run inside a `try`; a failure warns and returns `:unremoved` with the path left in place, rather than throwing. `rm_hpc_safe` now returns `:removed`/`:staged`/`:unremoved` (previously `nothing` off HPC and `mv`'s `String` on it).
+3. **Warn once per project**, latched on a new `trash_notices_shown::Set{Symbol}` field, cleared in `initializeModelManager` alongside the tag-hint latches.
+4. **Background sweep** in the existing diagnostics task, ahead of `databaseDiagnostics`, which gained a read-only report of whatever is left.
+
+### Key decisions / gotchas
+
+**A staging area on scratch cannot work, and the reason is POSIX, not Julia.** Getting bytes off filesystem A requires unlinking from A, which is exactly what the filesystem is refusing; a same-mount rename is the only operation that relocates a file *without* unlinking it. Any cross-mount destination makes `mv` a `cp` followed by `rm(src)` — and that `rm` is the refused operation. Demonstrated with an immutable child inside a writable directory: `rm` refused, the same-mount `mv` succeeded as a pure rename, and the cross-mount sequence copied 100 000 bytes and then failed the delete, leaving the original in place. Net: 0 bytes reclaimed, consumption doubled. Two exhaustive cases and no third — if the handle is still open the trailing `rm` fails; if it has closed, a plain `rm` retry would already have succeeded, so copying first is pure waste. The version that works needs no code: put `data/` on scratch.
+
+**The residue is waiting to be retried, not relocated.** A held-open file becomes deletable once the job exits, which is what makes the startup sweep the mechanism that actually reclaims the space.
+
+**Two days, not one, for the sweep's margin.** The bucket label comes from `now()` in whichever session created it; across the UTC-12..UTC+14 spread, a bucket a concurrent session is still staging into can be dated a day on *either* side of our local date. Skipping anything dated after `today() - Day(2)` covers a future-dated bucket for free. Note `Date("260803", "yymmdd")` parses the year as 26, not 2026 — build the `Date` from digit pairs.
+
+**Gate the sweep on `isdir(".trash")`, not `run_on_hpc`.** `useHPC()` is usually called *after* `initializeModelManager`, and `.trash` only exists because of a prior HPC session, so gating on the flag would skip exactly the backlog we want cleared.
+
+**`maxlog=1` cannot implement the warn-once.** It is keyed per call site for the whole session, so it never re-arms for a second project, and `Test.TestLogger` gets fresh `message_limits` per `@test_logs` block, making it indistinguishable from warn-always under test. A globals latch is the only testable option.
+
+**Two path bugs fixed while in there**, both reachable through the public API since `rm_hpc_safe` is exported and `managing_data.md` tells users to prefer it. The old mapping `replace(path, "$(dataDir())/" => "")` hardcoded `/` and left anything outside `data/` absolute; `joinpath` discards everything before an absolute component, so `dest` came back equal to `path`, the collision loop bumped it to `<path>-1`, and the "move" **silently renamed the target in place**, reporting success. Plain `relpath` is not the fix either — it yields `../..` prefixes that escape the trash and `.` for `dataDir()` itself. Needs strict component-wise containment plus an `_external/` branch. Separately, an empty `dataDir()` made `abspath` resolve to the current working directory; caught during verification when a misconfigured scratch harness created `.trash` inside the repo worktree. Now an explicit error, surfaced as `:unremoved`.
+
+### Rejected / considered
+- **Stage first, then delete** (rename into `.trash`, `rm` the staged copy, prune empty parents). Genuinely better on interruption safety: `outputs/` is never half-deleted, so a walltime kill mid-`resetDatabase` cannot leave a DB-row-less folder that `databaseDiagnostics` reports as phantom corruption. Rejected as more machinery than the problem warranted; the IO objection raised against it does not hold, since a rename moves no bytes.
+- **`emptyTrash()` / `trashPath()`.** The startup sweep covers the automatic case and the warnings name a ready-to-run `rm -rf`. A shell `rm -rf` is also better than a Julia one here — Julia's `rm` aborts its walk on the first non-`EACCES` error.
+- **A silencer** (`setTrashWarnings!` or an env var). Every existing suppression knob guards an optional `@info` nudge; these are `@warn`s reporting that a requested deletion did not happen, and they fire at most once per project per session.
+- **A `stat().device` cross-device guard.** Unsound: APFS volume groups report identical `st_dev` for genuinely different mounts, and `stat` on a missing path returns `device == 0`. Moot once the staging root stopped being configurable.
+
+### Version-specific findings worth keeping
+- On the **1.10 LTS and 1.11**, `rm`'s recursive walk has no per-child recovery (that arrived in 1.12) — one `EACCES` child abandons every remaining child, so staged residue can be much larger there. The docs deliberately do not promise that `rm` frees everything it can before staging.
+- On **1.10/1.11** `mv` is *more* aggressive about the cross-device copy than on 1.12: `rename(src,dst;force)` ccalls `jl_fs_rename` and on any `err < 0`, with no errno inspection at all, falls back to `cp` + `rm(src)`.
+- There is **no portable strict rename**: `Base.rename` is public and throwing only on 1.12; on 1.10/1.11 the same name is the silent `cp` + `rm`, and `hasmethod` cannot tell them apart.
+
+### Tests added (4 new testsets, all passing)
+In the isolated-project band, each restoring `useHPC(false)` in a `finally` since the flag is not reset by `initializeModelManager` and a throw skips the rest of a testset body. Fault injection is root-proof — chmod tricks are ignored under root and would silently no-op — so failures are forced by `recursive=false` on a non-empty directory (`rmdir` → `ENOTEMPTY`; `force` excuses only `ENOENT`) and by a regular file where `.trash` should be, which makes `mkpath` throw.
+
+### Files changed
+- `src/deletion.jl` — `rm_hpc_safe` rewritten; `_stageResidue`, `_trashRoot`, `_trashDestination`, `_isStrictlyUnder`, `_existsQuietly`, `_warnOnce`, `_sweepTrash`, `_trashBucketDate` added; `resetDatabase` guards the central database file against `:unremoved`.
+- `src/globals.jl` — `trash_notices_shown` field + docstring bullet, reset in `initializeModelManager`, sweep launched in the diagnostics task, and the false "auto-detected" claim on `run_on_hpc` corrected.
+- `src/database.jl` — read-only trash report at the end of `databaseDiagnostics`.
+- `test/runtests.jl` — `using Dates`; four new testsets.
+- `docs/src/man/{hpc,managing_data}.md` — both described a mechanism that did not exist ("tolerates transient `unlink` failures"); rewritten, plus the same auto-detect correction in `hpc.md`.
+- `PRD.md`, `README.md`.
+
+### Open questions
+- `run_on_hpc` is the wrong predicate for "my data is on NFS": a Lustre/GPFS user pays for staging machinery they do not need, and someone on an NFS-mounted lab server who never calls `useHPC()` gets bare `rm` and hits the exact failure this absorbs. Aiming it via the SLURM flag is a compromise.
+- `.trash` was an accidental undo buffer on HPC — nothing was ever deleted there, so it held a recoverable copy of every output tree and of the central database before a `resetDatabase`. Never documented or relied on, but a real capability loss; belongs in release notes.
+
+---
+
 ## Session: docs findability pass (2026-08-01)
 
 ### Goal

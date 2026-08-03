@@ -718,6 +718,30 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
             """
         end
     end
+
+    #! Housekeeping rather than database integrity: report only when a shared filesystem left
+    #! something behind that `rm_hpc_safe` had to stage. The retry itself runs separately, before
+    #! this function — a public function named "diagnostics" must not mutate the filesystem.
+    trash = _trashRoot()
+    if isdir(trash)
+        remaining = try
+            readdir(trash)
+        catch
+            String[]
+        end
+        if !isempty(remaining)
+            @warn """
+            Some paths could not be deleted and are still staged in
+                $(trash)
+            They are what a shared filesystem would not let ModelManager remove, usually files
+            another node still had open. They still occupy disk and quota, and none of it is a
+            backup. ModelManager retries the removal at the start of every session, so this
+            normally clears itself once the jobs holding them exit. To check or clear it now:
+                du -sh $(trash)
+                rm -rf $(trash)
+            """
+        end
+    end
 end
 
 ########### Summarizing functions (generic) ###########
