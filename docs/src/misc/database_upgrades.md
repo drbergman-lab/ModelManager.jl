@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# Database upgrades
+# [Database upgrades](@id database_upgrades)
 
 As a simulator package evolves, its database schema may need to change. ModelManager provides
 a generic, milestone-based migration framework so a project database created by an older

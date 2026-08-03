@@ -124,6 +124,13 @@ end
 #! docs. See CLAUDE.md, "Docstring cross-references".
 @compat public SimulationSpec, SimulationProcess
 
+#! Public despite not being exported: PhysiCellModelManager depends on `prepareHPCCommand` at
+#! `src/simulator_interface.jl:41`, and its interface docstrings `@ref`
+#! `ModelManager.prepareTrialHierarchy` (`src/simulator_interface.jl:28`, `:192`), which cannot
+#! resolve in a downstream build that renders only our public API.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public prepareTrialHierarchy, prepareHPCCommand
+
 """
     prepareTrialHierarchy(T::AbstractTrial; kwargs...) → Bool
 

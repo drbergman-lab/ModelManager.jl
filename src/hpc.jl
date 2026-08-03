@@ -64,3 +64,11 @@ function setJobOptions(options::Dict)
         mm_globals().sbatch_options[key] = value
     end
 end
+
+#! Public despite not being exported: the manual documents it as the starting point users
+#! copy and edit to configure sbatch. See CLAUDE.md, "Docstring cross-references".
+@compat public defaultJobOptions
+
+#! Public despite not being exported: PhysiCellModelManager depends on it at `src/movie.jl:75`.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public shellCommandExists

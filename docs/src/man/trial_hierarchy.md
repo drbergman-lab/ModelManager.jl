@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# The trial hierarchy
+# [The trial hierarchy](@id trial_hierarchy)
 
 Every run that ModelManager organizes is described by one of four nested types. They form a
 strict containment hierarchy, from a single execution up to an arbitrary collection:
@@ -57,7 +57,7 @@ already been simulated does not launch new work.
 A [`Simulation`](@ref), [`Monad`](@ref), or [`Sampling`](@ref) does not store parameter
 files directly — it references **input folders** by location. [`InputFolders`](@ref)
 consolidates that reference. Which locations exist (and which are required or varied) is
-defined by the project's `inputs.toml` (see [Project configuration](@ref)).
+defined by the project's `inputs.toml` (see [Project configuration](@ref project_configuration)).
 
 ```julia
 # Keyword form — omitted locations default to "" (unused).
@@ -81,7 +81,7 @@ effect. By convention:
 
 You rarely construct a `VariationID` by hand; [`addVariations`](@ref) and
 [`createTrial`](@ref) produce them as a side effect of registering variations
-(see [Variations](@ref)).
+(see [Variations](@ref variations)).
 
 ## Building trials in practice
 
@@ -112,6 +112,6 @@ new_trial = createTrial(reference_monad, more_variations...)
 ```
 
 Once you have a trial, hand it to [`run`](@ref) to execute it — see
-[Running simulations](@ref). For the constructor-level details and helper functions
+[Running simulations](@ref running_simulations). For the constructor-level details and helper functions
 (`simulationIDs`, `constituentIDs`, `trialID`, …), see the
 [Trial hierarchy](@ref) API reference.

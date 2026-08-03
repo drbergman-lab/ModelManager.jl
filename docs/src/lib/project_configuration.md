@@ -2,20 +2,12 @@
 CollapsedDocStrings = true
 ```
 
-# Project configuration & locations
+# [Project configuration & locations](@id project_configuration_lib)
 
 `inputs.toml` parsing, `ProjectLocations`, and location-path helpers.
 
-## Public API
 ```@autodocs
 Modules = [ModelManager]
 Pages = ["project_configuration.jl"]
 Private = false
-```
-
-## Private API
-```@autodocs
-Modules = [ModelManager]
-Pages = ["project_configuration.jl"]
-Public = false
 ```

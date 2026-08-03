@@ -1,4 +1,8 @@
-# Tagging and recovering simulations
+```@meta
+CurrentModule = ModelManager
+```
+
+# [Tagging and recovering simulations](@id tagging)
 
 Finding simulations by ID is not a robust way to find your own work later. A script that records
 `[41, 42, 43]` is correct exactly once; add replicates, regenerate the sweep, or come back
@@ -249,7 +253,7 @@ strings known at creation or curation time.
 
 **Computed** outcomes (final population, time to extinction, fit residual) belong in the
 post-processing sink instead, via `run(T; post_processor = f)`; see
-[Running simulations](running_simulations.md). That store has typed, numeric columns and
+[Post-processing and quantities of interest](@ref post_processing). That store has typed, numeric columns and
 supports range queries, which tags do not.
 
 Both are keyed by `simulation_id`, so a recovery query can use them together:

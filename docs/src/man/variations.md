@@ -2,11 +2,11 @@
 CurrentModule = ModelManager
 ```
 
-# Variations
+# [Variations](@id variations)
 
 A **variation** describes how to change one or more model parameters away from their base
 value. Variations are the unit of parameterization in ModelManager: you attach them to a set
-of [`InputFolders`](@ref), and the framework expands them into [monads](@ref "The trial hierarchy"),
+of [`InputFolders`](@ref), and the framework expands them into [monads](@ref trial_hierarchy),
 records them in the per-folder variations databases, and assigns each combination a
 [`VariationID`](@ref).
 
@@ -32,7 +32,7 @@ written into the file is the backend's concern.
     convenience constructors that take a plain vector if it wants that ergonomics.
 
 !!! note "location is explicit"
-    Every variation needs a `location` (the [project location](@ref "Project configuration") the
+    Every variation needs a `location` (the [project location](@ref project_configuration) the
     target lives in, e.g. `:config`). ModelManager requires it explicitly. Backends often add
     convenience constructors that infer the location from the path — but at this layer you
     pass it yourself.
@@ -116,13 +116,13 @@ lv = LatentVariation(
 ```
 
 When you provide `inverse_maps` (required for distribution-based latents used in calibration),
-the constructor runs a round-trip check ([`_validateInverseMaps`](@ref)) to confirm they are
+the constructor runs a round-trip check (`_validateInverseMaps`) to confirm they are
 consistent with the forward maps.
 
 ## Applying variations
 
 You normally hand variations to [`createTrial`](@ref) / [`run`](@ref), which call
-[`addVariations`](@ref) for you (see [The trial hierarchy](@ref) and [Running simulations](@ref)):
+[`addVariations`](@ref) for you (see [The trial hierarchy](@ref trial_hierarchy) and [Running simulations](@ref running_simulations)):
 
 ```julia
 output = run(inputs, dv1, dv2; n_replicates=3)
@@ -131,6 +131,6 @@ output = run(inputs, dv1, dv2; n_replicates=3)
 `addVariations` writes the variation rows into each varied location's variations database and
 returns the resulting [`VariationID`](@ref)s. How those combinations are generated — full
 grid versus a space-filling design — is controlled by the *method* argument, covered next in
-[Space-filling designs](@ref).
+[Space-filling designs](@ref space_filling).
 
-See the [Variations](@ref) API reference for every type and helper.
+See the [Variations & designs](@ref variations_lib) API reference for every type and helper.

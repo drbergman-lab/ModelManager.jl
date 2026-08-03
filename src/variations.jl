@@ -1673,3 +1673,12 @@ function recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{
         end
     end
 end
+
+#! Public despite not being exported: `addVariations` is the documented way to attach
+#! variations to a trial, `AddVariationMethod` is the design argument it takes, and
+#! `AddVariationsResult` is what it hands back. See CLAUDE.md, "Docstring cross-references".
+@compat public addVariations, AddVariationMethod, AddVariationsResult
+
+#! Public despite not being exported: PhysiCellModelManager depends on both from its own `src/variations.jl`
+#! and `src/up.jl`. See CLAUDE.md, "Docstring cross-references".
+@compat public defaultLatentParameterNames, validateParsBytes

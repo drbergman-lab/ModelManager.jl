@@ -2,7 +2,7 @@
 CurrentModule = ModelManager
 ```
 
-# Project configuration
+# [Project configuration](@id project_configuration)
 
 A ModelManager project is rooted at a **data directory** (`data/`). Everything about a
 project — which input categories exist, where their folders live, the database — is derived
@@ -65,7 +65,7 @@ Each location table supports these keys:
 | `required` | Whether every simulation must supply a folder for this location. |
 | `varied` | Whether the location supports parameter variations. A `Bool`, or a `Vector{Bool}` (one per basename) for multi-file locations. |
 | `basename` | The primary input file(s) inside each folder. Required when `varied` is true. May be a `Vector` to allow alternative file names. |
-| `path_from_inputs` | Optional relative path from `inputs/` to the location's folders. Defaults to the pluralized location name (e.g. `config` → `configs/`). Path elements are validated by [`sanitizePathElement`](@ref). |
+| `path_from_inputs` | Optional relative path from `inputs/` to the location's folders. Defaults to the pluralized location name (e.g. `config` → `configs/`). Path elements are validated: they may not be absolute, escape the project with `..`, or contain a path separator. |
 
 `inputs.toml` is parsed by [`parseProjectInputsConfigurationFile`](@ref), which validates the
 keys and stores the result in the project globals.
@@ -105,4 +105,4 @@ its symbol. These keep the schema and folder layout consistent:
 | [`locationFolder`](@ref) | `"configs"` |
 
 Backends and advanced users generally rely on these rather than hard-coding column or table
-names. See the [Project configuration](@ref) API reference for the full list.
+names. See the [Project configuration & locations](@ref project_configuration_lib) API reference for the full list.

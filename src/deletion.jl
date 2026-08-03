@@ -378,3 +378,7 @@ function rm_hpc_safe(path::String; force::Bool=false, recursive::Bool=false)
     mkpath(dirname(dest))
     mv(src, dest; force=force)
 end
+
+#! Public despite not being exported: the manual documents it as the targeted alternative to
+#! a full `resetDatabase`. See CLAUDE.md, "Docstring cross-references".
+@compat public resetFolder

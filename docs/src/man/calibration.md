@@ -85,7 +85,7 @@ making progress:
   the remaining allowance, so the run never evaluates more than `max_evaluations` simulations
   (the final generation may hold fewer than `population_size` particles).
 
-### Perturbation kernels
+### [Perturbation kernels](@id perturbation_kernels)
 
 Between generations, resampled particles are perturbed by a kernel. Choose one based on how
 the posterior is shaped:
@@ -111,8 +111,8 @@ result = runCalibration(problem, method)
 
 `progress` controls console output: `:auto` (a live progress bar on a TTY, generation logs
 otherwise), `:none`, `:generation`, `:batch`, or `:bar`. Particle evaluations run through the
-ordinary [parallel runner](@ref "Running simulations"), so calibration benefits from
-[`setNumberOfParallelSims`](@ref) and [HPC](@ref "HPC support") just like any other trial.
+ordinary [parallel runner](@ref running_simulations), so calibration benefits from
+[`setNumberOfParallelSims`](@ref) and [HPC](@ref hpc) just like any other trial.
 
 Simulations can and do fail mid-run; calibration treats that as an expected outcome rather than
 an error. See [When things go wrong](@ref calibration_troubleshooting) for what gets recorded and
@@ -148,7 +148,7 @@ under a [`Calibration`](@ref) record in the database, so an interrupted run can 
 result = resumeABC(Calibration(calibration_id))   # no need to re-supply the problem
 ```
 
-## Visualizing
+## [Visualizing calibration results](@id abc_plots)
 
 When a plotting backend is loaded, [RecipesBase](https://github.com/JuliaPlots/RecipesBase.jl)
 recipes turn an [`ABCResult`](@ref) or [`Calibration`](@ref) into standard diagnostics:
@@ -241,7 +241,7 @@ curves are the ABC-SMC analog of a flat MCMC chain).
   `epsilon_quantile` toward 1, or supply a gentler `epsilon_schedule`. Set `min_acceptance_rate`
   to stop automatically instead of grinding.
 - **ESS far below `population_size`** — a few particles carry all the weight. Try a different
-  [perturbation kernel](@ref "Perturbation kernels") (`ComponentwiseKernel` in higher dimensions,
+  [perturbation kernel](@ref perturbation_kernels) (`ComponentwiseKernel` in higher dimensions,
   `LocalNNCovKernel` for anisotropic posteriors) and set `min_ess_fraction`.
 - **ε stops decreasing** — you are at the noise floor of the model or the summary statistic.
   Raise `n_replicates`, or set `min_epsilon_decrease` to stop there.
