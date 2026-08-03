@@ -63,7 +63,10 @@ printSimulationsTable(; sink=CSV.write("all_simulations.csv"))
 ```
 
 Any function of one `DataFrame` works as a sink, so this is also the hook for writing
-Arrow, Parquet, or your own formatter.
+Arrow, Parquet, or your own formatter. Note that `CSV.write(path)` — one positional
+argument, no table — is not a completed write: it is CSV.jl's curried form, returning the
+one-argument function that `sink` expects. Sinks that do not curry need wrapping yourself,
+as in `sink = df -> myWriter(path, df)`.
 
 ## Adding outcomes and intent
 
