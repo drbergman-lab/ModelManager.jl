@@ -44,6 +44,8 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
   [`rm_hpc_safe`](@ref) issues when a shared filesystem forces it to stage a path in
   `data/.trash/` instead of removing it (`:staged`). The `:unremoved` case — where it can do
   neither — is deliberately not latched, since each occurrence names a different leaked path.
+- `last_trash_sweep::String`: `yymmdd` stamp of the day `data/.trash/` was last swept, so a
+  session that outlives a single day re-sweeps instead of relying on the one at startup.
 """
 @with_kw mutable struct ModelManagerGlobals
     initialized::Bool = false
@@ -69,6 +71,7 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
     tag_hint_shown::Bool = false
     tag_recovery_hint_shown::Bool = false
     trash_notices_shown::Set{Symbol} = Set{Symbol}()
+    last_trash_sweep::String = ""
 end
 
 """
@@ -212,6 +215,7 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().tag_hint_shown = false
     mm_globals().tag_recovery_hint_shown = false
     empty!(mm_globals().trash_notices_shown)
+    mm_globals().last_trash_sweep = ""
 
     try
         mm_globals().db = SQLite.DB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))

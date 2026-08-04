@@ -3265,6 +3265,31 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 end
             end
 
+            # A session outliving a single day must re-sweep: the startup sweep fires once, and a
+            # week-long driver script would otherwise stage into a new bucket every day while
+            # nothing ever retried the earlier ones.
+            rm(trash; force=true, recursive=true)
+            stale = joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(4)))")
+            mkpath(stale); write(joinpath(stale, "f.txt"), "x")
+            ModelManager.mm_globals().last_trash_sweep = stamp(Dates.today() - Dates.Day(1))
+            try
+                useHPC(true)
+                d = joinpath(ModelManager.dataDir(), "rollover"); mkpath(d)
+                write(joinpath(d, "f.txt"), "x")
+                @test rm_hpc_safe(d; force=true, recursive=false) == :staged
+                @test !ispath(stale)              # the day rolled over ⇒ swept mid-session
+                @test ModelManager.mm_globals().last_trash_sweep == stamp(Dates.today())
+
+                # ...and not again on the same day: a second staging leaves a fresh old bucket be.
+                mkpath(stale); write(joinpath(stale, "f.txt"), "x")
+                d2 = joinpath(ModelManager.dataDir(), "rollover2"); mkpath(d2)
+                write(joinpath(d2, "f.txt"), "x")
+                @test rm_hpc_safe(d2; force=true, recursive=false) == :staged
+                @test isdir(stale)
+            finally
+                useHPC(false)
+            end
+
             # With the trash gone, the sweep removes the directory itself and the report is silent.
             rm(trash; force=true, recursive=true)
             mkpath(joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(3)))"))

@@ -339,6 +339,7 @@ target location's file type.
 - Returns `:removed`, `:staged`, or `:unremoved`. In HPC mode a filesystem failure is warned about, not thrown: callers delete the matching database rows first, and most call it in a loop, so an exception would abandon a bulk deletion. A missing path with `force=false` still throws, as `rm` does.
 - The `:staged` warning fires at most once per project per session, latched on `ModelManagerGlobals.trash_notices_shown` and cleared by `initializeModelManager`. The `:unremoved` warning is not latched: each occurrence names a different leaked, untracked path and is the only record of it that will ever exist.
 - `initializeModelManager` retries the removal of staged paths in the background, ahead of `databaseDiagnostics`, which then reports whatever is still there. The sweep only touches top-level `data-YYMMDD` buckets dated more than two days ago — a margin wide enough that no concurrent session, in any timezone, can still be staging into one.
+- Staging also re-sweeps when the calendar day rolls over, at most once per day, so a session that outlives a single day does not accumulate buckets that nothing retries until the next startup.
 - Staging cannot be redirected to another filesystem: a cross-mount move is a copy followed by a delete of the source, and that delete is the refused operation. Put `data/` on scratch instead.
 
 **Acceptance criteria:**

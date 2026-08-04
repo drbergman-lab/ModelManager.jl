@@ -50,6 +50,13 @@ Three comments; two were real defects, one was a false positive.
 
 **Rejected — "the docstring example escapes `$`, so it prints literal text instead of interpolating."** Backwards. The `\$` in the source is what makes the *rendered* docstring contain a live `$(...)`; a bare `$` would interpolate at docstring-definition time, calling `dataDir()` at load. Verified with `@doc rm_hpc_safe`, which renders `@info "still on disk under $(joinpath(dataDir(), \".trash\"))"` — exactly the copy-pasteable code intended.
 
+### Review follow-up: a session that outlives the startup sweep
+The sweep fired exactly once, from `initializeModelManager`. A driver script running for a week on a cluster would sweep on day one and never again, staging into a fresh `data-YYMMDD` bucket each day while nothing retried the earlier ones — even though the jobs holding those files had long since exited and a retry would have succeeded. Worst on the 1.10/1.11 LTS, where `rm`'s walk aborts on the first `EACCES` and a bucket can hold a whole output tree rather than a few stubs.
+
+Staging now re-sweeps when the day rolls over, keyed on a `last_trash_sweep::String` (`yymmdd`) field. At most once a day, on a path that is already exceptional, so the cost is a `readdir` of a directory with a handful of entries. The stamp is set *before* the work and only once past the `isdir` check — before, so a sweep that cannot finish is not retried on every subsequent staging; only past the check, so a `.trash` created later the same day still gets its first sweep.
+
+The two-day window itself was left alone: it guards against a *concurrent* session writing into a bucket, which is independent of how long any one session runs. A six-day-old bucket cannot be receiving writes, since bucket names are stamped at write time.
+
 ### Review follow-up: the collision-suffix cap
 The staging-destination search was `for n in 1:1_000`, which was wrong twice over. It did not fail safe: on hitting the cap it returned `"$(stem)-1000$(ext)"` *without testing it*, so the 1000th collision handed back a possibly-taken path (caught downstream only because the `mv` carries no `force`, degrading to `:unremoved`). And the cap was guarding the wrong thing — the hang it prevented came from `_existsQuietly` reading an unanswerable check as "taken", not from legitimate collisions being numerous.
 

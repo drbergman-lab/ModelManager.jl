@@ -434,6 +434,7 @@ function _stageResidue(path::AbstractString, rm_error)
         #! so preserve it rather than papering over the mistake only on a cluster.
         throw(rm_error)
     end
+    _maybeSweepTrash()
     local dest
     try
         dest = _trashDestination(path)
@@ -556,11 +557,32 @@ end
 #! jobs that have since exited, so a later attempt usually just works — this, not the staging, is
 #! what actually reclaims the space. Runs in the background task launched by
 #! `initializeModelManager` and must never take initialization down with it.
+#! The startup sweep fires once, but a session can outlive a day — a driver script on a cluster
+#! may run for a week, staging into a fresh `data-YYMMDD` bucket each day while nothing ever
+#! retries the earlier ones, even though the jobs holding those files have long since exited.
+#! Re-sweep when the day rolls over, keyed off the same stamp the bucket names use. At most once
+#! a day, on a path that is already exceptional, so the cost is a `readdir` of a directory with a
+#! handful of entries.
+function _maybeSweepTrash()
+    try
+        mm_globals().last_trash_sweep == Dates.format(now(), "yymmdd") && return nothing
+        _sweepTrash()
+    catch e
+        e isa InterruptException && rethrow()
+        #! Housekeeping must never fail the deletion it is riding along with.
+    end
+    return nothing
+end
+
 function _sweepTrash()
     try
         isempty(dataDir()) && return nothing
         trash = _trashRoot()
         isdir(trash) || return nothing
+        #! Stamp before the work, not after: a sweep that cannot finish must not be retried on
+        #! every subsequent staging. Set only once past the checks above, so that a `.trash`
+        #! created later the same day still gets its first sweep.
+        mm_globals().last_trash_sweep = Dates.format(now(), "yymmdd")
         #! Two days, not one: the bucket label comes from `now()` in whichever session created
         #! it, and with the UTC-12..UTC+14 spread a bucket a concurrent session is still staging
         #! into can be dated a day either side of our local date. Sweeping one out from under it
