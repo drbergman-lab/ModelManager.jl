@@ -40,10 +40,10 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
   [`setTagHints!`](@ref).
 - `tag_hint_shown::Bool`, `tag_recovery_hint_shown::Bool`: Once-per-session latches
   for those hints.
-- `trash_notices_shown::Set{Symbol}`: Once-per-project latches for the warnings
+- `trash_staged_warning_shown::Bool`: Once-per-project latch for the warning
   [`rm_hpc_safe`](@ref) issues when a shared filesystem forces it to stage a path in
-  `data/.trash/` instead of removing it (`:staged`). The `:unremoved` case — where it can do
-  neither — is deliberately not latched, since each occurrence names a different leaked path.
+  `data/.trash/` instead of removing it. Its `:unremoved` case — where it can do neither — is
+  deliberately not latched, since each occurrence names a different leaked path.
 - `last_trash_sweep::String`: `yymmdd` stamp of the day `data/.trash/` was last swept, so a
   session that outlives a single day re-sweeps instead of relying on the one at startup.
 """
@@ -70,7 +70,7 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
     tag_hints::Bool = true
     tag_hint_shown::Bool = false
     tag_recovery_hint_shown::Bool = false
-    trash_notices_shown::Set{Symbol} = Set{Symbol}()
+    trash_staged_warning_shown::Bool = false
     last_trash_sweep::String = ""
 end
 
@@ -214,7 +214,7 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().provenance_id = nothing
     mm_globals().tag_hint_shown = false
     mm_globals().tag_recovery_hint_shown = false
-    empty!(mm_globals().trash_notices_shown)
+    mm_globals().trash_staged_warning_shown = false
     mm_globals().last_trash_sweep = ""
 
     try

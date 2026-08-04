@@ -13,7 +13,7 @@
 ### What was done
 1. **Try the removal first.** The HPC branch now attempts `rm(path; force, recursive)` and only stages what survives. This is the change that actually frees space.
 2. **Protected staging.** `mkpath`/`mv` run inside a `try`; a failure warns and returns `:unremoved` with the path left in place, rather than throwing. `rm_hpc_safe` now returns `:removed`/`:staged`/`:unremoved` (previously `nothing` off HPC and `mv`'s `String` on it).
-3. **Warn once per project** for the routine `:staged` case, latched on a new `trash_notices_shown::Set{Symbol}` field, cleared in `initializeModelManager` alongside the tag-hint latches. `:unremoved` is not latched — see the Copilot review notes below.
+3. **Warn once per project** for the routine `:staged` case, latched on a new `trash_staged_warning_shown::Bool` field, cleared in `initializeModelManager` alongside the tag-hint latches. `:unremoved` is not latched — see the Copilot review notes below. (The field started as a `Set{Symbol}` keyed by warning kind; once `:unremoved` stopped being latched it could only ever hold one value, so it collapsed to a `Bool` matching the two sibling tag latches.)
 4. **Background sweep** in the existing diagnostics task, ahead of `databaseDiagnostics`, which gained a read-only report of whatever is left.
 
 ### Key decisions / gotchas
@@ -68,8 +68,8 @@ Worth noting for anyone worried about the scan being linear: a collision require
 In the isolated-project band, each restoring `useHPC(false)` in a `finally` since the flag is not reset by `initializeModelManager` and a throw skips the rest of a testset body. Fault injection is root-proof — chmod tricks are ignored under root and would silently no-op — so failures are forced by `recursive=false` on a non-empty directory (`rmdir` → `ENOTEMPTY`; `force` excuses only `ENOENT`) and by a regular file where `.trash` should be, which makes `mkpath` throw.
 
 ### Files changed
-- `src/deletion.jl` — `rm_hpc_safe` rewritten; `_stageResidue`, `_trashRoot`, `_trashDestination`, `_isStrictlyUnder`, `_existsQuietly`, `_warnOnce`, `_sweepTrash`, `_trashBucketDate` added; `resetDatabase` guards the central database file against `:unremoved`.
-- `src/globals.jl` — `trash_notices_shown` field + docstring bullet, reset in `initializeModelManager`, sweep launched in the diagnostics task, and the false "auto-detected" claim on `run_on_hpc` corrected.
+- `src/deletion.jl` — `rm_hpc_safe` rewritten; `_stageResidue`, `_trashRoot`, `_trashDestination`, `_isStrictlyUnder`, `_existsQuietly`, `_warnStagedOnce`, `_sweepTrash`, `_maybeSweepTrash`, `_trashBucketDate` added; `resetDatabase` guards the central database file against `:unremoved`.
+- `src/globals.jl` — `trash_staged_warning_shown` and `last_trash_sweep` fields + docstring bullets, reset in `initializeModelManager`, sweep launched in the diagnostics task, and the false "auto-detected" claim on `run_on_hpc` corrected.
 - `src/database.jl` — read-only trash report at the end of `databaseDiagnostics`.
 - `test/runtests.jl` — `using Dates`; four new testsets.
 - `docs/src/man/{hpc,managing_data}.md` — both described a mechanism that did not exist ("tolerates transient `unlink` failures"); rewritten, plus the same auto-detect correction in `hpc.md`.

@@ -463,7 +463,7 @@ function _stageResidue(path::AbstractString, rm_error)
         """
         return :unremoved
     end
-    _warnOnce(:staged, """
+    _warnStagedOnce("""
     This filesystem would not let ModelManager finish removing a path, so what was left of it was
     moved aside rather than deleted:
         $(path)
@@ -546,9 +546,10 @@ end
 #! keyed per call site for the whole Julia session, so it never re-arms for a second project, and
 #! `Test.TestLogger` gets fresh `message_limits` for every `@test_logs` block, which makes a
 #! `maxlog` warn-once indistinguishable from warn-always under test.
-function _warnOnce(kind::Symbol, msg::AbstractString)
-    kind in mm_globals().trash_notices_shown && return nothing
-    push!(mm_globals().trash_notices_shown, kind)
+function _warnStagedOnce(msg::AbstractString)
+    g = mm_globals()
+    g.trash_staged_warning_shown && return nothing
+    g.trash_staged_warning_shown = true
     @warn msg
     return nothing
 end
