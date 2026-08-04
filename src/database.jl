@@ -726,10 +726,21 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     if isdir(trash)
         remaining = try
             readdir(trash)
-        catch
-            String[]
+        catch e
+            e isa InterruptException && rethrow()
+            missing
         end
-        if !isempty(remaining)
+        if ismissing(remaining)
+            #! Unreadable is not the same as empty. Staying silent here would report a clear
+            #! disk on the strength of a question we could not answer.
+            @warn """
+            Could not read the staging directory
+                $(trash)
+            It exists, so paths may still be staged there and occupying disk and quota, but
+            ModelManager could not inspect it to say. Check it yourself:
+                du -sh $(trash)
+            """
+        elseif !isempty(remaining)
             @warn """
             Some paths could not be deleted and are still staged in
                 $(trash)

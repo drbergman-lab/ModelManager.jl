@@ -42,7 +42,8 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
   for those hints.
 - `trash_notices_shown::Set{Symbol}`: Once-per-project latches for the warnings
   [`rm_hpc_safe`](@ref) issues when a shared filesystem forces it to stage a path in
-  `data/.trash/` instead of removing it (`:staged`), or when it can do neither (`:unremoved`).
+  `data/.trash/` instead of removing it (`:staged`). The `:unremoved` case — where it can do
+  neither — is deliberately not latched, since each occurrence names a different leaked path.
 """
 @with_kw mutable struct ModelManagerGlobals
     initialized::Bool = false

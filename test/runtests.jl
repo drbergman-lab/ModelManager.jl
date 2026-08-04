@@ -3198,6 +3198,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 end
                 @test res == :unremoved
                 @test isfile(joinpath(d, "f.txt"))    # left exactly where it was
+
+                # Unlike :staged, this one is NOT latched: every occurrence names a different
+                # leaked path and is the only record of it that will ever exist. Latching it
+                # would also leave resetDatabase's error citing a warning that never printed.
+                d2 = joinpath(ModelManager.dataDir(), "stuck2"); mkpath(d2)
+                write(joinpath(d2, "f.txt"), "x")
+                @test_logs (:warn, r"could not move it out of the way") match_mode=:any begin
+                    @test rm_hpc_safe(d2; force=true, recursive=false) == :unremoved
+                end
             finally
                 useHPC(false)
             end
@@ -3230,6 +3239,21 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
             # Anything left behind is reported, once, by the diagnostics pass.
             @test_logs (:warn, r"still staged in") match_mode=:any ModelManager.databaseDiagnostics()
+
+            # An unreadable staging directory must not be reported as an empty one — silence
+            # there would claim a clear disk on the strength of a question we could not answer.
+            if !iszero(parse(Int, readchomp(`id -u`)))   # permission bits are ignored under root
+                rm(trash; force=true, recursive=true)
+                mkpath(joinpath(trash, "data-000101"))
+                chmod(trash, 0o000)
+                try
+                    @test_logs (:warn, r"Could not read the staging directory") match_mode=:any begin
+                        ModelManager.databaseDiagnostics()
+                    end
+                finally
+                    chmod(trash, 0o700)
+                end
+            end
 
             # With the trash gone, the sweep removes the directory itself and the report is silent.
             rm(trash; force=true, recursive=true)

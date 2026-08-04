@@ -443,7 +443,14 @@ function _stageResidue(path::AbstractString, rm_error)
         mv(path, dest)
     catch e
         e isa InterruptException && rethrow()
-        _warnOnce(:unremoved, """
+        #! Deliberately NOT latched, unlike `:staged`. Every occurrence names a different path
+        #! that is now leaked and untracked, and this warning is the only record that will ever
+        #! exist of it — reporting just the first would silently lose the rest. It is also what
+        #! `resetDatabase` points the user at, so suppressing it would leave that error citing a
+        #! warning that was never printed. The routine, once-per-simulation case is `:staged`;
+        #! reaching here needs both the removal and the rename to fail, which is a broken
+        #! filesystem rather than a busy one, and then the noise is proportionate.
+        @warn """
         Could not remove
             $(path)
         and could not move it out of the way either.
@@ -451,9 +458,8 @@ function _stageResidue(path::AbstractString, rm_error)
             staging failed with: $(e)
         Its database rows have already been deleted, so nothing tracks this path any more —
         remove it yourself once the filesystem allows it. Deletion continued with the remaining
-        entries rather than stopping part-way. Only the first such path in this project is
-        reported.
-        """)
+        entries rather than stopping part-way.
+        """
         return :unremoved
     end
     _warnOnce(:staged, """

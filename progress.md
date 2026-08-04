@@ -13,7 +13,7 @@
 ### What was done
 1. **Try the removal first.** The HPC branch now attempts `rm(path; force, recursive)` and only stages what survives. This is the change that actually frees space.
 2. **Protected staging.** `mkpath`/`mv` run inside a `try`; a failure warns and returns `:unremoved` with the path left in place, rather than throwing. `rm_hpc_safe` now returns `:removed`/`:staged`/`:unremoved` (previously `nothing` off HPC and `mv`'s `String` on it).
-3. **Warn once per project**, latched on a new `trash_notices_shown::Set{Symbol}` field, cleared in `initializeModelManager` alongside the tag-hint latches.
+3. **Warn once per project** for the routine `:staged` case, latched on a new `trash_notices_shown::Set{Symbol}` field, cleared in `initializeModelManager` alongside the tag-hint latches. `:unremoved` is not latched — see the Copilot review notes below.
 4. **Background sweep** in the existing diagnostics task, ahead of `databaseDiagnostics`, which gained a read-only report of whatever is left.
 
 ### Key decisions / gotchas
@@ -40,6 +40,15 @@
 - On the **1.10 LTS and 1.11**, `rm`'s recursive walk has no per-child recovery (that arrived in 1.12) — one `EACCES` child abandons every remaining child, so staged residue can be much larger there. The docs deliberately do not promise that `rm` frees everything it can before staging.
 - On **1.10/1.11** `mv` is *more* aggressive about the cross-device copy than on 1.12: `rename(src,dst;force)` ccalls `jl_fs_rename` and on any `err < 0`, with no errno inspection at all, falls back to `cp` + `rm(src)`.
 - There is **no portable strict rename**: `Base.rename` is public and throwing only on 1.12; on 1.10/1.11 the same name is the silent `cp` + `rm`, and `hasmethod` cannot tell them apart.
+
+### Copilot review on PR #26
+Three comments; two were real defects, one was a false positive.
+
+**Accepted — `resetDatabase`'s error cited a warning the latch could suppress.** It says "The warning above names the underlying filesystem error", but `:unremoved` was latched per project, so an earlier failed deletion in the same session would swallow the warning and leave the user an error with no errno anywhere in the logs. Fixed by **not latching `:unremoved` at all**. That is the better semantics on its own merits: every occurrence names a *different* leaked, untracked path, and the warning is the only record of it that will ever exist, so reporting only the first silently loses the rest. The noise argument that justified the latch applies to `:staged`, which fires once per simulation on a merely busy filesystem; reaching `:unremoved` needs both the removal *and* the rename to fail, which is a broken filesystem rather than a busy one, and then loud is proportionate.
+
+**Accepted — `databaseDiagnostics` treated an unreadable `.trash` as an empty one.** The `catch` around `readdir` returned `String[]`, so a permissions failure produced silence, telling the user their disk was clear on the strength of a question we could not answer. Now distinguishes the two and warns that the directory exists but could not be inspected. Tested, guarded by a uid check since permission bits are ignored under root.
+
+**Rejected — "the docstring example escapes `$`, so it prints literal text instead of interpolating."** Backwards. The `\$` in the source is what makes the *rendered* docstring contain a live `$(...)`; a bare `$` would interpolate at docstring-definition time, calling `dataDir()` at load. Verified with `@doc rm_hpc_safe`, which renders `@info "still on disk under $(joinpath(dataDir(), \".trash\"))"` — exactly the copy-pasteable code intended.
 
 ### Tests added (4 new testsets, all passing)
 In the isolated-project band, each restoring `useHPC(false)` in a `finally` since the flag is not reset by `initializeModelManager` and a throw skips the rest of a testset body. Fault injection is root-proof — chmod tricks are ignored under root and would silently no-op — so failures are forced by `recursive=false` on a non-empty directory (`rmdir` → `ENOTEMPTY`; `force` excuses only `ENOENT`) and by a regular file where `.trash` should be, which makes `mkpath` throw.
