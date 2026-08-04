@@ -3160,6 +3160,16 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 mkpath(d); write(joinpath(d, "held.dat"), "second")
                 @test rm_hpc_safe(d; force=true, recursive=false) == :staged
                 @test isdir("$(staged)-1")
+                @test read(joinpath(staged, "held.dat"), String) == "x"        # first survived
+                @test read(joinpath("$(staged)-1", "held.dat"), String) == "second"
+
+                # The suffix search is unbounded: it must keep finding free names well past any
+                # round number, and must never hand back a name that is already taken.
+                for i in 2:12
+                    mkpath(d); write(joinpath(d, "held.dat"), "n$(i)")
+                    @test rm_hpc_safe(d; force=true, recursive=false) == :staged
+                    @test read(joinpath("$(staged)-$(i)", "held.dat"), String) == "n$(i)"
+                end
 
                 # A path outside data/ is staged under _external/ — regression test for the old
                 # mapping, which left such a path absolute, so `joinpath` discarded the trash

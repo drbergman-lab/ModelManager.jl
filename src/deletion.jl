@@ -502,9 +502,15 @@ function _trashDestination(path::AbstractString)
     stem, ext = splitext(base)
     dest = base
     #! Never overwrite: the same folder created and deleted twice on one day must not clobber its
-    #! own earlier staging. Bounded so an unstattable destination cannot spin.
-    for n in 1:1_000
-        _existsQuietly(dest) || break
+    #! own earlier staging. Unbounded on purpose — a cap does not fail safe here, it hands back
+    #! the last candidate without testing it once it is hit. Termination comes from the check
+    #! instead: each iteration tests a distinct path and a filesystem holds finitely many. Note
+    #! this is a strict `ispath`, not `_existsQuietly` — an unanswerable check must abort the
+    #! search rather than read as "taken", which is the only thing that could spin. The throw
+    #! reaches `_stageResidue` and is reported as `:unremoved` with the real error.
+    n = 0
+    while ispath(dest) || islink(dest)
+        n += 1
         dest = "$(stem)-$(n)$(ext)"
     end
     return dest

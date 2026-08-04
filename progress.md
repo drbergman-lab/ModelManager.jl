@@ -50,6 +50,13 @@ Three comments; two were real defects, one was a false positive.
 
 **Rejected — "the docstring example escapes `$`, so it prints literal text instead of interpolating."** Backwards. The `\$` in the source is what makes the *rendered* docstring contain a live `$(...)`; a bare `$` would interpolate at docstring-definition time, calling `dataDir()` at load. Verified with `@doc rm_hpc_safe`, which renders `@info "still on disk under $(joinpath(dataDir(), \".trash\"))"` — exactly the copy-pasteable code intended.
 
+### Review follow-up: the collision-suffix cap
+The staging-destination search was `for n in 1:1_000`, which was wrong twice over. It did not fail safe: on hitting the cap it returned `"$(stem)-1000$(ext)"` *without testing it*, so the 1000th collision handed back a possibly-taken path (caught downstream only because the `mv` carries no `force`, degrading to `:unremoved`). And the cap was guarding the wrong thing — the hang it prevented came from `_existsQuietly` reading an unanswerable check as "taken", not from legitimate collisions being numerous.
+
+Now unbounded, with a strict `ispath`/`islink` in the loop instead. Termination comes from the check: each iteration tests a distinct path and a filesystem holds finitely many, while an `EACCES` throws (verified: `ispath` under a `chmod 000` parent raises `IOError` code -13) and is reported as `:unremoved` with the real error. `_existsQuietly` is still right for the *residue* check in `_stageResidue`, where "cannot tell" should conservatively mean "something may be there" — the two call sites want opposite behavior on an unanswerable question, deliberately.
+
+Worth noting for anyone worried about the scan being linear: a collision requires the same path to have a *failed* removal twice in the same day. Ordinary high-volume create/delete traffic returns `:removed` and never touches `.trash` at all.
+
 ### Tests added (4 new testsets, all passing)
 In the isolated-project band, each restoring `useHPC(false)` in a `finally` since the flag is not reset by `initializeModelManager` and a throw skips the rest of a testset body. Fault injection is root-proof — chmod tricks are ignored under root and would silently no-op — so failures are forced by `recursive=false` on a non-empty directory (`rmdir` → `ENOTEMPTY`; `force` excuses only `ENOENT`) and by a regular file where `.trash` should be, which makes `mkpath` throw.
 
