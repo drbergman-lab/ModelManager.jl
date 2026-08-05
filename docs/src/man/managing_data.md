@@ -72,8 +72,8 @@ in — into `data/.trash/`, and returns `:removed`, `:staged`, or `:unremoved` t
 happened. A failure is reported rather than thrown, so one stubborn folder cannot abandon a bulk
 deletion after its database rows are already gone.
 
-Staged paths **still occupy disk and quota**; `data/.trash/` is a staging area, not a backup, and
-nothing there is recoverable by design. ModelManager retries the removal in the background each
+Staged paths **still occupy disk and quota** — they are out of `outputs/` and out of the database,
+but they have not been deleted. ModelManager retries the removal in the background each
 time [`initializeModelManager`](@ref) runs, so it normally empties itself once the jobs holding
 those files exit. To reclaim it now, delete the directory from a shell. If you write your own
 cleanup code in a workflow on a cluster, prefer `rm_hpc_safe` for the same reason (see

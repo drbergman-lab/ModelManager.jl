@@ -386,8 +386,8 @@ Returns:
 - `:removed` — `rm` succeeded.
 - `:staged` — the residue was moved into `data/.trash/`. **Nothing staged there has had its
   space reclaimed**, and the first time it happens in a project a warning says so and names the
-  directory. [`initializeModelManager`](@ref) retries the removal in the background at the start
-  of every later session, so staged paths clear themselves once the jobs holding them exit.
+  directory. [`initializeModelManager`](@ref) will retry the removal in the background at the
+  start of every later session, so staged paths clear themselves once the jobs holding them exit.
 - `:unremoved` — neither worked. `path` is left where it is and a warning names it.
 
 In HPC mode a filesystem failure does not throw: every caller deletes the corresponding database
@@ -437,11 +437,7 @@ function _stageResidue(path::AbstractString, rm_error)
     _maybeSweepTrash()
     local dest
     try
-        dest = _trashDestination(path)
-        mkpath(dirname(dest))
-        #! No `force`: `dest` is unique by construction, so `force` would only license
-        #! clobbering something staged earlier.
-        mv(path, dest)
+        dest = _stageInto(path)
     catch e
         e isa InterruptException && rethrow()
         #! Deliberately NOT latched, unlike `:staged`. Every occurrence names a different path
@@ -469,15 +465,40 @@ function _stageResidue(path::AbstractString, rm_error)
         $(path)
      -> $(dest)
     That is expected on a cluster: a network filesystem keeps a file alive until every node has
-    released it. The path is out of the project tree and out of the database, but whatever is
-    staged still occupies disk and quota, and none of it is a backup.
-    ModelManager retries the removal in the background at the start of every session, so this
+    released it. The path is out of the database and out of `outputs/`, but it still occupies
+    disk and quota where it now sits.
+    ModelManager will retry the removal in the background at the start of every session, so this
     normally clears itself once the jobs holding those files exit. To check or clear it now:
         du -sh $(_trashRoot())
         rm -rf $(_trashRoot())
-    Only the first staged path in this project is reported.
+    Suppressing further warnings about this for the rest of this session.
     """)
     return :staged
+end
+
+#! The staging directory can disappear between being created and being moved into: the sweep runs
+#! in a background task, and another session on the same project may be sweeping too. Recreating
+#! it and retrying is cheap, and it is what lets the sweep clear a bucket the moment it is safe to
+#! rather than having to reason about how long one must sit untouched first. `_trashDestination`
+#! is recomputed each attempt so a name another session took in the meantime is not reused.
+function _stageInto(path::AbstractString)
+    local err
+    for attempt in 1:3
+        dest = _trashDestination(path)
+        mkpath(dirname(dest))
+        try
+            #! No `force`: `dest` does not exist as of the line above, so `force` would only
+            #! license clobbering something staged earlier.
+            mv(path, dest)
+            return dest
+        catch e
+            e isa InterruptException && rethrow()
+            err = e
+            #! Only a vanished parent is worth another go; anything else will fail the same way.
+            isdir(dirname(dest)) && rethrow()
+        end
+    end
+    throw(err)
 end
 
 _trashRoot() = joinpath(dataDir(), ".trash")
@@ -558,12 +579,11 @@ end
 #! jobs that have since exited, so a later attempt usually just works — this, not the staging, is
 #! what actually reclaims the space. Runs in the background task launched by
 #! `initializeModelManager` and must never take initialization down with it.
-#! The startup sweep fires once, but a session can outlive a day — a driver script on a cluster
-#! may run for a week, staging into a fresh `data-YYMMDD` bucket each day while nothing ever
-#! retries the earlier ones, even though the jobs holding those files have long since exited.
-#! Re-sweep when the day rolls over, keyed off the same stamp the bucket names use. At most once
-#! a day, on a path that is already exceptional, so the cost is a `readdir` of a directory with a
-#! handful of entries.
+#! The startup sweep fires once, but a session can outlive it — a driver script on a cluster may
+#! run for a week, staging residue the whole time while nothing ever retries it, even though the
+#! jobs holding those files have long since exited. Re-sweep when the day rolls over, which is
+#! only a rate limit: sweeping on every staging would re-walk undeletable buckets inside a bulk
+#! deletion. At most once a day, on a path that is already exceptional.
 function _maybeSweepTrash()
     try
         mm_globals().last_trash_sweep == Dates.format(now(), "yymmdd") && return nothing
@@ -578,22 +598,22 @@ end
 function _sweepTrash()
     try
         isempty(dataDir()) && return nothing
+        #! Stamp before the work, and before the `isdir` check below. Before the work, because a
+        #! sweep that cannot finish must not be retried on every subsequent staging. Before the
+        #! check, because a `.trash` that appears later today holds only residue this session has
+        #! just failed to delete — retrying it minutes later would fail the same way, and with no
+        #! age threshold a sweep mid-session would otherwise reclaim what was staged seconds ago.
+        mm_globals().last_trash_sweep = Dates.format(now(), "yymmdd")
         trash = _trashRoot()
         isdir(trash) || return nothing
-        #! Stamp before the work, not after: a sweep that cannot finish must not be retried on
-        #! every subsequent staging. Set only once past the checks above, so that a `.trash`
-        #! created later the same day still gets its first sweep.
-        mm_globals().last_trash_sweep = Dates.format(now(), "yymmdd")
-        #! Two days, not one: the bucket label comes from `now()` in whichever session created
-        #! it, and with the UTC-12..UTC+14 spread a bucket a concurrent session is still staging
-        #! into can be dated a day either side of our local date. Sweeping one out from under it
-        #! would turn a healthy stage into a spurious `:unremoved`. Skipping anything dated after
-        #! two days ago covers a future-dated bucket for free.
-        cutoff = today() - Day(2)
         for entry in readdir(trash)
-            d = _trashBucketDate(entry)
-            #! Only touch buckets this package created, and only once they are old enough.
-            (isnothing(d) || d > cutoff) && continue
+            #! No age threshold. Sweeping a bucket another session is staging into is handled
+            #! where it happens — `_stageInto` recreates the directory and retries — which is far
+            #! cheaper than picking a delay long enough to cover clock skew and timezone spread
+            #! between sessions, and it reclaims space as soon as the filesystem allows rather
+            #! than days later. The shape check is the whole guard: never touch an entry this
+            #! package did not create.
+            occursin(r"^data-\d{6}$", entry) || continue
             try
                 rm(joinpath(trash, entry); force=true, recursive=true)
             catch e
@@ -611,14 +631,6 @@ function _sweepTrash()
     return nothing
 end
 
-#! `data-YYMMDD` -> `Date`, or `nothing` for anything this package did not create. Note that
-#! `Date("260803", "yymmdd")` parses the year as 26 rather than 2026, so build it from the digit
-#! pairs instead.
-function _trashBucketDate(entry::AbstractString)
-    m = match(r"^data-(\d{2})(\d{2})(\d{2})$", entry)
-    isnothing(m) && return nothing
-    return tryparse(Date, "20$(m[1])-$(m[2])-$(m[3])")
-end
 
 #! Public despite not being exported: the manual documents it as the targeted alternative to
 #! a full `resetDatabase`. See CLAUDE.md, "Docstring cross-references".

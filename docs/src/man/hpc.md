@@ -54,8 +54,9 @@ survives into `data/.trash/`, which succeeds where removal does not because a re
 releases the file. [`resetDatabase`](@ref) and the deletion helpers use it internally (see
 [Managing data](@ref managing_data)); prefer it over `rm` in your own cleanup code too.
 
-Anything staged this way **still occupies disk and quota** — it is not deleted and it is not a
-backup. The first time it happens in a project, a warning says so and names the directory.
+Anything staged this way **still occupies disk and quota** — it is out of `outputs/` and out of
+the database, but it has not been deleted. The first time it happens in a project, a warning says
+so and names the directory.
 [`initializeModelManager`](@ref) retries the removal in the background at the start of every
 later session, so staged paths normally clear themselves once the jobs holding those files
 exit; `databaseDiagnostics` reports whatever is still there.

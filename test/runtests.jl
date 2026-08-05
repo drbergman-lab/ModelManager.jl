@@ -3241,10 +3241,13 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             end
 
             ModelManager._sweepTrash()
-            @test !ispath(old)          # comfortably old ⇒ swept
-            @test !ispath(boundary)     # exactly two days ⇒ swept
-            @test isdir(recent)         # inside the timezone margin ⇒ left alone
-            @test isdir(future)         # a clock-skewed or other-timezone session ⇒ left alone
+            # No age threshold: a bucket another session is staging into is handled in
+            # `_stageInto`, which recreates the directory and retries, so the sweep can reclaim
+            # as soon as the filesystem allows instead of waiting out clock skew.
+            @test !ispath(old)
+            @test !ispath(boundary)
+            @test !ispath(recent)
+            @test !ispath(future)       # a clock-skewed or other-timezone session's bucket
             @test isdir(foreign)        # not created by ModelManager ⇒ never touched
 
             # Anything left behind is reported, once, by the diagnostics pass.
@@ -3270,6 +3273,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             # nothing ever retried the earlier ones.
             rm(trash; force=true, recursive=true)
             stale = joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(4)))")
+            mkpath(stale); write(joinpath(stale, "f.txt"), "x")
+            # `_stageInto` creates whatever it needs, which is what lets the sweep run without an
+            # age threshold: a destination swept out from under it is recreated and retried.
+            throwaway = joinpath(ModelManager.dataDir(), "throwaway"); mkpath(throwaway)
+            write(joinpath(throwaway, "f.txt"), "x")
+            rm(trash; force=true, recursive=true)             # as if a sweep had just run
+            landed = ModelManager._stageInto(throwaway)
+            @test isfile(joinpath(landed, "f.txt"))
+            @test !ispath(throwaway)
             mkpath(stale); write(joinpath(stale, "f.txt"), "x")
             ModelManager.mm_globals().last_trash_sweep = stamp(Dates.today() - Dates.Day(1))
             try

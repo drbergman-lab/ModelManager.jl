@@ -745,9 +745,9 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
             Some paths could not be deleted and are still staged in
                 $(trash)
             They are what a shared filesystem would not let ModelManager remove, usually files
-            another node still had open. They still occupy disk and quota, and none of it is a
-            backup. ModelManager retries the removal at the start of every session, so this
-            normally clears itself once the jobs holding them exit. To check or clear it now:
+            another node still had open. They still occupy disk and quota where they now sit.
+            ModelManager will retry the removal at the start of every session, so this normally
+            clears itself once the jobs holding them exit. To check or clear it now:
                 du -sh $(trash)
                 rm -rf $(trash)
             """
