@@ -481,9 +481,18 @@ end
 #! it and retrying is cheap, and it is what lets the sweep clear a bucket the moment it is safe to
 #! rather than having to reason about how long one must sit untouched first. `_trashDestination`
 #! is recomputed each attempt so a name another session took in the meantime is not reused.
+#!
+#! Three attempts, and the count is not plucked from the air. A sweep iterates a `readdir`
+#! snapshot and removes each entry once, so one sweep pass can knock us out at most once; a second
+#! attempt therefore covers the whole first-order race, and a third would mean yet another
+#! independent sweep landed in the window between our `mkpath` and our `mv`. It is bounded at all
+#! because — unlike the collision search in `_trashDestination`, where every iteration tests a
+#! distinct path and a filesystem holds finitely many — every attempt here repeats the same
+#! operation, so there is no progress to terminate on and a peer sweeping in a loop could
+#! otherwise livelock us. Running out reports `:unremoved`; livelocking would hang the caller.
 function _stageInto(path::AbstractString)
     local err
-    for attempt in 1:3
+    for _ in 1:3
         dest = _trashDestination(path)
         mkpath(dirname(dest))
         try
