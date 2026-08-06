@@ -2107,6 +2107,40 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                       "config_variations.db"))
             end
 
+            @testset "run_on_hpc auto-detection" begin
+                detected = mm_globals().run_on_hpc
+                try
+                    # The bug this guards: nothing ever called isRunningOnHPC(), so the flag
+                    # sat at its `false` struct default even on a SLURM machine where
+                    # isRunningOnHPC() returned true. Holds on a laptop and a cluster alike.
+                    @test detected == isRunningOnHPC()
+                    @test detected == ModelManager.shellCommandExists(`sbatch`)
+
+                    # useHPC still overrides in both directions after init. Sequenced so the
+                    # flag is always false before a `useHPC(true)`, which keeps the
+                    # already-on warning (maxlog=1) out of the test output.
+                    useHPC(false)
+                    @test mm_globals().run_on_hpc == false
+                    useHPC(true)
+                    @test mm_globals().run_on_hpc == true
+                    useHPC(false)
+                    @test mm_globals().run_on_hpc == false
+                    useHPC()
+                    @test mm_globals().run_on_hpc == true
+
+                    # Re-initializing re-detects unconditionally, discarding an override.
+                    # Set the field directly rather than via useHPC to avoid the warning.
+                    mm_globals().run_on_hpc = !detected
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                    @test mm_globals().run_on_hpc == detected
+                finally
+                    # A stale `true` would send every later deletion test's rm_hpc_safe down
+                    # the .trash/ staging path instead of rm.
+                    mm_globals().run_on_hpc = detected
+                end
+            end
+
             # Shorthand XMLPaths used throughout the section
             xp_x = XMLPath(["data", "x"])
             xp_y = XMLPath(["data", "y"])
@@ -3096,10 +3130,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
     ################## rm_hpc_safe / .trash staging ##################
 
-    # `useHPC` is not reset by `initializeModelManager`, and a throw inside a @testset skips the
-    # rest of its body, so every block below restores the flag in a `finally`. These live in the
-    # isolated-project band rather than the shared "DB-backed integration" project for the same
-    # reason: flipping the flag there would leak into the ~60 testsets that follow.
+    # `initializeModelManager` resets the flag to `isRunningOnHPC()`, but nothing else does, and a
+    # throw inside a @testset skips the rest of its body, so every block below restores it in a
+    # `finally`. These live in the isolated-project band rather than the shared "DB-backed
+    # integration" project for the same reason: flipping the flag there would leak into the ~60
+    # testsets that follow.
+    #
+    # Each block also sets the flag explicitly rather than trusting the post-init value. Since
+    # that value is now probed from the environment, a suite run on a cluster login node would
+    # otherwise start these blocks in HPC mode and fail the off-HPC assertions.
     #
     # Fault injection is deliberately root-proof. chmod-based tricks are ignored when the process
     # is root (as CI containers often are) and would silently degrade to a no-op, so failures are
@@ -3114,6 +3153,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             trash = joinpath(ModelManager.dataDir(), ".trash")
 
             # Off HPC the behavior is plain `rm`, exceptions included.
+            useHPC(false)
             d = joinpath(ModelManager.dataDir(), "local_case"); mkpath(d)
             write(joinpath(d, "f.txt"), "x")
             @test rm_hpc_safe(d; force=true, recursive=true) == :removed

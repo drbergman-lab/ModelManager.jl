@@ -31,6 +31,17 @@ useHPC(false)   # run simulations locally
 ```
 """
 function useHPC(use::Bool=true)
+    #! Turning HPC mode on when it is already on means the caller is working around the
+    #! pre-v0.8.4 bug where `run_on_hpc` was never auto-detected and stayed `false` on a
+    #! cluster. `initializeModelManager` now seeds it, so the call is dead weight.
+    if use && mm_globals().run_on_hpc
+        @warn """
+        `useHPC(true)` is redundant here — HPC mode is already on.
+        Before v0.8.4 the `run_on_hpc` global was never auto-detected, so scripts had to call \
+        `useHPC()` by hand to get `sbatch` submission on a cluster. `initializeModelManager` \
+        now probes for SLURM at startup; this call can be deleted.
+        """ maxlog=1
+    end
     mm_globals().run_on_hpc = use
 end
 

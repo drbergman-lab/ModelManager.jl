@@ -5,6 +5,89 @@
 
 ---
 
+## Session: `run_on_hpc` was never auto-detected (2026-08-05)
+
+### The bug
+`mm_globals().run_on_hpc` had **exactly one writer in the entire package**: `useHPC` at
+`src/hpc.jl:34`. `isRunningOnHPC()` was exported for users and otherwise dead code — nothing in
+`src/` ever called it. So the field sat at its `false` struct default forever, and on a SLURM
+machine you got `run_on_hpc == false` while `isRunningOnHPC() == true`.
+
+Two docs had already specified the behavior that was missing, which is why it went unnoticed:
+`src/globals.jl:24` ("`true` when `sbatch` is available (auto-detected)") and
+`docs/src/man/hpc.md:13` ("`initializeModelManager` checks this at startup and stores the
+result"). Neither was true. The fix makes the code match them; both files needed no edit.
+
+Blast radius of the stale `false`, all silent:
+- `postInitDisplay` printed `Running on HPC: false` on a cluster.
+- `rm_hpc_safe` (`src/deletion.jl:360`) took the plain `rm` branch instead of `.trash/`
+  staging — the NFS lock protection the function exists for was simply off.
+- PCMM's `runSimulation` gates its `prepareHPCCommand` call on this flag, so no jobs were ever
+  submitted to SLURM unless the user called `useHPC()` by hand.
+
+### Relationship to #26 (2026-08-03) — this reverses one of its decisions
+#26 found the same discrepancy two days earlier and resolved it **the other way**: it rewrote
+`src/globals.jl`'s field docstring and `docs/src/man/hpc.md` to say that ModelManager
+deliberately does not probe, that `run_on_hpc` "defaults to `false` and is set only by
+`useHPC`", and that a simulator package may call `useHPC(isRunningOnHPC())` on the user's
+behalf. This session reverses that specific choice — the code now probes, and those two
+passages are rewritten again — while keeping every other line of #26 intact. The reason is
+the reported symptom: on a real SLURM machine the flag read `false` while `isRunningOnHPC()`
+read `true`, and no simulator package was in fact making that delegated call, so cluster users
+got local dispatch and bare `rm`. Delegating detection to every backend also duplicates the
+decision N times and leaves `isRunningOnHPC` dead in this package.
+
+Worth noting that #26 and this change *compose* rather than fight: #26 built the try-then-stage
+machinery and gated it on `run_on_hpc`, and this is what actually delivers it to the cluster
+users it was written for. #26's own open question — that `run_on_hpc` is the wrong predicate
+for "my data is on NFS" — is untouched and still open, and auto-detection sharpens it: the
+staging path now switches itself on wherever `sbatch` exists.
+
+### Decisions
+**Detect just before `postInitDisplay`, not at the top of `initializeModelManager`.** The
+function documents that "all mutated globals are reset to a clean state before any `false`
+return", and each of its four early-return paths resets `data_dir` and `db`. Setting the flag
+alongside `simulator`/`data_dir` at the top would have added a fourth global to every one of
+those blocks. Placing it after the last failure path costs nothing and still precedes the only
+in-init reader (the banner).
+
+**Re-detect unconditionally on every init; no "explicit override" sticky flag.** A second
+`initializeModelManager` in one session discards a prior `useHPC(false)`. Considered a latch so
+an explicit override survives, rejected as a new global field for a rare case — and
+`initializeModelManager` already deliberately resets other per-session state (`provenance_id`,
+the tag-hint latches). The natural order (init, then override) is unaffected. Per the user:
+this is rare enough that it gets no user-facing documentation at all.
+
+**Rejected:** making `run_on_hpc` a lazily-computed `Union{Nothing,Bool}`. Changing the field
+type would touch `deletion.jl`, `postInitDisplay`, and every downstream PCMM read for no gain
+over a one-line eager set.
+
+**The `@warn` in `useHPC`.** Fires only when `use && mm_globals().run_on_hpc` — i.e. turning
+HPC mode on when it is already on, which is exactly the signature of a script written to work
+around this bug. `maxlog=1`. Tells the reader that ≥ v0.8.4 does not need the call.
+
+### Verification
+The test suite cannot exercise the true branch on a dev machine, so the fix was checked against
+a fake `sbatch` shim placed on `PATH`: without it, `run_on_hpc == false` after init; with it,
+`run_on_hpc == true` (pre-fix: `false` in both cases), and the redundant-`useHPC` warning fires
+as intended.
+
+The testset asserts `mm_globals().run_on_hpc == isRunningOnHPC()` after init, which holds on a
+laptop and a cluster alike and fails on neither for the wrong reason. It restores the detected
+value in a `finally`: leaving a stale `true` behind would send every later deletion test's
+`rm_hpc_safe` down the `.trash/` staging path instead of `rm`, silently changing what those
+tests exercise. Its `useHPC` calls are also sequenced so the flag is always `false` before any
+`useHPC(true)`, keeping the new warning out of the test output — asserting the warning with
+`@test_logs` was rejected because `TestLogger`'s `maxlog` handling varies across the 1.10 floor.
+
+### Files changed
+- `src/globals.jl` — one-line detection before `postInitDisplay`; init docstring step list
+- `src/hpc.jl` — redundant-call `@warn` in `useHPC`
+- `test/runtests.jl` — `"run_on_hpc auto-detection"` testset (8 assertions, 1354 total passing)
+- `PRD.md` (Global State), `README.md`, `Project.toml` → v0.8.4
+
+---
+
 ## Session: rm_hpc_safe try-then-stage, warning, and sweep (2026-08-03)
 
 ### Goal

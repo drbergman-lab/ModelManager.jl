@@ -22,9 +22,8 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
 - `project_locations::ProjectLocations`: Derived from `inputs_dict`.
 - `db::SQLite.DB`: Connection to the central project database.
 - `run_on_hpc::Bool`: `true` to submit simulations as SLURM jobs and to route file removal
-  through the staging path of [`rm_hpc_safe`](@ref). Defaults to `false` and is set only by
-  [`useHPC`](@ref); a simulator package may auto-detect with [`isRunningOnHPC`](@ref) and call
-  it, but `initializeModelManager` does not probe.
+  through the staging path of [`rm_hpc_safe`](@ref). [`initializeModelManager`](@ref) sets it
+  from [`isRunningOnHPC`](@ref) on every call; override afterwards with [`useHPC`](@ref).
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
 - `max_number_of_parallel_simulations::Int`: Concurrency limit.
 - `diagnostics_task::Union{Nothing,Task}`: The background `Task` running
@@ -183,8 +182,10 @@ It performs all framework-agnostic initialization steps in order:
 3. Resolve the package version, creating or upgrading the DB schema if needed.
 4. Parse `inputs.toml`.
 5. Initialize the database schema (tables, folder registration).
-6. Call [`postInitDisplay`](@ref) to print startup information.
-7. Launch a background `@async` task that retries the removal of anything
+6. Detect whether SLURM is available via [`isRunningOnHPC`](@ref) and store the result in
+   `run_on_hpc`. Override it afterwards with [`useHPC`](@ref).
+7. Call [`postInitDisplay`](@ref) to print startup information.
+8. Launch a background `@async` task that retries the removal of anything
    [`rm_hpc_safe`](@ref) had to stage in `data/.trash/`, then runs `databaseDiagnostics`.
 
 Returns `true` on success, `false` on any initialization failure — including errors that
@@ -244,6 +245,10 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
         mm_globals().data_dir = ""
         return false
     end
+    #! Detected here, after every failure path has returned, so that none of the early-return
+    #! reset blocks above need to know about this field. Still ahead of `postInitDisplay`,
+    #! which prints it.
+    mm_globals().run_on_hpc = isRunningOnHPC()
     postInitDisplay(simulator)
     flush(stdout)
     # Snapshot max IDs now (before any simulations launch) so that diagnostics
