@@ -22,8 +22,10 @@ Blast radius of the stale `false`, all silent:
 - `postInitDisplay` printed `Running on HPC: false` on a cluster.
 - `rm_hpc_safe` (`src/deletion.jl:360`) took the plain `rm` branch instead of `.trash/`
   staging — the NFS lock protection the function exists for was simply off.
-- PCMM's `runSimulation` gates its `prepareHPCCommand` call on this flag, so no jobs were ever
-  submitted to SLURM unless the user called `useHPC()` by hand.
+- PCMM's `runSimulation` gates its `prepareHPCCommand` call on this flag
+  (`src/simulator_interface.jl:40`), so no jobs were ever submitted to SLURM unless the user
+  called `useHPC()` by hand — cluster runs went to a local process, writing `output.log`
+  instead of `hpc.out`.
 
 ### Relationship to #26 (2026-08-03) — this reverses one of its decisions
 #26 found the same discrepancy two days earlier and resolved it **the other way**: it rewrote
@@ -31,11 +33,23 @@ Blast radius of the stale `false`, all silent:
 deliberately does not probe, that `run_on_hpc` "defaults to `false` and is set only by
 `useHPC`", and that a simulator package may call `useHPC(isRunningOnHPC())` on the user's
 behalf. This session reverses that specific choice — the code now probes, and those two
-passages are rewritten again — while keeping every other line of #26 intact. The reason is
-the reported symptom: on a real SLURM machine the flag read `false` while `isRunningOnHPC()`
-read `true`, and no simulator package was in fact making that delegated call, so cluster users
-got local dispatch and bare `rm`. Delegating detection to every backend also duplicates the
-decision N times and leaves `isRunningOnHPC` dead in this package.
+passages are rewritten again — while keeping every other line of #26 intact.
+
+The reason is what an audit of PCMM actually found (checked directly, not inferred):
+
+- `useHPC` appears **only** in `test/test-scripts/HPCTests.jl` (`:8`, `:72`). No `src/` file
+  calls it. The delegated call #26 described was not being made by the one backend that exists.
+- `src/simulator_interface.jl:40` gates `prepareHPCCommand` on `mm_globals().run_on_hpc`, so
+  the stuck `false` meant cluster runs never reached `sbatch` at all.
+- `src/physicell_simulator.jl:46` **does** call `isRunningOnHPC()` — into a local, to pick
+  `march_flag` (`"x86-64"` vs `"native"`), then discards it. The value #26 said a backend "may"
+  supply was already in hand one line from where it was needed, and still never reached the
+  global. Note this probe cannot be replaced by reading the global: `PhysiCellSimulator()` runs
+  in PCMM's `__init__` to build the simulator that is *then* passed to `initializeModelManager`,
+  so the global does not exist yet at that point.
+
+Delegating detection to every backend also duplicates the decision N times and leaves
+`isRunningOnHPC` dead in this package.
 
 Worth noting that #26 and this change *compose* rather than fight: #26 built the try-then-stage
 machinery and gated it on `run_on_hpc`, and this is what actually delivers it to the cluster
