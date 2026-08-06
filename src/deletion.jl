@@ -371,8 +371,8 @@ deleteSimulationsByStatus(status_code_to_delete::String; kwargs...) = deleteSimu
 
 Remove `path`, tolerating shared cluster filesystems that refuse to release files.
 
-Off HPC — the default; see [`useHPC`](@ref) — this is exactly `rm(path; force, recursive)`,
-exceptions included.
+Off HPC — anywhere `sbatch` is absent, unless [`useHPC`](@ref) says otherwise — this is exactly
+`rm(path; force, recursive)`, exceptions included.
 
 On HPC that same `rm` is attempted first, since removing is the only thing that actually frees
 disk space. A network filesystem routinely refuses to remove a directory that a process on

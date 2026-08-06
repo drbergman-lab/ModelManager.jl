@@ -9,13 +9,13 @@ script that runs on a laptop scales to a cluster without modification.
 
 ## Detection
 
-[`isRunningOnHPC`](@ref) returns `true` when the `sbatch` command is available on the
-`PATH`. ModelManager does not probe for this itself — `run_on_hpc` defaults to `false` and is
-set only by [`useHPC`](@ref), though a simulator package may call `useHPC(isRunningOnHPC())` on
-your behalf. When HPC mode is on, the runner submits each pending simulation as a job rather
-than running it in a local task, and file removal goes through the staging path described below.
+[`isRunningOnHPC`](@ref) returns `true` when the `sbatch` command is available on the `PATH`.
+[`initializeModelManager`](@ref) probes for it at startup and stores the result in
+`run_on_hpc`, so HPC mode turns itself on wherever SLURM exists. When it is on, the runner
+submits each pending simulation as a job rather than running it in a local task, and file
+removal goes through the staging path described below.
 
-Set it explicitly with [`useHPC`](@ref):
+Override the detected value with [`useHPC`](@ref), after initializing:
 
 ```julia
 useHPC(true)    # force HPC mode on

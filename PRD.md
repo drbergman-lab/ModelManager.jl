@@ -84,10 +84,13 @@ the "Docstring Cross-References" section of `CLAUDE.md`.
 - `mm_globals()` returns the current globals, asserting it has been initialized.
 - Simulator packages call `mm_globals_ref[] = ModelManagerGlobals(simulator=MySimulator(...))` in their `__init__`.
 - Zero-arg accessor functions (`centralDB()`, `dataDir()`, `projectLocations()`, etc.) read from `mm_globals()`.
+- `initializeModelManager` seeds `run_on_hpc` from `isRunningOnHPC()` (a probe for `sbatch` on the `PATH`) on every call, placed after all early-return failure paths and before `postInitDisplay` prints it. `useHPC(use)` overrides it afterwards; a subsequent `initializeModelManager` re-detects unconditionally and discards the override.
+- `useHPC(true)` when `run_on_hpc` is already `true` emits a one-time `@warn` that the call is redundant — pre-v0.8.4 scripts called it to work around the auto-detection that was specified but never implemented.
 
 **Acceptance criteria:**
 - Calling `mm_globals()` before initialization throws a descriptive error.
 - After a simulator package sets `mm_globals_ref[]`, all zero-arg accessors return correct values.
+- After `initializeModelManager` returns `true`, `mm_globals().run_on_hpc == isRunningOnHPC()`.
 
 ---
 
