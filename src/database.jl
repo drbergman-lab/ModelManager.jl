@@ -718,6 +718,41 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
             """
         end
     end
+
+    #! Housekeeping rather than database integrity: report only when a shared filesystem left
+    #! something behind that `rm_hpc_safe` had to stage. The retry itself runs separately, before
+    #! this function — a public function named "diagnostics" must not mutate the filesystem.
+    trash = _trashRoot()
+    if isdir(trash)
+        remaining = try
+            readdir(trash)
+        catch e
+            e isa InterruptException && rethrow()
+            missing
+        end
+        if ismissing(remaining)
+            #! Unreadable is not the same as empty. Staying silent here would report a clear
+            #! disk on the strength of a question we could not answer.
+            @warn """
+            Could not read the staging directory
+                $(trash)
+            It exists, so paths may still be staged there and occupying disk and quota, but
+            ModelManager could not inspect it to say. Check it yourself:
+                du -sh $(trash)
+            """
+        elseif !isempty(remaining)
+            @warn """
+            Some paths could not be deleted and are still staged in
+                $(trash)
+            They are what a shared filesystem would not let ModelManager remove, usually files
+            another node still had open. They still occupy disk and quota where they now sit.
+            ModelManager will retry the removal at the start of every session, so this normally
+            clears itself once the jobs holding them exit. To check or clear it now:
+                du -sh $(trash)
+                rm -rf $(trash)
+            """
+        end
+    end
 end
 
 ########### Summarizing functions (generic) ###########

@@ -10,11 +10,12 @@ script that runs on a laptop scales to a cluster without modification.
 ## Detection
 
 [`isRunningOnHPC`](@ref) returns `true` when the `sbatch` command is available on the
-`PATH`. [`initializeModelManager`](@ref) checks this at startup and stores the result; when
-SLURM is detected, the runner submits each pending simulation as a job rather than running it
-in a local task.
+`PATH`. ModelManager does not probe for this itself — `run_on_hpc` defaults to `false` and is
+set only by [`useHPC`](@ref), though a simulator package may call `useHPC(isRunningOnHPC())` on
+your behalf. When HPC mode is on, the runner submits each pending simulation as a job rather
+than running it in a local task, and file removal goes through the staging path described below.
 
-You can override the auto-detected value with [`useHPC`](@ref):
+Set it explicitly with [`useHPC`](@ref):
 
 ```julia
 useHPC(true)    # force HPC mode on
@@ -46,9 +47,24 @@ submit a job.
 
 ## Filesystem safety on shared clusters
 
-Some shared filesystems intermittently fail or delay `unlink`/`rm` operations. Use
-[`rm_hpc_safe`](@ref) instead of `rm` when removing files inside ModelManager workflows on
-HPC; it tolerates these transient failures. [`resetDatabase`](@ref) and the deletion helpers
-use it internally (see [Managing data](@ref managing_data)).
+A network filesystem will not remove a file that a process on another node still holds open, so
+`rm` fails part-way through and leaves the directory behind. [`rm_hpc_safe`](@ref) absorbs that:
+it attempts the real removal first — the only thing that frees disk space — and *moves* whatever
+survives into `data/.trash/`, which succeeds where removal does not because a rename never
+releases the file. [`resetDatabase`](@ref) and the deletion helpers use it internally (see
+[Managing data](@ref managing_data)); prefer it over `rm` in your own cleanup code too.
+
+Anything staged this way **still occupies disk and quota** — it is out of `outputs/` and out of
+the database, but it has not been deleted. The first time it happens in a project, a warning says
+so and names the directory.
+[`initializeModelManager`](@ref) retries the removal in the background at the start of every
+later session, so staged paths normally clear themselves once the jobs holding those files
+exit; `databaseDiagnostics` reports whatever is still there.
+
+If you want that space reclaimed automatically instead, put the project's `data/` directory on
+scratch — `data/.trash` then lives on scratch too and your site's purge policy sweeps it with
+everything else. Pointing the staging area itself at another filesystem cannot work: moving
+across mounts is a copy followed by a delete of the source, and that delete is the operation
+being refused.
 
 See the [HPC & SLURM](@ref hpc_lib) API reference for the full set of functions.

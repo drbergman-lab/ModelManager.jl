@@ -331,13 +331,23 @@ target location's file type.
 - `deleteSimulations(ids)` removes simulations from DB and disk; optionally cascades to empty monads/samplings/trials (`delete_supers=true`).
 - `deleteMonad`, `deleteSampling`, `deleteTrial` cascade up and down as appropriate.
 - `resetDatabase()` deletes all outputs, clears variation files, calls `clearSimulatorArtifacts(sim)`, and reinitializes the DB.
-- On HPC, file removal goes through `rm_hpc_safe` (staging in `.trash/`) to avoid NFS lock issues.
 - Each deletion routine also removes the deleted objects' rows from the `tags` table (see *Trial Tagging*), since SQLite cannot foreign-key the polymorphic `trial_class`/`trial_id` pair.
+
+*Removal on shared filesystems*
+- All file removal goes through `rm_hpc_safe`. Off HPC it is exactly `rm(path; force, recursive)`, exceptions included.
+- On HPC it attempts that same `rm` first — removal is the only thing that reclaims space — and *moves* whatever survives into `data/.trash/data-YYMMDD/`, mirroring the path's position under `data/` (a path outside `data/` goes under `_external/`). A rename succeeds where an unlink does not because it never releases the file.
+- Returns `:removed`, `:staged`, or `:unremoved`. In HPC mode a filesystem failure is warned about, not thrown: callers delete the matching database rows first, and most call it in a loop, so an exception would abandon a bulk deletion. A missing path with `force=false` still throws, as `rm` does.
+- The `:staged` warning fires at most once per project per session, latched on `ModelManagerGlobals.trash_staged_warning_shown` and cleared by `initializeModelManager`. The `:unremoved` warning is not latched: each occurrence names a different leaked, untracked path and is the only record of it that will ever exist.
+- `initializeModelManager` retries the removal of staged paths in the background, ahead of `databaseDiagnostics`, which then reports whatever is still there. The sweep touches only top-level entries named `data-YYMMDD`, never anything it did not create, and applies no age threshold: a bucket another session is concurrently staging into is handled where it happens, by recreating the directory and retrying the move.
+- Staging also re-sweeps when the calendar day rolls over, at most once per day, so a session that outlives a single day does not accumulate residue that nothing retries until the next startup.
+- Staging cannot be redirected to another filesystem: a cross-mount move is a copy followed by a delete of the source, and that delete is the refused operation. Put `data/` on scratch instead.
 
 **Acceptance criteria:**
 - After `deleteSimulations(ids)`, no rows remain in `simulations` for those IDs.
 - Empty monads are removed when `delete_supers=true`.
-- `resetDatabase()` leaves the project in the same state as a fresh `initializeDatabase()`.
+- `resetDatabase()` leaves the project in the same state as a fresh `initializeDatabase()`, and errors rather than reinitializing if the central database file could not be removed or staged.
+- On HPC, a removable path is actually removed and `data/.trash/` is never created; only a path the filesystem refuses to release is staged, and it is staged whole.
+- The sweep clears an old bucket and removes `data/.trash/` itself when it empties, leaving today's and any future-dated bucket untouched, along with any entry it did not create.
 
 ---
 

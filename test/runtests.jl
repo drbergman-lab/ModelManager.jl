@@ -10,6 +10,7 @@ using JLD2
 using NearestNeighbors
 using LinearAlgebra
 using RecipesBase
+using Dates
 import GlobalSensitivity
 
 # Full-featured stub simulator used by both the existing in-memory unit tests and the
@@ -3090,6 +3091,244 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             run(createTrial(inputs, [DiscreteVariation(:config, xp, 702.0)]; n_replicates=1);
                 post_processor = sp -> (; v = 1.0))
             @test isfile(postProcessingDBPath())     # first stored quantity creates it
+        end
+    end
+
+    ################## rm_hpc_safe / .trash staging ##################
+
+    # `useHPC` is not reset by `initializeModelManager`, and a throw inside a @testset skips the
+    # rest of its body, so every block below restores the flag in a `finally`. These live in the
+    # isolated-project band rather than the shared "DB-backed integration" project for the same
+    # reason: flipping the flag there would leak into the ~60 testsets that follow.
+    #
+    # Fault injection is deliberately root-proof. chmod-based tricks are ignored when the process
+    # is root (as CI containers often are) and would silently degrade to a no-op, so failures are
+    # forced two other ways: `recursive=false` on a non-empty directory (rmdir → ENOTEMPTY; the
+    # `force` excuse covers only ENOENT), and a regular file where `.trash` should be, which makes
+    # `mkpath` throw.
+    @testset "rm_hpc_safe removes on HPC and stages only the residue" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            trash = joinpath(ModelManager.dataDir(), ".trash")
+
+            # Off HPC the behavior is plain `rm`, exceptions included.
+            d = joinpath(ModelManager.dataDir(), "local_case"); mkpath(d)
+            write(joinpath(d, "f.txt"), "x")
+            @test rm_hpc_safe(d; force=true, recursive=true) == :removed
+            @test !ispath(d)
+            @test_throws Base.IOError rm_hpc_safe(joinpath(ModelManager.dataDir(), "gone"))
+
+            try
+                useHPC(true)
+
+                # Happy path: the removal succeeds, so nothing is staged and `.trash` is never
+                # created. This is the case that never worked before — on HPC the old code moved
+                # everything and reclaimed nothing.
+                d = joinpath(ModelManager.dataDir(), "removable"); mkpath(d)
+                write(joinpath(d, "f.txt"), "x")
+                @test rm_hpc_safe(d; force=true, recursive=true) == :removed
+                @test !ispath(d)
+                @test !ispath(trash)
+
+                # A missing path with force=false still throws, exactly as off HPC.
+                @test_throws Base.IOError rm_hpc_safe(joinpath(ModelManager.dataDir(), "gone"))
+                @test rm_hpc_safe(joinpath(ModelManager.dataDir(), "gone"); force=true) == :removed
+
+                # `rm` refused ⇒ the residue is moved aside and the user is told once.
+                d = joinpath(ModelManager.dataDir(), "outputs", "held"); mkpath(d)
+                write(joinpath(d, "held.dat"), "x")
+                local res
+                @test_logs (:warn, r"moved aside rather than deleted") match_mode=:any begin
+                    res = rm_hpc_safe(d; force=true, recursive=false)
+                end
+                @test res == :staged
+                @test !ispath(d)
+                staged = joinpath(trash, "data-$(Dates.format(Dates.now(), "yymmdd"))",
+                                  "outputs", "held")
+                @test isfile(joinpath(staged, "held.dat"))
+
+                # Warn-once: a second staging in the same project is silent.
+                d2 = joinpath(ModelManager.dataDir(), "outputs", "held2"); mkpath(d2)
+                write(joinpath(d2, "held.dat"), "x")
+                @test_logs min_level=Base.CoreLogging.Warn begin
+                    @test rm_hpc_safe(d2; force=true, recursive=false) == :staged
+                end
+
+                # Collision: the same name staged twice on one day must not clobber the first.
+                mkpath(d); write(joinpath(d, "held.dat"), "second")
+                @test rm_hpc_safe(d; force=true, recursive=false) == :staged
+                @test isdir("$(staged)-1")
+                @test read(joinpath(staged, "held.dat"), String) == "x"        # first survived
+                @test read(joinpath("$(staged)-1", "held.dat"), String) == "second"
+
+                # The suffix search is unbounded: it must keep finding free names well past any
+                # round number, and must never hand back a name that is already taken.
+                for i in 2:12
+                    mkpath(d); write(joinpath(d, "held.dat"), "n$(i)")
+                    @test rm_hpc_safe(d; force=true, recursive=false) == :staged
+                    @test read(joinpath("$(staged)-$(i)", "held.dat"), String) == "n$(i)"
+                end
+
+                # A path outside data/ is staged under _external/ — regression test for the old
+                # mapping, which left such a path absolute, so `joinpath` discarded the trash
+                # prefix and the "move" silently renamed the target in place to `<path>-1`.
+                mktempdir() do outside
+                    d3 = joinpath(outside, "elsewhere"); mkpath(d3)
+                    write(joinpath(d3, "held.dat"), "x")
+                    @test rm_hpc_safe(d3; force=true, recursive=false) == :staged
+                    @test !ispath(d3)
+                    @test !ispath("$(d3)-1")          # the old bug
+                    @test isfile(joinpath(trash, "data-$(Dates.format(Dates.now(), "yymmdd"))",
+                                          "_external", "elsewhere", "held.dat"))
+                end
+            finally
+                useHPC(false)
+            end
+        end
+    end
+
+    @testset "rm_hpc_safe reports but does not throw when it can stage nothing" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            try
+                useHPC(true)
+                # A regular file where `.trash` should be makes `mkpath` throw, so neither the
+                # removal nor the staging can succeed.
+                write(joinpath(ModelManager.dataDir(), ".trash"), "not a directory")
+                d = joinpath(ModelManager.dataDir(), "stuck"); mkpath(d)
+                write(joinpath(d, "f.txt"), "x")
+
+                local res
+                @test_logs (:warn, r"could not move it out of the way") match_mode=:any begin
+                    res = rm_hpc_safe(d; force=true, recursive=false)   # no throw
+                end
+                @test res == :unremoved
+                @test isfile(joinpath(d, "f.txt"))    # left exactly where it was
+
+                # Unlike :staged, this one is NOT latched: every occurrence names a different
+                # leaked path and is the only record of it that will ever exist. Latching it
+                # would also leave resetDatabase's error citing a warning that never printed.
+                d2 = joinpath(ModelManager.dataDir(), "stuck2"); mkpath(d2)
+                write(joinpath(d2, "f.txt"), "x")
+                @test_logs (:warn, r"could not move it out of the way") match_mode=:any begin
+                    @test rm_hpc_safe(d2; force=true, recursive=false) == :unremoved
+                end
+            finally
+                useHPC(false)
+            end
+        end
+    end
+
+    @testset "trash sweep and diagnostics report" begin
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            trash = joinpath(ModelManager.dataDir(), ".trash")
+
+            stamp(d) = Dates.format(d, "yymmdd")
+            old      = joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(30)))")
+            boundary = joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(2)))")
+            recent   = joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(1)))")
+            future   = joinpath(trash, "data-$(stamp(Dates.today() + Dates.Day(1)))")
+            foreign  = joinpath(trash, "not-ours")
+            for p in (old, boundary, recent, future, foreign)
+                mkpath(p); write(joinpath(p, "f.txt"), "x")
+            end
+
+            ModelManager._sweepTrash()
+            # No age threshold: a bucket another session is staging into is handled in
+            # `_stageInto`, which recreates the directory and retries, so the sweep can reclaim
+            # as soon as the filesystem allows instead of waiting out clock skew.
+            @test !ispath(old)
+            @test !ispath(boundary)
+            @test !ispath(recent)
+            @test !ispath(future)       # a clock-skewed or other-timezone session's bucket
+            @test isdir(foreign)        # not created by ModelManager ⇒ never touched
+
+            # Anything left behind is reported, once, by the diagnostics pass.
+            @test_logs (:warn, r"still staged in") match_mode=:any ModelManager.databaseDiagnostics()
+
+            # An unreadable staging directory must not be reported as an empty one — silence
+            # there would claim a clear disk on the strength of a question we could not answer.
+            if !iszero(parse(Int, readchomp(`id -u`)))   # permission bits are ignored under root
+                rm(trash; force=true, recursive=true)
+                mkpath(joinpath(trash, "data-000101"))
+                chmod(trash, 0o000)
+                try
+                    @test_logs (:warn, r"Could not read the staging directory") match_mode=:any begin
+                        ModelManager.databaseDiagnostics()
+                    end
+                finally
+                    chmod(trash, 0o700)
+                end
+            end
+
+            # A session outliving a single day must re-sweep: the startup sweep fires once, and a
+            # week-long driver script would otherwise stage into a new bucket every day while
+            # nothing ever retried the earlier ones.
+            rm(trash; force=true, recursive=true)
+            stale = joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(4)))")
+            mkpath(stale); write(joinpath(stale, "f.txt"), "x")
+            # `_stageInto` creates whatever it needs, which is what lets the sweep run without an
+            # age threshold: a destination swept out from under it is recreated and retried.
+            throwaway = joinpath(ModelManager.dataDir(), "throwaway"); mkpath(throwaway)
+            write(joinpath(throwaway, "f.txt"), "x")
+            rm(trash; force=true, recursive=true)             # as if a sweep had just run
+            landed = ModelManager._stageInto(throwaway)
+            @test isfile(joinpath(landed, "f.txt"))
+            @test !ispath(throwaway)
+            mkpath(stale); write(joinpath(stale, "f.txt"), "x")
+            ModelManager.mm_globals().last_trash_sweep = stamp(Dates.today() - Dates.Day(1))
+            try
+                useHPC(true)
+                d = joinpath(ModelManager.dataDir(), "rollover"); mkpath(d)
+                write(joinpath(d, "f.txt"), "x")
+                @test rm_hpc_safe(d; force=true, recursive=false) == :staged
+                @test !ispath(stale)              # the day rolled over ⇒ swept mid-session
+                @test ModelManager.mm_globals().last_trash_sweep == stamp(Dates.today())
+
+                # ...and not again on the same day: a second staging leaves a fresh old bucket be.
+                mkpath(stale); write(joinpath(stale, "f.txt"), "x")
+                d2 = joinpath(ModelManager.dataDir(), "rollover2"); mkpath(d2)
+                write(joinpath(d2, "f.txt"), "x")
+                @test rm_hpc_safe(d2; force=true, recursive=false) == :staged
+                @test isdir(stale)
+            finally
+                useHPC(false)
+            end
+
+            # With the trash gone, the sweep removes the directory itself and the report is silent.
+            rm(trash; force=true, recursive=true)
+            mkpath(joinpath(trash, "data-$(stamp(Dates.today() - Dates.Day(3)))"))
+            ModelManager._sweepTrash()
+            @test !ispath(trash)
+            @test_logs min_level=Base.CoreLogging.Warn ModelManager.databaseDiagnostics()
+        end
+    end
+
+    @testset "trash warn-once latch resets per project" begin
+        # The latch lives on globals, so a second project in the same session must warn again.
+        for _ in 1:2
+            mktempdir() do project_dir
+                _make_test_project(project_dir)
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                try
+                    useHPC(true)
+                    d = joinpath(ModelManager.dataDir(), "held"); mkpath(d)
+                    write(joinpath(d, "f.txt"), "x")
+                    @test_logs (:warn, r"moved aside rather than deleted") match_mode=:any begin
+                        @test rm_hpc_safe(d; force=true, recursive=false) == :staged
+                    end
+                finally
+                    useHPC(false)
+                end
+            end
         end
     end
 

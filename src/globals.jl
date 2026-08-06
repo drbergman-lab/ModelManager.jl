@@ -21,7 +21,10 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
 - `inputs_dict::Dict{Symbol,Any}`: Parsed contents of `inputs.toml`.
 - `project_locations::ProjectLocations`: Derived from `inputs_dict`.
 - `db::SQLite.DB`: Connection to the central project database.
-- `run_on_hpc::Bool`: `true` when `sbatch` is available (auto-detected).
+- `run_on_hpc::Bool`: `true` to submit simulations as SLURM jobs and to route file removal
+  through the staging path of [`rm_hpc_safe`](@ref). Defaults to `false` and is set only by
+  [`useHPC`](@ref); a simulator package may auto-detect with [`isRunningOnHPC`](@ref) and call
+  it, but `initializeModelManager` does not probe.
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
 - `max_number_of_parallel_simulations::Int`: Concurrency limit.
 - `diagnostics_task::Union{Nothing,Task}`: The background `Task` running
@@ -37,6 +40,12 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
   [`setTagHints!`](@ref).
 - `tag_hint_shown::Bool`, `tag_recovery_hint_shown::Bool`: Once-per-session latches
   for those hints.
+- `trash_staged_warning_shown::Bool`: Once-per-project latch for the warning
+  [`rm_hpc_safe`](@ref) issues when a shared filesystem forces it to stage a path in
+  `data/.trash/` instead of removing it. Its `:unremoved` case — where it can do neither — is
+  deliberately not latched, since each occurrence names a different leaked path.
+- `last_trash_sweep::String`: `yymmdd` stamp of the day `data/.trash/` was last swept, so a
+  session that outlives a single day re-sweeps instead of relying on the one at startup.
 """
 @with_kw mutable struct ModelManagerGlobals
     initialized::Bool = false
@@ -61,6 +70,8 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
     tag_hints::Bool = true
     tag_hint_shown::Bool = false
     tag_recovery_hint_shown::Bool = false
+    trash_staged_warning_shown::Bool = false
+    last_trash_sweep::String = ""
 end
 
 """
@@ -173,7 +184,8 @@ It performs all framework-agnostic initialization steps in order:
 4. Parse `inputs.toml`.
 5. Initialize the database schema (tables, folder registration).
 6. Call [`postInitDisplay`](@ref) to print startup information.
-7. Launch `databaseDiagnostics` as a background `@async` task.
+7. Launch a background `@async` task that retries the removal of anything
+   [`rm_hpc_safe`](@ref) had to stage in `data/.trash/`, then runs `databaseDiagnostics`.
 
 Returns `true` on success, `false` on any initialization failure — including errors that
 would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are reset to
@@ -196,11 +208,14 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().simulator = simulator
     mm_globals().data_dir = abspath(normpath(data_dir))
 
-    #! Provenance and hint latches are per-project: a new project in the same
-    #! session should re-resolve its script/git context and hint again.
+    #! Provenance, hint, and trash-staging latches are per-project: a new project in the
+    #! same session should re-resolve its script/git context, hint again, and warn again
+    #! about its own `data/.trash`.
     mm_globals().provenance_id = nothing
     mm_globals().tag_hint_shown = false
     mm_globals().tag_recovery_hint_shown = false
+    mm_globals().trash_staged_warning_shown = false
+    mm_globals().last_trash_sweep = ""
 
     try
         mm_globals().db = SQLite.DB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))
@@ -237,6 +252,9 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     snapshot = _snapshotMaxIDs()
     mm_globals().diagnostics_task = @async begin
         try
+            #! Before the report, not after: `databaseDiagnostics` only warns about what is
+            #! left in `data/.trash`, so the retry has to have had its turn first.
+            _sweepTrash()
             databaseDiagnostics(snapshot)
         catch e
             println("""
