@@ -100,6 +100,38 @@ Cautioned:
 - **Interface methods:** defined as bare `function foo end` stubs in `abstract_simulator.jl`; concrete implementations live in the simulator package. Unexported but declared `@compat public` — see [Docstring Cross-References](#docstring-cross-references)
 - **Exported vs internal:** public API is exported from the relevant `src/*.jl` file; internal helpers are prefixed with `_`
 
+## Docstring Length
+
+**Rule: spend words only on what a reader cannot infer from the signature. Everything else is
+noise, and a wrong example is worse than no example.**
+
+Most accessors need one to three sentences and nothing else. Do **not** reach for
+`# Arguments` / `# Returns` / `# Examples` by default — that structure is for functions with a real
+keyword surface or a genuinely non-obvious contract (`run`, `createTrial`, `simulationsTable`,
+`runABC`), not for `trialID` or `trialType`.
+
+What earns length:
+
+- a return value the signature does not imply — `trialID(::Vector{Sampling})` gives `missing` and
+  never creates a row;
+- a distinction a reader will otherwise get wrong — `monadIDs(::Simulation)` matches on
+  *parameterization*, not membership, so it resolves to a monad that may not list that simulation;
+- keyword arguments, and which of several methods a keyword applies to.
+
+What does not: restating the argument list in prose, naming the return type when it is already in
+the signature, or an example that only shows the obvious call.
+
+**Verify every example against actual dispatch before writing it.** A `trialType` docstring once
+claimed `createTrial(inputs, dv; n_replicates=1)` yields a `Simulation` and `[dv1, dv2]` yields a
+`Sampling`. Both are wrong: the trial type follows from how many *values* the variations carry, so
+one `DiscreteVariation` over three values is a `Sampling` at any replicate count. An example that
+teaches the wrong mental model does more damage than the omission it was filling.
+
+The same rule governs `docs/src/man/*.md`: a manual page describes how the code behaves, never
+which cases the current change happened to touch. If a list of "cases worth knowing about" is
+really an inventory of your diff, delete it — the substance belongs in the docstring and the
+reasoning in `progress.md`.
+
 ## Docstring Cross-References
 
 **Rule: a docstring may only `[`link`](@ref)` to a *public* binding — one that is either
@@ -217,7 +249,8 @@ and is internal. Verify against the actual signature.
 A feature is complete when **all** of the following are true:
 
 1. **Tests pass:** `julia --project=. -e 'using Pkg; Pkg.test()'` runs green.
-2. **Docstrings written:** Every exported function has a docstring with description, argument list, return value, and at least one usage example.
+2. **Docstrings written:** Every exported function has a docstring. Length is earned by
+   non-obvious content, not owed by default — see [Docstring Length](#docstring-length).
 3. **README updated:** Implementation Status section marks the feature as complete.
 4. **PRD reflects reality:** If implementation deviated from the PRD, update the PRD entry.
 5. **No regressions:** Full test suite has no new failures.
