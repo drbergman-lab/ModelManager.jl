@@ -131,19 +131,33 @@ ModelManager.upgradeToMilestone(sim::MySimulator, version, auto_upgrade)::Bool
 
 See [Database upgrades](@ref database_upgrades) for how these are orchestrated by [`upgradePackage`](@ref).
 
-ModelManager also compares the version installed in the environment against the version loaded
-in the session before it migrates anything, and refuses when they differ. It reads the loaded
-version from [`loadedPackageVersion`](@ref), whose default —
-`pkgversion(parentmodule(typeof(sim)))` — is correct when your simulator type is defined
-directly in the package named by [`packageName`](@ref). Override it if that is not your layout:
+Two different versions of your package matter here, and migrations depend on telling them apart:
+
+| | What it is | How it changes |
+| --- | --- | --- |
+| **Installed** ([`getPackageVersion`](@ref)) | What the active environment's manifest records — what `Pkg.status` prints | `Pkg.update`, `Pkg.add`, editing a `develop`ed package's `version` |
+| **Loaded** ([`loadedPackageVersion`](@ref)) | What `using` actually brought into this session's memory | Only by starting a new session |
+
+They agree until the environment changes underneath a running session, at which point the
+session goes on executing the code it loaded while the manifest advertises something newer.
+
+Migrations follow the **loaded** version, because `upgradeMilestones` is your loaded code — it
+cannot describe schema changes belonging to a release that code predates. So the furthest a
+session can correctly migrate a database is the release it is actually running.
+
+The default `loadedPackageVersion` is `pkgversion(parentmodule(typeof(sim)))`, which is right for
+the ordinary layout where your simulator type is defined in the package [`packageName`](@ref)
+names. A type in a submodule needs no override — `pkgversion` resolves through
+`Base.moduleroot`. Override only when the type's defining package is not the one you name:
 
 ```julia
-# The type lives in a submodule, so `parentmodule` returns the submodule, which has no version.
-ModelManager.loadedPackageVersion(::Backends.MySimulator) = pkgversion(MyModelManager)
+# The type lives in an adapter package; the version the database tracks is the core package's.
+ModelManager.packageName(::MySimulator)          = "MySimCore"
+ModelManager.loadedPackageVersion(::MySimulator) = pkgversion(MySimCore)
 ```
 
-Returning `nothing` disables the comparison, which is what a type defined at the REPL or in a
-script gets.
+Returning `nothing` falls back to the installed version, which is what a type defined at the
+REPL or in a script gets.
 
 ## 5. Override optional hooks as needed
 

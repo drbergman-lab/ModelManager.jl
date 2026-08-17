@@ -50,28 +50,61 @@ milestone filter, and every write to the version table. The bug is entirely in t
 PCMM has no hook to declare "I am actually loaded at version X", and even given one, the filter and
 the stamp are ModelManager's code.
 
+### The fix, after review reshaped it
+The first implementation compared the loaded version against the installed one and **refused** to
+initialize on a mismatch. Review (PR #30) replaced that with the better fix: **use the loaded
+version as the migration target.**
+
+The reasoning is that the installed version was never a legitimate target in the first place.
+`upgradeMilestones` *is* the loaded code, so the loaded release is the furthest point whose schema
+changes a session can actually apply. Targeting it makes the corruption **unrepresentable** rather
+than detected — the recorded version and the applied migrations now come from the same source — and
+it drops the refusal, so a mid-session update no longer blocks the session at all. The database is
+migrated to the schema the running code expects; the next session, loading the new version, applies
+the remainder. Self-healing, and verified as such (Scenario C below).
+
+`getPackageVersion` survives only as the `nothing` fallback and as input to the warning.
+
+**Why the refusal was worse than it looked.** For a backend whose simulator type lives in a
+different package than `packageName` names, `loaded != installed` holds on *every* session, not just
+after an update — so the refusal would have bricked that backend permanently rather than failing
+safe. The retargeting has a real residual risk there (a wrong `loaded` number becomes a wrong stamp)
+but the `@warn` names both versions on every init, and the fix is the override the hook exists for.
+The earlier framing of this as "the one property the old design had" was wrong and was withdrawn.
+
 ### Decisions
-- **Refuse, don't warn.** A warning is insufficient because continuing is precisely what writes the
-  wrong stamp. A throw would be inconsistent: `initializeModelManager` is documented to return
-  `false` rather than throw, and the sibling "database is newer than the package" branch already
-  prints and returns `false`. Returning `false` reuses the existing clean-abort path.
-- **`nothing` means "cannot tell, proceed."** `pkgversion` returns `nothing` for a module not
-  imported from a versioned package — which is exactly `TestSimulator`, defined in `Main` while
-  declaring `packageName = "ModelManager"`. Treating `nothing` as a mismatch would fail every
-  project in the suite. Hence the unit test on a module-less type (`_NoModuleSimulator`), needed
-  because the `TestSimulator` override shadows the default.
-- **`>` not `!=` in the `upgradePackage` guard.** A target below the loaded version is legitimate:
-  resuming a partly-applied chain, or an explicitly older target.
+- **Migrate to the loaded version; never refuse for a version mismatch.** See above.
+- **`@warn`, `maxlog=1`.** The condition cannot change within a session — the loaded version is
+  fixed at load time — so one notice per session is the right cardinality even across several
+  projects. `maxlog=1` matches the `useHPC` already-on warning.
+- **`nothing` means "cannot determine" → use the installed version.** `pkgversion` returns `nothing`
+  for a module not imported from a versioned package, which is exactly `TestSimulator`, defined in
+  `Main` while declaring `packageName = "ModelManager"`. Hence the unit test on a module-less type
+  (`_NoModuleSimulator`), needed because the `TestSimulator` override shadows the default.
+- **`getDBPackageVersion` stamps the target, not the installed version.** This is the load-bearing
+  half: it stamps a database that has no version table, so it is the *only* code on the
+  new-project-mid-session path. Mutation testing confirmed it — with the retargeting reverted, the
+  re-init path was still caught by `upgradePackage`'s guard, but the fresh-project path corrupted.
+- **`upgradePackage` keeps its own guard, refusing rather than clamping.** Unreachable from
+  `resolvePackageVersion` now, so it exists for direct callers (it is `@compat public`), where
+  `to_version` is whatever was passed. Clamping to the loaded version would silently migrate
+  somewhere other than asked, which is the worse surprise. `>` not `!=`, since a target below the
+  loaded version is legitimate (resuming a partly-applied chain).
+- **Split the "database is newer" remedy.** Restart Julia when the session merely lags the
+  environment; upgrade the package otherwise. Printing "upgrade your package" to someone whose
+  package is already new enough sends them in circles.
 - **Working default, not an `error` stub.** `loadedPackageVersion` follows
   `getInputFolderDescription`, so no existing backend has to change anything. Declared
-  `@compat public` because overriding it is the documented contract for an unusual module layout.
+  `@compat public` because overriding it is the documented contract for an unusual package layout.
 - **Hook named `loadedPackageVersion`**, matching `abstract_simulator.jl` (nothing there carries a
   `get` prefix except the legacy `getInputFolderDescription`), over `getLoadedPackageVersion`,
   which would have matched call-site symmetry with `getPackageVersion`/`getDBPackageVersion`.
-- **No escape-hatch keyword.** An `allow_version_mismatch=true` was considered and rejected: there
-  is no known legitimate reason to proceed, since the only effect of continuing is writing a wrong
-  stamp. It stays a one-line addition if a real need appears. Adding an override to a data-integrity
-  guard on day one mostly guarantees it gets found in a stack trace and used.
+- **A submodule needs no override.** Measured, not assumed: `pkgversion` resolves through
+  `Base.moduleroot`, so `pkgversion(Pkg.Types) == pkgversion(Pkg)`. The first draft's docstring
+  claimed otherwise and was corrected. (`DataFrames.PrettyTables` returning its own version is not a
+  counterexample — that is a re-exported separate package, which is the actual override case.)
+- **No escape-hatch keyword.** An `allow_version_mismatch=true` was considered while the design
+  still refused. The reshape moots it: there is nothing left to escape from.
 
 ### Rejected: do the check in `__init__`
 Proposed during review — detect in `__init__` that the version increased, drop the current state,

@@ -66,16 +66,21 @@ a partial upgrade is recoverable. If any milestone fails the chain is aborted an
 After all milestones pass, if `to_version` is beyond the last milestone the version
 table is stamped with `to_version` (a "no schema change" bump).
 
-Migrating past the version currently loaded in the session is refused: the milestone list
-comes from the loaded code, so it cannot describe a later release's schema changes. Prints
-an explanation and returns `false` in that case, leaving the version table untouched.
+A `to_version` beyond the version loaded in this session is refused: `milestones` is built
+from the loaded code, so it cannot describe a later release's schema changes. Prints an
+explanation and returns `false`, leaving the version table untouched.
+[`resolvePackageVersion`](@ref) never asks for such a target; the check applies to direct
+callers.
 """
 function upgradePackage(sim::AbstractSimulator, db::SQLite.DB,
                         from_version::VersionNumber, to_version::VersionNumber,
                         auto_upgrade::Bool)
+    #! Unreachable from `resolvePackageVersion`, which already targets the loaded version — this
+    #! guards a direct call, where `to_version` is whatever the caller passed. Refusing rather
+    #! than clamping to the loaded version, because silently migrating somewhere other than
+    #! where the caller asked is the worse surprise.
     #! `>`, not `!=`: a target *below* the loaded version is legitimate — resuming a partially
-    #! applied chain, or deliberately migrating to an earlier milestone. Only a target the
-    #! loaded code cannot know the milestones for is refused.
+    #! applied chain, or deliberately migrating to an earlier milestone.
     loaded_version = loadedPackageVersion(sim)
     if !isnothing(loaded_version) && to_version > loaded_version
         println("""

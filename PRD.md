@@ -396,18 +396,23 @@ target location's file type.
 - `upgradePackage(sim; auto_upgrade)` walks from the DB's recorded version to the current package version, calling `upgradeToMilestone(sim, v, auto_upgrade)` for each milestone.
 - Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, `dbVersionTableName`, and `packageName`.
 - `continueMilestoneUpgrade(version, auto_upgrade)` prompts the user for destructive migrations (unless `auto_upgrade=true`).
-- `loadedPackageVersion(sim)` reports the version of the backend loaded in the running session, defaulting to `pkgversion(parentmodule(typeof(sim)))`. `nothing` means "cannot determine" and disables the comparison below.
-- Migration is refused when the loaded version disagrees with the version installed in the environment — the state produced by updating the environment mid-session. Refusal is a printed explanation naming both versions plus a `false` return, never a throw:
-  - `resolvePackageVersion` refuses when `loadedPackageVersion(sim) != getPackageVersion(sim)`, **before** reading the version table (reading it creates and stamps it when absent). `initializeModelManager` then returns `false`.
-  - `upgradePackage` refuses when `to_version > loadedPackageVersion(sim)`. A target at or below the loaded version is permitted, since resuming a partly-applied chain is legitimate.
+- `loadedPackageVersion(sim)` reports the version of the backend loaded in the running session, defaulting to `pkgversion(parentmodule(typeof(sim)))`. A type in a submodule needs no override, since `pkgversion` resolves through `Base.moduleroot`; override when the type's defining package is not the one `packageName` names. `nothing` means "cannot determine".
+- **Migrations target the loaded version, not the installed one.** The milestone list comes from the loaded code, so the loaded release is the furthest a session can correctly migrate to; targeting it keeps the recorded version and the applied migrations in step by construction. When `loadedPackageVersion` returns `nothing`, the installed version (`getPackageVersion`) is the target instead.
+  - `resolvePackageVersion` compares the recorded version against the target and migrates to it. Equal → `true`; target newer → `upgradePackage`; target older → prints and returns `false`.
+  - `getDBPackageVersion` stamps a database with no version table using the same target, so a project created mid-session records the version whose code built its schema.
+  - When the target differs from the installed version, `@warn` (with `maxlog=1`, since the loaded version is fixed for the session) states both versions and that a restart picks up the installed one. It does not block: the session continues and the database is migrated to the running code's schema.
+  - `upgradePackage` refuses when `to_version > loadedPackageVersion(sim)`. Unreachable from `resolvePackageVersion`; it guards direct callers, which supply `to_version` themselves. Refuses rather than clamping, so a caller is never silently migrated somewhere other than where they asked. A target at or below the loaded version is permitted, since resuming a partly-applied chain is legitimate.
+- The "database is newer than the package" refusal prints one of two remedies: restart Julia when the session merely lags the environment (`target < installed`), or upgrade the package when it does not.
 - Every early `false` return from `initializeModelManager` clears `initialized`, `data_dir`, and the central DB handle, so `isInitialized()` reports `false` after a failed initialization — including one that follows an earlier success.
 
 **Acceptance criteria:**
 - A project at version N can be upgraded to version N+2 by walking through N→N+1→N+2.
 - If the user declines at a milestone, the upgrade stops and the DB remains at the last successfully upgraded version.
-- With the installed and loaded versions in disagreement: `initializeModelManager` returns `false`, `isInitialized()` is `false`, `dataDir()` is `""`, and a project opened for the first time in that state has no version table written to it.
-- With the installed and loaded versions in disagreement, a direct `upgradePackage` call to the newer version returns `false`, applies no milestone, and leaves the recorded version unchanged.
-- `loadedPackageVersion` returns `nothing` for a simulator type belonging to no package, and initialization proceeds normally in that case.
+- After the environment is updated mid-session, initialization still succeeds and the database is stamped with the *loaded* version, never the installed one — both when re-initializing an existing project and when creating a new one.
+- A session restarted with the newer version loaded applies the deferred milestone and advances the recorded version, so the delay resolves on its own.
+- A database recorded ahead of the loaded version stops initialization with `isInitialized()` `false` and `dataDir()` `""`.
+- A direct `upgradePackage` call to a version beyond the loaded one returns `false`, applies no milestone, and leaves the recorded version unchanged.
+- `loadedPackageVersion` returns `nothing` for a simulator type belonging to no package, and the installed version is used as the target in that case.
 
 ---
 

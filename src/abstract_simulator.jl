@@ -196,26 +196,22 @@ Return the version of `sim`'s package as **loaded into this Julia session**, or 
 if it cannot be determined.
 
 This is the counterpart to [`getPackageVersion`](@ref), which reports the version
-*installed* in the active environment. The two disagree whenever the environment is
-updated after the package was loaded: the session keeps running the old code while the
-manifest advertises the new version. ModelManager compares them before it touches a
-project database, because the migration machinery draws its milestone list from the
-loaded module ([`upgradeMilestones`](@ref)) while the version it would record comes from
-the environment.
+*installed* in the active environment. The two disagree whenever the environment changes
+while a session is running: the session keeps executing the code it loaded at startup,
+while the manifest advertises something else.
 
-The default is `pkgversion(parentmodule(typeof(sim)))`, correct whenever the simulator
-type is defined directly in the package named by [`packageName`](@ref). Override it when
-that does not hold:
+Database migrations are driven by this version, not the installed one, because the
+milestone list comes from the loaded module ([`upgradeMilestones`](@ref)) — so the loaded
+release is the furthest point whose schema changes this session can actually apply.
 
-- the type is defined in a submodule or a package extension, so `parentmodule` returns
-  something other than the top-level package module;
-- the type lives in a different package than the one [`packageName`](@ref) names, where
-  the default would compare two unrelated versions.
+The default is `pkgversion(parentmodule(typeof(sim)))`. A type defined in a submodule needs
+no override: `pkgversion` resolves through `Base.moduleroot`, so a submodule reports its
+package's version. Override when the type's defining package is **not** the package
+[`packageName`](@ref) names, where the default would report an unrelated package's version.
 
-`nothing` means "cannot determine" and disables the comparison, letting initialization
-and migration proceed as though the versions agreed. That is the result for a simulator
-type defined at the REPL or in a script, which belongs to no package and so has no
-version to report.
+`nothing` means "cannot determine", and the installed version is used as the migration
+target instead. That is the result for a simulator type defined at the REPL or in a script,
+which belongs to no package and so has no version to report.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -225,17 +221,11 @@ The loaded `VersionNumber`, or `nothing` if it cannot be determined.
 
 # Example
 ```julia
-# A simulator type defined in a submodule carries no version of its own, because
-# `parentmodule` resolves to the submodule rather than to the package.
-module MyModelManager
-
-module Backends
-    struct MySimulator <: ModelManager.AbstractSimulator end
-end
-
-ModelManager.loadedPackageVersion(::Backends.MySimulator) = pkgversion(MyModelManager)
-
-end
+# The type lives in an adapter package, while the version the database tracks belongs to
+# the core package that `packageName` names. Without the override, the default would
+# report MySimAdapter's version.
+ModelManager.packageName(::MySimulator)          = "MySimCore"
+ModelManager.loadedPackageVersion(::MySimulator) = pkgversion(MySimCore)
 ```
 """
 loadedPackageVersion(sim::AbstractSimulator) = pkgversion(parentmodule(typeof(sim)))

@@ -2159,57 +2159,90 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 end
             end
 
-            # A mid-session `Pkg.update()` leaves the environment advertising a new version
-            # while the session still runs the old code. Migrating then would stamp the
-            # database with the new version without applying its schema changes, and the
-            # version equality check would skip them in every later session. Both entry
-            # points refuse instead.
-            @testset "mid-session package update guard" begin
+            # Migrations follow the version loaded in the session, not the one installed in the
+            # environment: the milestone list comes from the loaded code, so the loaded release
+            # is the furthest a session can correctly migrate to. Updating the environment
+            # mid-session therefore delays the schema change to the next session rather than
+            # recording a version whose migration never ran.
+            @testset "migration targets the loaded version" begin
                 installed = ModelManager.getPackageVersion(TestSimulator())
                 table = ModelManager.dbVersionTableName(TestSimulator())
                 try
                     # --- the default hook -------------------------------------------------
-                    # A type outside any package has no version to report, and `nothing` must
-                    # read as "cannot tell, proceed" — it is what TestSimulator itself gets,
-                    # so getting this wrong fails every project in the suite.
+                    # A type outside any package has no version to report. `nothing` must fall
+                    # back to the installed version — it is what TestSimulator itself gets, so
+                    # getting this wrong fails every project in the suite.
                     @test ModelManager.loadedPackageVersion(_NoModuleSimulator()) === nothing
 
+                    # --- the migration target ---------------------------------------------
+                    # The loaded version is the target; `nothing` falls back to the installed one.
+                    _loaded_version_override[] = nothing
+                    @test ModelManager._migrationTargetVersion(TestSimulator()) == installed
+                    _loaded_version_override[] = v"0.4.0"
+                    @test ModelManager._migrationTargetVersion(TestSimulator()) == v"0.4.0"
+
                     # --- resolvePackageVersion --------------------------------------------
-                    # Undeterminable loaded version: guard inert, initialization proceeds.
+                    # Undeterminable loaded version: behaves as it always did.
                     _loaded_version_override[] = nothing
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == installed
 
-                    # Versions agree: guard inert.
+                    # Versions agree: nothing to do.
                     _loaded_version_override[] = installed
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()
 
-                    # Versions disagree: refused, and no half-initialized state is left
-                    # behind. The `dataDir`/`isInitialized` assertions cover the reset that
-                    # keeps a later query from silently reading an empty in-memory database.
-                    _loaded_version_override[] = v"0.0.1"
+                    # A mid-session update no longer blocks the session. The database is
+                    # migrated to the *loaded* version rather than the installed one, so the
+                    # recorded version never runs ahead of the milestones actually applied.
+                    ModelManager.DBInterface.execute(centralDB(),
+                                                     "UPDATE $(table) SET version='0.1.0';")
+                    _loaded_version_override[] = v"0.5.0"
+                    _milestone_override[] = VersionNumber[]
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                    @test isInitialized()
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.5.0"
+
+                    # A project created for the first time mid-update is stamped with the loaded
+                    # version too. getDBPackageVersion stamps a fresh database itself, so this
+                    # is the route that corrupts with no re-initialization involved at all.
+                    mktempdir() do fresh_dir
+                        _make_test_project(fresh_dir)
+                        _loaded_version_override[] = v"0.5.0"
+                        @test initializeModelManager(TestSimulator(), fresh_dir; auto_upgrade=true)
+                        waitForDiagnostics()
+                        @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.5.0"
+                    end
+
+                    # A database ahead of the running code stops initialization: the schema is
+                    # newer than the code about to query it. project_dir's database sits at
+                    # 0.5.0 from the migration above, so 0.2.0 is behind it. The session merely
+                    # lags the environment here, so the remedy printed is to restart Julia.
+                    _loaded_version_override[] = v"0.2.0"
                     @test !initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     @test !isInitialized()
                     @test dataDir() == ""
 
-                    # The refusal precedes any read of the version table, because reading it
-                    # creates and stamps it when absent. A project opened for the first time
-                    # after a mid-session update must not be stamped at all.
-                    mktempdir() do fresh_dir
-                        _make_test_project(fresh_dir)
-                        _loaded_version_override[] = v"0.0.1"
-                        @test !initializeModelManager(TestSimulator(), fresh_dir; auto_upgrade=true)
-                        fresh_db = ModelManager.SQLite.DB(joinpath(fresh_dir, "mm.db"))
-                        try
-                            @test !ModelManager.tableExists(table; db=fresh_db)
-                        finally
-                            close(fresh_db)
-                        end
+                    # The other remedy: with no mid-session update in play, a database ahead of
+                    # the installed version means the package itself is too old to open it.
+                    mktempdir() do old_pkg_dir
+                        _make_test_project(old_pkg_dir)
+                        stale = ModelManager.SQLite.DB(joinpath(old_pkg_dir, "mm.db"))
+                        ModelManager.DBInterface.execute(stale,
+                            "CREATE TABLE $(table) (version TEXT PRIMARY KEY);")
+                        ModelManager.DBInterface.execute(stale,
+                            "INSERT INTO $(table) (version) VALUES ('99.9.9');")
+                        close(stale)
+                        _loaded_version_override[] = nothing   # target == installed
+                        @test !initializeModelManager(TestSimulator(), old_pkg_dir; auto_upgrade=true)
+                        @test !isInitialized()
                     end
 
                     # --- upgradePackage ---------------------------------------------------
-                    # Public and callable directly, so it carries its own guard.
+                    # Public and callable directly, so it keeps a guard of its own — a direct
+                    # caller supplies to_version, which resolvePackageVersion never would.
                     _loaded_version_override[] = nothing
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()

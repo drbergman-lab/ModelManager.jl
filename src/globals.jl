@@ -206,11 +206,6 @@ would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are r
 a clean state before any `false` return, so [`isInitialized`](@ref) reports `false` and a
 subsequent retry starts fresh.
 
-Initialization is also refused, with an explanation, when the version of the simulator
-package installed in the environment differs from the version loaded in this session —
-the situation after updating the environment mid-session. Restart Julia and initialize
-again.
-
 Simulator packages typically provide their own path-level overloads (e.g. accepting
 `path_to_physicell` and `path_to_data`) that validate paths, set simulator-specific
 state, then delegate here.

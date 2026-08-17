@@ -15,36 +15,34 @@ backend authors implement the hooks described in
 Every project database records the package version it was last migrated to, in a version
 table named by the backend ([`dbVersionTableName`](@ref)). During
 [`initializeModelManager`](@ref), [`resolvePackageVersion`](@ref) compares that stored version
-to the running package version:
+to the version of the backend **loaded into the running session**
+([`loadedPackageVersion`](@ref)):
 
 - versions match → nothing to do;
 - the database is older → [`upgradePackage`](@ref) runs the migration chain;
+- the database is newer → initialization stops, since the running code is behind the schema;
 - with `auto_upgrade=false` (the default), the backend may prompt before applying large or
   destructive changes.
 
-## Updating the package mid-session
+## Why the loaded version, and not the installed one
 
-Migrations are driven by the version of the backend **loaded into the running Julia session**,
-not by whatever is installed in the environment. The two come apart if you update the
-environment — `Pkg.update()`, `Pkg.add`, editing a `develop`ed package's `version` — while a
-session is already running: the session keeps executing the code it loaded at startup, but the
-environment now advertises the new version.
+The loaded version is the one whose code is executing. Since
+[`upgradeMilestones`](@ref) *is* that code, it can only describe schema changes belonging to
+the release the session is running — so that release is the furthest a session can correctly
+migrate a database to. Targeting it keeps the version a database records and the migrations
+actually applied to it in step, by construction.
 
-Opening or migrating a project in that state is refused, with a message naming both versions.
-**Restart Julia and initialize again.** `Revise` does not help here; it revises method bodies,
-not the version a session recorded when it loaded the package.
+This matters when the environment changes underneath a running session — `Pkg.update()`,
+`Pkg.add`, or editing a `develop`ed package's `version`. From then on the manifest advertises
+one version while the session runs another. ModelManager warns, then migrates the database to
+the version it is running, which is the schema that session's code expects. **Restart Julia**
+to load the newer version; the next session migrates the rest of the way on its own. `Revise`
+does not help, as it revises method bodies rather than the version a session recorded when it
+loaded the package.
 
-Refusing is the conservative choice because the alternative is worse than a delayed upgrade.
-The list of schema milestones comes from the loaded code, so it cannot describe a release that
-code predates. Migrating anyway would find no work to do, record the database as being at the
-new version, and thereby mark that release's schema changes as applied — after which the
-version comparison above matches, and the changes are skipped for the life of the database.
-
-The refusal covers both entry points: [`resolvePackageVersion`](@ref), which every
-[`initializeModelManager`](@ref) passes through, and [`upgradePackage`](@ref) when called
-directly. A backend reports its loaded version through
-[`loadedPackageVersion`](@ref), which is also the hook to override in the rare layout where
-the default cannot determine it.
+A migration target beyond the loaded version is refused outright. Nothing in
+[`initializeModelManager`](@ref) asks for one, but [`upgradePackage`](@ref) is callable
+directly, and there the target is whatever the caller passed.
 
 ## The milestone chain
 

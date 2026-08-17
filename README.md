@@ -54,7 +54,7 @@ end
 - [x] Trial hierarchy — `Simulation`, `Monad`, `Sampling`, `Trial`, `InputFolders`, `VariationID`
 - [x] Database schema — generic SQLite schema parameterized by simulator version table/column names
 - [x] Database utilities — `queryToDataFrame`, `constructSelectQuery`, `buildWhereClause`, etc.
-- [x] Schema migrations — `up.jl` framework with `upgradePackage`, `upgradeToMilestone`; `loadedPackageVersion` reports the version loaded in the session, and both `resolvePackageVersion` and `upgradePackage` refuse to migrate when it disagrees with the version installed in the environment (the state after updating mid-session), rather than recording a version whose migration never ran
+- [x] Schema migrations — `up.jl` framework with `upgradePackage`, `upgradeToMilestone`; migrations target the version loaded in the session (`loadedPackageVersion`) rather than the one installed in the environment, since the milestone list comes from the loaded code — so updating the environment mid-session defers the schema change to the next session instead of recording a version whose migration never ran, and `upgradePackage` refuses a target beyond the loaded version for direct callers
 - [x] Runner — parallel simulation execution via Julia tasks/channels; HPC SLURM support; `prepareTrialHierarchy` + `pendingSimulationSpecs` split
 - [x] Deletion — `deleteSimulations`, `deleteMonad`, `deleteSampling`, `deleteTrial`, `resetDatabase`
 - [x] Parameter variations — `XMLPath`, `DiscreteVariation`, `DistributedVariation`, `CoVariation`, `LatentVariation`
