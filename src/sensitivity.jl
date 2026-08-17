@@ -44,6 +44,18 @@ Return the simulation IDs run in the sensitivity analysis.
 simulationIDs(gsa_sampling::GSASampling) = simulationIDs(gsa_sampling.sampling)
 
 """
+    monadIDs(gsa_sampling::GSASampling)
+
+Return the IDs of the monads evaluated in the sensitivity analysis.
+
+These are the same monads that [`getMonadIDDataFrame`](@ref) reports, flattened and
+deduplicated: the data frame arranges them in the shape the method's design requires — one
+column per factor for [`MOAT`](@ref), for instance — while this gives the flat set, which is
+what [`monadsTable`](@ref) and the deletion functions want.
+"""
+monadIDs(gsa_sampling::GSASampling) = monadIDs(gsa_sampling.sampling)
+
+"""
     methodString(gsa_sampling::GSASampling)
 
 Return a lowercase string identifier for the GSA method (e.g. `"moat"`, `"sobol"`).

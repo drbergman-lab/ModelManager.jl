@@ -32,6 +32,35 @@ All associated simulations share both input folders and variation IDs.
 """
 abstract type AbstractMonad <: AbstractSampling end
 
+"""
+    trialType(T::AbstractTrial)
+    trialType(output::MMOutput)
+
+Return the concrete trial type of `T`: one of [`Simulation`](@ref), [`Monad`](@ref),
+[`Sampling`](@ref), or [`Trial`](@ref).
+
+Useful because [`createTrial`](@ref) chooses the type from the variations and replicate count it
+is handed, so calling code that must branch on what it got asks here rather than testing
+`isa` four times. For the [`MMOutput`](@ref) returned by [`run`](@ref), the answer comes from
+`MMOutput`'s type parameter — the type of the trial that was run — and is therefore known at
+compile time.
+
+# Arguments
+- `T`: any trial object.
+- `output`: a run result.
+
+# Returns
+A `DataType`: the concrete subtype of [`AbstractTrial`](@ref).
+
+# Examples
+```julia
+trialType(createTrial(inputs, dv; n_replicates=1))          # Simulation
+trialType(createTrial(inputs, dv; n_replicates=5))          # Monad
+
+out = run(createTrial(inputs, [dv1, dv2]))
+trialType(out) == Sampling                                  # true
+```
+"""
 trialType(::T) where T<:AbstractTrial = T
 
 """
@@ -40,6 +69,45 @@ trialType(::T) where T<:AbstractTrial = T
 Return the full path to the input folder for `location` used by sampling `S`.
 """
 locationPath(location::Symbol, S::AbstractSampling) = locationPath(location, S.inputs[location].folder)
+
+"""
+    trialID(T::AbstractTrial) -> Int
+    trialID(output::MMOutput) -> Int
+    trialID(samplings::Vector{Sampling}) -> Union{Int,Missing}
+
+Return the database ID of a trial.
+
+For a [`Simulation`](@ref), [`Monad`](@ref), [`Sampling`](@ref), or [`Trial`](@ref) — and for
+the [`MMOutput`](@ref) that [`run`](@ref) returns, which forwards to the trial it wraps — this
+is the object's own ID.
+
+The `Vector{Sampling}` form answers a different question: which [`Trial`](@ref) groups exactly
+these samplings, in any order? It is a lookup only, and returns `missing` when no trial does.
+Creating one is the job of the [`Trial`](@ref) constructor, `Trial(samplings)`, which inserts a
+row when it finds no match.
+
+# Arguments
+- `T`: a trial object; its ID is read straight from the struct.
+- `output`: a run result; its `trial` field supplies the ID.
+- `samplings`: the samplings a trial would have to contain, in any order.
+
+# Returns
+`Int` for a trial or a run result. `Union{Int,Missing}` for the `Vector{Sampling}` form: the
+matching trial's ID, or `missing` if no trial matches.
+
+# Examples
+```julia
+sampling = createTrial(inputs, DiscreteVariation(:config, xp, [1.0, 2.0]))
+trialID(sampling) == sampling.id      # true
+
+out = run(sampling)
+trialID(out) == trialID(out.trial)    # true
+
+trialID([sampling])                   # missing — no Trial groups it yet
+trial = Trial([sampling])             # creates one
+trialID([sampling]) == trial.id       # true
+```
+"""
 trialID(T::AbstractTrial) = T.id
 
 Base.length(T::AbstractTrial) = simulationIDs(T) |> length
@@ -364,6 +432,35 @@ end
 ############   Monad   #################################
 ########################################################
 
+#! Single place that knows the `monads` key tuple — exactly the columns `monadsSchema` declares
+#! `UNIQUE` over. Both the find-or-insert `Monad` constructor and the read-only `_monadIDForKey`
+#! lookup build their SQL from this, so a column added to the key cannot leave the accessor
+#! matching on a different tuple than the writer inserts. The two halves are returned together
+#! because they are only ever meaningful as a pair, `<columns>=<values>`.
+#!
+#! `version_id` defaults to the current simulator version, which is what a *writer* wants: a
+#! parameterization re-created under a new simulator version is deliberately a new monad row.
+#! A *reader* asking which monad an existing simulation belongs to must pass that simulation's
+#! recorded version instead, or it would look for a monad the upgrade has not created.
+function _monadKeyStrings(inputs::InputFolders, variation_id::VariationID,
+                          version_id::Integer=currentSimulatorVersionID())
+    feature_str = """
+    (\
+    $(simulatorVersionIDName()),\
+    $(join(locationIDNames(), ",")),\
+    $(join(locationVariationIDNames(), ","))\
+    ) \
+    """
+    value_str = """
+    (\
+    $(version_id),\
+    $(join([inputs[loc].id for loc in projectLocations().all], ",")),\
+    $(join([variation_id[loc] for loc in projectLocations().varied],","))\
+    ) \
+    """
+    return feature_str, value_str
+end
+
 """
     Monad
 
@@ -387,20 +484,7 @@ struct Monad <: AbstractMonad
     variation_id::VariationID
 
     function Monad(inputs::InputFolders, variation_id::VariationID=VariationID(inputs); n_replicates::Integer=0, use_previous::Bool=true)
-        feature_str = """
-        (\
-        $(simulatorVersionIDName()),\
-        $(join(locationIDNames(), ",")),\
-        $(join(locationVariationIDNames(), ","))\
-        ) \
-        """
-        value_str = """
-        (\
-        $(currentSimulatorVersionID()),\
-        $(join([inputs[loc].id for loc in projectLocations().all], ",")),\
-        $(join([variation_id[loc] for loc in projectLocations().varied],","))\
-        ) \
-        """
+        feature_str, value_str = _monadKeyStrings(inputs, variation_id)
         #! No transaction: the write comes first and is atomic, and `UNIQUE` makes it
         #! self-correcting — a losing racer's lookup finds the winner's row.
         inserted = DBInterface.execute(centralDB(),
@@ -664,7 +748,7 @@ end
 
 function Trial(Ss::AbstractArray{<:AbstractSampling}; n_replicates::Integer=0, use_previous::Bool=true)
     samplings = Sampling.(Ss; n_replicates=n_replicates, use_previous=use_previous)
-    id = trialID(samplings)
+    id = _findOrCreateTrialID(samplings)
     return Trial(id, samplings)
 end
 
@@ -677,23 +761,29 @@ function Trial(trial_id::Int; n_replicates::Integer=0, use_previous::Bool=true)
     return Trial(trial_id, samplings)
 end
 
+#! Constituents live in a CSV rather than a `trials` column, so there is nothing to join
+#! against: matching means reading each trial's constituent list and comparing sets.
 function trialID(samplings::Vector{Sampling})
     sampling_ids = [sampling.id for sampling in samplings]
-    id = -1
     trial_ids = constructSelectQuery("trials"; selection="trial_id") |> queryToDataFrame |> x -> x.trial_id
     for trial_id in trial_ids
         sampling_ids_in_db = constituentIDs(Trial, trial_id)
         if symdiff(sampling_ids_in_db, sampling_ids) |> isempty
-            id = trial_id
-            break
+            return Int(trial_id)
         end
     end
+    return missing
+end
 
-    if id == -1
-        id = DBInterface.execute(centralDB(), "INSERT INTO trials (datetime) VALUES($(Dates.format(now(),"yymmddHHMM"))) RETURNING trial_id;") |> DataFrame |> x -> x.trial_id[1]
-        recordConstituentIDs(Trial, id, sampling_ids)
-        applyCreationTags(Trial, id)
-    end
+#! Find-or-create, deliberately kept out of `trialID` so the exported accessor never writes.
+#! The `Trial` constructor is the one caller that genuinely needs the create half.
+function _findOrCreateTrialID(samplings::Vector{Sampling})
+    id = trialID(samplings)
+    ismissing(id) || return id
+    sampling_ids = [sampling.id for sampling in samplings]
+    id = DBInterface.execute(centralDB(), "INSERT INTO trials (datetime) VALUES($(Dates.format(now(),"yymmddHHMM"))) RETURNING trial_id;") |> DataFrame |> x -> x.trial_id[1]
+    recordConstituentIDs(Trial, id, sampling_ids)
+    applyCreationTags(Trial, id)
     return id
 end
 
@@ -734,8 +824,14 @@ constituentTypeFilename(T) = "$(T |> constituentType |> lowerClassString)s.csv"
 """
     constituentIDs(T::AbstractTrial)
     constituentIDs(::Type{T}, id::Int)
+    constituentIDs(output::MMOutput)
 
-Read the constituent IDs for trial `T` from its CSV file.
+Read the constituent IDs for trial `T` from its CSV file — one level down only, so a
+[`Trial`](@ref) reports its samplings and a [`Sampling`](@ref) its monads. Use
+[`simulationIDs`](@ref) or [`monadIDs`](@ref) to descend the whole hierarchy instead.
+
+A [`Simulation`](@ref) has no constituents and throws `ArgumentError`; the [`MMOutput`](@ref)
+form forwards to the trial that was run, and so throws for a simulation-wrapping output.
 """
 function constituentIDs(path_to_csv::String)
     if !isfile(path_to_csv)
@@ -770,9 +866,39 @@ end
 
 """
     simulationIDs()
+    simulationIDs(simulation::Simulation)
+    simulationIDs(monad::Monad)
+    simulationIDs(sampling::Sampling)
+    simulationIDs(trial::Trial)
+    simulationIDs(Ts::AbstractArray{<:AbstractTrial})
+    simulationIDs(output::MMOutput)
 
-Return all simulation IDs in the database.  Overloaded forms accept a trial,
-sampling, monad, or simulation object.
+Return the IDs of every simulation a trial covers, descending as far as the hierarchy goes: a
+[`Sampling`](@ref) reports the simulations of all its monads, a [`Trial`](@ref) those of all its
+samplings. With no argument, return every simulation ID in the database.
+
+The [`MMOutput`](@ref) form forwards to the trial that was run, so `simulationIDs(out)` and
+`simulationIDs(out.trial)` are the same. Note that it reports every simulation in the trial, not
+only the ones this particular [`run`](@ref) dispatched — a re-run of a trial whose simulations
+already completed schedules nothing but still reports them all.
+
+# Arguments
+- `simulation`, `monad`, `sampling`, `trial`: a trial object to descend from.
+- `Ts`: an array of trial objects; results are concatenated in order.
+- `output`: a run result.
+
+# Returns
+`Vector{Int}`, in hierarchy order. Not deduplicated for the array form: a simulation reachable
+from two elements of `Ts` appears twice.
+
+# Examples
+```julia
+sampling = createTrial(inputs, DiscreteVariation(:config, xp, [1.0, 2.0]); n_replicates=3)
+length(simulationIDs(sampling))            # 6 — 2 monads × 3 replicates
+
+out = run(sampling)
+simulationIDs(out) == simulationIDs(out.trial)   # true
+```
 """
 simulationIDs() = constructSelectQuery("simulations"; selection="simulation_id") |> queryToDataFrame |> x -> x.simulation_id
 simulationIDs(simulation::Simulation) = [simulation.id]
@@ -781,13 +907,84 @@ simulationIDs(sampling::Sampling) = samplingSimulationIDs(sampling.id)
 simulationIDs(trial::Trial) = trialSimulationIDs(trial.id)
 simulationIDs(Ts::AbstractArray{<:AbstractTrial}) = reduce(vcat, simulationIDs.(Ts))
 
+#! Pure lookup for the monad carrying a given key. The `simulations` table has no `monad_id`
+#! column, but `monads` declares `UNIQUE` over the same key tuple, so a key match identifies the
+#! enclosing monad — at most one — without writing anything. Going through `Monad(simulation)`
+#! instead would `INSERT OR IGNORE` the row and rewrite the monad's constituent CSV, which is
+#! right for `pendingSimulationSpecs` but never for an accessor.
+function _monadIDForKey(inputs::InputFolders, variation_id::VariationID, version_id::Integer)
+    feature_str, value_str = _monadKeyStrings(inputs, variation_id, version_id)
+    df = constructSelectQuery("monads", "WHERE $(feature_str)=$(value_str)"; selection="monad_id") |> queryToDataFrame
+    return isempty(df) ? Int[] : Int.(df.monad_id)
+end
+
+#! The simulator version stored on a simulation's own row. `_simulationFromRow` does not carry it
+#! onto the struct, and the `monads` key includes it, so the lookup has to read it back: after a
+#! simulator upgrade the recorded version and the current one differ, and matching on the current
+#! one would miss the monad the simulation actually belongs to.
+function _simulationVersionID(simulation_id::Int)
+    df = constructSelectQuery("simulations", "WHERE simulation_id=$(simulation_id)";
+                              selection=simulatorVersionIDName()) |> queryToDataFrame
+    return isempty(df) ? missing : df[1, 1]
+end
+
 """
     monadIDs()
+    monadIDs(simulation::Simulation)
+    monadIDs(monad::Monad)
+    monadIDs(sampling::Sampling)
+    monadIDs(trial::Trial)
+    monadIDs(Ts::AbstractArray{<:AbstractTrial})
+    monadIDs(output::MMOutput)
 
-Return all monad IDs in the database.  Overloaded forms accept a monad, sampling,
-or trial object.
+Return the IDs of the monads a trial covers. With no argument, return every monad ID in the
+database.
+
+A [`Monad`](@ref) reports itself, a [`Sampling`](@ref) its constituent monads, and a
+[`Trial`](@ref) the monads of all its samplings. The [`MMOutput`](@ref) form forwards to the
+trial that was run, so `monadIDs(out)` and `monadIDs(out.trial)` agree.
+
+For a [`Simulation`](@ref) the answer is the monad for that simulation's parameterization: the one
+whose simulator version, input folders and variation IDs all match, of which there can be at most
+one. This is a lookup, never a write, so asking cannot bring a monad into being — which also
+makes it safe against a database you do not want to modify. Any simulation from
+[`createTrial`](@ref) or [`run`](@ref) has such a monad; the result is `Int[]` only when nothing
+shares the parameterization, and an empty result rather than an error is what lets
+`monadsTable(simulation)` return an empty table instead of throwing.
+
+Matching on parameterization is not the same as matching on membership, and the difference shows
+in two places. A simulation inserted directly with `Simulation(inputs, variation_id)` — which is
+what `Simulation(monad)` does — resolves to the monad sharing its parameters even though that
+monad does not list it among its replicates; [`run`](@ref) is what adds it there. And a simulation
+that failed has been removed from its monad's replicate list, yet still resolves to it.
+
+# Arguments
+- `simulation`, `monad`, `sampling`, `trial`: a trial object to collect monads from.
+- `Ts`: an array of trial objects; results are concatenated in order.
+- `output`: a run result.
+
+# Returns
+`Vector{Int}` — empty when a simulation's parameterization has no monad. Not deduplicated for the
+array form: two elements of `Ts` sharing a monad each contribute it.
+
+# Examples
+```julia
+sampling = createTrial(inputs, DiscreteVariation(:config, xp, [1.0, 2.0]); n_replicates=3)
+monadIDs(sampling)                               # one ID per parameter value
+monadIDs(sampling) == constituentIDs(sampling)   # true
+
+out = run(sampling)
+monadIDs(out) == monadIDs(sampling)              # true
+
+monadIDs(Simulation(sim_id))                     # the monad for one run's parameterization
+```
 """
 monadIDs() = constructSelectQuery("monads"; selection="monad_id") |> queryToDataFrame |> x -> x.monad_id
+function monadIDs(simulation::Simulation)
+    version_id = _simulationVersionID(simulation.id)
+    ismissing(version_id) && return Int[]
+    return _monadIDForKey(simulation.inputs, simulation.variation_id, version_id)
+end
 monadIDs(monad::Monad) = [monad.id]
 monadIDs(sampling::Sampling) = constituentIDs(sampling)
 monadIDs(trial::Trial) = reduce(vcat, (constituentIDs(Sampling, s) for s in constituentIDs(Trial, trial.id)); init=Int[])
@@ -796,8 +993,10 @@ monadIDs(Ts::AbstractArray{<:AbstractTrial}) = reduce(vcat, monadIDs.(Ts))
 """
     trialFolder(T::Type{<:AbstractTrial}, id::Int)
     trialFolder(T::AbstractTrial)
+    trialFolder(output::MMOutput)
 
-Return the output folder path for trial type `T` with the given ID.
+Return the output folder path for trial type `T` with the given ID. The [`MMOutput`](@ref) form
+gives the folder of the trial that was run.
 """
 trialFolder(T::Type{<:AbstractTrial}, id::Int) = joinpath(dataDir(), "outputs", "$(lowerClassString(T))s", string(id))
 trialFolder(T::AbstractTrial) = trialFolder(typeof(T), T.id)
@@ -858,7 +1057,20 @@ function Base.show(io::IO, output::MMOutput)
     println(io, "  - Successfully completed $(output.n_success) simulations.")
 end
 
+#! ID and trivially-derived accessors forward to the wrapped trial so `run`'s result can answer
+#! "what did that produce?" directly. `MMOutput` stays outside `AbstractTrial` for two reasons:
+#! it has no `id` field, so `trialID(::AbstractTrial)`, `trialFolder`, `lowerClassString` and
+#! every `T.id` in the runner, tagging and deletion paths would need guards; and
+#! `run(::AbstractTrial)` would silently start accepting `MMOutput{Sampling}` and
+#! `MMOutput{Trial}` and re-running them, where today that is a `MethodError`. (Monad-wrapping
+#! outputs would be unaffected — `run(::MMOutput{<:AbstractMonad}, args...)` is more specific and
+#! keeps winning dispatch.) `MMOutput{T}`'s type parameter is also what makes
+#! `trialType(::MMOutput{T})` a compile-time answer.
 simulationIDs(output::MMOutput) = simulationIDs(output.trial)
+monadIDs(output::MMOutput) = monadIDs(output.trial)
+constituentIDs(output::MMOutput) = constituentIDs(output.trial)
+Base.length(output::MMOutput) = length(output.trial)
+trialFolder(output::MMOutput) = trialFolder(output.trial)
 trialType(::MMOutput{T}) where T<:AbstractTrial = T
 trialID(output::MMOutput) = trialID(output.trial)
 

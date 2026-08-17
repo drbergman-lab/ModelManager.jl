@@ -2266,6 +2266,20 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test trialType(out) == Trial
                 @test out.n_success == 1 + 2 + 2      # s1 + m1(2 reps) + samp1(2 monads)
 
+                # An MMOutput forwards the ID and trivially-derived accessors to its trial,
+                # so "what did that run produce?" needs no reach into out.trial.
+                @test monadIDs(out)      == monadIDs(out.trial)
+                @test simulationIDs(out) == simulationIDs(out.trial)
+                @test constituentIDs(out) == constituentIDs(out.trial)
+                @test length(out)        == length(out.trial)
+                @test trialFolder(out)   == trialFolder(out.trial)
+                @test trialID(out)       == out.trial.id
+
+                # constituentIDs is the one accessor that does not answer at every level: a
+                # Simulation has nothing below it, and an output wrapping one inherits that.
+                @test_throws ArgumentError constituentIDs(s1)
+                @test_throws ArgumentError constituentIDs(run(s1))
+
                 # Single-element vector still yields a Trial.
                 @test createTrial([s1]) isa Trial
 
@@ -2278,8 +2292,35 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test_throws ArgumentError createTrial(AbstractTrial[])
             end
 
-            # ---------- constituentIDs / simulationIDs ----------
-            @testset "constituentIDs and simulationIDs" begin
+            # ---------- trialID: pure lookup vs. Trial creation ----------
+            @testset "trialID lookup and Trial creation" begin
+                dv   = DiscreteVariation(:config, xp_x, [301.0, 302.0])
+                samp = createTrial(inputs, [dv]; n_replicates=1)
+
+                # No Trial groups this sampling yet, so the lookup misses — and saying so must
+                # not create one. This is the assertion that fails if trialID ever goes back to
+                # find-or-insert.
+                n_trials_before = nrow(queryToDataFrame(constructSelectQuery("trials")))
+                @test trialID([samp]) === missing
+                @test nrow(queryToDataFrame(constructSelectQuery("trials"))) == n_trials_before
+
+                # The Trial constructor still creates on a miss: the create path moved into
+                # _findOrCreateTrialID, it did not disappear.
+                trial = Trial([samp])
+                @test trial isa Trial
+                @test nrow(queryToDataFrame(constructSelectQuery("trials"))) == n_trials_before + 1
+
+                # Now the lookup finds it, and agrees with the AbstractTrial accessor.
+                @test trialID([samp]) == trial.id
+                @test trialID(trial) == trial.id
+
+                # Constructing again reuses the row rather than adding a duplicate.
+                @test Trial([samp]).id == trial.id
+                @test nrow(queryToDataFrame(constructSelectQuery("trials"))) == n_trials_before + 1
+            end
+
+            # ---------- constituentIDs / simulationIDs / monadIDs ----------
+            @testset "constituentIDs, simulationIDs, and monadIDs" begin
                 dv   = DiscreteVariation(:config, xp_x, [21.0, 22.0, 23.0])
                 samp = createTrial(inputs, [dv]; n_replicates=2)
                 run(samp)
@@ -2289,6 +2330,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 sim_ids  = simulationIDs(samp)
                 @test length(sim_ids) == 6           # 3 monads × 2 replicates
+
+                # monadIDs on a Sampling is its constituent list; a Monad reports itself.
+                @test length(monadIDs(samp)) == 3
+                @test monadIDs(samp) == mono_ids
+                @test monadIDs(Monad(mono_ids[1])) == [mono_ids[1]]
+
+                # A simulation resolves to the monad holding it. simulationIDs walks the
+                # monads in constituent order, so the first simulation is in the first monad.
+                @test monadIDs(Simulation(sim_ids[1])) == [mono_ids[1]]
             end
 
             # ---------- simulationsTable / monadsTable ----------
@@ -2319,6 +2369,52 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 m1 = Monad(monad_ids[1])
                 @test nrow(monadsTable(m1)) == 1
                 @test nrow(monadsTable(m1, Monad(monad_ids[2]))) == 2
+
+                # A Simulation is an AbstractTrial, so it must work here too: it resolves to
+                # the monad holding it, and mixes with other trial types in one vector.
+                sim = Simulation(simulationIDs(m1)[1])
+                @test monadIDs(sim) == [m1.id]
+                @test nrow(monadsTable(sim)) == 1
+                @test nrow(monadsTable([sim, Monad(monad_ids[2])])) == 2
+
+                # A simulation inserted straight into `simulations` belongs to no monad. Mint a
+                # variation row without a monad for it, so the key genuinely has no match.
+                lone_vids = ModelManager.addVariations(GridVariation(), inputs,
+                                                       [DiscreteVariation(:config, xp_x, 2049.0)],
+                                                       VariationID(inputs)).variation_ids
+                lone_sim = Simulation(inputs, only(lone_vids))
+
+                # Asking must never create the monad: a Monad(simulation).id implementation
+                # would pass every assertion above and fail this one.
+                n_monads_before = nrow(queryToDataFrame(constructSelectQuery("monads")))
+                @test monadIDs(lone_sim) == Int[]
+                @test nrow(monadsTable(lone_sim)) == 0
+                @test nrow(queryToDataFrame(constructSelectQuery("monads"))) == n_monads_before
+
+                # The match is on parameterization, not membership: a simulation inserted
+                # directly on an EXISTING monad's key resolves to that monad even though the
+                # monad's replicate list does not contain it. Documented, not accidental.
+                shared_key_sim = Simulation(m1.inputs, m1.variation_id)
+                @test monadIDs(shared_key_sim) == [m1.id]
+                @test shared_key_sim.id ∉ constituentIDs(Monad, m1.id)
+
+                # The version component of the key comes from the simulation's own row, not from
+                # currentSimulatorVersionID(). Bumping the project's simulator version must not
+                # orphan simulations whose monads already exist.
+                simulator = mm_globals().simulator
+                version_before = simulator.current_version_id
+                try
+                    queryToDataFrame("INSERT INTO test_versions (tag) VALUES ('v-bump');")
+                    simulator.current_version_id = queryToDataFrame(
+                        constructSelectQuery("test_versions", "WHERE tag='v-bump'";
+                                             selection="test_version_id")).test_version_id[1]
+                    @test simulator.current_version_id != version_before
+                    @test monadIDs(sim) == [m1.id]
+                    @test nrow(monadsTable(sim)) == 1
+                finally
+                    simulator.current_version_id = version_before
+                end
+                @test monadIDs(sim) == [m1.id]
 
                 # No-arg form returns all monads in the project (⊇ this sampling's monads).
                 all_mt = monadsTable()
@@ -3045,6 +3141,11 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 samp = run(MOAT(3), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
                 @test size(samp.monad_ids_df, 2) == 3   # intercept + 2 factors
+
+                # The flat monad-ID accessor agrees with the design matrix it was built from.
+                design_ids = ModelManager.getMonadIDDataFrame(samp) |> Matrix |> vec |> unique
+                @test sort(monadIDs(samp)) == sort(design_ids)
+                @test simulationIDs(samp) == simulationIDs(samp.sampling)
 
                 # Recipe (full path: sampling → builder → wrapper) on a real sampling.
                 rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp)

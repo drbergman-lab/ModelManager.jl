@@ -108,11 +108,25 @@ the "Docstring Cross-References" section of `CLAUDE.md`.
 - `InputFolders` — named tuple of `InputFolder` objects, one per location.
 - `VariationID` — named tuple mapping location symbols to their current variation row IDs.
 
+*Accessors*
+- `simulationIDs` and `monadIDs` accept any level of the hierarchy, an array of levels, the `MMOutput` returned by `run`, a `GSASampling`, or no argument (everything in the database). They descend the full hierarchy; `constituentIDs` stops one level down and also accepts an `MMOutput`, but throws for a `Simulation`, which has no constituents.
+- `monadIDs(simulation)` resolves the monad for that simulation's parameterization by matching the `monads` key tuple that `monadsSchema` declares `UNIQUE` — simulator version, input folders and variation IDs. It is a pure `SELECT`: an accessor never creates a row.
+  - The version component is read from the simulation's own `simulations` row, not from `currentSimulatorVersionID()`. The two differ after a simulator upgrade within a project, and using the ambient value would miss the monad the simulation actually belongs to. The writer (`Monad(inputs, variation_id)`) keeps the ambient value, since re-creating a parameterization under a new simulator version is deliberately a new monad row.
+  - Matching on parameterization is not matching on membership. `Simulation(inputs, variation_id)` and `Simulation(monad)` insert into `simulations` alone, so such a simulation resolves to the monad sharing its parameters without appearing in that monad's replicate list; `run` is what adds it. A failed simulation, removed from its monad's list by `simulationFailed`, likewise still resolves to it.
+  - `Int[]` means no monad shares the parameterization at all. An empty table beats an error, which is why `monadsTable(simulation)` returns zero rows in that case.
+- `trialID(T::AbstractTrial)` and `trialID(output::MMOutput)` read an ID. `trialID(samplings::Vector{Sampling})` looks up the trial containing exactly those samplings and returns `missing` when none does — it does not create one. Creation belongs to `Trial(samplings)`, which routes through the internal find-or-create.
+- `trialType` reports the concrete type; on an `MMOutput` it comes from the type parameter and is known at compile time. `length` counts simulations. `trialFolder` gives the output folder. Both also accept an `MMOutput`.
+- `MMOutput` deliberately stays outside `AbstractTrial`: it has no `id` field, so `trialID(::AbstractTrial)`, `trialFolder`, `lowerClassString` and every `T.id` in the runner, tagging and deletion paths would need guards; and `run(::AbstractTrial)` would silently start accepting `MMOutput{Sampling}`/`MMOutput{Trial}` and re-running them, where today that is a `MethodError`. Monad-wrapping outputs would keep dispatching to the more specific `run(::MMOutput{<:AbstractMonad}, args...)`.
+
 **Acceptance criteria:**
 - `Simulation(id)` reconstructs a simulation from the database by ID.
 - `Monad(inputs, variation_id; n_replicates, use_previous)` creates or retrieves a monad.
 - `Sampling(inputs, location_variation_ids; n_replicates, use_previous)` creates or retrieves a sampling.
 - `constituentIDs(T, id)` returns the IDs of the next level down in the hierarchy.
+- `monadsTable` and `simulationsTable` work for every `AbstractTrial`, including a bare `Simulation` and mixed vectors such as `[simulation, monad]`.
+- Calling `monadIDs` on a monad-less simulation leaves the `monads` row count unchanged; calling `trialID` on an unmatched sampling set leaves the `trials` row count unchanged.
+- `trialID(samplings)` returns `missing` before `Trial(samplings)` is called and that trial's ID afterwards; a second `Trial(samplings)` reuses the row.
+- `monadIDs(simulation)` still finds the simulation's monad after the project's simulator version changes.
 
 ---
 
@@ -216,7 +230,7 @@ target location's file type.
 **Behavioral specification:**
 - `simulationsTable(args...; kwargs...)` returns a `DataFrame` with one row per simulation and its varied parameters. `printSimulationsTable` routes the result through a `sink` (default `println`).
 - `monadsTable(args...; kwargs...)` is the monad-level analogue: one row per monad and its varied parameters. `printMonadsTable` routes the result through a `sink`.
-- Both accept the same `args...` forms: `AbstractTrial` objects (or arrays), a vector of IDs (simulation IDs / monad IDs respectively), or no argument (all simulations / all monads). ID collection uses `simulationIDs` / `monadIDs`.
+- Both accept the same `args...` forms: `AbstractTrial` objects (or arrays), a vector of IDs (simulation IDs / monad IDs respectively), or no argument (all simulations / all monads). ID collection uses `simulationIDs` / `monadIDs`, so every level works — including a bare `Simulation`, whose monad is resolved by key lookup. A simulation with no monad yields an empty table rather than an error.
 - Both share keyword arguments (via `simulationsTableFromQuery` / `monadsTableFromQuery`): `remove_constants` (default `true`, drop columns constant across rows), `sort_by`, `sort_ignore` (defaults to the table's ID column plus variation-ID columns), and `short_names` (default `true`, shorten column names via `shortVariationName`; `false` keeps raw XML-path names).
 - The primary-key column is renamed for display: `:SimID` for simulations, `:MonadID` for monads.
 - `tags=true` (default `false`) pivots user tags into `tag:<key>` columns; `include_auto_tags=true` additionally pivots `mm:` provenance. See *Trial Tagging and Feature-Based Recovery*.
@@ -298,7 +312,7 @@ target location's file type.
 *Concurrency*
 - `withTransaction(f; mode)` wraps a transaction and joins rather than nests when already inside one. It is used in exactly one place — batching tag inserts into a single commit — and always with the default mode.
 - No write path uses `EXCLUSIVE`. A single statement is already atomic, and an `INSERT OR IGNORE` against a `UNIQUE` constraint is self-correcting, since a losing racer's lookup finds the winner's row. That covers `Monad` and provenance resolution.
-- `Sampling` and `trialID` scan before inserting with no `UNIQUE` constraint to fall back on, so two *sessions* creating the same object could each insert a row. This is accepted: concurrent trial creation is unsupported, and protecting it would mean holding the database write lock across constituent-CSV file reads. The remedy, should duplicates ever appear, is recorded in `progress.md`; `withTransaction`'s `mode` keyword exists to make it a one-word change.
+- `Sampling` and `_findOrCreateTrialID` (reached through the `Trial` constructor) scan before inserting with no `UNIQUE` constraint to fall back on, so two *sessions* creating the same object could each insert a row. This is accepted: concurrent trial creation is unsupported, and protecting it would mean holding the database write lock across constituent-CSV file reads. The remedy, should duplicates ever appear, is recorded in `progress.md`; `withTransaction`'s `mode` keyword exists to make it a one-word change.
 - Two sessions cannot corrupt the database — SQLite serializes writers itself.
 - This serializes against **other processes** sharing the project (concurrent HPC jobs, a second REPL). It does not serialize tasks within one session, because SQLite locks are per-connection and ModelManager shares one. Concurrent trial creation in a session is unsupported by design; `recordConstituentIDs` is read-modify-write on a CSV outside SQLite's reach.
 
