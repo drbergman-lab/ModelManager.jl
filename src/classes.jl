@@ -36,30 +36,8 @@ abstract type AbstractMonad <: AbstractSampling end
     trialType(T::AbstractTrial)
     trialType(output::MMOutput)
 
-Return the concrete trial type of `T`: one of [`Simulation`](@ref), [`Monad`](@ref),
-[`Sampling`](@ref), or [`Trial`](@ref).
-
-Useful because [`createTrial`](@ref) chooses the type from the variations and replicate count it
-is handed, so calling code that must branch on what it got asks here rather than testing
-`isa` four times. For the [`MMOutput`](@ref) returned by [`run`](@ref), the answer comes from
-`MMOutput`'s type parameter — the type of the trial that was run — and is therefore known at
-compile time.
-
-# Arguments
-- `T`: any trial object.
-- `output`: a run result.
-
-# Returns
-A `DataType`: the concrete subtype of [`AbstractTrial`](@ref).
-
-# Examples
-```julia
-trialType(createTrial(inputs, dv; n_replicates=1))          # Simulation
-trialType(createTrial(inputs, dv; n_replicates=5))          # Monad
-
-out = run(createTrial(inputs, [dv1, dv2]))
-trialType(out) == Sampling                                  # true
-```
+Return the concrete type of `T`: [`Simulation`](@ref), [`Monad`](@ref), [`Sampling`](@ref), or
+[`Trial`](@ref). For an [`MMOutput`](@ref), the type of the trial that was run.
 """
 trialType(::T) where T<:AbstractTrial = T
 
@@ -75,38 +53,11 @@ locationPath(location::Symbol, S::AbstractSampling) = locationPath(location, S.i
     trialID(output::MMOutput) -> Int
     trialID(samplings::Vector{Sampling}) -> Union{Int,Missing}
 
-Return the database ID of a trial.
+Return the database ID of a trial, or of the trial an [`MMOutput`](@ref) wraps.
 
-For a [`Simulation`](@ref), [`Monad`](@ref), [`Sampling`](@ref), or [`Trial`](@ref) — and for
-the [`MMOutput`](@ref) that [`run`](@ref) returns, which forwards to the trial it wraps — this
-is the object's own ID.
-
-The `Vector{Sampling}` form answers a different question: which [`Trial`](@ref) groups exactly
-these samplings, in any order? It is a lookup only, and returns `missing` when no trial does.
-Creating one is the job of the [`Trial`](@ref) constructor, `Trial(samplings)`, which inserts a
-row when it finds no match.
-
-# Arguments
-- `T`: a trial object; its ID is read straight from the struct.
-- `output`: a run result; its `trial` field supplies the ID.
-- `samplings`: the samplings a trial would have to contain, in any order.
-
-# Returns
-`Int` for a trial or a run result. `Union{Int,Missing}` for the `Vector{Sampling}` form: the
-matching trial's ID, or `missing` if no trial matches.
-
-# Examples
-```julia
-sampling = createTrial(inputs, DiscreteVariation(:config, xp, [1.0, 2.0]))
-trialID(sampling) == sampling.id      # true
-
-out = run(sampling)
-trialID(out) == trialID(out.trial)    # true
-
-trialID([sampling])                   # missing — no Trial groups it yet
-trial = Trial([sampling])             # creates one
-trialID([sampling]) == trial.id       # true
-```
+The `Vector{Sampling}` form instead looks up which [`Trial`](@ref) groups exactly those
+samplings, in any order, and gives `missing` when none does. It never creates one — that is
+`Trial(samplings)`.
 """
 trialID(T::AbstractTrial) = T.id
 
@@ -873,32 +824,13 @@ end
     simulationIDs(Ts::AbstractArray{<:AbstractTrial})
     simulationIDs(output::MMOutput)
 
-Return the IDs of every simulation a trial covers, descending as far as the hierarchy goes: a
+Return the IDs of every simulation a trial covers, descending the full hierarchy: a
 [`Sampling`](@ref) reports the simulations of all its monads, a [`Trial`](@ref) those of all its
-samplings. With no argument, return every simulation ID in the database.
+samplings. With no argument, every simulation ID in the database. An [`MMOutput`](@ref) forwards
+to the trial that was run, reporting all of its simulations rather than only the ones that
+[`run`](@ref) dispatched.
 
-The [`MMOutput`](@ref) form forwards to the trial that was run, so `simulationIDs(out)` and
-`simulationIDs(out.trial)` are the same. Note that it reports every simulation in the trial, not
-only the ones this particular [`run`](@ref) dispatched — a re-run of a trial whose simulations
-already completed schedules nothing but still reports them all.
-
-# Arguments
-- `simulation`, `monad`, `sampling`, `trial`: a trial object to descend from.
-- `Ts`: an array of trial objects; results are concatenated in order.
-- `output`: a run result.
-
-# Returns
-`Vector{Int}`, in hierarchy order. Not deduplicated for the array form: a simulation reachable
-from two elements of `Ts` appears twice.
-
-# Examples
-```julia
-sampling = createTrial(inputs, DiscreteVariation(:config, xp, [1.0, 2.0]); n_replicates=3)
-length(simulationIDs(sampling))            # 6 — 2 monads × 3 replicates
-
-out = run(sampling)
-simulationIDs(out) == simulationIDs(out.trial)   # true
-```
+Results are concatenated for the array form, not deduplicated.
 """
 simulationIDs() = constructSelectQuery("simulations"; selection="simulation_id") |> queryToDataFrame |> x -> x.simulation_id
 simulationIDs(simulation::Simulation) = [simulation.id]
@@ -937,47 +869,21 @@ end
     monadIDs(Ts::AbstractArray{<:AbstractTrial})
     monadIDs(output::MMOutput)
 
-Return the IDs of the monads a trial covers. With no argument, return every monad ID in the
-database.
+Return the IDs of the monads a trial covers: a [`Monad`](@ref) reports itself, a
+[`Sampling`](@ref) its constituent monads, a [`Trial`](@ref) the monads of all its samplings.
+With no argument, every monad ID in the database. An [`MMOutput`](@ref) forwards to the trial that
+was run. Results are concatenated for the array form, not deduplicated.
 
-A [`Monad`](@ref) reports itself, a [`Sampling`](@ref) its constituent monads, and a
-[`Trial`](@ref) the monads of all its samplings. The [`MMOutput`](@ref) form forwards to the
-trial that was run, so `monadIDs(out)` and `monadIDs(out.trial)` agree.
+For a [`Simulation`](@ref) the answer is the monad matching that simulation's parameterization —
+its simulator version, input folders and variation IDs — of which there can be at most one. This
+is a lookup, never a write, so asking cannot bring a monad into being. `Int[]` means nothing
+shares the parameterization, which is why `monadsTable(simulation)` gives an empty table rather
+than throwing.
 
-For a [`Simulation`](@ref) the answer is the monad for that simulation's parameterization: the one
-whose simulator version, input folders and variation IDs all match, of which there can be at most
-one. This is a lookup, never a write, so asking cannot bring a monad into being — which also
-makes it safe against a database you do not want to modify. Any simulation from
-[`createTrial`](@ref) or [`run`](@ref) has such a monad; the result is `Int[]` only when nothing
-shares the parameterization, and an empty result rather than an error is what lets
-`monadsTable(simulation)` return an empty table instead of throwing.
-
-Matching on parameterization is not the same as matching on membership, and the difference shows
-in two places. A simulation inserted directly with `Simulation(inputs, variation_id)` — which is
-what `Simulation(monad)` does — resolves to the monad sharing its parameters even though that
-monad does not list it among its replicates; [`run`](@ref) is what adds it there. And a simulation
-that failed has been removed from its monad's replicate list, yet still resolves to it.
-
-# Arguments
-- `simulation`, `monad`, `sampling`, `trial`: a trial object to collect monads from.
-- `Ts`: an array of trial objects; results are concatenated in order.
-- `output`: a run result.
-
-# Returns
-`Vector{Int}` — empty when a simulation's parameterization has no monad. Not deduplicated for the
-array form: two elements of `Ts` sharing a monad each contribute it.
-
-# Examples
-```julia
-sampling = createTrial(inputs, DiscreteVariation(:config, xp, [1.0, 2.0]); n_replicates=3)
-monadIDs(sampling)                               # one ID per parameter value
-monadIDs(sampling) == constituentIDs(sampling)   # true
-
-out = run(sampling)
-monadIDs(out) == monadIDs(sampling)              # true
-
-monadIDs(Simulation(sim_id))                     # the monad for one run's parameterization
-```
+Parameterization is not membership. A simulation inserted directly with
+`Simulation(inputs, variation_id)`, as `Simulation(monad)` does, resolves to the monad sharing its
+parameters without appearing in that monad's replicate list; [`run`](@ref) is what adds it there.
+A failed simulation, removed from that list, also still resolves to it.
 """
 monadIDs() = constructSelectQuery("monads"; selection="monad_id") |> queryToDataFrame |> x -> x.monad_id
 function monadIDs(simulation::Simulation)

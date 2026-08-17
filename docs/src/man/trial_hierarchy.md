@@ -138,19 +138,6 @@ length(out)                    # how many simulations the trial holds
 trialType(out)                 # Sampling
 ```
 
-Two cases are worth knowing about:
-
-- **A simulation's monad is looked up, never created.** `monadIDs(simulation)` finds the monad
-  whose simulator version, input folders and variation IDs match the simulation's. Asking does not
-  bring a monad into being, so it is safe against a database you do not want to modify. Note that
-  this matches on *parameterization*, not on membership: a simulation built with
-  `Simulation(inputs, variation_id)` or `Simulation(monad)` resolves to the monad sharing its
-  parameters without appearing in that monad's replicate list — [`run`](@ref) is what adds it
-  there. The result is `Int[]` only when no monad shares the parameterization at all.
-- **`trialID` over a vector of samplings is also a lookup.** `trialID(samplings)` reports which
-  [`Trial`](@ref) groups exactly those samplings, in any order, and `missing` when no trial
-  does. Call `Trial(samplings)` to create one.
-
 Once you have a trial, hand it to [`run`](@ref) to execute it — see
 [Running simulations](@ref running_simulations). For the constructor-level details, see the
 [Trial hierarchy](@ref) API reference.
