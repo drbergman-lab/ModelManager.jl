@@ -167,6 +167,19 @@ function assertInitialized()
     @assert isInitialized() "The model manager has not been initialized for a project. Please run `initializeModelManager` first."
 end
 
+#! Every early return from `initializeModelManager` funnels through here so that a failed
+#! initialization cannot leave a half-configured project behind. Clearing `initialized` is the
+#! load-bearing part: a failure *after* an earlier success would otherwise leave
+#! `isInitialized()` true over an empty in-memory database, and every later query would quietly
+#! read from it instead of reporting that there is no project.
+function _abortInitialization()
+    close(centralDB())
+    mm_globals().db = SQLite.DB()
+    mm_globals().data_dir = ""
+    mm_globals().initialized = false
+    return false
+end
+
 """
     initializeModelManager(simulator::AbstractSimulator, data_dir::AbstractString; auto_upgrade::Bool=false)
 
@@ -190,7 +203,13 @@ It performs all framework-agnostic initialization steps in order:
 
 Returns `true` on success, `false` on any initialization failure — including errors that
 would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are reset to
-a clean state before any `false` return so that subsequent retries start fresh.
+a clean state before any `false` return, so [`isInitialized`](@ref) reports `false` and a
+subsequent retry starts fresh.
+
+Initialization is also refused, with an explanation, when the version of the simulator
+package installed in the environment differs from the version loaded in this session —
+the situation after updating the environment mid-session. Restart Julia and initialize
+again.
 
 Simulator packages typically provide their own path-level overloads (e.g. accepting
 `path_to_physicell` and `path_to_data`) that validate paths, set simulator-specific
@@ -209,6 +228,11 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().simulator = simulator
     mm_globals().data_dir = abspath(normpath(data_dir))
 
+    #! Cleared up front, not just on the failure paths: from here until `initializeDatabase`
+    #! succeeds there is no usable project, and a stale `true` left over from a previous
+    #! project would make `isInitialized()` vouch for this one.
+    mm_globals().initialized = false
+
     #! Provenance, hint, and trash-staging latches are per-project: a new project in the
     #! same session should re-resolve its script/git context, hint again, and warn again
     #! about its own `data/.trash`.
@@ -222,32 +246,23 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
         mm_globals().db = SQLite.DB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))
     catch e
         println("Could not open database: $e")
-        mm_globals().data_dir = ""
-        return false
+        #! The assignment above never happened, so this closes the *previous* project's
+        #! connection — which is correct: that project is being abandoned either way.
+        return _abortInitialization()
     end
 
     if !resolvePackageVersion(simulator, centralDB(); auto_upgrade=auto_upgrade)
-        close(centralDB())
-        mm_globals().db = SQLite.DB()
-        mm_globals().data_dir = ""
-        return false
+        return _abortInitialization()
     end
     if !parseProjectInputsConfigurationFile()
-        close(centralDB())
-        mm_globals().db = SQLite.DB()
-        mm_globals().data_dir = ""
-        return false
+        return _abortInitialization()
     end
     initializeDatabase()
     if !isInitialized()
-        close(centralDB())
-        mm_globals().db = SQLite.DB()
-        mm_globals().data_dir = ""
-        return false
+        return _abortInitialization()
     end
-    #! Detected here, after every failure path has returned, so that none of the early-return
-    #! reset blocks above need to know about this field. Still ahead of `postInitDisplay`,
-    #! which prints it.
+    #! Detected here, after every failure path has returned, so that `_abortInitialization`
+    #! need not know about this field. Still ahead of `postInitDisplay`, which prints it.
     mm_globals().run_on_hpc = isRunningOnHPC()
     postInitDisplay(simulator)
     flush(stdout)

@@ -53,8 +53,26 @@ ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
 # ---- Package version / upgrade ----------------------------------------------
 ModelManager.packageName(::TestSimulator)       = "ModelManager"
 ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
-ModelManager.upgradeMilestones(::TestSimulator)  = VersionNumber[]
-ModelManager.upgradeToMilestone(::TestSimulator, args...) = true
+
+# Overridable so the migration-guard tests can stage a mid-session package update.  A
+# `nothing` default reproduces what the real default hook returns for TestSimulator (which
+# lives in Main and so belongs to no package), keeping the guard inert for every other test.
+const _loaded_version_override = Ref{Union{Nothing,VersionNumber}}(nothing)
+ModelManager.loadedPackageVersion(::TestSimulator) = _loaded_version_override[]
+
+# Overridable so the guard tests can present a milestone the "loaded" version knows about,
+# and count how many times it was applied.
+const _milestone_override = Ref{Vector{VersionNumber}}(VersionNumber[])
+const _milestone_calls    = Ref(0)
+ModelManager.upgradeMilestones(::TestSimulator) = _milestone_override[]
+function ModelManager.upgradeToMilestone(::TestSimulator, args...)
+    _milestone_calls[] += 1
+    return true
+end
+
+# Module-level type with no override, used to exercise the *default* loadedPackageVersion.
+# The TestSimulator override above shadows the default, so a separate type is required.
+struct _NoModuleSimulator <: AbstractSimulator end
 
 # ---- Trial execution --------------------------------------------------------
 ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
@@ -2139,6 +2157,97 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # the .trash/ staging path instead of rm.
                     mm_globals().run_on_hpc = detected
                 end
+            end
+
+            # A mid-session `Pkg.update()` leaves the environment advertising a new version
+            # while the session still runs the old code. Migrating then would stamp the
+            # database with the new version without applying its schema changes, and the
+            # version equality check would skip them in every later session. Both entry
+            # points refuse instead.
+            @testset "mid-session package update guard" begin
+                installed = ModelManager.getPackageVersion(TestSimulator())
+                table = ModelManager.dbVersionTableName(TestSimulator())
+                try
+                    # --- the default hook -------------------------------------------------
+                    # A type outside any package has no version to report, and `nothing` must
+                    # read as "cannot tell, proceed" — it is what TestSimulator itself gets,
+                    # so getting this wrong fails every project in the suite.
+                    @test ModelManager.loadedPackageVersion(_NoModuleSimulator()) === nothing
+
+                    # --- resolvePackageVersion --------------------------------------------
+                    # Undeterminable loaded version: guard inert, initialization proceeds.
+                    _loaded_version_override[] = nothing
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+
+                    # Versions agree: guard inert.
+                    _loaded_version_override[] = installed
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+
+                    # Versions disagree: refused, and no half-initialized state is left
+                    # behind. The `dataDir`/`isInitialized` assertions cover the reset that
+                    # keeps a later query from silently reading an empty in-memory database.
+                    _loaded_version_override[] = v"0.0.1"
+                    @test !initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    @test !isInitialized()
+                    @test dataDir() == ""
+
+                    # The refusal precedes any read of the version table, because reading it
+                    # creates and stamps it when absent. A project opened for the first time
+                    # after a mid-session update must not be stamped at all.
+                    mktempdir() do fresh_dir
+                        _make_test_project(fresh_dir)
+                        _loaded_version_override[] = v"0.0.1"
+                        @test !initializeModelManager(TestSimulator(), fresh_dir; auto_upgrade=true)
+                        fresh_db = ModelManager.SQLite.DB(joinpath(fresh_dir, "mm.db"))
+                        try
+                            @test !ModelManager.tableExists(table; db=fresh_db)
+                        finally
+                            close(fresh_db)
+                        end
+                    end
+
+                    # --- upgradePackage ---------------------------------------------------
+                    # Public and callable directly, so it carries its own guard.
+                    _loaded_version_override[] = nothing
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+
+                    # Refused: the loaded code cannot know 0.2.0's milestones, so the version
+                    # table must still read 0.1.0 afterwards. This is the assertion that
+                    # fails if the "no schema change" bump ever fires under the guard.
+                    ModelManager.DBInterface.execute(centralDB(),
+                                                     "UPDATE $(table) SET version='0.1.0';")
+                    _loaded_version_override[] = v"0.1.0"
+                    _milestone_override[] = VersionNumber[]
+                    _milestone_calls[] = 0
+                    @test !ModelManager.upgradePackage(TestSimulator(), centralDB(),
+                                                       v"0.1.0", v"0.2.0", true)
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.1.0"
+                    @test _milestone_calls[] == 0
+
+                    # A target below the loaded version is legitimate (resuming a partially
+                    # applied chain), so the guard uses `>` rather than `!=`.
+                    _loaded_version_override[] = v"0.3.0"
+                    _milestone_override[] = [v"0.2.0"]
+                    _milestone_calls[] = 0
+                    @test ModelManager.upgradePackage(TestSimulator(), centralDB(),
+                                                      v"0.1.0", v"0.2.0", true)
+                    @test _milestone_calls[] == 1
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.2.0"
+                finally
+                    # Leave the project initialized and correctly stamped for everything below.
+                    # Re-initializing restores the stamp on its own: the assertions above
+                    # rewound the version table, and with no milestones to cross the upgrade
+                    # path bumps it straight back to the installed version.
+                    _loaded_version_override[] = nothing
+                    _milestone_override[] = VersionNumber[]
+                    _milestone_calls[] = 0
+                    initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                end
+                @test isInitialized()
             end
 
             # Shorthand XMLPaths used throughout the section

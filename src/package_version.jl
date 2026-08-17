@@ -50,6 +50,8 @@ end
 Compare the runtime package version with the version recorded in `db` and upgrade
 if needed.
 
+- If the version installed in the environment differs from the one loaded in this session,
+  prints an explanation and returns `false` without reading or writing `db` (restart Julia).
 - If the database is *newer* than the package, prints an error and returns `false`
   (the user must upgrade their package).
 - If versions match, returns `true` immediately.
@@ -58,6 +60,26 @@ if needed.
 function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
                                auto_upgrade::Bool=false)::Bool
     pkg_version = getPackageVersion(sim)
+
+    #! Ahead of `getDBPackageVersion`, which is not a pure read: on a database with no version
+    #! table it creates one and stamps `pkg_version`. Were the check to follow it, the
+    #! mis-stamping this guard exists to prevent would already have happened.
+    loaded_version = loadedPackageVersion(sim)
+    if !isnothing(loaded_version) && loaded_version != pkg_version
+        name = packageName(sim)
+        println("""
+        $(name) $(pkg_version) is installed in this environment but $(loaded_version) is loaded
+        in this session — the environment was updated after the package was loaded.
+
+        Restart Julia and re-run initialization before opening this project.
+
+        Migrating the database now would record it as $(pkg_version) without applying
+        $(pkg_version)'s schema changes, and those changes would then be skipped in every
+        future session.
+        """)
+        return false
+    end
+
     db_version  = getDBPackageVersion(sim, db)
 
     if pkg_version < db_version

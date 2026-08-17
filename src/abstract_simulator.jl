@@ -190,6 +190,57 @@ function packageName(sim::AbstractSimulator)
 end
 
 """
+    loadedPackageVersion(sim::AbstractSimulator)::Union{Nothing,VersionNumber}
+
+Return the version of `sim`'s package as **loaded into this Julia session**, or `nothing`
+if it cannot be determined.
+
+This is the counterpart to [`getPackageVersion`](@ref), which reports the version
+*installed* in the active environment. The two disagree whenever the environment is
+updated after the package was loaded: the session keeps running the old code while the
+manifest advertises the new version. ModelManager compares them before it touches a
+project database, because the migration machinery draws its milestone list from the
+loaded module ([`upgradeMilestones`](@ref)) while the version it would record comes from
+the environment.
+
+The default is `pkgversion(parentmodule(typeof(sim)))`, correct whenever the simulator
+type is defined directly in the package named by [`packageName`](@ref). Override it when
+that does not hold:
+
+- the type is defined in a submodule or a package extension, so `parentmodule` returns
+  something other than the top-level package module;
+- the type lives in a different package than the one [`packageName`](@ref) names, where
+  the default would compare two unrelated versions.
+
+`nothing` means "cannot determine" and disables the comparison, letting initialization
+and migration proceed as though the versions agreed. That is the result for a simulator
+type defined at the REPL or in a script, which belongs to no package and so has no
+version to report.
+
+# Arguments
+- `sim::AbstractSimulator`: the active simulator backend.
+
+# Returns
+The loaded `VersionNumber`, or `nothing` if it cannot be determined.
+
+# Example
+```julia
+# A simulator type defined in a submodule carries no version of its own, because
+# `parentmodule` resolves to the submodule rather than to the package.
+module MyModelManager
+
+module Backends
+    struct MySimulator <: ModelManager.AbstractSimulator end
+end
+
+ModelManager.loadedPackageVersion(::Backends.MySimulator) = pkgversion(MyModelManager)
+
+end
+```
+"""
+loadedPackageVersion(sim::AbstractSimulator) = pkgversion(parentmodule(typeof(sim)))
+
+"""
     dbVersionTableName(sim::AbstractSimulator)::String
 
 Return the name of the SQLite table used to persist the package version in the
@@ -323,10 +374,13 @@ function clearSimulatorArtifacts(sim::AbstractSimulator) end
 #! Documenter's `Private = false` include them. See CLAUDE.md, "Docstring cross-references".
 #! `postInitDisplay` and `centralDBFileName` are absent because they are already exported —
 #! Julia errors on declaring an exported name public.
+#! `loadedPackageVersion` ships with a working default rather than an `error` stub, so most
+#! backends never touch it; it is public because an unusual module layout (type in a submodule
+#! or a package extension) makes overriding it part of the documented contract.
 @compat public runSimulation, simulatorDir, simulatorVersionSchema, simulatorVersionIDName,
                simulatorVersionTableName, resolveSimulatorVersionID, currentSimulatorVersionID,
                simulatorInfo, setupMonad, setupSampling,
-               packageName, dbVersionTableName, upgradeMilestones, upgradeToMilestone,
+               packageName, loadedPackageVersion, dbVersionTableName, upgradeMilestones, upgradeToMilestone,
                postSimulationProcessing, postSimulationCleanup, initializeInputFolder,
                getInputFolderDescription, clearSimulatorArtifacts
 

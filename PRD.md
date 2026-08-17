@@ -396,10 +396,18 @@ target location's file type.
 - `upgradePackage(sim; auto_upgrade)` walks from the DB's recorded version to the current package version, calling `upgradeToMilestone(sim, v, auto_upgrade)` for each milestone.
 - Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, `dbVersionTableName`, and `packageName`.
 - `continueMilestoneUpgrade(version, auto_upgrade)` prompts the user for destructive migrations (unless `auto_upgrade=true`).
+- `loadedPackageVersion(sim)` reports the version of the backend loaded in the running session, defaulting to `pkgversion(parentmodule(typeof(sim)))`. `nothing` means "cannot determine" and disables the comparison below.
+- Migration is refused when the loaded version disagrees with the version installed in the environment — the state produced by updating the environment mid-session. Refusal is a printed explanation naming both versions plus a `false` return, never a throw:
+  - `resolvePackageVersion` refuses when `loadedPackageVersion(sim) != getPackageVersion(sim)`, **before** reading the version table (reading it creates and stamps it when absent). `initializeModelManager` then returns `false`.
+  - `upgradePackage` refuses when `to_version > loadedPackageVersion(sim)`. A target at or below the loaded version is permitted, since resuming a partly-applied chain is legitimate.
+- Every early `false` return from `initializeModelManager` clears `initialized`, `data_dir`, and the central DB handle, so `isInitialized()` reports `false` after a failed initialization — including one that follows an earlier success.
 
 **Acceptance criteria:**
 - A project at version N can be upgraded to version N+2 by walking through N→N+1→N+2.
 - If the user declines at a milestone, the upgrade stops and the DB remains at the last successfully upgraded version.
+- With the installed and loaded versions in disagreement: `initializeModelManager` returns `false`, `isInitialized()` is `false`, `dataDir()` is `""`, and a project opened for the first time in that state has no version table written to it.
+- With the installed and loaded versions in disagreement, a direct `upgradePackage` call to the newer version returns `false`, applies no milestone, and leaves the recorded version unchanged.
+- `loadedPackageVersion` returns `nothing` for a simulator type belonging to no package, and initialization proceeds normally in that case.
 
 ---
 

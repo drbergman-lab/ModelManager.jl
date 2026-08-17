@@ -5,6 +5,156 @@
 
 ---
 
+## Session: mid-session package update silently skipped migrations (2026-08-17)
+
+### The bug
+Two sources of truth for "what version is this?", never reconciled. `getPackageVersion`
+(`src/package_version.jl:12`) reads the **on-disk environment** via `Pkg`, while
+`upgradeMilestones`/`upgradeToMilestone` dispatch on the **loaded module**. `pkgversion(::Module)`
+appeared nowhere in `src/`.
+
+The benign half is what was reported: after `Pkg.update()`, the DB is not upgraded until restart.
+That is arguably correct — the new code is not loaded, so migrating to match it would break the
+running session.
+
+The serious half is that the benign half only holds if nothing calls `initializeModelManager`
+again. When it does (opening a second project, or re-running an init cell — a tested flow):
+
+1. `getPackageVersion` → **new** version, from the manifest.
+2. `getDBPackageVersion` → **old** version, from the version table.
+3. `resolvePackageVersion` falls through to `upgradePackage(sim, db, old, new, auto_upgrade)`.
+4. `upgradeMilestones(sim)` comes from the **stale loaded module**, so it lacks the new release's
+   milestone; `pending` is empty and the loop body never runs.
+5. `success` is therefore still at its initialized `true`, and `isempty(pending)` is `true`, so
+   `src/up.jl:85-87` fires as a "no schema change" bump and stamps `version='<new>'`.
+6. Every later session short-circuits on `pkg_version == db_version` (`src/package_version.jl:72`).
+   The migration is skipped **permanently and silently**.
+
+The subtlety worth remembering: `success == true` does **not** mean a migration ran. It means
+nothing in `pending` failed, and an empty `pending` satisfies that trivially. Afterwards a skipped
+migration and a release that genuinely needed none leave byte-identical database state.
+
+There is a second route with **no re-init at all**: create a new project directory after the
+update, in the same session. `getDBPackageVersion` is not a pure read — on a database with no
+version table it creates one and stamps `getPackageVersion(sim)` (`:41-44`) — so the new version
+lands in a database whose schema `createSchema` then builds from the old loaded code. This is why
+the guard sits *above* the `getDBPackageVersion` call rather than merely above the comparison; the
+ordering is load-bearing and has its own test (the fresh-project case asserting no version table
+was written).
+
+### Why this is a ModelManager fix, not a PCMM one
+The ownership split at `src/abstract_simulator.jl` gives the backend *what* the milestones are
+(`packageName`, `dbVersionTableName`, `upgradeMilestones`, `upgradeToMilestone`). ModelManager owns
+*when* to migrate and *what the database claims*: the comparison in `resolvePackageVersion`, the
+milestone filter, and every write to the version table. The bug is entirely in that second half.
+PCMM has no hook to declare "I am actually loaded at version X", and even given one, the filter and
+the stamp are ModelManager's code.
+
+### Decisions
+- **Refuse, don't warn.** A warning is insufficient because continuing is precisely what writes the
+  wrong stamp. A throw would be inconsistent: `initializeModelManager` is documented to return
+  `false` rather than throw, and the sibling "database is newer than the package" branch already
+  prints and returns `false`. Returning `false` reuses the existing clean-abort path.
+- **`nothing` means "cannot tell, proceed."** `pkgversion` returns `nothing` for a module not
+  imported from a versioned package — which is exactly `TestSimulator`, defined in `Main` while
+  declaring `packageName = "ModelManager"`. Treating `nothing` as a mismatch would fail every
+  project in the suite. Hence the unit test on a module-less type (`_NoModuleSimulator`), needed
+  because the `TestSimulator` override shadows the default.
+- **`>` not `!=` in the `upgradePackage` guard.** A target below the loaded version is legitimate:
+  resuming a partly-applied chain, or an explicitly older target.
+- **Working default, not an `error` stub.** `loadedPackageVersion` follows
+  `getInputFolderDescription`, so no existing backend has to change anything. Declared
+  `@compat public` because overriding it is the documented contract for an unusual module layout.
+- **Hook named `loadedPackageVersion`**, matching `abstract_simulator.jl` (nothing there carries a
+  `get` prefix except the legacy `getInputFolderDescription`), over `getLoadedPackageVersion`,
+  which would have matched call-site symmetry with `getPackageVersion`/`getDBPackageVersion`.
+- **No escape-hatch keyword.** An `allow_version_mismatch=true` was considered and rejected: there
+  is no known legitimate reason to proceed, since the only effect of continuing is writing a wrong
+  stamp. It stays a one-line addition if a real need appears. Adding an override to a data-integrity
+  guard on day one mostly guarantees it gets found in a stack trace and used.
+
+### Rejected: do the check in `__init__`
+Proposed during review — detect in `__init__` that the version increased, drop the current state,
+and tell the user to restart. It cannot work, for reasons of timing rather than style:
+
+1. `__init__` runs once, at module load, **before the discrepancy exists**. The sequence is: load at
+   1.3.2 → `Pkg.update()` → user acts. Changing the manifest reloads nothing, so `__init__` never
+   re-fires.
+2. "Already initialized" cannot be true there: `mm_globals_ref[]` is `nothing` until a backend
+   registers globals, so there is no project, no `data_dir`, and no DB to drop.
+3. The version that matters is not ModelManager's but the **backend's** (`packageName(sim)`), and
+   ModelManager's `__init__` does not know which backend will load. The backend's own `__init__` has
+   the same t0 problem.
+
+`resolvePackageVersion` is the earliest point in a session where both a simulator and a database
+exist, so it is not a compromise location — it is the only one.
+
+The half of the proposal that *was* right is "drop the current state", which is the
+`_abortInitialization` change below. What did not survive review was "if they run it anyway, that's
+on them": that reasoning holds when the cost lands on the session the user chose to break, but here
+the artifact is a mis-stamped **file** that outlives the session, skips the migration forever, and
+does so for anyone else sharing the project directory. The user cannot consent on the file's behalf.
+
+### Rejected: a `migrations_applied` audit table
+The only way to *detect* an already-corrupted database, since nothing records which migrations
+actually ran. Dropped, deliberately, with the reasoning corrected mid-discussion:
+
+- The argument first offered for dropping it — that the corrupted set is probably empty depending on
+  release history — was **wrong**, and was withdrawn. There is no observable event "when users began
+  updating mid-session". Release history bounds whether corruption was *possible*; whether any
+  session actually hit load-at-A → update-to-B → re-init is unrecorded and unknowable, and the
+  resulting database is byte-identical to a clean one. The set's size is not small, it is unknown.
+- The honest remaining argument *for* the table is a hole the guard does not close: a milestone added
+  to `upgradeMilestones` **below** a version some database has already recorded is skipped forever,
+  with no mid-session update involved at all, because `pkg_version == db_version` short-circuits
+  before `upgradePackage` is ever called. Shared root cause with the original bug — version equality
+  is treated as proof of schema state.
+- Resolution (user's call): rely on backend discipline rather than build the table, on the grounds
+  that the main downstream backend is the same author's. **Revisit and build the audit table if a
+  release ever ships a schema change without its milestone.** The assumption this now rests on is
+  written into `docs/src/misc/database_upgrades.md` as a warning admonition, so it lives where a
+  backend author reads it rather than only here.
+
+### Also fixed: `initialized` was never reset
+Separate pre-existing bug, folded in because this change makes it strictly more reachable — the new
+guard is a fourth early-`false` path that fires *precisely* on a re-init after a previous success,
+the exact scenario where the flag went stale.
+
+`initializeModelManager` never set `initialized = false` on entry, and none of its early-`false`
+paths did either. A failed re-init after a successful one left `isInitialized() == true` with
+`data_dir == ""` and a fresh in-memory `SQLite.DB()`, so every later query silently read an empty
+database. (`reinitializeDatabase` had always done it correctly.)
+
+Fixed by factoring all four abort blocks into `_abortInitialization()` and clearing `initialized` at
+entry — removing the bug class rather than one instance. Four sites, not the three originally
+scoped: the `catch` around opening the database cleared `data_dir` but left `db` pointing at the
+previous project's connection and `initialized` stale. Closing the previous connection there is
+correct, since that project is being abandoned either way.
+
+Verified safe to clear at entry: nothing on the path to `initializeDatabase` consults
+`isInitialized()`. `createSchema` cannot depend on it, since on a *first* init the flag is already
+`false` while it runs. The `assertInitialized` callers are all in query/deletion/tag code, and
+`databaseDiagnostics` runs `@async` only after init succeeds — behind the `waitForDiagnostics()` at
+entry.
+
+### Not fixed: `currentSimulatorVersionID()` staleness
+`createSchema` re-resolves `simulator().current_version_id` on every `initializeDatabase()`, and that
+ID is embedded in `Simulation`/`Monad` INSERTs and matched by `Sampling`'s find-or-insert, so a
+mid-session change makes previously-created objects stop matching lookups and can mint duplicate
+samplings. It does **not** apply to this session's scenario: `resolveSimulatorVersionID` is keyed on
+the simulator's own version tag, which tracks the simulator build, not the manager package. Distinct,
+pre-existing, backend-driven. Left alone by explicit decision — no fix and no Known Trade-offs entry.
+
+### Docs note
+Nearly wrote `[Database upgrades](@ref database_upgrades)` into the `initializeModelManager`
+docstring. That would have been the only manual-page anchor `@ref` in any `src/` docstring, and it
+would have broken **downstream** builds: PCMM renders ModelManager's docstrings but not
+ModelManager's manual pages, so the anchor is unresolvable there. The `"docstrings only @ref public
+bindings"` testset would not have caught it — its regex only matches backticked binding refs. Stated
+the substance inline instead.
+
+---
+
 ## Session: `run_on_hpc` was never auto-detected (2026-08-05)
 
 ### The bug

@@ -22,6 +22,30 @@ to the running package version:
 - with `auto_upgrade=false` (the default), the backend may prompt before applying large or
   destructive changes.
 
+## Updating the package mid-session
+
+Migrations are driven by the version of the backend **loaded into the running Julia session**,
+not by whatever is installed in the environment. The two come apart if you update the
+environment — `Pkg.update()`, `Pkg.add`, editing a `develop`ed package's `version` — while a
+session is already running: the session keeps executing the code it loaded at startup, but the
+environment now advertises the new version.
+
+Opening or migrating a project in that state is refused, with a message naming both versions.
+**Restart Julia and initialize again.** `Revise` does not help here; it revises method bodies,
+not the version a session recorded when it loaded the package.
+
+Refusing is the conservative choice because the alternative is worse than a delayed upgrade.
+The list of schema milestones comes from the loaded code, so it cannot describe a release that
+code predates. Migrating anyway would find no work to do, record the database as being at the
+new version, and thereby mark that release's schema changes as applied — after which the
+version comparison above matches, and the changes are skipped for the life of the database.
+
+The refusal covers both entry points: [`resolvePackageVersion`](@ref), which every
+[`initializeModelManager`](@ref) passes through, and [`upgradePackage`](@ref) when called
+directly. A backend reports its loaded version through
+[`loadedPackageVersion`](@ref), which is also the hook to override in the rare layout where
+the default cannot determine it.
+
 ## The milestone chain
 
 Not every release changes the schema. A backend declares the versions that do via
@@ -39,6 +63,17 @@ Each `upgradeToMilestone` implementation is responsible for:
 
 Returning `false` aborts the chain, leaving the database at the last successfully applied
 milestone.
+
+!!! warning "Declare a milestone before the release ships"
+    A milestone must be in [`upgradeMilestones`](@ref) by the time the release containing its
+    schema change is published. Once a database records a version, the chain is only ever walked
+    *forward* from there — a milestone added below a version some database has already reached
+    will never be applied to that database, and nothing detects it, because the recorded version
+    already satisfies the comparison above.
+
+    If a schema change ships without its milestone, the recovery is a new milestone at a *later*
+    version that brings the schema up to date idempotently, rather than backdating the one that
+    was missed.
 
 ## Helpers for writing migrations
 

@@ -131,6 +131,20 @@ ModelManager.upgradeToMilestone(sim::MySimulator, version, auto_upgrade)::Bool
 
 See [Database upgrades](@ref database_upgrades) for how these are orchestrated by [`upgradePackage`](@ref).
 
+ModelManager also compares the version installed in the environment against the version loaded
+in the session before it migrates anything, and refuses when they differ. It reads the loaded
+version from [`loadedPackageVersion`](@ref), whose default —
+`pkgversion(parentmodule(typeof(sim)))` — is correct when your simulator type is defined
+directly in the package named by [`packageName`](@ref). Override it if that is not your layout:
+
+```julia
+# The type lives in a submodule, so `parentmodule` returns the submodule, which has no version.
+ModelManager.loadedPackageVersion(::Backends.MySimulator) = pkgversion(MyModelManager)
+```
+
+Returning `nothing` disables the comparison, which is what a type defined at the REPL or in a
+script gets.
+
 ## 5. Override optional hooks as needed
 
 These have working defaults; override only when your simulator needs them.
