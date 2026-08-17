@@ -66,37 +66,25 @@ a partial upgrade is recoverable. If any milestone fails the chain is aborted an
 After all milestones pass, if `to_version` is beyond the last milestone the version
 table is stamped with `to_version` (a "no schema change" bump).
 
-A `to_version` beyond the version loaded in this session is refused: `milestones` is built
-from the loaded code, so it cannot describe a later release's schema changes. Prints an
-explanation and returns `false`, leaving the version table untouched.
-[`resolvePackageVersion`](@ref) never asks for such a target; the check applies to direct
-callers.
+A `to_version` beyond the version loaded in this session is refused, leaving the version table
+untouched. [`resolvePackageVersion`](@ref) never asks for such a target; the check applies to
+direct callers.
 """
 function upgradePackage(sim::AbstractSimulator, db::SQLite.DB,
                         from_version::VersionNumber, to_version::VersionNumber,
                         auto_upgrade::Bool)
     #! Unreachable from `resolvePackageVersion`, which already targets the loaded version — this
     #! guards a direct call, where `to_version` is whatever the caller passed. Refusing rather
-    #! than clamping to the loaded version, because silently migrating somewhere other than
-    #! where the caller asked is the worse surprise.
+    #! than clamping, because silently migrating somewhere other than asked is the worse surprise.
     #! `>`, not `!=`: a target *below* the loaded version is legitimate — resuming a partially
     #! applied chain, or deliberately migrating to an earlier milestone.
     loaded_version = loadedPackageVersion(sim)
     if !isnothing(loaded_version) && to_version > loaded_version
-        println("""
-        Refusing to migrate the database to version $(to_version): $(packageName(sim)) is loaded
-        at version $(loaded_version) in this session.
-
-        Restart Julia so that $(to_version) is loaded, then migrate.
-
-        The list of schema milestones comes from the loaded code, so it cannot include
-        $(to_version)'s changes; recording $(to_version) now would mark those changes as
-        applied and skip them permanently.
-        """)
+        _errorTargetBeyondLoaded(packageName(sim), to_version, loaded_version)
         return false
     end
 
-    println("Upgrading from version $(from_version) to $(to_version)...")
+    @info "Upgrading from version $(from_version) to $(to_version)..."
     milestones = upgradeMilestones(sim)
     @assert issorted(milestones) "Milestone versions must be sorted in ascending order. Got $(milestones)."
     pending = filter(v -> from_version < v <= to_version, milestones)

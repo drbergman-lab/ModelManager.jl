@@ -178,6 +178,66 @@ samplings. It does **not** apply to this session's scenario: `resolveSimulatorVe
 the simulator's own version tag, which tracks the simulator build, not the manager package. Distinct,
 pre-existing, backend-driven. Left alone by explicit decision — no fix and no Known Trade-offs entry.
 
+### Second review round (PR #30)
+Mostly a verbosity pass — the docs and docstrings were over-explaining behavior the reviewer
+considered self-evident once the design was right ("I get that having to fix this undermines this
+argument; but now that we have the right thing in place, it is obvious this is correct"). Cut the
+"why the loaded version" justification, the installed-vs-loaded table, and most of the
+`loadedPackageVersion` docstring. Worth remembering as a general pull: the rationale that felt
+necessary while the bug was live reads as padding once the fix is in. It lives here instead.
+
+Substantive changes from that round:
+
+- **`packageName` gained a default** — `string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))`
+  — so it is no longer a required `error` stub. Uses `moduleroot`, not a bare `parentmodule`, for
+  two reasons: a type in a submodule should report its package, and it must name the *same* package
+  whose version `loadedPackageVersion` reports (`pkgversion` resolves through `moduleroot` too). If
+  those two disagreed, the mismatch warning would compare unrelated packages.
+  This makes the "$name is not an installed dependency" error newly reachable — the default names
+  `Main` for a REPL-defined type — so that message now points at overriding `packageName`.
+- **`getPackageVersion` → `getInstalledVersion`.** Exported, so this is breaking; the old name is
+  gone rather than deprecated, on the grounds that the package is pre-1.0. PCMM must be checked for
+  callers.
+- **All version diagnostics funnelled** into one block in `src/package_version.jl` with consistent
+  levels, replacing `println`s scattered across `resolvePackageVersion` and `upgradePackage`.
+  `@warn` for the two recoverable-by-restart cases, `@error` for the two unsupported ones,
+  `@info` for progress. `continueMilestoneUpgrade` stays a `println` — a `readline` follows it, and
+  a prompt cannot go through a logger.
+- **Dropped a redundant `IF NOT EXISTS`** in `getDBPackageVersion`, which only runs in the branch
+  where `tableExists` already returned false.
+- The **installed-version fallback was kept.** The reviewer twice proposed removing it ("if there is
+  no loaded version, how are we even here??"). The answer is that `nothing` does not mean "not
+  loaded" — `pkgversion` returns it for a module that is loaded but not *from a versioned package*,
+  which is a REPL- or script-defined simulator, and `TestSimulator` in `Main`. Removing the fallback
+  would refuse those. Collapsing the interface further (dropping `packageName`, deriving the name
+  from `moduleroot`, requiring simulator types to live in packages) was considered and deferred: it
+  is a breaking interface change needing a coordinated PCMM edit, unrelated to this bug.
+
+### The `@ref` guard test had a blind spot, now closed
+Giving `packageName` a one-line definition broke the docs build, and the existing
+`"docstrings only @ref public bindings"` testset passed anyway. Two things combined:
+
+1. A `#!` comment placed between a docstring and a **one-line** definition silently prevents the
+   docstring from attaching. No error, no warning; `Docs.meta` simply has no entry.
+2. The guard only asked whether an `@ref` target is *public*. `packageName` is public — it just had
+   no docstring left to link to. Documenter resolves `@ref` against a rendered docstring, so a
+   public-but-undocumented binding fails a build exactly as a private one does.
+
+The testset now checks both, reporting `"not public"` and `"public but has no docstring"`
+separately. Verified by re-introducing the detaching comment: it flags
+`getInstalledVersion → packageName`. This is the same gap CLAUDE.md already noted for `@ref`s to
+*nonexistent* names, and the fix covers that case too.
+
+The `#!` comment on `packageName` now sits above its docstring, with a note saying why it must stay
+there.
+
+### A claim corrected mid-review
+The reviewer proposed a nested-module counterexample where `parentmodule(MySim)` returns the inner
+module, expecting the default to break. Measured on a purpose-built package with exactly that shape:
+`parentmodule` does return the inner module, but `pkgversion` resolves through `Base.moduleroot` to
+the package and reports its version, so the default is correct there. The genuine override case is
+narrower — the type living in a *separate package* from the one being upgraded.
+
 ### Docs note
 Nearly wrote `[Database upgrades](@ref database_upgrades)` into the `initializeModelManager`
 docstring. That would have been the only manual-page anchor `@ref` in any `src/` docstring, and it

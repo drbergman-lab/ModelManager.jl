@@ -70,9 +70,17 @@ function ModelManager.upgradeToMilestone(::TestSimulator, args...)
     return true
 end
 
-# Module-level type with no override, used to exercise the *default* loadedPackageVersion.
-# The TestSimulator override above shadows the default, so a separate type is required.
+# Module-level type with no override, used to exercise the *default* loadedPackageVersion and
+# packageName. The TestSimulator overrides above shadow the defaults, so separate types are
+# required.
 struct _NoModuleSimulator <: AbstractSimulator end
+
+# A simulator type inside a submodule, for checking that the packageName default resolves to the
+# enclosing package instead of stopping at the submodule.
+module _NestedSimModule
+    import ModelManager
+    struct NestedSimulator <: ModelManager.AbstractSimulator end
+end
 
 # ---- Trial execution --------------------------------------------------------
 ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
@@ -2165,14 +2173,24 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             # mid-session therefore delays the schema change to the next session rather than
             # recording a version whose migration never ran.
             @testset "migration targets the loaded version" begin
-                installed = ModelManager.getPackageVersion(TestSimulator())
+                installed = ModelManager.getInstalledVersion(TestSimulator())
                 table = ModelManager.dbVersionTableName(TestSimulator())
                 try
-                    # --- the default hook -------------------------------------------------
+                    # --- the default hooks ------------------------------------------------
                     # A type outside any package has no version to report. `nothing` must fall
                     # back to the installed version — it is what TestSimulator itself gets, so
                     # getting this wrong fails every project in the suite.
                     @test ModelManager.loadedPackageVersion(_NoModuleSimulator()) === nothing
+                    # packageName defaults to the package defining the type, resolved through
+                    # moduleroot so it names the same package whose version pkgversion reports.
+                    # _NoModuleSimulator is defined here, so that is Main.
+                    @test ModelManager.packageName(_NoModuleSimulator()) == "Main"
+                    # A type inside a submodule resolves to the enclosing package rather than
+                    # stopping at the submodule, which is what distinguishes moduleroot from a
+                    # bare parentmodule. Both this module and Main root at Main.
+                    @test ModelManager.packageName(_NestedSimModule.NestedSimulator()) == "Main"
+                    @test parentmodule(_NestedSimModule.NestedSimulator) !=
+                          Base.moduleroot(parentmodule(_NestedSimModule.NestedSimulator))
 
                     # --- the migration target ---------------------------------------------
                     # The loaded version is the target; `nothing` falls back to the installed one.
@@ -4453,21 +4471,33 @@ end
         #! `[`foo`](@ref)` → `foo`; also handles `ModelManager.foo`, `foo(x)`, and `Foo{T}`.
         refTarget(s) = strip(first(split(replace(s, r"^ModelManager\." => ""), r"[({]")))
 
-        violations = Tuple{Symbol,String}[]
-        for (binding, multidoc) in Docs.meta(ModelManager)
+        docs_meta = Docs.meta(ModelManager)
+        #! Public is necessary but not sufficient: Documenter resolves an `@ref` against a rendered
+        #! *docstring*, so a public binding that carries none fails the docs build just as a private
+        #! one does. That is easy to cause by accident — a comment between a docstring and a
+        #! one-line definition silently detaches it — and it surfaced only in the docs job before
+        #! this check existed.
+        isDocumented(target) = haskey(docs_meta, Docs.Binding(ModelManager, target))
+
+        violations = Tuple{Symbol,String,String}[]
+        for (binding, multidoc) in docs_meta
             for docstr in values(multidoc.docs)
                 text = join(Iterators.filter(x -> x isa AbstractString, docstr.text), "")
                 for m in eachmatch(r"\[`([^`]+)`\]\(@ref\)", text)
                     target = Symbol(refTarget(m.captures[1]))
-                    Base.ispublic(ModelManager, target) && continue
-                    push!(violations, (binding.var, m.captures[1]))
+                    if !Base.ispublic(ModelManager, target)
+                        push!(violations, (binding.var, m.captures[1], "not public"))
+                    elseif !isDocumented(target)
+                        push!(violations, (binding.var, m.captures[1], "public but has no docstring"))
+                    end
                 end
             end
         end
 
         if !isempty(violations)
-            msg = join(["  $(owner) → [`$(target)`](@ref)" for (owner, target) in sort(violations)], "\n")
-            @info "Docstrings referencing non-public bindings:\n$msg"
+            msg = join(["  $(owner) → [`$(target)`](@ref): $(why)"
+                        for (owner, target, why) in sort(violations)], "\n")
+            @info "Docstrings with unresolvable @refs:\n$msg"
         end
         @test isempty(violations)
     end

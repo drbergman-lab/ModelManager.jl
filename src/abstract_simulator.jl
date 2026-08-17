@@ -178,40 +178,47 @@ end
 ############   Database upgrade interface   ############
 ########################################################
 
+#! `moduleroot` rather than `parentmodule` alone, so that a type defined in a submodule reports
+#! the package rather than the submodule — and so that this names the same package whose version
+#! `loadedPackageVersion` reports, since `pkgversion` resolves through `moduleroot` too. If the
+#! two disagreed, the mismatch warning would compare unrelated packages.
+#! Keep this comment above the docstring: between the docstring and a one-line definition, it
+#! silently prevents the docstring from attaching, which only surfaces as a docs-build
+#! `:cross_references` failure on every `@ref` to this name.
 """
     packageName(sim::AbstractSimulator)::String
 
-Return the registered Julia package name for this simulator framework
-(e.g. `"PhysiCellModelManager"`). Used by [`getPackageVersion`](@ref) to look up
-the runtime version via `Pkg`.
+Return the Julia package name for this simulator framework (e.g. `"PhysiCellModelManager"`),
+used to look up the installed version via `Pkg`.
+
+Defaults to the package that defines `typeof(sim)`. Override when the version the database
+tracks belongs to a different package.
+
+# Arguments
+- `sim::AbstractSimulator`: the active simulator backend.
+
+# Returns
+The package name, as a `String`.
+
+# Example
+```julia
+ModelManager.packageName(::MySimulator) = "MySimCore"
+```
 """
-function packageName(sim::AbstractSimulator)
-    error("$(nameof(typeof(sim))) must implement: packageName(::$(nameof(typeof(sim))))::String")
-end
+packageName(sim::AbstractSimulator) = string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))
 
 """
     loadedPackageVersion(sim::AbstractSimulator)::Union{Nothing,VersionNumber}
 
-Return the version of `sim`'s package as **loaded into this Julia session**, or `nothing`
-if it cannot be determined.
+Return the version of `sim`'s package as loaded into this Julia session, or `nothing` if it
+cannot be determined — a type defined outside any package, such as at the REPL, in which
+case the installed version ([`getInstalledVersion`](@ref)) is used instead.
 
-This is the counterpart to [`getPackageVersion`](@ref), which reports the version
-*installed* in the active environment. The two disagree whenever the environment changes
-while a session is running: the session keeps executing the code it loaded at startup,
-while the manifest advertises something else.
+Migrations target this version rather than the installed one, since
+[`upgradeMilestones`](@ref) comes from the loaded code.
 
-Database migrations are driven by this version, not the installed one, because the
-milestone list comes from the loaded module ([`upgradeMilestones`](@ref)) — so the loaded
-release is the furthest point whose schema changes this session can actually apply.
-
-The default is `pkgversion(parentmodule(typeof(sim)))`. A type defined in a submodule needs
-no override: `pkgversion` resolves through `Base.moduleroot`, so a submodule reports its
-package's version. Override when the type's defining package is **not** the package
-[`packageName`](@ref) names, where the default would report an unrelated package's version.
-
-`nothing` means "cannot determine", and the installed version is used as the migration
-target instead. That is the result for a simulator type defined at the REPL or in a script,
-which belongs to no package and so has no version to report.
+Defaults to `pkgversion(parentmodule(typeof(sim)))`. Override when the simulator type is
+defined in a different package from the one being upgraded.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -221,10 +228,6 @@ The loaded `VersionNumber`, or `nothing` if it cannot be determined.
 
 # Example
 ```julia
-# The type lives in an adapter package, while the version the database tracks belongs to
-# the core package that `packageName` names. Without the override, the default would
-# report MySimAdapter's version.
-ModelManager.packageName(::MySimulator)          = "MySimCore"
 ModelManager.loadedPackageVersion(::MySimulator) = pkgversion(MySimCore)
 ```
 """

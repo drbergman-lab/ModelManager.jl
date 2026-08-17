@@ -9,7 +9,7 @@ using QuasiMonteCarlo
 using Sobol
 
 export AbstractSimulator, postInitDisplay, centralDBFileName
-export getPackageVersion, getDBPackageVersion, resolvePackageVersion
+export getInstalledVersion, getDBPackageVersion, resolvePackageVersion
 export queryToDataFrame, stmtToDataFrame, constructSelectQuery, tableIDName
 export tableExists, tableColumns
 export locationVariationsDatabase
