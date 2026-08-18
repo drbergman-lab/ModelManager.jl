@@ -191,8 +191,10 @@ end
 Return the Julia package name for this simulator framework (e.g. `"PhysiCellModelManager"`),
 used to look up the installed version via `Pkg`.
 
-Defaults to the package that defines `typeof(sim)`. Override when the version the database
-tracks belongs to a different package.
+Defaults to the package that defines `typeof(sim)`. This is the single place that decides which
+package is version-checked: both [`getInstalledVersion`](@ref) and [`loadedPackageVersion`](@ref)
+resolve through it, so overriding it here moves them together. Override when the version the
+database tracks belongs to a different package than the one defining the simulator type.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -207,6 +209,14 @@ ModelManager.packageName(::MySimulator) = "MySimCore"
 """
 packageName(sim::AbstractSimulator) = string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))
 
+#! Resolved through `packageName` rather than straight from `parentmodule(typeof(sim))`, so that
+#! this and `getInstalledVersion` always describe the *same* package — otherwise a backend that
+#! overrides only `packageName` reports its adapter package's loaded version against the core
+#! package's installed version, which both warns spuriously and aims the migration at a version
+#! belonging to an unrelated package. `packageName` defaults to the type's own package, so the
+#! ordinary case is unaffected. Read from the module registry, never from the environment:
+#! substituting the installed version for the running one is the conflation this mechanism exists
+#! to avoid. `_loadedModuleNamed` lives in `package_version.jl` with the version machinery.
 """
     loadedPackageVersion(sim::AbstractSimulator)::Union{Nothing,VersionNumber}
 
@@ -216,13 +226,16 @@ cannot be determined.
 Migrations target this version rather than the installed one, since
 [`upgradeMilestones`](@ref) comes from the loaded code.
 
-The default tries the package defining `typeof(sim)`, then — for a simulator defined in a
-script or at the REPL, which belongs to no package — the loaded package named by
-[`packageName`](@ref). Both report a *loaded* version; the installed version is never
-substituted. `nothing` means neither was found, and the project then opens without migrating
-or recording a version.
+The default reads the version of the loaded package named by [`packageName`](@ref), which is
+what makes this and [`getInstalledVersion`](@ref) describe the same package — one asking the
+module registry, the other the environment. Override `packageName` to point both at a different
+package; the installed version is never substituted for this one.
 
-Override when the simulator type is defined in a different package from the one being upgraded.
+`nothing` means that package is not loaded, or carries no version (a simulator defined in a
+script or at the REPL). The project then opens without migrating or recording a version.
+
+Overriding this method as well is rarely necessary — reach for it only when the loaded version
+cannot be read from the named package's module.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -236,12 +249,6 @@ ModelManager.loadedPackageVersion(::MySimulator) = pkgversion(MySimCore)
 ```
 """
 function loadedPackageVersion(sim::AbstractSimulator)
-    version = pkgversion(parentmodule(typeof(sim)))
-    isnothing(version) || return version
-    #! The type is not in a versioned package, but the package it *names* may still be loaded.
-    #! Read the version from there rather than from the environment: substituting the installed
-    #! version for the running one is the conflation this whole mechanism exists to avoid.
-    #! `_loadedModuleNamed` lives in `package_version.jl` with the rest of the version machinery.
     mod = _loadedModuleNamed(packageName(sim))
     return isnothing(mod) ? nothing : pkgversion(mod)
 end

@@ -139,8 +139,9 @@ build now, but was not before.
 
 ### A `#!` comment can silently detach a docstring
 
-Between a docstring and a **one-line** definition, a comment prevents the docstring from
-attaching at all — no error, no warning, and `Docs.meta` simply has no entry for the name:
+Between a docstring and the definition it documents, a comment prevents the docstring from
+attaching at all — no error, no warning, and `Docs.meta` simply has no entry for the name. This
+holds for **every** definition form; `f(x) = x` and `function f(x) ... end` behave identically:
 
 ```julia
 """

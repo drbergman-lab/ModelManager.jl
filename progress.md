@@ -250,6 +250,39 @@ separately. Verified by re-introducing the detaching comment: it flags
 The `#!` comment on `packageName` now sits above its docstring, with a note saying why it must stay
 there.
 
+### Fourth review round: `packageName` became the authority
+The reviewer asked why `packageName` did not overrule, given it already defaults to
+`parentmodule(typeof(sim))`. It should, and the previous ordering was a live bug rather than a
+style preference. `loadedPackageVersion` tried `pkgversion(parentmodule(typeof(sim)))` *first* and
+only fell back to the named package, so a backend overriding only `packageName` got the two
+versions from two different packages.
+
+Demonstrated with a purpose-built package (type in `NestTest` v7.7.7, `packageName` returning
+`"ModelManager"` v0.8.4): `loadedPackageVersion` reported **7.7.7** while `getInstalledVersion`
+reported **0.8.4**. That warns spuriously on every session *and* aims the migration at a version
+belonging to an unrelated package — it would have stamped the database 7.7.7. Resolving through
+`packageName` gives 0.8.4 from both.
+
+`packageName` is now the single place deciding which package is version-checked; both version
+functions resolve through it, so overriding it moves them together. Overriding
+`loadedPackageVersion` is now rarely needed and documented as such.
+
+### The docstring-detaching comment is not limited to one-line definitions
+Same trap as last round, and this time it exposed an error in what I had written into CLAUDE.md.
+I had recorded that an intervening comment detaches a docstring from a **one-line** definition;
+it applies to `function ... end` equally. Measured directly:
+
+```
+fA (one-line, comment between)      documented: false
+fB (function...end, comment between) documented: false
+fC (one-line, no comment)            documented: true
+fD (function...end, no comment)      documented: true
+```
+
+CLAUDE.md now says "every definition form". Worth noting the payoff of last round's guard change:
+the strengthened testset caught this on the first run, where previously it would have passed and
+left the failure to CI's docs job.
+
 ### A claim corrected mid-review
 The reviewer proposed a nested-module counterexample where `parentmodule(MySim)` returns the inner
 module, expecting the default to break. Measured on a purpose-built package with exactly that shape:
