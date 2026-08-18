@@ -111,7 +111,33 @@ You can also start from an existing reference monad to inherit its fixed paramet
 new_trial = createTrial(reference_monad, more_variations...)
 ```
 
+## Asking what a trial contains
+
+| Function | Returns | Levels |
+| --- | --- | --- |
+| [`simulationIDs`](@ref) | every simulation the trial covers | all |
+| [`monadIDs`](@ref) | every monad the trial covers | all |
+| [`constituentIDs`](@ref) | only the level immediately below | all but `Simulation` |
+| [`trialID`](@ref) | the object's own database ID | all |
+| [`trialType`](@ref) | its concrete type | all |
+
+`simulationIDs` and `monadIDs` descend as far as the hierarchy goes, so
+`simulationIDs(trial)` reaches the individual runs while `constituentIDs(trial)` stops at that
+trial's samplings. Each also takes an array of trials, concatenating the results.
+`constituentIDs` is the one exception to "works at every level": a [`Simulation`](@ref) has
+nothing below it, so it throws rather than returning an empty list.
+
+All five accept the [`MMOutput`](@ref) that [`run`](@ref) hands back, forwarding to the trial it
+wraps, so a result can be queried without unpacking it. So do `length` and
+[`trialFolder`](@ref):
+
+```julia
+out = run(sampling)
+monadIDs(out)                  # identical to monadIDs(sampling)
+length(out)                    # how many simulations the trial holds
+trialType(out)                 # Sampling
+```
+
 Once you have a trial, hand it to [`run`](@ref) to execute it — see
-[Running simulations](@ref running_simulations). For the constructor-level details and helper functions
-(`simulationIDs`, `constituentIDs`, `trialID`, …), see the
+[Running simulations](@ref running_simulations). For the constructor-level details, see the
 [Trial hierarchy](@ref) API reference.

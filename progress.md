@@ -2017,3 +2017,193 @@ for legibility, not correctness.
 - `test/runtests.jl` — `"docstrings only @ref public bindings"` testset
 - `docs/src/man/building_a_simulator.md` — removed stale "Variation row writing" section
 - `CLAUDE.md` — new "Docstring Cross-References" section
+
+---
+
+## Session: Trial-ID accessor symmetry; `trialID(::Vector{Sampling})` made a pure lookup (2026-08-17)
+
+Work-plan item 2 of 8. Independent of items 1 and 3, which ran in parallel worktrees.
+
+### Goal
+`simulationIDs(out)` worked on an `MMOutput`; `monadIDs(out)` was a `MethodError`. Closing that
+gap turned up the larger hole: `monadIDs(::Simulation)` did not exist at all, so
+`monadsTable(simulation)` and `monadsTable([sim, monad])` threw — despite `monadsTable`
+collecting IDs through `monadIDs(T)` and PRD.md promising "`AbstractTrial` objects (or arrays)".
+Separately `trialID` was exported under two opposite meanings: a field read, and a
+find-or-INSERT.
+
+### The trap: `monadIDs(::Simulation)` must not go through `Monad(simulation)`
+`Monad(simulation::Simulation)` **writes** — `INSERT OR IGNORE INTO monads … RETURNING
+monad_id`, then `addSimulationID`, which rewrites the monad's `simulations.csv`. That is exactly
+right for `pendingSimulationSpecs`, where materializing the enclosing monad is the point, and
+exactly wrong for an accessor. The one-liner that looks obvious would have silently created a
+row every time a user asked a question.
+
+The read-only route exists because `simulations` and `monads` carry the same key columns and
+`monadsSchema` declares `UNIQUE` over exactly that tuple, so a key match identifies at most one
+monad. `simulations` has no `monad_id` column, so this is the only non-CSV-scanning route.
+
+Rather than duplicate the key-tuple SQL, the builder was extracted from the `Monad` inner
+constructor into `_monadKeyStrings(inputs, variation_id)`, now used by both the find-or-insert
+constructor and the read-only `_monadIDForKey`. Pure move, no behavior change. The point is that
+the accessor cannot drift from the writer: if the key ever gains a column, one edit covers both.
+
+**Corrected a factual error in the planning brief.** The brief asserted that a `Simulation` from
+`createTrial(inputs, dv; n_replicates=1)` has no monad row until `run` creates one, and proposed
+documenting and testing that. It is false: `_buildTrial` takes the single-variation branch,
+constructs `Monad(inputs, variation_ids; n_replicates=1)` — which inserts the monad and records
+the constituent CSV — and only then returns `Simulation(simulationIDs(monad)[end])`. The genuine
+`Int[]` case is a simulation from the raw `Simulation(inputs, variation_id)` constructor, which
+touches `simulations` only. Had the brief's version been written into the docstring it would
+have been actively misleading, and the test built on it would have failed for the wrong reason.
+The test now mints a variation row via `addVariations` *without* a monad, so the key genuinely
+has no match.
+
+Returning `Int[]` rather than throwing: `monadIDs` returns a `Vector` at every other level,
+`monadIDs(trial)` already used `init=Int[]`, and an empty `monadsTable` beats an error. Verified
+empirically that the empty path is clean end to end — SQLite accepts `IN ()` and evaluates it
+false, and `_variationsTableFromQuery` returns a 0-row frame with columns intact (the
+`remove_constants` branch is guarded by `size(df,1) > 1`).
+
+### `trialID(::Vector{Sampling})`: lookup and create split
+The old method scanned `trials` and, on a miss, INSERTed a row plus `recordConstituentIDs` and
+`applyCreationTags` — the exact opposite of `trialID(::AbstractTrial) = T.id`, under the same
+exported name. Now a pure `SELECT` returning `missing` on no match; the insert block moved
+verbatim into `_findOrCreateTrialID`, called by `Trial(Ss::AbstractArray{<:AbstractSampling})`,
+its only caller. Blast radius verified: one caller, zero tests, zero `docs/`.
+
+`missing`, not `nothing`. The planning brief argued for `nothing` on the grounds that it matches
+Julia's `findfirst` convention and that this repo reserves `missing` for absent DB *data* (as in
+`eraseSimulationIDFromConstituents(…; monad_id=missing)`). The user had asked for `missing`
+explicitly and reaffirmed it when the brief was presented, so `missing` it is — and the
+`monad_id=missing` precedent reads the same way here: a trial ID that the database does not have.
+
+**Note for work-plan item 4.** If that brief gives each ABC generation its own `Trial` row it
+needs the create half, so it must call `_findOrCreateTrialID`, not `trialID`. The exported name
+no longer creates anything.
+
+CLAUDE.md's "Known Trade-offs" and PRD.md's concurrency bullet both named `trialID(samplings)`
+as one of the two unguarded find-or-insert blocks. Both updated to name `_findOrCreateTrialID`,
+which is now where an `EXCLUSIVE` transaction would have to go — and it has to span the lookup
+*and* the insert, which is easier to see now that they are one function.
+
+### Why `MMOutput` stays outside `AbstractTrial`
+Subtyping would collapse six forwarding one-liners into zero, and was rejected for two
+independent reasons:
+
+1. `MMOutput` has no `id` field, so `trialID(T::AbstractTrial) = T.id`, `trialFolder`,
+   `lowerClassString`, and every `T.id` in `runner.jl` / `tags.jl` / `deletion.jl` would need
+   guards.
+2. `run(::AbstractTrial)` would start accepting an `MMOutput` and *re-running* it, colliding
+   with `run(output_ref::MMOutput{<:AbstractMonad}, args...)`, whose meaning is "build a new
+   trial using this as a reference." A silent semantic change to a public method.
+
+Also `MMOutput{T}`'s type parameter is what makes `trialType(::MMOutput{T})` a compile-time
+answer; that is lost under an abstract supertype.
+
+A `trial(out)` unwrapping accessor was also rejected: `trial` cannot be exported, because users
+routinely write `trial = createTrial(...)` at top level and an exported binding of that name
+makes the assignment fail outright. `out.trial` is already a documented public field, so the
+field *is* the accessor. `trialOf` is the safe name if a function is ever wanted.
+
+### Scope held
+Deliberately *not* done, so the stopping rule stays defensible at "ID accessors and
+trivially-derived accessors on wrapper types":
+- `simulationsTable` / `monadsTable` / `postProcessingTable` taking an `MMOutput`. Each is a
+  4-method family with a keyword surface; ~12 new methods to save one word over
+  `simulationsTable(out.trial)`.
+- `untag!` / `tags` / `hasTag` on `MMOutput`. `tag!(::MMOutput, …)` exists because it returns
+  `output` and chains with the `tags=` keyword; the read/remove functions have no such
+  motivation, and adding them invites the same question for `tagsTable`, `findTrials`,
+  `deleteSimulations`, and everything else taking an `AbstractTrial`.
+
+### Docstrings
+`trialID` and `trialType` were exported with no docstring at all — a Definition-of-Done item 2
+violation that `checkdocs=:exports` cannot see, since it audits docstrings that *exist* and
+those contributed no entry to `Docs.meta`. Both now documented, plus tightened umbrella
+docstrings for `simulationIDs` and `monadIDs` that enumerate every method and state the
+`Int[]`-for-no-monad rule. `_monadKeyStrings`, `_monadIDForKey`, and `_findOrCreateTrialID` are
+internal, so they appear only as plain code spans.
+
+### Open questions
+- `monadIDs` on an array is not deduplicated: `[sim, monad]` where the simulation lives in that
+  monad yields the ID twice, and `monadsTable` collapses it back to one row only because SQL
+  `IN` does. Documented as-is rather than changed — `simulationIDs` has the same property and
+  changing either would be a separate, wider decision.
+
+### Files changed
+- `src/classes.jl` — `_monadKeyStrings` extraction; `_monadIDForKey`; `monadIDs(::Simulation)`;
+  `monadIDs`/`length`/`trialFolder` on `MMOutput`; `trialID`/`_findOrCreateTrialID` split;
+  docstrings for `trialID`, `trialType`, `simulationIDs`, `monadIDs`, `trialFolder`
+- `src/sensitivity.jl` — `monadIDs(::GSASampling)`
+- `src/database.jl` — `monadsTable` docstring: what a bare `Simulation` yields
+- `test/runtests.jl` — non-mutation tests for both accessors; `monadsTable` regression tests for
+  `Simulation` and mixed vectors; `MMOutput` forwarding; MOAT design-matrix agreement
+- `docs/src/man/trial_hierarchy.md` — "Asking what a trial contains" section
+- `Project.toml` — `0.8.4` → `0.9.0` (breaking)
+- `README.md`, `PRD.md`, `CLAUDE.md`
+
+### Adversarial review pass — three real defects in the first cut
+
+An adversarial review (five independent lenses, each finding handed to a verifier prompted to
+refute it, then a completeness critic) filed 7 findings; 4 survived verification and the critic
+added 2. Three were real and are fixed. Recording them because two are the kind of thing that
+looks like a deliberate choice once it is in the tree.
+
+**1. `monadIDs(::Simulation)` used the ambient simulator version — real bug.** `_monadKeyStrings`
+was written for the *writer*, where `currentSimulatorVersionID()` is exactly right: re-creating a
+parameterization under a new simulator version is deliberately a new monad row, since the version
+column is part of the `monads` `UNIQUE` key. Reusing that builder for the *reader* inherited the
+ambient value, so after a simulator upgrade inside a project the lookup searched for a
+version-2 monad that the upgrade had not created. Reproduced directly: a monad holding
+simulations `[1,2]`, then a version bump, and `monadIDs(Simulation(1))` returns `Int[]` and
+`monadsTable(Simulation(1))` zero rows while `constituentIDs(Monad, 1)` still lists simulation 1
+— falsifying this method's own docstring claim that a run simulation always has its monad. Worse,
+if the trial were re-created post-upgrade, the accessor would return the *version-2* monad's ID,
+attributing the simulation to a monad whose replicate list excludes it.
+
+Fixed by reading the version off the simulation's own `simulations` row (`_simulationVersionID`)
+and passing it in: `_monadKeyStrings` gained an optional third argument defaulting to
+`currentSimulatorVersionID()`, so the writer's behavior is unchanged by construction while the
+reader supplies the recorded value. Pinned by a test that bumps the project's simulator version
+and asserts the monad is still found.
+
+One reviewer argued this was not a defect, on the grounds that the runner's own
+`Monad(simulation)` also resolves against the current version and so the accessor was merely
+consistent. That is true but does not rescue it: `Monad(simulation)` is a writer whose job
+post-upgrade *is* to mint a new monad, whereas an accessor answering "which monad holds this
+simulation" must describe the recorded past. The two now legitimately differ, which is the point.
+
+**2. The `Int[]` rule was documented wrongly in the manual and the PRD.** Both said a simulation
+inserted with `Simulation(inputs, variation_id)` yields `Int[]`. It does not when a monad already
+carries that key — and `Simulation(monad::Monad)` is a documented constructor that *guarantees*
+the key is shared, so this is the common case, not a collision. The accessor matches on
+**parameterization, not membership**: such a simulation resolves to the monad sharing its
+parameters without appearing in that monad's replicate list, and a failed simulation that
+`simulationFailed` removed from the list still resolves to it. The docstring had been corrected
+for this during drafting; the manual page and PRD had not, so they contradicted it. All three now
+state the parameterization-vs-membership distinction explicitly, because a reader who assumes
+membership will misread `monadsTable(sim)`.
+
+**3. The manual's accessor table over-promised.** It presented five accessors as answering at
+every level and accepting an `MMOutput`, but `constituentIDs(::Simulation)` throws by design
+(a simulation has nothing below it) and `constituentIDs` had no `MMOutput` method at all.
+Resolved by adding `constituentIDs(::MMOutput)` — a one-line forward that sits squarely inside
+this change's own rule of "ID accessors on wrapper types", and whose absence made the family
+incoherent — and by marking the `Simulation` exception in the table rather than papering over it.
+
+**4. The `MMOutput`/`AbstractTrial` rationale was itself wrong, and is corrected.** The original
+argument (inherited from the planning brief) was that subtyping would make `run(::AbstractTrial)`
+accept an `MMOutput` and re-run it, "colliding" with `run(::MMOutput{<:AbstractMonad}, args...)`.
+Both halves are wrong. Julia resolves `f(::A)` vs `f(::B, args...)` with `B<:A` in favor of the
+Vararg method with no ambiguity — verified — so monad-wrapping outputs would keep dispatching
+exactly where they do today. And that method does not exclusively mean "build a new trial from
+this reference": with no `args` it forwards to `run(output_ref.trial)` and re-runs the wrapped
+monad. The decision to stay outside the hierarchy is unchanged, but it now rests on the two
+reasons that actually hold — no `id` field, and `run(::AbstractTrial)` would silently begin
+accepting `MMOutput{Sampling}`/`MMOutput{Trial}` where today those are a `MethodError`.
+
+Two findings were refuted and are recorded so they are not re-litigated: that `run` deleting an
+emptied monad leaves a run simulation with `Int[]` (real mechanism, but pre-existing behavior of
+`simulationFailed`, not introduced here — and now covered by the membership wording), and a
+duplicate of finding 2 filed against PRD.md alone.

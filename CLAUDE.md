@@ -100,6 +100,38 @@ Cautioned:
 - **Interface methods:** defined as bare `function foo end` stubs in `abstract_simulator.jl`; concrete implementations live in the simulator package. Unexported but declared `@compat public` — see [Docstring Cross-References](#docstring-cross-references)
 - **Exported vs internal:** public API is exported from the relevant `src/*.jl` file; internal helpers are prefixed with `_`
 
+## Docstring Length
+
+**Rule: spend words only on what a reader cannot infer from the signature. Everything else is
+noise, and a wrong example is worse than no example.**
+
+Most accessors need one to three sentences and nothing else. Do **not** reach for
+`# Arguments` / `# Returns` / `# Examples` by default — that structure is for functions with a real
+keyword surface or a genuinely non-obvious contract (`run`, `createTrial`, `simulationsTable`,
+`runABC`), not for `trialID` or `trialType`.
+
+What earns length:
+
+- a return value the signature does not imply — `trialID(::Vector{Sampling})` gives `missing` and
+  never creates a row;
+- a distinction a reader will otherwise get wrong — `monadIDs(::Simulation)` matches on
+  *parameterization*, not membership, so it resolves to a monad that may not list that simulation;
+- keyword arguments, and which of several methods a keyword applies to.
+
+What does not: restating the argument list in prose, naming the return type when it is already in
+the signature, or an example that only shows the obvious call.
+
+**Verify every example against actual dispatch before writing it.** A `trialType` docstring once
+claimed `createTrial(inputs, dv; n_replicates=1)` yields a `Simulation` and `[dv1, dv2]` yields a
+`Sampling`. Both are wrong: the trial type follows from how many *values* the variations carry, so
+one `DiscreteVariation` over three values is a `Sampling` at any replicate count. An example that
+teaches the wrong mental model does more damage than the omission it was filling.
+
+The same rule governs `docs/src/man/*.md`: a manual page describes how the code behaves, never
+which cases the current change happened to touch. If a list of "cases worth knowing about" is
+really an inventory of your diff, delete it — the substance belongs in the docstring and the
+reasoning in `progress.md`.
+
 ## Docstring Cross-References
 
 **Rule: a docstring may only `[`link`](@ref)` to a *public* binding — one that is either
@@ -217,7 +249,8 @@ and is internal. Verify against the actual signature.
 A feature is complete when **all** of the following are true:
 
 1. **Tests pass:** `julia --project=. -e 'using Pkg; Pkg.test()'` runs green.
-2. **Docstrings written:** Every exported function has a docstring with description, argument list, return value, and at least one usage example.
+2. **Docstrings written:** Every exported function has a docstring. Length is earned by
+   non-obvious content, not owed by default — see [Docstring Length](#docstring-length).
 3. **README updated:** Implementation Status section marks the feature as complete.
 4. **PRD reflects reality:** If implementation deviated from the PRD, update the PRD entry.
 5. **No regressions:** Full test suite has no new failures.
@@ -242,8 +275,8 @@ ModelManager is **simulator-agnostic** infrastructure. Therefore:
 
 Deliberate decisions whose symptoms would otherwise look like bugs. Check here before "fixing" one.
 
-- **Concurrent trial creation is unsupported** — in one session or across sessions. Two Julia sessions cannot corrupt the SQLite file (SQLite serializes writers), but `Sampling(monads, inputs)` and `trialID(samplings)` in `src/classes.jl` scan for a matching row before inserting, with no `UNIQUE` constraint to fall back on, so each could insert a duplicate. They also race on the constituent-ID CSVs, which no database lock covers.
-  **If duplicate or inconsistent rows show up in `samplings` or `trials`, that is the cause.** The fix is to wrap those two find-or-insert blocks in `withTransaction(mode="EXCLUSIVE")` — `withTransaction`'s `mode` keyword exists for exactly this — and to set `PRAGMA busy_timeout`, without which the losing session fails immediately with `"database is locked"` instead of waiting.
+- **Concurrent trial creation is unsupported** — in one session or across sessions. Two Julia sessions cannot corrupt the SQLite file (SQLite serializes writers), but `Sampling(monads, inputs)` and `_findOrCreateTrialID(samplings)` in `src/classes.jl` scan for a matching row before inserting, with no `UNIQUE` constraint to fall back on, so each could insert a duplicate. They also race on the constituent-ID CSVs, which no database lock covers. (`_findOrCreateTrialID` is reached only through the `Trial(Ss)` constructor; the exported `trialID(samplings)` is a pure lookup and never inserts.)
+  **If duplicate or inconsistent rows show up in `samplings` or `trials`, that is the cause.** The fix is to wrap those two find-or-insert blocks in `withTransaction(mode="EXCLUSIVE")` — `withTransaction`'s `mode` keyword exists for exactly this — and to set `PRAGMA busy_timeout`, without which the losing session fails immediately with `"database is locked"` instead of waiting. For `trials`, the block to wrap is `_findOrCreateTrialID`, which must hold the transaction across both the `trialID` lookup and the insert.
 
   Setting that pragma has a trap worth reading before you try. `busy_timeout` lives in the connection handle, not the database file: it is not shared between connections to the same file and does not survive a close. ModelManager opens the central connection in **two** places — `initializeModelManager` (`src/globals.jl`) and `initializeDatabase` (`src/database.jl`) — and the second one **closes and reopens** the first, because `initializeModelManager` calls `initializeDatabase` right after opening. Set the pragma only in `initializeModelManager` and it is silently discarded a few lines later, with no error. Apply it through a single `openCentralDB(path)` wrapper used at both sites so it cannot be missed. The three other `SQLite.DB(...)` calls in `src/database.jl` are separate connections to separate files (per-location variations, the post-processing sink) and would each need their own.
 

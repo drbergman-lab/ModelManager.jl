@@ -1115,6 +1115,10 @@ analogue of [`simulationsTable`](@ref). See [`monadsTableFromQuery`](@ref) for k
 - A vector of monad IDs.
 - Omitted (returns data for all monads).
 
+A [`Simulation`](@ref) contributes the monad holding it, so a bare simulation gives a one-row
+table. In the rare case that a simulation has no monad — see [`monadIDs`](@ref) — the result is
+an empty table rather than an error.
+
 # Examples
 ```julia
 monadsTable(sampling)
