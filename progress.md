@@ -195,6 +195,12 @@ Substantive changes from that round:
   those two disagreed, the mismatch warning would compare unrelated packages.
   This makes the "$name is not an installed dependency" error newly reachable — the default names
   `Main` for a REPL-defined type — so that message now points at overriding `packageName`.
+- **Diagnostic names normalized** to one vocabulary — `installed` / `loaded` / `db_version` — after
+  the reviewer could not map the function names onto the checks ("Does `target` = `Session`? Does
+  `installed` = `Database`?"). The local `target` became `loaded` for the same reason.
+  `_warnLoadedBehindInstalled` was also simply wrong: its caller only establishes that the two
+  differ, and a mid-session `Pkg` change can move the environment in either direction, so it is now
+  `_warnLoadedDiffersFromInstalled`.
 - **`getPackageVersion` → `getInstalledVersion`.** Exported, so this is breaking; the old name is
   gone rather than deprecated, on the grounds that the package is pre-1.0. PCMM must be checked for
   callers.
@@ -205,7 +211,20 @@ Substantive changes from that round:
   a prompt cannot go through a logger.
 - **Dropped a redundant `IF NOT EXISTS`** in `getDBPackageVersion`, which only runs in the branch
   where `tableExists` already returned false.
-- The **installed-version fallback was kept.** The reviewer twice proposed removing it ("if there is
+- **The installed-version fallback was replaced, not kept** (third review round). The reviewer's
+  framing landed it: put the fallback inside `loadedPackageVersion` itself, resolving
+  `packageName` and reading the version from the *loaded* module registry
+  (`Base.loaded_modules`) rather than from the environment. Both routes now report a loaded
+  version, so the substitution being objected to is gone rather than merely defended, and
+  `_migrationTargetVersion` disappeared with it — which also answers their earlier "why do we need
+  this?" about that helper. When neither route finds a version, `resolvePackageVersion` warns and
+  returns `true` without migrating: nothing to migrate *with*, so the project opens untracked
+  rather than being blocked. `getDBPackageVersion` throws in that state instead of inventing a
+  version, and is unreachable from the init path because the short-circuit returns first.
+  The test harness needed a three-way sentinel as a result — `:default` (resolve normally), a
+  `VersionNumber` (staged mid-session change), and `nothing` (genuinely undeterminable) — because
+  `nothing` had previously meant "inert" and now means "short-circuit".
+- Earlier in the same discussion, the fallback **was** defended and kept: The reviewer twice proposed removing it ("if there is
   no loaded version, how are we even here??"). The answer is that `nothing` does not mean "not
   loaded" — `pkgversion` returns it for a module that is loaded but not *from a versioned package*,
   which is a REPL- or script-defined simulator, and `TestSimulator` in `Main`. Removing the fallback

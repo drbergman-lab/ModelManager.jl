@@ -54,11 +54,14 @@ ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
 ModelManager.packageName(::TestSimulator)       = "ModelManager"
 ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
 
-# Overridable so the migration-guard tests can stage a mid-session package update.  A
-# `nothing` default reproduces what the real default hook returns for TestSimulator (which
-# lives in Main and so belongs to no package), keeping the guard inert for every other test.
-const _loaded_version_override = Ref{Union{Nothing,VersionNumber}}(nothing)
-ModelManager.loadedPackageVersion(::TestSimulator) = _loaded_version_override[]
+# Overridable so the migration tests can stage a mid-session package update. Three settings:
+#   :default          — what the real hook resolves to for TestSimulator. Its type lives in Main,
+#                       so the default chains through packageName to the loaded ModelManager.
+#   a VersionNumber   — a staged loaded version, i.e. a mid-session Pkg change.
+#   nothing           — genuinely undeterminable, exercising the short-circuit path.
+const _loaded_version_override = Ref{Any}(:default)
+ModelManager.loadedPackageVersion(::TestSimulator) =
+    _loaded_version_override[] === :default ? pkgversion(ModelManager) : _loaded_version_override[]
 
 # Overridable so the guard tests can present a milestone the "loaded" version knows about,
 # and count how many times it was applied.
@@ -2193,18 +2196,42 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                           Base.moduleroot(parentmodule(_NestedSimModule.NestedSimulator))
 
                     # --- the migration target ---------------------------------------------
-                    # The loaded version is the target; `nothing` falls back to the installed one.
-                    _loaded_version_override[] = nothing
-                    @test ModelManager._migrationTargetVersion(TestSimulator()) == installed
+                    # The loaded version is the target. For TestSimulator the default resolves via
+                    # packageName to the loaded ModelManager, which here equals the installed one.
+                    _loaded_version_override[] = :default
+                    @test ModelManager.loadedPackageVersion(TestSimulator()) == installed
                     _loaded_version_override[] = v"0.4.0"
-                    @test ModelManager._migrationTargetVersion(TestSimulator()) == v"0.4.0"
+                    @test ModelManager.loadedPackageVersion(TestSimulator()) == v"0.4.0"
+
+                    # The default chains through packageName when the type is not in a versioned
+                    # package: _NoModuleSimulator names Main, which is not a loaded package, so
+                    # there is genuinely no version to find.
+                    @test ModelManager._loadedModuleNamed("ModelManager") === ModelManager
+                    @test ModelManager._loadedModuleNamed("NoSuchPackage") === nothing
 
                     # --- resolvePackageVersion --------------------------------------------
-                    # Undeterminable loaded version: behaves as it always did.
-                    _loaded_version_override[] = nothing
+                    # Resolvable loaded version: behaves as it always did.
+                    _loaded_version_override[] = :default
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()
                     @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == installed
+
+                    # No determinable loaded version: the project still opens, but nothing is
+                    # migrated and nothing is recorded, because which milestones belong to the
+                    # running code is unknowable.
+                    mktempdir() do unversioned_dir
+                        _make_test_project(unversioned_dir)
+                        _loaded_version_override[] = nothing
+                        @test initializeModelManager(TestSimulator(), unversioned_dir;
+                                                     auto_upgrade=true)
+                        waitForDiagnostics()
+                        @test isInitialized()
+                        # No version table was stamped on the way through.
+                        @test !ModelManager.tableExists(table)
+                        # And getDBPackageVersion says why rather than inventing a version.
+                        @test_throws ArgumentError ModelManager.getDBPackageVersion(
+                            TestSimulator(), centralDB())
+                    end
 
                     # Versions agree: nothing to do.
                     _loaded_version_override[] = installed
@@ -2253,7 +2280,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                         ModelManager.DBInterface.execute(stale,
                             "INSERT INTO $(table) (version) VALUES ('99.9.9');")
                         close(stale)
-                        _loaded_version_override[] = nothing   # target == installed
+                        _loaded_version_override[] = :default   # target == installed
                         @test !initializeModelManager(TestSimulator(), old_pkg_dir; auto_upgrade=true)
                         @test !isInitialized()
                     end
@@ -2261,7 +2288,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # --- upgradePackage ---------------------------------------------------
                     # Public and callable directly, so it keeps a guard of its own — a direct
                     # caller supplies to_version, which resolvePackageVersion never would.
-                    _loaded_version_override[] = nothing
+                    _loaded_version_override[] = :default
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()
 
@@ -2292,7 +2319,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # Re-initializing restores the stamp on its own: the assertions above
                     # rewound the version table, and with no milestones to cross the upgrade
                     # path bumps it straight back to the installed version.
-                    _loaded_version_override[] = nothing
+                    _loaded_version_override[] = :default
                     _milestone_override[] = VersionNumber[]
                     _milestone_calls[] = 0
                     initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)

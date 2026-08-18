@@ -211,14 +211,18 @@ packageName(sim::AbstractSimulator) = string(nameof(Base.moduleroot(parentmodule
     loadedPackageVersion(sim::AbstractSimulator)::Union{Nothing,VersionNumber}
 
 Return the version of `sim`'s package as loaded into this Julia session, or `nothing` if it
-cannot be determined — a type defined outside any package, such as at the REPL, in which
-case the installed version ([`getInstalledVersion`](@ref)) is used instead.
+cannot be determined.
 
 Migrations target this version rather than the installed one, since
 [`upgradeMilestones`](@ref) comes from the loaded code.
 
-Defaults to `pkgversion(parentmodule(typeof(sim)))`. Override when the simulator type is
-defined in a different package from the one being upgraded.
+The default tries the package defining `typeof(sim)`, then — for a simulator defined in a
+script or at the REPL, which belongs to no package — the loaded package named by
+[`packageName`](@ref). Both report a *loaded* version; the installed version is never
+substituted. `nothing` means neither was found, and the project then opens without migrating
+or recording a version.
+
+Override when the simulator type is defined in a different package from the one being upgraded.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -231,7 +235,16 @@ The loaded `VersionNumber`, or `nothing` if it cannot be determined.
 ModelManager.loadedPackageVersion(::MySimulator) = pkgversion(MySimCore)
 ```
 """
-loadedPackageVersion(sim::AbstractSimulator) = pkgversion(parentmodule(typeof(sim)))
+function loadedPackageVersion(sim::AbstractSimulator)
+    version = pkgversion(parentmodule(typeof(sim)))
+    isnothing(version) || return version
+    #! The type is not in a versioned package, but the package it *names* may still be loaded.
+    #! Read the version from there rather than from the environment: substituting the installed
+    #! version for the running one is the conflation this whole mechanism exists to avoid.
+    #! `_loadedModuleNamed` lives in `package_version.jl` with the rest of the version machinery.
+    mod = _loadedModuleNamed(packageName(sim))
+    return isnothing(mod) ? nothing : pkgversion(mod)
+end
 
 """
     dbVersionTableName(sim::AbstractSimulator)::String

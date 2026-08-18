@@ -42,46 +42,64 @@ function getInstalledVersion(sim::AbstractSimulator)::VersionNumber
     return deps[uuid].version
 end
 
-#! `upgradeMilestones` dispatches on the loaded module, so the loaded version is the furthest
-#! point whose schema changes are knowable here. `nothing` means it cannot be determined.
-function _migrationTargetVersion(sim::AbstractSimulator)::VersionNumber
-    loaded = loadedPackageVersion(sim)
-    return isnothing(loaded) ? getInstalledVersion(sim) : loaded
+#! Getting from a package *name* to its loaded module needs the module registry, because
+#! `packageName` yields a string. `Base.loaded_modules` is semi-internal Base API — a
+#! `Dict{PkgId,Module}` — and is the only route available. Used by the `loadedPackageVersion`
+#! default to resolve a simulator that is not itself defined in a versioned package.
+function _loadedModuleNamed(name::AbstractString)
+    for (pkgid, mod) in Base.loaded_modules
+        pkgid.name == name && return mod
+    end
+    return nothing
 end
 
 ########################################################
 ############      Version diagnostics       ############
 ########################################################
 
-#! Every version-resolution message is emitted here rather than at its call site, so the level
-#! and the phrasing cannot drift apart as they did when these were `println`s spread across
-#! `resolvePackageVersion` and `upgradePackage`. `continueMilestoneUpgrade` is the deliberate
-#! exception: a `readline` follows it, and a prompt cannot go through a logger.
+#! Three versions are in play throughout this file, and every name below uses them consistently:
+#!   installed  — recorded in the active environment's manifest (`getInstalledVersion`)
+#!   loaded     — running in this session (`loadedPackageVersion`); the migration target
+#!   db_version — recorded in the project database (`getDBPackageVersion`)
+#! Messages are emitted here rather than at their call sites so the level and the phrasing cannot
+#! drift apart, as they did when these were `println`s spread across two files.
 #! Every case below is caused by changing versions with `Pkg` mid-session, so each says so —
 #! without it the user has no way to connect the message to what they did.
+#! `continueMilestoneUpgrade` is the deliberate exception: a `readline` follows it, and a prompt
+#! cannot go through a logger.
 
 #! `maxlog=1`: the loaded version is fixed at load time, so this cannot change within a session.
-_warnLoadedBehindInstalled(name, installed, loaded) = @warn """
+#! Says nothing about which of the two is newer, because the caller only establishes that they
+#! differ — a mid-session `Pkg` change can move the environment in either direction.
+_warnLoadedDiffersFromInstalled(name, installed, loaded) = @warn """
     $(name) $(installed) is installed but $(loaded) is loaded here, because the environment
     changed with Pkg after the package was loaded. The database will be migrated to $(loaded),
     matching the code that is running. Restart Julia to load $(installed).
     """ maxlog=1
 
-_warnSessionBehindDatabase(name, loaded, installed, db_version) = @warn """
+_warnLoadedBehindDatabase(name, loaded, installed, db_version) = @warn """
     The database is at $(db_version) but only $(name) $(loaded) is loaded here, because the
     environment changed with Pkg after the package was loaded. Restart Julia to load
     $(installed) before opening this project.
     """
 
-_errorDatabaseAheadOfPackage(name, installed, db_version) = @error """
+_errorInstalledBehindDatabase(name, installed, db_version) = @error """
     The database is at $(db_version) but $(name) $(installed) is installed. Upgrade $(name) to
     $(db_version) or higher before opening this project.
     """
 
-_errorTargetBeyondLoaded(name, to_version, loaded) = @error """
-    Cannot migrate the database to $(to_version): $(name) $(loaded) is loaded here. The schema
-    milestones come from the loaded code, so $(to_version)'s are unavailable to apply. Restart
-    Julia with $(to_version) loaded, then migrate.
+_warnUnversionedSimulator(sim_type, name) = @warn """
+    $(sim_type) is not defined in a versioned package, and no loaded package named $(name) was
+    found, so the schema version cannot be determined. Opening the project without migrating it
+    and without recording a version. If this database was created by a versioned build, its schema
+    may not match the code now running — define loadedPackageVersion(::$(sim_type)) to restore
+    version tracking.
+    """ maxlog=1
+
+_errorTargetBeyondLoaded(name, target, loaded) = @error """
+    Cannot migrate the database to $(target): $(name) $(loaded) is loaded here. The schema
+    milestones come from the loaded code, so $(target)'s are unavailable to apply. Restart
+    Julia with $(target) loaded, then migrate.
     """
 
 """
@@ -90,7 +108,8 @@ _errorTargetBeyondLoaded(name, to_version, loaded) = @error """
 Return the package version recorded in `db` under [`dbVersionTableName`](@ref)`(sim)`.
 
 If the table does not exist it is created and stamped with the version this session is
-running, which is the version whose code builds the schema.
+running, which is the version whose code builds the schema. Throws if that version cannot be
+determined, since there is then nothing to record.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -109,7 +128,13 @@ function getDBPackageVersion(sim::AbstractSimulator, db::SQLite.DB)::VersionNumb
     if tableExists(table; db=db)
         return queryToDataFrame("SELECT * FROM $(table);"; db=db) |> x -> VersionNumber(x.version[1])
     end
-    version = _migrationTargetVersion(sim)
+    #! The loaded version, since that is the code building this database's schema.
+    version = loadedPackageVersion(sim)
+    isnothing(version) && throw(ArgumentError(
+        "Cannot record a version for $(nameof(typeof(sim))): it is not defined in a versioned " *
+        "package and no loaded package named $(packageName(sim)) was found. Define " *
+        "loadedPackageVersion(::$(nameof(typeof(sim)))) to record one."
+    ))
     DBInterface.execute(db, "CREATE TABLE $(table) (version TEXT PRIMARY KEY);")
     DBInterface.execute(db, "INSERT INTO $(table) (version) VALUES ('$(version)');")
     return version
@@ -122,7 +147,8 @@ Compare the version recorded in `db` with [`loadedPackageVersion`](@ref) and upg
 needed. Returns `true` when the database is ready to use, `false` when it is not.
 
 Migrations target the loaded version because [`upgradeMilestones`](@ref) comes from the loaded
-code. When the loaded version cannot be determined, [`getInstalledVersion`](@ref) is used.
+code. When it cannot be determined at all, the project opens unmigrated and untracked, with a
+warning — there is no way to tell which milestones belong to the running code.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -142,26 +168,36 @@ ModelManager.resolvePackageVersion(simulator(), centralDB(); auto_upgrade=true)
 """
 function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
                                auto_upgrade::Bool=false)::Bool
-    name      = packageName(sim)
-    installed = getInstalledVersion(sim)
-    target    = _migrationTargetVersion(sim)
+    name   = packageName(sim)
+    loaded = loadedPackageVersion(sim)
 
-    target != installed && _warnLoadedBehindInstalled(name, installed, target)
+    #! No loaded version means there is nothing to migrate *with*: which milestones belong to the
+    #! running code is unknowable. Open the project anyway rather than blocking, so a simulator
+    #! prototyped in a script still works — it simply gets no version tracking. Returning before
+    #! `getDBPackageVersion` also keeps it from stamping a version table it cannot fill.
+    if isnothing(loaded)
+        _warnUnversionedSimulator(nameof(typeof(sim)), name)
+        return true
+    end
+
+    installed = getInstalledVersion(sim)
+    loaded != installed && _warnLoadedDiffersFromInstalled(name, installed, loaded)
 
     db_version = getDBPackageVersion(sim, db)
 
-    if target < db_version
-        #! Two remedies, and the wrong one sends the user in circles: a session lagging the
-        #! environment already has a new enough package, so restarting is the fix, not upgrading.
-        if target < installed
-            _warnSessionBehindDatabase(name, target, installed, db_version)
+    if loaded < db_version
+        #! Which remedy applies turns on whether restarting would help: a session running older
+        #! code than the environment holds already has a new enough package installed, so telling
+        #! it to upgrade would send the user in circles.
+        if loaded < installed
+            _warnLoadedBehindDatabase(name, loaded, installed, db_version)
         else
-            _errorDatabaseAheadOfPackage(name, installed, db_version)
+            _errorInstalledBehindDatabase(name, installed, db_version)
         end
         return false
     end
 
-    target == db_version && return true
+    loaded == db_version && return true
 
-    return upgradePackage(sim, db, db_version, target, auto_upgrade)
+    return upgradePackage(sim, db, db_version, loaded, auto_upgrade)
 end
