@@ -92,6 +92,22 @@ Both sets of columns are appended as-is: they are not subject to `remove_constan
 not sorted on. `monadsTable` supports `tags` but not `post_processing`, since the sink is
 keyed by simulation.
 
+## One row per calibration run
+
+[`calibrationsTable`](@ref) lists the calibration runs in the project — `CalibrationID`,
+`DateTime`, `Method`, and `Description` — rather than their simulations:
+
+```julia
+calibrationsTable()
+calibrationsTable(; tags = true)        # what each run was for
+printCalibrationsTable([1, 2, 3])
+```
+
+Only tags placed on the run itself appear in those columns; a calibration is not a container of
+simulations, so nothing is inherited into them. For a run's per-generation convergence numbers use
+[`ConvergenceSummary`](@ref), and for its simulations pass one of its views to `simulationsTable`
+— see [Calibration](@ref calibration_man).
+
 ## Quantities on their own
 
 [`postProcessingTable`](@ref) reads the post-processing sink directly, without the parameter

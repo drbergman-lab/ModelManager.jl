@@ -141,3 +141,29 @@ trialType(out)                 # Sampling
 Once you have a trial, hand it to [`run`](@ref) to execute it — see
 [Running simulations](@ref running_simulations). For the constructor-level details, see the
 [Trial hierarchy](@ref) API reference.
+
+## What is not in the hierarchy
+
+Two things address collections of simulations without being levels of it, because they are
+*procedures* that produce simulations rather than containers of them.
+
+A sensitivity analysis returns a [`GSASampling`](@ref), which holds the one `Sampling` its design
+produced and forwards [`simulationIDs`](@ref) and [`monadIDs`](@ref) to it.
+
+A [`Calibration`](@ref) has no single sampling to hold: it evaluates monads in batches, each of
+which becomes a `Sampling` of its own as the run proceeds. Instead it offers *views* —
+`Sampling(calibration)` over every monad the run evaluated, and `Sampling(calibration, t)` over
+one generation's. These overlap rather than nest: a monad belongs to a batch's sampling, to its
+generation's view, and to the run's view all at once. That is why a calibration is not a fifth
+level. The four levels form a strict chain, in which each object's constituents are objects of
+exactly one lower type, and overlapping views cannot be expressed that way — a `Sampling`'s
+constituents are `Monad`s, never other `Sampling`s.
+
+What makes the views legal is the `Sampling` guarantee itself: all constituent simulations share
+input folders. Every monad in a calibration is built from one [`CalibrationProblem`](@ref)'s
+inputs, so any subset of them is a valid sampling.
+
+[`monadIDs`](@ref) and [`simulationIDs`](@ref) accept a [`Calibration`](@ref) as well, and like
+every accessor in the table above they only read — building a view is what records one, so it is
+the `Sampling` constructors that do it. See [Calibration](@ref calibration_man) for how to use
+them.

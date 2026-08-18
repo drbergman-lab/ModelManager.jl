@@ -2905,6 +2905,300 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test_throws ArgumentError posterior(result; generation=99)
             end
 
+            # ---------- calibration as coalesced Sampling views ----------
+            #
+            # A generation is not one Sampling: the batch loop builds one per batch. But every
+            # monad of a calibration shares problem.inputs, which is what defines a Sampling, so
+            # the run and each of its generations are valid samplings too — overlapping views
+            # over the same monads.
+            @testset "coalesced Sampling views over a calibration" begin
+                # _test_nonzero_ss keeps every distance at 1.0, so the run does not converge in
+                # generation 1 and there really are several generations to coalesce over.
+                dv       = DistributedVariation(:config, xp_x, Uniform(30.0, 32.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_nonzero_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+                result = runCalibration(prob, method; description="views")
+                cal = result.calibration
+                waitForDiagnostics()
+                @test length(result.generations) == 2
+
+                recorded = ModelManager.calibrationMonadIDs(cal)
+                @test !isempty(recorded)
+                @test allunique(recorded)              # generations overlap; the record dedupes
+                @test monadIDs(cal) == recorded        # nothing failed here, so all survive
+
+                # Every simulation of the run, reachable through the batch tag alone.
+                batch_ids = sort(findSimulationIDs(tags=("mm:calibration" => string(cal.id),)))
+                @test !isempty(batch_ids)
+
+                sampling = Sampling(cal)
+                @test sampling isa Sampling
+                # Matching is on the exact monad set, so the same view is the same row.
+                @test Sampling(cal).id == sampling.id
+
+                # The run-wide set spans both generations, so it is its own row rather than any
+                # of the per-batch ones.
+                batch_sampling_ids = [Int(row.ID) for row in eachrow(tagsTable())
+                                      if row.Class == "sampling" && row.Key == "mm:calibration" &&
+                                         row.Value == string(cal.id)]
+                @test !isempty(batch_sampling_ids)
+                @test !(sampling.id in batch_sampling_ids)
+
+                # The view agrees with the accessors, and covers every simulation of the run.
+                @test sort(monadIDs(sampling)) == sort(monadIDs(cal))
+                @test sort(simulationIDs(sampling)) == sort(simulationIDs(cal))
+                @test sort(simulationIDs(cal)) == batch_ids
+
+                # Per-generation views are strict subsets of the run-wide one.
+                gen1 = Sampling(cal, 1)
+                gen2 = Sampling(cal, 2)
+                @test gen1.id != sampling.id
+                @test gen2.id != gen1.id
+                @test Set(monadIDs(gen1)) ⊆ Set(monadIDs(sampling))
+                @test Set(monadIDs(gen2)) ⊆ Set(monadIDs(sampling))
+                @test Set(monadIDs(gen1)) != Set(monadIDs(sampling))
+                @test Set(monadIDs(cal, 1)) == Set(monadIDs(gen1))
+                @test Set(simulationIDs(cal, 1)) ⊆ Set(simulationIDs(cal))
+                @test union(Set(monadIDs(gen1)), Set(monadIDs(gen2))) == Set(monadIDs(sampling))
+
+                # An unrecorded generation names the ones that exist.
+                @test_throws ArgumentError Sampling(cal, 99)
+                @test_throws ArgumentError monadIDs(cal, 99)
+                @test_throws ArgumentError ModelManager.calibrationMonadIDs(cal, 99)
+
+                # The accessors record nothing: only the explicit view constructor inserts a row.
+                n_samplings() = nrow(ModelManager.queryToDataFrame(
+                    ModelManager.constructSelectQuery("samplings"; selection="sampling_id")))
+                before = n_samplings()
+                monadIDs(cal); monadIDs(cal, 1); simulationIDs(cal); ModelManager.calibrationMonadIDs(cal)
+                @test n_samplings() == before
+            end
+
+            @testset "a single-batch calibration's view reuses the batch row" begin
+                # When the run converges in generation 1 and that generation was one batch, all
+                # three monad sets coincide. Exact-set matching then returns the row the batch
+                # already created rather than inserting a duplicate for the same monads — which
+                # is the property that makes coalescing safe in the first place.
+                dv       = DistributedVariation(:config, xp_x, Uniform(45.0, 47.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+                result = runCalibration(prob, method; description="single batch")
+                cal = result.calibration
+                waitForDiagnostics()
+                @test length(result.generations) == 1
+
+                batch_sampling_ids = [Int(row.ID) for row in eachrow(tagsTable())
+                                      if row.Class == "sampling" && row.Key == "mm:calibration" &&
+                                         row.Value == string(cal.id)]
+                @test length(batch_sampling_ids) == 1
+
+                n_samplings() = nrow(ModelManager.queryToDataFrame(
+                    ModelManager.constructSelectQuery("samplings"; selection="sampling_id")))
+                before = n_samplings()
+                @test Sampling(cal).id == batch_sampling_ids[1]
+                @test Sampling(cal, 1).id == batch_sampling_ids[1]
+                @test n_samplings() == before          # no row added for a set that already exists
+            end
+
+            @testset "views exclude monads deleted after total failure" begin
+                # `Monad(id)` throws for a deleted monad, and the runner deletes a monad whose
+                # every simulation failed — so without the survival filter a run with any total
+                # monad failure could not be viewed at all. This is also the regression test for
+                # the file filter: the deleted IDs are exactly what `_failed_monads.csv` holds.
+                dv       = DistributedVariation(:config, xp_x, Uniform(33.0, 35.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+                method = ABCSMC(population_size=6, max_nr_populations=1, minimum_epsilon=0.0)
+
+                n_dispatched = Ref(0)
+                _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) <= 2
+                cal = try
+                    runCalibration(prob, method; description="views with failures").calibration
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                dead = ModelManager.constituentIDs(
+                    ModelManager._failedMonadsPath(cal, 1, method.max_nr_populations))
+                @test length(dead) == 2
+
+                # The raw record still names them; the survival filter drops them.
+                @test all(id -> id in ModelManager.calibrationMonadIDs(cal), dead)
+                @test !any(id -> id in monadIDs(cal), dead)
+
+                # And the view builds anyway.
+                sampling = Sampling(cal)
+                @test !isempty(monadIDs(sampling))
+                @test isempty(intersect(Set(dead), Set(monadIDs(sampling))))
+            end
+
+            @testset "calibration runs are taggable" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(36.0, 38.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
+                cal = runCalibration(prob, method; description="taggable").calibration
+                waitForDiagnostics()
+
+                tag!(cal, "project" => "immune-escape")
+                @test tags(cal)["project"] == ["immune-escape"]
+                @test hasTag(cal, "project" => "immune-escape")
+                @test hasTag(cal, "project")
+                @test findTrials(Calibration; tags=("project" => "immune-escape",)) == [cal]
+                @test !isempty(tagsTable(cal))
+
+                # Provenance comes for free, as it does for every other created object.
+                @test haskey(tags(cal), "mm:created")
+                @test tags(cal)["mm:method"] == ["ABCSMC"]
+                @test findTrials(Calibration; tags=("mm:method" => "ABCSMC",)) ⊇ [cal]
+
+                # The reserved namespace is writable internally and rejected publicly.
+                @test_throws ArgumentError tag!(cal, "mm:method" => "forged")
+                ModelManager.tagReserved!(cal, ["mm:note" => "internal"])
+                @test tags(cal)["mm:note"] == ["internal"]
+
+                # untag! clears user tags and leaves mm: provenance alone.
+                untag!(cal, "project")
+                @test !hasTag(cal, "project")
+                @test haskey(tags(cal), "mm:created")
+                @test haskey(tags(cal), "mm:method")
+
+                # Type+ID forms, and a multi-valued key.
+                tag!(Calibration, cal.id, "arm" => "a", "arm" => "b")
+                @test tags(Calibration, cal.id)["arm"] == ["a", "b"]
+                untag!(Calibration, cal.id, "arm" => "a")
+                @test tags(cal)["arm"] == ["b"]
+
+                # A query's results are a Vector{Calibration}, so labelling them in one call has
+                # to work as it does for trial objects.
+                found = findTrials(Calibration; tags=("mm:method" => "ABCSMC",))
+                @test found isa Vector{Calibration}
+                tag!(found, "verdict" => "keep")
+                @test all(c -> hasTag(c, "verdict" => "keep"), found)
+                untag!(found, "verdict")
+                @test !any(c -> hasTag(c, "verdict"), found)
+
+                # Calibration tags do not reach the monads the run evaluated (v1 decision):
+                # the mm:calibration tag on each generation's sampling is the route for that.
+                tag!(cal, "purpose" => "figure")
+                @test isempty(findSimulationIDs(tags=("purpose" => "figure",)))
+                @test isempty(findMonads(tags=("purpose" => "figure",)))
+                @test !isempty(findMonads(tags=("mm:calibration" => string(cal.id),)))
+
+                # The durable win: the calibrations row survives a monad cascade, so a tag on
+                # the run outlives the per-sampling mm:calibration tags, which are deleted with
+                # the sampling whose monads all went.
+                monad_ids = monadIDs(cal)
+                @test !isempty(monad_ids)
+                deleteMonad(monad_ids; delete_subs=true, delete_supers=true)
+                @test isempty(findMonads(tags=("mm:calibration" => string(cal.id),)))
+                @test hasTag(cal, "purpose" => "figure")
+                @test findTrials(Calibration; tags=("purpose" => "figure",)) == [cal]
+            end
+
+            @testset "calibrationsTable" begin
+                df = calibrationsTable()
+                @test df isa DataFrame
+                @test names(df) == ["CalibrationID", "DateTime", "Method", "Description"]
+                @test !isempty(df)
+                # One row per run, and the descriptions written above are readable back —
+                # nothing SELECTed from this table before.
+                @test allunique(df.CalibrationID)
+                @test "db integration" in df.Description
+                @test all(df.Method .== "ABC-SMC")
+                # The datetime is the same shape as every other table's, so mm:created reads
+                # back uniformly.
+                @test all(s -> occursin(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", String(s)), df.DateTime)
+
+                one_id = df.CalibrationID[1]
+                sub = calibrationsTable([one_id])
+                @test nrow(sub) == 1
+                @test sub.CalibrationID == [one_id]
+                @test calibrationsTable(Calibration(one_id)).CalibrationID == [one_id]
+
+                # Tag columns, off by default.
+                @test !any(startswith.(names(calibrationsTable()), "tag:"))
+                tag!(Calibration, one_id, "project" => "table-test")
+                tagged = calibrationsTable(; tags=true)
+                @test "tag:project" in names(tagged)
+                @test tagged[tagged.CalibrationID .== one_id, "tag:project"] == ["table-test"]
+                @test !any(startswith.(names(tagged), "tag:mm:"))
+                @test "tag:mm:method" in names(calibrationsTable(; tags=true, include_auto_tags=true))
+
+                # The raw provenance column is never presented.
+                @test !("provenance_id" in names(df))
+                @test !("ProvenanceID" in names(df))
+
+                printed = sprint(io -> printCalibrationsTable(; sink=x -> show(io, x)))
+                @test occursin("CalibrationID", printed)
+            end
+
+            @testset "show(::Calibration)" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(39.0, 41.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+                cal = runCalibration(prob, method; description="shown").calibration
+                waitForDiagnostics()
+
+                out = sprint(show, cal)
+                @test occursin("Calibration (ID=$(cal.id))", out)
+                @test occursin("shown", out)                  # the description
+                @test occursin("ABC-SMC", out)
+                @test occursin("Generations: 1", out)         # distance is 0, so it stops at gen 1
+                @test occursin("Final ε", out)
+
+                # A description was optional before this table was ever read back; an empty one
+                # is omitted rather than printed blank.
+                bare = runCalibration(prob, method).calibration
+                waitForDiagnostics()
+                @test !occursin("Description", sprint(show, bare))
+
+                # An id with no row must not throw — the struct validates nothing.
+                @test occursin("no row", sprint(show, Calibration(999_999)))
+            end
+
+            @testset "deleteCalibration" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(42.0, 44.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+                method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
+
+                cal = runCalibration(prob, method; description="deleteme").calibration
+                waitForDiagnostics()
+                tag!(cal, "project" => "doomed")
+                monad_ids = monadIDs(cal)
+                sim_ids = simulationIDs(cal)
+                folder = ModelManager.calibrationFolder(cal)
+                @test isdir(folder)
+
+                deleteCalibration(cal)
+                @test isempty(calibrationsTable([cal.id]))
+                @test isempty(tags(cal))
+                @test !isdir(folder)
+                @test isempty(findTrials(Calibration; tags=("project" => "doomed",)))
+                # Monads are shared through the bank and `use_previous`, so they are kept.
+                @test all(id -> id in monadIDs(), monad_ids)
+                @test all(id -> id in simulationIDs(), sim_ids)
+
+                # Opting in cascades to the monads and their simulations.
+                cal2 = runCalibration(prob, method; description="doomed subs").calibration
+                waitForDiagnostics()
+                monad_ids2 = monadIDs(cal2)
+                sim_ids2 = simulationIDs(cal2)
+                @test !isempty(monad_ids2)
+                deleteCalibration(cal2.id; delete_subs=true)
+                @test isempty(calibrationsTable([cal2.id]))
+                @test !any(id -> id in monadIDs(), monad_ids2)
+                @test !any(id -> id in simulationIDs(), sim_ids2)
+
+                # Deleting nothing is a no-op, not an error.
+                @test isnothing(deleteCalibration(Int[]))
+            end
+
             @testset "runCalibration progress levels" begin
                 dv       = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 observed = Dict{String,Any}("x" => 1.0)
@@ -3831,6 +4125,51 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test ModelManager.normalizeTagPairs(("a" => " x ", "a" => "x")) == [("a", "x")]
     end
 
+    @testset "tag classes cover Calibration" begin
+        # A Calibration is outside the trial hierarchy, so its class string is stated rather
+        # than derived from `lowerClassString` (which is defined for AbstractTrial only).
+        @test ModelManager._tagClass(Calibration) == "calibration"
+        @test ModelManager._tagClass(Calibration(7)) == "calibration"
+        @test ModelManager._tagTable("calibration") == "calibrations"
+        # The table's ID column already follows the strip-the-s convention every other
+        # tagged class relies on.
+        @test tableIDName("calibrations") == "calibration_id"
+        @test "calibration" in ModelManager.TAG_CLASSES
+        @test length(ModelManager.TAG_CLASSES) == 5
+        # Nothing above a calibration to inherit from, so `inherit=true` is a no-op for it.
+        @test ModelManager._inheritedIDs(Calibration, "sampling", 1) == Int[]
+        @test ModelManager._inheritedIDs(Calibration, "trial", 1) == Int[]
+        # Fresh databases get the provenance column from the schema; existing ones from
+        # `ensureProvenanceColumns`.
+        @test occursin("provenance_id", ModelManager.calibrationsSchema())
+    end
+
+    @testset "generation files are ordered numerically, not lexicographically" begin
+        # The zero-padding is ndigits(max_nr_populations), so a run resumed with a larger
+        # max_nr_populations writes wider names into the same directory. Sorting on the name
+        # would then put generation 10 before generation 9.
+        mktempdir() do dir
+            for name in ("generation_9_monads.csv", "generation_10_monads.csv",
+                         "generation_1_monads.csv", "generation_002_monads.csv",
+                         # Must not be picked up: these are the monads that lost every
+                         # simulation, i.e. exactly the ones no longer in the database.
+                         "generation_1_failed_monads.csv", "generation_9_failed_monads.csv",
+                         # Nor any of the other per-generation artifacts.
+                         "generation_1.csv", "generation_1.toml",
+                         "generation_1_failed_simulations.csv")
+                write(joinpath(dir, name), "1\n")
+            end
+            files = ModelManager._indexedGenerationFiles(dir, r"^generation_(\d+)_monads\.csv$")
+            @test first.(files) == [1, 2, 9, 10]
+            @test all(f -> occursin("_monads.csv", last(f)), files)
+            @test !any(f -> occursin("failed", last(f)), files)
+
+            # A missing directory is empty, not an error.
+            @test isempty(ModelManager._indexedGenerationFiles(joinpath(dir, "nope"),
+                                                               r"^generation_(\d+)_monads\.csv$"))
+        end
+    end
+
     @testset "tagging round-trip and retrieval" begin
         mktempdir() do project_dir
             _make_test_project(project_dir)
@@ -4109,7 +4448,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             tag!(Monad, monad_ids[1], "verdict" => "suspect")
             tag!(Simulation, sim_ids[1], "arm" => "a")
 
-            @test orphanedTagCounts() == Dict("simulation" => 0, "monad" => 0, "sampling" => 0, "trial" => 0)
+            @test orphanedTagCounts() == Dict("simulation" => 0, "monad" => 0, "sampling" => 0,
+                                              "trial" => 0, "calibration" => 0)
 
             # Deleting a simulation removes its tag rows.
             deleteSimulations([sim_ids[1]]; delete_supers=false)
@@ -4228,7 +4568,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             setTagHints!(false)
 
             @test ModelManager.tableExists("provenances")
-            for table in ("simulations", "monads", "samplings", "trials")
+            for table in ("simulations", "monads", "samplings", "trials", "calibrations")
                 @test ModelManager.columnsExist(["datetime", "provenance_id"], table)
             end
 
@@ -4236,6 +4576,17 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             xp = XMLPath(["data", "x"])
             sampling = createTrial(inputs, [DiscreteVariation(:config, xp, [95.0, 96.0])]; n_replicates=2)
             sim_ids = simulationIDs(sampling)
+
+            # A calibration records provenance the same way — in its own row, not as tag rows.
+            cal = ModelManager.createCalibration("ABC-SMC"; description="provenance")
+            cal_df = ModelManager.queryToDataFrame(
+                "SELECT datetime, provenance_id FROM calibrations WHERE calibration_id=$(cal.id);")
+            @test !ismissing(cal_df.datetime[1])
+            @test !ismissing(cal_df.provenance_id[1])
+            @test haskey(tags(cal), "mm:created")
+            @test haskey(tags(cal), "mm:session")
+            @test isempty(ModelManager.queryToDataFrame(
+                "SELECT 1 AS n FROM tags WHERE trial_class='calibration' AND tag_key='mm:session';"))
 
             # Storage: provenance costs no tag rows at all.
             n_auto_rows = ModelManager.queryToDataFrame(
@@ -4552,6 +4903,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test length(findSimulations(tags=("project" => "guard",), limit=4)) == 4
             @test_throws ArgumentError findMonads(tags=("project" => "guard",), limit=1)
             @test_throws ArgumentError findTrials(Sampling; tags=("project" => "guard",), limit=0)
+
+            # The guard covers Calibration on the same path, and `status` stays a
+            # simulations-only filter there as it is for Sampling and Trial.
+            @test isempty(findTrials(Calibration))
+            @test_throws ArgumentError findTrials(Calibration; status="Completed")
+            createCal = ModelManager.createCalibration("ABC-SMC"; description="guard")
+            @test length(findTrials(Calibration)) == 1
+            @test_throws ArgumentError findTrials(Calibration; limit=0)
+            @test findTrials(Calibration; limit=1) == [createCal]
         end
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end
@@ -4568,32 +4928,39 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
             # An object that exists before the upgrade, to check it survives it.
             legacy = createTrial(inputs, [DiscreteVariation(:config, xp, 80.0)]; n_replicates=1)
+            legacy_cal = ModelManager.createCalibration("ABC-SMC"; description="legacy")
 
             # Simulate a database written by a ModelManager version predating tagging:
             # both new tables gone, and the added columns stripped from every trial table.
+            # `calibrations` predates the provenance column specifically, so it is stripped of
+            # that while keeping the datetime it has always carried.
             for stmt in ("DROP TABLE tags;", "DROP TABLE provenances;",
                          "ALTER TABLE simulations DROP COLUMN provenance_id;",
                          "ALTER TABLE simulations DROP COLUMN datetime;",
                          "ALTER TABLE monads DROP COLUMN provenance_id;",
-                         "ALTER TABLE monads DROP COLUMN datetime;")
+                         "ALTER TABLE monads DROP COLUMN datetime;",
+                         "ALTER TABLE calibrations DROP COLUMN provenance_id;")
                 ModelManager.DBInterface.execute(centralDB(), stmt)
             end
             @test !ModelManager.tableExists("tags")
             @test !ModelManager.tableExists("provenances")
             @test !ModelManager.columnsExist(["provenance_id"], "simulations")
+            @test !ModelManager.columnsExist(["provenance_id"], "calibrations")
+            @test ModelManager.columnsExist(["datetime"], "calibrations")
 
             # No migration milestone needed: createSchema creates tables with IF NOT EXISTS
             # and adds columns guarded by columnsExist, so both are additive and idempotent.
             @test ModelManager.reinitializeDatabase()
             @test ModelManager.tableExists("tags")
             @test ModelManager.tableExists("provenances")
-            for table in ("simulations", "monads", "samplings", "trials")
+            for table in ("simulations", "monads", "samplings", "trials", "calibrations")
                 @test ModelManager.columnsExist(["datetime", "provenance_id"], table)
             end
 
             # A second pass must not duplicate columns or fail.
             @test ModelManager.reinitializeDatabase()
             @test ModelManager.columnsExist(["datetime", "provenance_id"], "simulations")
+            @test ModelManager.columnsExist(["datetime", "provenance_id"], "calibrations")
 
             # Objects that predate the upgrade have no provenance, and must not break the
             # read paths — they simply report no mm: keys.
@@ -4601,6 +4968,12 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test isempty(tags(Simulation, legacy_sim))
             @test !isempty(findSimulationIDs())              # still queryable
             @test isempty(findSimulationIDs(tags=("mm:session",)))
+
+            # A calibration from before the column keeps the datetime it always had, so it
+            # still reports mm:created — only its provenance is absent.
+            @test tags(legacy_cal) |> keys |> collect == ["mm:created"]
+            @test findTrials(Calibration) == [legacy_cal]
+            @test !isempty(calibrationsTable())
 
             # New objects created after the upgrade are tagged normally.
             sim = createTrial(inputs, [DiscreteVariation(:config, xp, 81.0)]; n_replicates=1)

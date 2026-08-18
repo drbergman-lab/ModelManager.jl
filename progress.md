@@ -440,6 +440,221 @@ ModelManager's manual pages, so the anchor is unresolvable there. The `"docstrin
 bindings"` testset would not have caught it — its regex only matches backticked binding refs. Stated
 the substance inline instead.
 
+## Session: Calibration as coalesced `Sampling` views + taggable `Calibration` (2026-08-17)
+
+Brief 4 of 8; gate for briefs 5–8, which build on the types and tagging machinery settled here.
+
+### Why `Calibration` is not in the containment hierarchy
+
+This was the central call, and the reason is structural rather than stylistic. **A generation is not
+one `Sampling`.** The batch loop is `while length(accepted) < population_size`
+(`abc_smc.jl:615`) and *each batch* constructs its own `Sampling(monads, problem.inputs)`
+(`abc.jl:165`). So containment really reads batch → generation → calibration — one level deeper
+than the four levels — and those groupings **overlap**: a monad belongs to its batch's sampling,
+its generation, and the whole run simultaneously. A strict chain cannot express that, because a
+`Sampling`'s constituents are `Monad`s and never other `Sampling`s. It is a poset, not a total
+order.
+
+Subtyping `AbstractTrial` was rejected for a second, independent reason: `run(T::AbstractTrial)`
+(`runner.jl:256`) would dispatch on a `Calibration` and call `prepareTrialHierarchy` on it, and
+`AbstractTrial` carries assumptions about `inputs`, `constituentIDs`, `length` and `trialFolder`
+that a calibration run does not satisfy.
+
+The GSA precedent does not transfer directly either. `GSASampling` is not an `AbstractTrial`; it
+wraps exactly *one* `sampling` field and forwards `simulationIDs` to it (`sensitivity.jl:44`). A
+calibration has many samplings, so there is nothing single to wrap — **until you coalesce**.
+Coalescing is precisely what makes the GSA pattern applicable, and that is the whole idea of this
+change.
+
+What makes the views legal: a `Sampling` is defined by all input folders matching
+(`classes.jl:505-512`), and every calibration monad is built from one `problem.inputs`. So *any*
+subset of a calibration's monads is a valid sampling — the run and each generation included.
+
+### Why the accessors do not materialize (a deviation from the brief)
+
+The brief specified `simulationIDs(cal) = simulationIDs(Sampling(cal))`, mirroring `GSASampling`.
+Implemented that way, an innocuous read would insert a row — and because sampling identity is the
+*exact* monad set, doing that mid-run pins a partial set that the finished run will never reuse
+(the final set differs, so it gets a second row). Split instead:
+
+| Call | Inserts? | Returns |
+|---|---|---|
+| `calibrationMonadIDs(cal)` (internal) | no | the raw on-disk record, deleted monads included |
+| `monadIDs(cal[, t])`, `simulationIDs(cal[, t])` | **no** | surviving monads / their simulations |
+| `Sampling(cal[, t])` | yes | an addressable `Sampling` |
+
+Now only an explicit `Sampling(...)` can mint a row. Documented rather than gated, because there
+is no completion flag on the `calibrations` row and the one available heuristic — generation count
+against `max_nr_populations` — misreports every run that stopped early on a convergence criterion,
+i.e. the normal successful ending.
+
+### The test that was wrong, and what it taught
+
+Two assertions failed on the first full run, and the code was right both times. With
+`minimum_epsilon=0.0` and a distance identically 0, a calibration converges in **generation 1**,
+and generation 1 is a **single batch**. So the run-wide set, generation 1's set, and that batch's
+set are all the same set — and exact-set find-or-insert correctly returns the row the batch already
+created instead of inserting a duplicate. The brief's phrasing ("a coalesced view never collides
+with a batch row") holds only when the sets differ.
+
+That is a feature, not a collision, so both halves are now pinned: a multi-generation run (via
+`_test_nonzero_ss`, which keeps every distance at 1.0 and so prevents convergence) gets its own
+row distinct from every batch, and a single-batch run reuses the batch row and adds none. The
+`Sampling(calibration)` docstring was corrected to say this.
+
+### Include order: `tags.jl` moves last
+
+`_tagClass(::Type{Calibration})` in `tags.jl` was an `UndefVarError` before this change — a method
+signature is evaluated when the method is defined, and `tags.jl` loaded at `:75` while
+`calibration/calibration.jl` loads at `:83`. Rather than the alternative (an `AbstractTaggable`
+supertype, below), `include("tags.jl")` moved to the **bottom**.
+
+Verified safe before moving it, not after: `tags.jl` defines no types, only constants and
+functions; nothing loaded after it names those constants in a signature; every call *into* tagging
+from an earlier file is inside a function body, which Julia resolves lazily (`applyCreationTags`
+×4 in `classes.jl`, `deleteTagsFor` ×4 in `deletion.jl`, `refreshProvenance!` ×3,
+`tagsSchema`/`createTagIndices`/`ensureProvenanceColumns` inside `createSchema`, `tagReserved!` in
+`sensitivity.jl` and `abc.jl`); and `LibGit2`/`randstring`, which only `tags.jl` imports, appear
+nowhere else in `src/`. Any violation of this would be a load-time error, never silent.
+
+The position has a natural floor, which is what makes it a one-time move rather than a recurring
+chore: after `calibration/visualize.jl`, every type in the package is ahead of it. Encoded as a
+`#!` comment at the include site so the next person adding an `include` does not undo it.
+
+### `AbstractTaggable` — considered, rejected, and why it may return
+
+A capability supertype (`abstract type AbstractTaggable end`, `AbstractTrial <: AbstractTaggable`,
+`Calibration <: AbstractTaggable`) would make the marginal cost of the *next* taggable type one
+line instead of ~15 methods, and it names a real category instead of leaving it enumerated by hand.
+Rejected for now: it widens ~21 signatures in `tags.jl`, touches `classes.jl` (the most
+load-bearing file), adds a layer to the documented public type tree, and changes `AbstractTrial`'s
+supertype from `Any`. At two taggable families the per-type methods are cheaper.
+
+What kept the per-type cost honest: the private implementation cores in `tags.jl` are now keyed by
+class **string** (`_tags`, `_tagsTable`, `_deleteTagRows`, `_deleteTagsFor`, `_applyCreationTags`,
+`_tagReserved`, `_idsWithDirectTags`, `_appendTags!`), so the 19 `Calibration` methods are thin
+delegations rather than copy-pasted bodies. If a third taggable family appears, revisit
+`AbstractTaggable` — the delegation layer is exactly what it would replace.
+
+**Every `T<:AbstractTrial` signature in `tags.jl` was left narrow.** Under Option A none are
+widened; each taggable entry point instead gained a sibling `Calibration` method. Extended (19
+methods): `_tagClass` ×2, `tag!` ×4 (type+ids, type+id, object, object vector), `untag!` ×4,
+`tags` ×2, `hasTag` ×2, `tagsTable` ×2, `tagReserved!`, `applyCreationTags`, `deleteTagsFor`,
+`appendTags!`, `findTrials`, `_inheritedIDs`. The object-*vector* forms of `tag!`/`untag!` were not
+in the brief's list and are needed: `findTrials(Calibration; …)` returns a `Vector{Calibration}`,
+and without them labelling a query's results in one call is a `MethodError` — a bare integer vector
+cannot stand in, since that form is reserved for simulation IDs.
+
+Three entry points were deliberately **not** extended:
+`tag!(ids::AbstractVector{<:Union{Integer,Missing}})`, because a bare integer vector must keep
+meaning simulation IDs; `findSimulations`/`findMonads`, because those are the inheritance-aware
+finders and calibration tags do not inherit; and `trialFolder`, because `calibrationFolder` already
+yields the identical `data/outputs/calibrations/{id}` path.
+
+### Inheritance: no, for v1
+
+Calibration-class tags do not propagate to samplings/monads/simulations.
+`_inheritedIDs(::Type{Calibration}, …)` returns `Int[]`, so `inherit=true` is a no-op rather than
+an error. Reasoning: `mm:calibration` on every generation's sampling (`abc.jl:169`) already gives a
+working route — `findMonads(tags=("mm:calibration" => "42",))` — and real inheritance would need
+the finders to traverse a new edge whose parent/child mapping lives in per-generation CSVs on disk.
+
+The asymmetry worth knowing is durability, and it runs the other way: tag rows die with their
+object, and a sampling all of whose monads were deleted is itself deleted (`deletion.jl:161`), so a
+batch's `mm:calibration` tag can vanish with the work it described. The `calibrations` row is never
+touched by a monad cascade. Pinned by a test that deletes every monad of a run and checks the tag
+on the run survives.
+
+### `calibrationMonadIDs` had three defects, not two
+
+The brief named two. The third came out of reading `compressIDs`:
+
+1. `endswith(f, "_monads.csv")` also matched `generation_{NNN}_failed_monads.csv`, folding the
+   failed monads — exactly the ones the runner has deleted — into the "all monads evaluated" list.
+   And `reduce(vcat, …)` did not dedupe, though a bank-reused monad is recorded in every generation
+   that evaluated it. → anchored `^generation_(\d+)_monads\.csv$` plus `unique!`.
+2. `sort` was lexicographic, so `generation_10` preceded `generation_9` whenever the padding
+   differed between the original run and a resume with a larger `max_nr_populations` (padding is
+   `ndigits(max_nr_populations)`). → sort on the number parsed out of the name.
+3. **The docstring's "in evaluation order" was never true.** `_appendCompressedIDs` writes through
+   `compressIDs`, which does `ids |> vec |> unique |> sort` (`recorder.jl:41`) — so each
+   per-generation file is already sorted and within-generation proposal order is not recoverable
+   from the format at all. The real guarantee, now documented, is generation order with ascending
+   IDs inside a generation.
+
+Brief 05 lists defects 1–2 as well; they are fixed here, so that session should not redo them.
+
+### Known follow-up, deliberately not fixed here
+
+The lexicographic-sort defect has **four more instances** outside this brief's scope, all of which
+additionally derive the generation number from array *position* rather than from the filename, so
+they mislabel generations under mixed padding rather than merely reordering them:
+`posterior(::Calibration)` (`problem.jl:261`), `ConvergenceSummary(::Calibration)`
+(`problem.jl:332`), and `visualize.jl:274` and `:679`. `_indexedGenerationFiles` in
+`calibration/calibration.jl` is the shared fix; it takes a directory and a pattern capturing the
+index. Left for its own change so this one stays reviewable.
+
+### Smaller decisions
+
+- **`mm:method` on the run** is the method *type* (`"ABCSMC"`), matching GSA's
+  `string(nameof(typeof(method)))`, so the key reads the same way across both subsystems. The
+  `calibrations.method` column keeps its own spelling (`"ABC-SMC"`); nothing reads it, and changing
+  it would alter the meaning of existing rows. Stamped in `runCalibration` only, not `resumeABC` —
+  the tag records what created the run.
+- **The datetime format fix** (`calibration.jl:37`) was safe precisely because the column was
+  write-only: nothing had ever `SELECT`ed it. `_normalizeStamp` (`tags.jl:680-690`) special-cases
+  only the 10-digit legacy `trials` format, so the old space-separated spelling would have surfaced
+  `mm:created` in a different shape for calibrations alone.
+- **No `up.jl` milestone**, and this matters more than it looks: `upgradeMilestones` /
+  `upgradeToMilestone` are `AbstractSimulator` methods, so any milestone ModelManager needs must be
+  implemented by *every* downstream simulator. `provenance_id` is added by the same additive
+  `ensureProvenanceColumns` mechanism the `#!` at `database.jl:142-143` describes.
+- **`calibrations` already had a `datetime`**, so only `provenance_id` is added — which means a
+  calibration created before this change still reports `mm:created`, synthesized from the column it
+  always had, while reporting no provenance. Same graceful degradation as objects predating the
+  tagging upgrade, and pinned in the same testset.
+- **Placement**: everything new lives in `src/calibration/calibration.jl`, not `database.jl` /
+  `deletion.jl`. A `::Calibration` argument in a signature is evaluated at definition time and both
+  those files load first; splitting `deleteCalibration`'s integer methods from its `Calibration`
+  method across two files would be worse than one cohesive home. The deletion lib page cross-refs it.
+- **`calibrationsTable` takes no `limit`**, unlike the brief's sketch: nothing in it materializes
+  objects, and neither `simulationsTable` nor `monadsTable` has one.
+- **`show(::Calibration)` must never throw** — `Calibration(999999)` is constructible because the
+  struct validates nothing, so an uninitialized project prints the bare id, a missing row says so,
+  and a malformed generation TOML is skipped.
+- `calibrationFolder` / `calibrationsDir` / `calibrationMonadIDs` stay internal. `monadIDs` and
+  `simulationIDs` are the public accessors, so no name needed promoting to `@compat public` just to
+  keep a docstring hyperlink alive.
+
+### Rebased onto #31 (trial-ID accessor gaps)
+
+#31 landed first and overlapped in three ways, all resolved in the rebase rather than papered over.
+
+**The coordination point the brief warned about did not apply.** #31 split
+`trialID(::Vector{Sampling})` into a pure lookup returning `missing` plus an internal
+`_findOrCreateTrialID`, with the instruction to call the latter *if* generations became `Trial`
+rows. They did not — generations stay views — so nothing here calls either.
+
+**The pure-lookup principle is now a repo convention, not a one-off.** #31 made
+`trialID(::Vector{Sampling})` and `monadIDs(::Simulation)` read-only on the reasoning that an
+exported accessor must never write; this change independently made `monadIDs`/`simulationIDs` on a
+`Calibration` read-only so a stray read cannot pin a partial monad set. Same rule, two different
+motivations, which is worth knowing before anyone "simplifies" either back into a find-or-insert.
+
+**Three merge fixes.** The `CLAUDE.md` trade-off entry had been rewritten by #31 to name
+`_findOrCreateTrialID`, so the calibration paragraph was weaved into that version rather than the
+old one; `docs/src/man/trial_hierarchy.md` gained a `GSASampling` sentence that was already stale on
+arrival, since #31 added `monadIDs(::GSASampling)` alongside `simulationIDs`; and PRD's concurrency
+bullet auto-merged to #31's wording, which is correct as-is.
+
+### Cost accounted for
+
+A 10-generation run gains up to 11 coalesced sampling rows plus their constituent CSVs, on top of
+one row per batch — bounded and small. Building a view is one `SELECT` per monad (`Monad(id)`), so
+a 1000-monad calibration issues 1000 queries; there is no bulk monad constructor as there is for
+simulations (`simulationsFromIDs`). Acceptable for a one-time view build, and the obvious follow-up
+if it bites.
+
 ---
 
 ## Session: `run_on_hpc` was never auto-detected (2026-08-05)

@@ -36,6 +36,21 @@ consistent: a deleted simulation's stored quantities are removed from
 `data/outputs/postprocessing.db` (cascading deletes route through `deleteSimulations`, so they
 are covered too).
 
+## Deleting a calibration run
+
+[`deleteCalibration`](@ref) removes a calibration's record, its tags, and its output folder:
+
+```julia
+deleteCalibration(3)                      # keep the simulations it evaluated
+deleteCalibration(3; delete_subs = true)  # remove them too
+```
+
+The default is the opposite of the levels above: `delete_subs` is `false`, because a
+calibration's monads are not its private property. The simulation bank reuses monads across runs,
+and a monad the calibration snapped onto may predate it entirely. Deleting the run does discard
+its posterior, since the generation CSVs and the serialized problem live in the folder — see
+[Calibration](@ref calibration_man).
+
 ## Deleting by status
 
 To clear out failed runs (the most common cleanup):

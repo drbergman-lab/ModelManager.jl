@@ -9,8 +9,8 @@ Finding simulations by ID is not a robust way to find your own work later. A scr
 in six months and the list means nothing. Parameter values are not much better — they say
 what a simulation *was*, not what it was *for*.
 
-Tags fix this by letting you attach `key => value` pairs to any trial object and then
-search by them.
+Tags fix this by letting you attach `key => value` pairs to any trial object — or to a
+[`Calibration`](@ref) run — and then search by them.
 
 ## The short version
 
@@ -36,7 +36,7 @@ Even if you never write a single tag, ModelManager records where each object cam
 | `mm:script` | Script that created the object. In an interactive session, the script you `include`d or else the launcher that opened the prompt — read together with `mm:interactive` |
 | `mm:interactive` | Present when the session was interactive |
 | `mm:git`, `mm:git.branch`, `mm:git.dirty` | Commit and branch of the script's repository, and whether the tree had uncommitted changes |
-| `mm:method` | The sensitivity method (`MOAT`, `Sobolʼ`, `RBD`) that produced a sweep |
+| `mm:method` | The sensitivity method (`MOAT`, `Sobolʼ`, `RBD`) that produced a sweep, or the calibration method (`ABCSMC`) that produced a run |
 | `mm:calibration`, `mm:generation` | The calibration run and generation that proposed a monad |
 
 So this works on a database you never tagged by hand:
@@ -199,6 +199,42 @@ findSimulationIDs(tags = ("project" => "immune-escape",), inherit = false) # non
 
 Inheritance only ever runs downward — tagging one simulation never tags its monad.
 
+## Tagging a calibration run
+
+A [`Calibration`](@ref) is tagged the same way, and shows up in [`findTrials`](@ref) alongside
+the four trial types:
+
+```julia
+result = runABC(problem)
+tag!(result.calibration, "project" => "immune-escape")
+
+findTrials(Calibration; tags = ("project" => "immune-escape",))
+findTrials(Calibration; tags = ("mm:method" => "ABCSMC",))
+calibrationsTable(; tags = true)
+```
+
+A calibration is a *run*, not a container of simulations, so it sits outside the hierarchy above
+and its tags do not reach the monads it evaluated. Reach those through the `mm:calibration` tag
+that every generation's sampling already carries:
+
+```julia
+findMonads(tags = ("mm:calibration" => string(result.calibration.id),))
+findMonads(tags = ("mm:calibration" => "42", "mm:generation" => "3"))
+```
+
+Tagging the run is nevertheless the more durable of the two, and this is the reason to prefer it
+for anything you want to keep. Tag rows are deleted with the object they point at, and a sampling
+whose monads have all been deleted is itself deleted — so a batch's `mm:calibration` tag can
+disappear along with the work it described. The `calibrations` row is never removed by a monad
+cascade, so a tag placed on the run survives it:
+
+```julia
+tag!(result.calibration, "purpose" => "figure")
+deleteMonad(monadIDs(result.calibration))              # the batch tags go with the samplings
+
+findTrials(Calibration; tags = ("purpose" => "figure",))   # still finds the run
+```
+
 ## Composing filters
 
 ```julia
@@ -220,7 +256,8 @@ sampling tagged `project => immune-escape` matches a query for both.
 
 Use [`findSimulationIDs`](@ref) for large result sets and [`findSimulations`](@ref) when
 you want constructed objects. [`findMonads`](@ref) works one level up, and
-[`findTrials`](@ref) dispatches on type.
+[`findTrials`](@ref) dispatches on type — `Simulation`, `Monad`, `Sampling`, `Trial`, or
+[`Calibration`](@ref).
 
 A tag on a parent matches everything beneath it, so a query can select far more than you
 intended. The ID-returning form hands that back without complaint; the object-returning
@@ -236,6 +273,8 @@ findSimulations(tags = ("project" => "big",), limit = 50_000)
 
 ```julia
 simulationsTable(ids; tags = true)
+monadsTable(ids; tags = true)
+calibrationsTable(; tags = true)
 ```
 
 adds a `tag:<key>` column per key. The prefix keeps tag columns from colliding with ID,

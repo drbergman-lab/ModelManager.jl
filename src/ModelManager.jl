@@ -32,12 +32,13 @@ export MMOutput, trialID, trialType
 export simulationID, monadID, wasSuccessful
 export createMMTable, insertFolder
 export deleteSimulation, deleteSimulations, deleteAllSimulations, deleteSimulationsByStatus
-export deleteMonad, deleteSampling, deleteTrial, resetDatabase
+export deleteMonad, deleteSampling, deleteTrial, deleteCalibration, resetDatabase
 export run
 export printSimulationIDs
 export shortLocationVariationID
 export simulationsTable, printSimulationsTable
 export monadsTable, printMonadsTable
+export calibrationsTable, printCalibrationsTable
 export postProcessingTable, printPostProcessingTable, postProcessingDBPath
 export tag!, untag!, tags, hasTag
 export findTrials, findSimulations, findSimulationIDs, findMonads
@@ -72,7 +73,6 @@ include("globals.jl")
 include("classes.jl")
 include("recorder.jl")
 include("database.jl")
-include("tags.jl")
 include("runner.jl")
 include("deletion.jl")
 include("xml_utilities.jl")
@@ -82,5 +82,11 @@ include("sensitivity_visualize.jl")
 include("user_api.jl")
 include("calibration/calibration.jl")
 include("calibration/visualize.jl")
+#! `tags.jl` is included last so its methods can dispatch on any type in the package: a method
+#! signature is evaluated when the method is defined, so a tagging method for a type declared in a
+#! later file would be an `UndefVarError`. Keep it last when adding a new include. Nothing loaded
+#! before it needs its names at load time — every call into tagging from an earlier file is inside a
+#! function body, which Julia resolves lazily.
+include("tags.jl")
 
 end

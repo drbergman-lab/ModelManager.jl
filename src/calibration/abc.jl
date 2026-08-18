@@ -302,6 +302,11 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
     calibration = createCalibration("ABC-SMC"; description=description)
+    #! Labels the run itself, mirroring what a sensitivity sweep puts on its sampling. The value is
+    #! the method *type*, as it is there, so `findTrials(Calibration; tags=("mm:method" => ...))`
+    #! reads the same way across both; the `calibrations.method` column keeps its own
+    #! human-facing spelling.
+    tagReserved!(calibration, ["mm:method" => string(nameof(typeof(method)))])
     _saveMethod(calibration, method)
     _saveProblem(calibration, problem)
     _writeParametersTOML(calibration, problem.parameters)

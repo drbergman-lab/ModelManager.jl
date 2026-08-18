@@ -30,7 +30,11 @@ const TAG_KEY_BODY_REGEX = r"^[a-z0-9][a-z0-9_.-]*$"
 
 const RECOMMENDED_TAG_KEYS = ("project", "purpose", "figure", "arm", "verdict", "note")
 
-const TAG_CLASSES = ("simulation", "monad", "sampling", "trial")
+#! `"calibration"` is not a trial class. A calibration is a *run*, not a collection of
+#! simulations, and `Calibration` is deliberately outside the trial hierarchy — but the tag store
+#! needs only an integer primary key in a `<class>s` table, which it has. Every site that iterates
+#! this tuple is already guarded on the table and its columns existing.
+const TAG_CLASSES = ("simulation", "monad", "sampling", "trial", "calibration")
 
 const MM_CREATED_KEY = "mm:created"
 
@@ -72,8 +76,8 @@ _isSyntheticKey(key::AbstractString) = key == MM_CREATED_KEY || !isnothing(_prov
 
 Return the SQL schema string for the `tags` table.
 
-Each row asserts one key/value pair about one trial object. `trial_class` is the
-lowercased type name (`"simulation"`, `"monad"`, `"sampling"`, `"trial"`) and
+Each row asserts one key/value pair about one object. `trial_class` is the lowercased
+type name (`"simulation"`, `"monad"`, `"sampling"`, `"trial"`, or `"calibration"`) and
 `trial_id` is that object's primary key. The `UNIQUE` constraint spans the value
 as well as the key, so a single object may carry several values for one key.
 """
@@ -131,18 +135,21 @@ end
 """
     ensureProvenanceColumns(; db::SQLite.DB=centralDB())
 
-Add the `datetime` and `provenance_id` columns to the trial tables when missing.
+Add the `datetime` and `provenance_id` columns to the taggable tables when missing.
 
 Run from `createSchema`, so an existing project gains the columns on its
 next `initializeModelManager`. No migration milestone is required, and a simulator
 package needs to implement nothing.
 """
 function ensureProvenanceColumns(; db::SQLite.DB=centralDB())
-    for T in (Simulation, Monad, Sampling, Trial)
-        table = "$(lowerClassString(T))s"
+    #! Keyed through `_tagClass` rather than `lowerClassString`, which is defined only for
+    #! `AbstractTrial` and so cannot name `Calibration`.
+    for T in (Simulation, Monad, Sampling, Trial, Calibration)
+        table = _tagTable(_tagClass(T))
         tableExists(table; db=db) || continue
         columns = tableColumns(table; db=db)
-        #! `trials` has carried a datetime since before tagging; leave that column alone.
+        #! `trials` and `calibrations` have carried a datetime since before tagging; leave those
+        #! columns alone.
         columnsExist(["datetime"], columns) ||
             SQLite.execute(db, "ALTER TABLE $(table) ADD COLUMN datetime TEXT;")
         columnsExist(["provenance_id"], columns) ||
@@ -233,6 +240,10 @@ normalizeTagPairs(ps...) = normalizeTagPairs(ps)
 
 _tagClass(::Type{T}) where {T<:AbstractTrial} = lowerClassString(T)
 _tagClass(T::AbstractTrial) = lowerClassString(T)
+#! Stated rather than derived: `lowerClassString` is defined for `AbstractTrial` only, and a
+#! `Calibration` is deliberately not one.
+_tagClass(::Type{Calibration}) = "calibration"
+_tagClass(::Calibration) = "calibration"
 _tagTable(class::AbstractString) = "$(class)s"
 
 #! Framework bookkeeping must never take down a run — an uninitialized project or a
@@ -273,7 +284,7 @@ end
 """
     tag!(target, tags...)
 
-Attach one or more tags to a trial object (or to many at once) and return `target`.
+Attach one or more tags to an object (or to many at once) and return `target`.
 
 Each tag is a `Pair` such as `"arm" => "high_dose"`, or a bare key such as
 `"baseline"` which is stored with an empty value. Keys are lowercased and must
@@ -295,7 +306,14 @@ tag!([sim_a, sim_b], "project" => "x")        # vector of objects
 tag!([1, 2, 3], "project" => "x")             # bare ids are interpreted as simulations
 tag!(df.SimID, "project" => "x")              # a column straight out of `simulationsTable`
 tag!(output, "project" => "x")                # an MMOutput from `run`
+tag!(calibration, "project" => "x")           # a Calibration from runABC
 ```
+
+A [`Calibration`](@ref) is tagged the same way, but it is a *run* rather than a container of
+simulations, so its tags do not reach the monads it evaluated. Use the `mm:calibration` tag that
+every generation's sampling already carries for that: `findMonads(tags = ("mm:calibration" =>
+string(calibration.id),))`. The trade is durability — the `calibrations` row outlives any monad
+cascade, so a tag placed there survives even when every simulation of the run is deleted.
 
 # Returns
 The `target`, so calls can be chained or piped.
@@ -341,6 +359,21 @@ tag!(ids::AbstractVector{<:Union{Integer,Missing}}, ps...) = tag!(Simulation, id
 
 tag!(output::MMOutput, ps...) = (tag!(output.trial, ps...); output)
 
+function tag!(::Type{Calibration}, ids::AbstractVector{<:Union{Integer,Missing}}, ps...)
+    _insertTagRows(_tagClass(Calibration), collect(skipmissing(ids)), normalizeTagPairs(ps))
+    return ids
+end
+
+tag!(::Type{Calibration}, id::Integer, ps...) = (tag!(Calibration, [id], ps...); id)
+tag!(target::Calibration, ps...) = (tag!(Calibration, [target.id], ps...); target)
+
+#! `findTrials(Calibration; ...)` hands back a `Vector{Calibration}`, so labelling a query's
+#! results in one call has to work here as it does for trial objects.
+function tag!(targets::AbstractVector{Calibration}, ps...)
+    tag!(Calibration, [target.id for target in targets], ps...)
+    return targets
+end
+
 """
     tagReserved!(target, pairs)
 
@@ -349,19 +382,22 @@ Attach ModelManager-generated `mm:` tags to `target`.
 The internal counterpart to [`tag!`](@ref): it accepts the reserved namespace the
 public function rejects, so framework entry points (sensitivity analyses,
 calibrations) can label what they produce. Only the object handed back to the user
-is tagged; its constituents pick the tags up through the usual query-time
-inheritance.
+is tagged; for a trial object its constituents pick the tags up through the usual
+query-time inheritance.
 """
-function tagReserved!(target::AbstractTrial, pairs)
+tagReserved!(target::AbstractTrial, pairs) = _tagReserved(_tagClass(target), target.id, pairs)
+tagReserved!(target::Calibration, pairs) = _tagReserved(_tagClass(target), target.id, pairs)
+
+function _tagReserved(class::AbstractString, id::Integer, pairs)
     normalized = Tuple{String,String}[(_reservedTagKey(string(k)), _normalizeTagValue(v)) for (k, v) in pairs]
-    _quietly(() -> _insertTagRows(_tagClass(target), [target.id], normalized))
+    _quietly(() -> _insertTagRows(class, [id], normalized))
     return nothing
 end
 
 """
     untag!(target, tags...)
 
-Remove tags from a trial object (or from many at once) and return `target`.
+Remove tags from an object (or from many at once) and return `target`.
 
 Each argument may be a full `key => value` pair, which removes exactly that pair,
 or a bare key, which removes every value stored under that key. Removing a tag
@@ -381,27 +417,7 @@ untag!(sim)                           # drop all user tags, keep mm: provenance
 See also [`tag!`](@ref).
 """
 function untag!(::Type{T}, ids::AbstractVector{<:Union{Integer,Missing}}, ps...) where {T<:AbstractTrial}
-    assertInitialized()
-    present = collect(skipmissing(ids))
-    isempty(present) && return ids
-    class = _tagClass(T)
-    id_list = join(Int.(present), ",")
-    if isempty(ps)
-        DBInterface.execute(centralDB(),
-            "DELETE FROM tags WHERE trial_class='$(class)' AND trial_id IN ($(id_list)) AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%';")
-        return ids
-    end
-    for p in ps
-        if p isa Pair
-            k, v = _tagPair(p)
-            stmt = "DELETE FROM tags WHERE trial_class=? AND trial_id IN ($(id_list)) AND tag_key=? AND tag_value=?;"
-            DBInterface.execute(SQLite.Stmt(centralDB(), stmt), (class, k, v))
-        else
-            k = normalizeTagKey(p)
-            stmt = "DELETE FROM tags WHERE trial_class=? AND trial_id IN ($(id_list)) AND tag_key=?;"
-            DBInterface.execute(SQLite.Stmt(centralDB(), stmt), (class, k))
-        end
-    end
+    _deleteTagRows(_tagClass(T), ids, ps)
     return ids
 end
 
@@ -414,6 +430,43 @@ function untag!(targets::AbstractVector{<:AbstractTrial}, ps...)
         untag!(typeof(target), [target.id], ps...)
     end
     return targets
+end
+
+function untag!(::Type{Calibration}, ids::AbstractVector{<:Union{Integer,Missing}}, ps...)
+    _deleteTagRows(_tagClass(Calibration), ids, ps)
+    return ids
+end
+
+untag!(::Type{Calibration}, id::Integer, ps...) = (untag!(Calibration, [id], ps...); id)
+untag!(target::Calibration, ps...) = (untag!(Calibration, [target.id], ps...); target)
+
+function untag!(targets::AbstractVector{Calibration}, ps...)
+    untag!(Calibration, [target.id for target in targets], ps...)
+    return targets
+end
+
+function _deleteTagRows(class::AbstractString, ids, ps)
+    assertInitialized()
+    present = collect(skipmissing(ids))
+    isempty(present) && return nothing
+    id_list = join(Int.(present), ",")
+    if isempty(ps)
+        DBInterface.execute(centralDB(),
+            "DELETE FROM tags WHERE trial_class='$(class)' AND trial_id IN ($(id_list)) AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%';")
+        return nothing
+    end
+    for p in ps
+        if p isa Pair
+            k, v = _tagPair(p)
+            stmt = "DELETE FROM tags WHERE trial_class=? AND trial_id IN ($(id_list)) AND tag_key=? AND tag_value=?;"
+            DBInterface.execute(SQLite.Stmt(centralDB(), stmt), (class, k, v))
+        else
+            k = normalizeTagKey(p)
+            stmt = "DELETE FROM tags WHERE trial_class=? AND trial_id IN ($(id_list)) AND tag_key=?;"
+            DBInterface.execute(SQLite.Stmt(centralDB(), stmt), (class, k))
+        end
+    end
+    return nothing
 end
 
 ########################################################
@@ -633,15 +686,19 @@ end
 """
     applyCreationTags(T, id)
 
-Record creation time and provenance on a newly created trial object.
+Record creation time and provenance on a newly created object.
 
-Called from the four object constructors immediately after the database row is
-inserted. An object that already carries provenance keeps it, so a `Monad` picking
-up replicates in a later session still reports when it was originally created.
+Called from the four trial constructors — and from `createCalibration` — immediately
+after the database row is inserted. An object that already carries provenance keeps it,
+so a `Monad` picking up replicates in a later session still reports when it was
+originally created.
 """
-function applyCreationTags(::Type{T}, id::Integer) where {T<:AbstractTrial}
+applyCreationTags(::Type{T}, id::Integer) where {T<:AbstractTrial} = _applyCreationTags(_tagClass(T), id)
+applyCreationTags(::Type{Calibration}, id::Integer) = _applyCreationTags(_tagClass(Calibration), id)
+
+function _applyCreationTags(class::AbstractString, id::Integer)
     _quietly() do
-        table = _tagTable(_tagClass(T))
+        table = _tagTable(class)
         columnsExist(["provenance_id", "datetime"], table) || return nothing
         #! Objects can also be built by calling a constructor directly, bypassing the
         #! createTrial/run entry points that normally resolve this.
@@ -708,8 +765,10 @@ end
 """
     tags(target; include_auto::Bool=true) -> Dict{String,Vector{String}}
 
-Return the tags attached directly to a trial object, as a mapping from key to the
+Return the tags attached directly to an object, as a mapping from key to the
 sorted list of values stored under that key.
+
+`target` may be any trial object or a [`Calibration`](@ref), or a type and ID.
 
 Only tags placed on this exact object are returned; tags inherited from a parent
 `Sampling` or `Trial` are not, since inheritance is resolved at query time by
@@ -725,9 +784,11 @@ tags(sim; include_auto=false)
 # Dict("arm" => ["high_dose"])
 ```
 """
-function tags(::Type{T}, id::Integer; include_auto::Bool=true) where {T<:AbstractTrial}
+tags(::Type{T}, id::Integer; kwargs...) where {T<:AbstractTrial} = _tags(_tagClass(T), id; kwargs...)
+tags(::Type{Calibration}, id::Integer; kwargs...) = _tags(_tagClass(Calibration), id; kwargs...)
+
+function _tags(class::AbstractString, id::Integer; include_auto::Bool=true)
     assertInitialized()
-    class = _tagClass(T)
     out = Dict{String,Vector{String}}()
     if include_auto
         for (k, v) in _syntheticTags(class, id)
@@ -748,6 +809,7 @@ function tags(::Type{T}, id::Integer; include_auto::Bool=true) where {T<:Abstrac
 end
 
 tags(target::AbstractTrial; kwargs...) = tags(typeof(target), target.id; kwargs...)
+tags(target::Calibration; kwargs...) = tags(Calibration, target.id; kwargs...)
 
 """
     hasTag(target, tag) -> Bool
@@ -762,8 +824,10 @@ hasTag(sim, "arm" => "high_dose")
 hasTag(sim, "arm")
 ```
 """
-function hasTag(::Type{T}, id::Integer, tag) where {T<:AbstractTrial}
-    d = tags(T, id)
+hasTag(::Type{T}, id::Integer, tag) where {T<:AbstractTrial} = _hasTag(tags(T, id), tag)
+hasTag(::Type{Calibration}, id::Integer, tag) = _hasTag(tags(Calibration, id), tag)
+
+function _hasTag(d::Dict{String,Vector{String}}, tag)
     if tag isa Pair
         key = string(first(tag))
         k = startswith(lowercase(strip(key)), MM_TAG_PREFIX) ? _reservedTagKey(key) : normalizeTagKey(key)
@@ -775,6 +839,7 @@ function hasTag(::Type{T}, id::Integer, tag) where {T<:AbstractTrial}
 end
 
 hasTag(target::AbstractTrial, tag) = hasTag(typeof(target), target.id, tag)
+hasTag(target::Calibration, tag) = hasTag(Calibration, target.id, tag)
 
 """
     tagsTable(; include_auto::Bool=true) -> DataFrame
@@ -783,8 +848,9 @@ hasTag(target::AbstractTrial, tag) = hasTag(typeof(target), target.id, tag)
 Return the tag store as a long-format `DataFrame` with columns `Class`, `ID`,
 `Key`, `Value`, and `DateTime`.
 
-With no argument the whole store is returned; with a trial object (or a type and
-ID) only that object's rows are. Pass `include_auto=false` to omit `mm:` keys.
+With no argument the whole store is returned; with a trial object, a
+[`Calibration`](@ref), or a type and ID, only that object's rows are. Pass
+`include_auto=false` to omit `mm:` keys.
 
 # Example
 ```julia
@@ -811,9 +877,11 @@ function tagsTable(; include_auto::Bool=true, limit::Integer=MAX_MATERIALIZED_TR
     return df
 end
 
-function tagsTable(::Type{T}, id::Integer; include_auto::Bool=true) where {T<:AbstractTrial}
+tagsTable(::Type{T}, id::Integer; kwargs...) where {T<:AbstractTrial} = _tagsTable(_tagClass(T), id; kwargs...)
+tagsTable(::Type{Calibration}, id::Integer; kwargs...) = _tagsTable(_tagClass(Calibration), id; kwargs...)
+
+function _tagsTable(class::AbstractString, id::Integer; include_auto::Bool=true)
     assertInitialized()
-    class = _tagClass(T)
     extra = include_auto ? "" : " AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%'"
     df = stmtToDataFrame(
         "SELECT trial_class, trial_id, tag_key, tag_value, datetime FROM tags WHERE trial_class=? AND trial_id=?$(extra);",
@@ -831,6 +899,7 @@ function tagsTable(::Type{T}, id::Integer; include_auto::Bool=true) where {T<:Ab
 end
 
 tagsTable(target::AbstractTrial; kwargs...) = tagsTable(typeof(target), target.id; kwargs...)
+tagsTable(target::Calibration; kwargs...) = tagsTable(Calibration, target.id; kwargs...)
 
 function _countTaggableObjects(class::AbstractString)
     table = _tagTable(class)
@@ -1232,20 +1301,22 @@ function findMonads(; tags=nothing, any_of=nothing, inherit::Bool=true,
 end
 
 """
-    findTrials(T::Type{<:AbstractTrial}; tags=nothing, any_of=nothing, inherit=true, status=nothing, limit=MAX_MATERIALIZED_TRIALS)
+    findTrials(T; tags=nothing, any_of=nothing, inherit=true, status=nothing, limit=MAX_MATERIALIZED_TRIALS)
 
 Return the objects of type `T` matching the given tag filters.
 
-`T` may be `Simulation`, `Monad`, `Sampling`, or `Trial`. For `Simulation` and
-`Monad` this dispatches to [`findSimulations`](@ref) and [`findMonads`](@ref),
-which support downward inheritance. For `Sampling` and `Trial` only tags placed
-directly on those objects are considered, since there is nothing above them to
-inherit from.
+`T` may be `Simulation`, `Monad`, `Sampling`, `Trial`, or [`Calibration`](@ref). For
+`Simulation` and `Monad` this dispatches to [`findSimulations`](@ref) and
+[`findMonads`](@ref), which support downward inheritance. For the other three only
+tags placed directly on those objects are considered: there is nothing above a
+`Sampling` or `Trial` to inherit from, and a `Calibration` sits outside the
+containment hierarchy entirely.
 
 # Example
 ```julia
 findTrials(Simulation; tags = ("project" => "immune-escape",), status = "Completed")
 findTrials(Sampling;   tags = ("purpose" => "sensitivity",))
+findTrials(Calibration; tags = ("mm:method" => "ABCSMC",))
 ```
 
 See also [`tag!`](@ref).
@@ -1255,16 +1326,32 @@ findTrials(::Type{Monad}; kwargs...) = findMonads(; kwargs...)
 
 function findTrials(::Type{T}; tags=nothing, any_of=nothing, inherit::Bool=true, status=nothing,
                     limit::Integer=MAX_MATERIALIZED_TRIALS) where {T<:AbstractTrial}
+    return T.(_idsWithDirectTags(_tagClass(T), T; tags=tags, any_of=any_of, status=status, limit=limit))
+end
+
+#! `inherit` is accepted and ignored, as it is for `Sampling` and `Trial`: a calibration's tags do
+#! not reach the monads it evaluated. `mm:calibration` on each generation's sampling is the route
+#! for that.
+function findTrials(::Type{Calibration}; tags=nothing, any_of=nothing, inherit::Bool=true,
+                    status=nothing, limit::Integer=MAX_MATERIALIZED_TRIALS)
+    ids = _idsWithDirectTags(_tagClass(Calibration), Calibration;
+                             tags=tags, any_of=any_of, status=status, limit=limit)
+    return Calibration.(ids)
+end
+
+#! IDs of the objects in `class` carrying the filters directly, intersected with the objects that
+#! still exist so orphaned tag rows never surface.
+function _idsWithDirectTags(class::AbstractString, what; tags=nothing, any_of=nothing,
+                            status=nothing, limit::Integer=MAX_MATERIALIZED_TRIALS)
     assertInitialized()
-    isnothing(status) || throw(ArgumentError("`status` filtering applies to simulations only; got $(T)."))
-    class = _tagClass(T)
+    isnothing(status) || throw(ArgumentError("`status` filtering applies to simulations only; got $(what)."))
     matcher = f -> _idsMatchingDirect(class, f)
     ids = _combineFilters(matcher, tags, any_of)
     df = queryToDataFrame("SELECT $(tableIDName(_tagTable(class))) FROM $(_tagTable(class));")
     existing = Set(Int.(df[!, 1]))
     ids = isnothing(ids) ? existing : intersect(ids, existing)
     _assertMaterializable(length(ids), limit, "$(class)s")
-    return T.(sort!(collect(ids)))
+    return sort!(collect(ids))
 end
 
 function _maybeShowRecoveryHint()
@@ -1307,6 +1394,10 @@ end
 
 _inheritedIDs(::Type{T}, ::AbstractString, ::Int) where {T<:AbstractTrial} = Int[]
 
+#! A `Calibration` has no parent to inherit from, so `inherit=true` is a no-op for it rather than
+#! an error — the keyword keeps its meaning across every class.
+_inheritedIDs(::Type{Calibration}, ::AbstractString, ::Int) = Int[]
+
 """
     appendTags!(df, T, id_column; include_auto=false, inherit=true)
 
@@ -1320,7 +1411,9 @@ Objects with no value for a key get `missing`.
 
 With `inherit=true` (the default) a tag on a parent object contributes to its
 constituents' columns, matching [`findSimulationIDs`](@ref) — otherwise a
-simulation recovered *by* a sampling-level tag would show no column for it.
+simulation recovered *by* a sampling-level tag would show no column for it. `T` may
+also be [`Calibration`](@ref), which has no parent, so `inherit` makes no difference
+there.
 
 Used by `simulationsTable(...; tags = true)`; call it directly only to pivot tags
 onto a table you have built yourself.
@@ -1332,8 +1425,14 @@ appendTags!(df, Simulation, :SimID)                  # adds tag:<key> columns
 appendTags!(df, Simulation, :SimID; inherit = false) # only tags on the simulations
 ```
 """
-function appendTags!(df::DataFrame, ::Type{T}, id_column::Symbol;
-                     include_auto::Bool=false, inherit::Bool=true) where {T<:AbstractTrial}
+appendTags!(df::DataFrame, ::Type{T}, id_column::Symbol; kwargs...) where {T<:AbstractTrial} =
+    _appendTags!(df, T, _tagClass(T), id_column; kwargs...)
+
+appendTags!(df::DataFrame, ::Type{Calibration}, id_column::Symbol; kwargs...) =
+    _appendTags!(df, Calibration, _tagClass(Calibration), id_column; kwargs...)
+
+function _appendTags!(df::DataFrame, T, class::AbstractString, id_column::Symbol;
+                      include_auto::Bool=false, inherit::Bool=true)
     (isempty(df) || !hasproperty(df, id_column)) && return df
     tableExists("tags") || return df
     ids = Int.(df[!, id_column])
@@ -1351,14 +1450,14 @@ function appendTags!(df::DataFrame, ::Type{T}, id_column::Symbol;
     auto_condition = include_auto ? "" : " AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%'"
     direct = queryToDataFrame("""
         SELECT trial_id, tag_key, tag_value FROM tags
-        WHERE trial_class='$(_tagClass(T))' AND trial_id IN ($(join(ids, ",")))$(auto_condition);
+        WHERE trial_class='$(class)' AND trial_id IN ($(join(ids, ",")))$(auto_condition);
         """)
     for row in eachrow(direct)
         record!(String(row.tag_key), Int(row.trial_id), String(row.tag_value))
     end
 
     if include_auto
-        for id in ids, (k, v) in _syntheticTags(_tagClass(T), id)
+        for id in ids, (k, v) in _syntheticTags(class, id)
             record!(k, id, v)
         end
     end
@@ -1368,7 +1467,7 @@ function appendTags!(df::DataFrame, ::Type{T}, id_column::Symbol;
         #! human actually labeled rather than every object in the project.
         parents = queryToDataFrame("""
             SELECT trial_class, trial_id, tag_key, tag_value FROM tags
-            WHERE trial_class != '$(_tagClass(T))' AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%';
+            WHERE trial_class != '$(class)' AND tag_key NOT LIKE '$(MM_TAG_PREFIX)%';
             """)
         #! Keyed by the parent object, not the tag row: a sampling with ten tags would
         #! otherwise walk its constituent CSVs ten times.
@@ -1407,19 +1506,25 @@ SQLite cannot enforce a foreign key on the polymorphic `trial_class`/`trial_id`
 pair, so this is the mechanism that keeps the tag store consistent with the
 central tables.
 """
-function deleteTagsFor(::Type{T}, ids::AbstractVector{<:Integer}) where {T<:AbstractTrial}
+deleteTagsFor(::Type{T}, ids::AbstractVector{<:Integer}) where {T<:AbstractTrial} =
+    _deleteTagsFor(_tagClass(T), ids)
+
+deleteTagsFor(::Type{Calibration}, ids::AbstractVector{<:Integer}) =
+    _deleteTagsFor(_tagClass(Calibration), ids)
+
+function _deleteTagsFor(class::AbstractString, ids::AbstractVector{<:Integer})
     isempty(ids) && return nothing
     isInitialized() || return nothing
     tableExists("tags") || return nothing
     DBInterface.execute(centralDB(),
-        "DELETE FROM tags WHERE trial_class='$(_tagClass(T))' AND trial_id IN ($(join(Int.(ids), ",")));")
+        "DELETE FROM tags WHERE trial_class='$(class)' AND trial_id IN ($(join(Int.(ids), ",")));")
     return nothing
 end
 
 """
     orphanedTagCounts() -> Dict{String,Int}
 
-Return, per trial class, the number of tag rows pointing at objects that no longer
+Return, per tagged class, the number of tag rows pointing at objects that no longer
 exist. Used by `databaseDiagnostics`.
 
 A healthy database returns zeros for every class. Non-zero counts mean tag rows
@@ -1428,7 +1533,7 @@ outlived their objects — usually an interrupted deletion.
 # Example
 ```julia
 orphanedTagCounts()
-# Dict("simulation" => 0, "monad" => 0, "sampling" => 0, "trial" => 0)
+# Dict("simulation" => 0, "monad" => 0, "sampling" => 0, "trial" => 0, "calibration" => 0)
 ```
 """
 function orphanedTagCounts()
