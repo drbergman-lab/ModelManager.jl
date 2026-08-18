@@ -15,8 +15,8 @@ backend authors implement the hooks described in
 Every project database records the package version it was last migrated to, in a version
 table named by the backend ([`dbVersionTableName`](@ref)). During
 [`initializeModelManager`](@ref), [`resolvePackageVersion`](@ref) compares that stored version
-to the version of the backend loaded into the running session
-([`loadedPackageVersion`](@ref)):
+to the version of the backend loaded into the running session, found from
+[`packageName`](@ref):
 
 - versions match → nothing to do;
 - the database is older → [`upgradePackage`](@ref) runs the migration chain;

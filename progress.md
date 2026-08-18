@@ -267,6 +267,31 @@ belonging to an unrelated package — it would have stamped the database 7.7.7. 
 functions resolve through it, so overriding it moves them together. Overriding
 `loadedPackageVersion` is now rarely needed and documented as such.
 
+### `loadedPackageVersion` became internal
+Asked what a backend would actually override it *for*, and none of the cases I had documented
+survived. Enumerated:
+
+| Scenario | Default yields | Real fix |
+| --- | --- | --- |
+| Named package not loaded | `nothing` | Fix `packageName` — the backend's own declaration |
+| Named package has no `version` in Project.toml | `nothing` (measured) | Add one; milestones *are* versions |
+| Simulator defined in a script/REPL | `nothing` | Untracked is the honest state |
+| Schema version decoupled from package version | package version | Overriding *breaks* it — `getInstalledVersion` still reports the real version, so the mismatch warning fires forever |
+
+The last row is the general argument: any override returning something other than the named
+package's real loaded version breaks the installed-vs-loaded comparison everything here rests on,
+so the function is not safely overridable. Renamed `_loadedPackageVersion`, dropped from
+`@compat public`, and moved out of `abstract_simulator.jl` into `package_version.jl` with the rest
+of the version machinery. Free to do because it had never shipped; `packageName` is now the single
+interface method for redirecting which package gets version-checked.
+
+Also fixed while checking this: a `PkgId` is `(uuid, name)`, so two loaded packages can share a
+name, and `_loadedModuleNamed` was returning whichever `Dict` iteration reached first. An
+ambiguous name now resolves to `nothing` — reporting an unrelated package's version is the exact
+failure this machinery exists to prevent, so a guess is worse than admitting ignorance. Not
+directly unit-tested: loading two same-named packages in one session is not something a test can
+readily construct.
+
 ### The docstring-detaching comment is not limited to one-line definitions
 Same trap as last round, and this time it exposed an error in what I had written into CLAUDE.md.
 I had recorded that an intervening comment detaches a docstring from a **one-line** definition;

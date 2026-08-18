@@ -180,7 +180,7 @@ end
 
 #! `moduleroot` rather than `parentmodule` alone, so that a type defined in a submodule reports
 #! the package rather than the submodule — and so that this names the same package whose version
-#! `loadedPackageVersion` reports, since `pkgversion` resolves through `moduleroot` too. If the
+#! `_loadedPackageVersion` reports, since `pkgversion` resolves through `moduleroot` too. If the
 #! two disagreed, the mismatch warning would compare unrelated packages.
 #! Keep this comment above the docstring: between the docstring and a one-line definition, it
 #! silently prevents the docstring from attaching, which only surfaces as a docs-build
@@ -192,9 +192,10 @@ Return the Julia package name for this simulator framework (e.g. `"PhysiCellMode
 used to look up the installed version via `Pkg`.
 
 Defaults to the package that defines `typeof(sim)`. This is the single place that decides which
-package is version-checked: both [`getInstalledVersion`](@ref) and [`loadedPackageVersion`](@ref)
-resolve through it, so overriding it here moves them together. Override when the version the
-database tracks belongs to a different package than the one defining the simulator type.
+package is version-checked — the version installed in the environment and the version loaded in
+the session are both resolved from this name, so overriding it moves them together. Override when
+the version the database tracks belongs to a different package than the one defining the
+simulator type.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -208,50 +209,6 @@ ModelManager.packageName(::MySimulator) = "MySimCore"
 ```
 """
 packageName(sim::AbstractSimulator) = string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))
-
-#! Resolved through `packageName` rather than straight from `parentmodule(typeof(sim))`, so that
-#! this and `getInstalledVersion` always describe the *same* package — otherwise a backend that
-#! overrides only `packageName` reports its adapter package's loaded version against the core
-#! package's installed version, which both warns spuriously and aims the migration at a version
-#! belonging to an unrelated package. `packageName` defaults to the type's own package, so the
-#! ordinary case is unaffected. Read from the module registry, never from the environment:
-#! substituting the installed version for the running one is the conflation this mechanism exists
-#! to avoid. `_loadedModuleNamed` lives in `package_version.jl` with the version machinery.
-"""
-    loadedPackageVersion(sim::AbstractSimulator)::Union{Nothing,VersionNumber}
-
-Return the version of `sim`'s package as loaded into this Julia session, or `nothing` if it
-cannot be determined.
-
-Migrations target this version rather than the installed one, since
-[`upgradeMilestones`](@ref) comes from the loaded code.
-
-The default reads the version of the loaded package named by [`packageName`](@ref), which is
-what makes this and [`getInstalledVersion`](@ref) describe the same package — one asking the
-module registry, the other the environment. Override `packageName` to point both at a different
-package; the installed version is never substituted for this one.
-
-`nothing` means that package is not loaded, or carries no version (a simulator defined in a
-script or at the REPL). The project then opens without migrating or recording a version.
-
-Overriding this method as well is rarely necessary — reach for it only when the loaded version
-cannot be read from the named package's module.
-
-# Arguments
-- `sim::AbstractSimulator`: the active simulator backend.
-
-# Returns
-The loaded `VersionNumber`, or `nothing` if it cannot be determined.
-
-# Example
-```julia
-ModelManager.loadedPackageVersion(::MySimulator) = pkgversion(MySimCore)
-```
-"""
-function loadedPackageVersion(sim::AbstractSimulator)
-    mod = _loadedModuleNamed(packageName(sim))
-    return isnothing(mod) ? nothing : pkgversion(mod)
-end
 
 """
     dbVersionTableName(sim::AbstractSimulator)::String
@@ -387,13 +344,10 @@ function clearSimulatorArtifacts(sim::AbstractSimulator) end
 #! Documenter's `Private = false` include them. See CLAUDE.md, "Docstring cross-references".
 #! `postInitDisplay` and `centralDBFileName` are absent because they are already exported —
 #! Julia errors on declaring an exported name public.
-#! `loadedPackageVersion` ships with a working default rather than an `error` stub, so most
-#! backends never touch it; it is public because an unusual module layout (type in a submodule
-#! or a package extension) makes overriding it part of the documented contract.
 @compat public runSimulation, simulatorDir, simulatorVersionSchema, simulatorVersionIDName,
                simulatorVersionTableName, resolveSimulatorVersionID, currentSimulatorVersionID,
                simulatorInfo, setupMonad, setupSampling,
-               packageName, loadedPackageVersion, dbVersionTableName, upgradeMilestones, upgradeToMilestone,
+               packageName, dbVersionTableName, upgradeMilestones, upgradeToMilestone,
                postSimulationProcessing, postSimulationCleanup, initializeInputFolder,
                getInputFolderDescription, clearSimulatorArtifacts
 

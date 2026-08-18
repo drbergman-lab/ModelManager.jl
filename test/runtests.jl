@@ -60,7 +60,7 @@ ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
 #   a VersionNumber   — a staged loaded version, i.e. a mid-session Pkg change.
 #   nothing           — genuinely undeterminable, exercising the short-circuit path.
 const _loaded_version_override = Ref{Any}(:default)
-ModelManager.loadedPackageVersion(::TestSimulator) =
+ModelManager._loadedPackageVersion(::TestSimulator) =
     _loaded_version_override[] === :default ? pkgversion(ModelManager) : _loaded_version_override[]
 
 # Overridable so the guard tests can present a milestone the "loaded" version knows about,
@@ -73,7 +73,7 @@ function ModelManager.upgradeToMilestone(::TestSimulator, args...)
     return true
 end
 
-# Module-level type with no override, used to exercise the *default* loadedPackageVersion and
+# Module-level type with no override, used to exercise the *default* _loadedPackageVersion and
 # packageName. The TestSimulator overrides above shadow the defaults, so separate types are
 # required.
 struct _NoModuleSimulator <: AbstractSimulator end
@@ -2180,10 +2180,10 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 table = ModelManager.dbVersionTableName(TestSimulator())
                 try
                     # --- the default hooks ------------------------------------------------
-                    # A type outside any package has no version to report. `nothing` must fall
-                    # back to the installed version — it is what TestSimulator itself gets, so
-                    # getting this wrong fails every project in the suite.
-                    @test ModelManager.loadedPackageVersion(_NoModuleSimulator()) === nothing
+                    # A type outside any package resolves to no version: packageName gives "Main",
+                    # which is a loaded module but carries no version. That path is what every
+                    # project in the suite depends on behaving predictably.
+                    @test ModelManager._loadedPackageVersion(_NoModuleSimulator()) === nothing
                     # packageName defaults to the package defining the type, resolved through
                     # moduleroot so it names the same package whose version pkgversion reports.
                     # _NoModuleSimulator is defined here, so that is Main.
@@ -2199,15 +2199,19 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # The loaded version is the target. For TestSimulator the default resolves via
                     # packageName to the loaded ModelManager, which here equals the installed one.
                     _loaded_version_override[] = :default
-                    @test ModelManager.loadedPackageVersion(TestSimulator()) == installed
+                    @test ModelManager._loadedPackageVersion(TestSimulator()) == installed
                     _loaded_version_override[] = v"0.4.0"
-                    @test ModelManager.loadedPackageVersion(TestSimulator()) == v"0.4.0"
+                    @test ModelManager._loadedPackageVersion(TestSimulator()) == v"0.4.0"
 
                     # The default chains through packageName when the type is not in a versioned
                     # package: _NoModuleSimulator names Main, which is not a loaded package, so
                     # there is genuinely no version to find.
                     @test ModelManager._loadedModuleNamed("ModelManager") === ModelManager
                     @test ModelManager._loadedModuleNamed("NoSuchPackage") === nothing
+                    # Main is loaded but carries no version, so the chain ends at nothing rather
+                    # than at a module whose version cannot be read.
+                    @test ModelManager._loadedModuleNamed("Main") === Main
+                    @test pkgversion(Main) === nothing
 
                     # --- resolvePackageVersion --------------------------------------------
                     # Resolvable loaded version: behaves as it always did.

@@ -78,7 +78,7 @@ function upgradePackage(sim::AbstractSimulator, db::SQLite.DB,
     #! than clamping, because silently migrating somewhere other than asked is the worse surprise.
     #! `>`, not `!=`: a target *below* the loaded version is legitimate — resuming a partially
     #! applied chain, or deliberately migrating to an earlier milestone.
-    loaded_version = loadedPackageVersion(sim)
+    loaded_version = _loadedPackageVersion(sim)
     if !isnothing(loaded_version) && to_version > loaded_version
         _errorTargetBeyondLoaded(packageName(sim), to_version, loaded_version)
         return false
