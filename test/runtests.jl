@@ -3097,6 +3097,23 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test isempty(findMonads(tags=("mm:calibration" => string(cal.id),)))
                 @test hasTag(cal, "purpose" => "figure")
                 @test findTrials(Calibration; tags=("purpose" => "figure",)) == [cal]
+
+                # The run is still listed and tagged, but there is nothing left to view: both
+                # scopes say so rather than throwing an assertion from the Sampling constructor.
+                @test isempty(monadIDs(cal))
+                @test_throws "no monads left to view" Sampling(cal)
+                @test_throws "Generation 1 of Calibration($(cal.id))" Sampling(cal, 1)
+                # A run that never recorded a generation reports the same way, naming the
+                # directory it looked in.
+                bare = ModelManager.createCalibration("ABC-SMC")
+                @test_throws "generation_{NNN}_monads.csv" Sampling(bare)
+
+                # mm:created is column-backed, so `tagValues` reads it out of each class's own
+                # table. That loop covers `calibrations` too, guarded only on the datetime
+                # column, which this table has always had.
+                stamp = tags(cal)["mm:created"][1]
+                @test stamp in tagValues("mm:created")
+                @test "mm:created" in tagKeys(; include_auto=true)
             end
 
             @testset "calibrationsTable" begin
@@ -3159,6 +3176,18 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # An id with no row must not throw — the struct validates nothing.
                 @test occursin("no row", sprint(show, Calibration(999_999)))
+
+                # Nor may it throw with no project initialized, which is the state a stray
+                # `Calibration(3)` at the REPL lands in. Globals are restored immediately.
+                saved_globals = ModelManager.mm_globals_ref[]
+                try
+                    ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+                    @test !isInitialized()
+                    @test sprint(show, cal) == "Calibration (ID=$(cal.id))"
+                finally
+                    ModelManager.mm_globals_ref[] = saved_globals
+                end
+                @test isInitialized()
             end
 
             @testset "deleteCalibration" begin

@@ -626,6 +626,22 @@ index. Left for its own change so this one stays reviewable.
   `simulationIDs` are the public accessors, so no name needed promoting to `@compat public` just to
   keep a docstring hyperlink alive.
 
+### Coverage follow-up
+
+Codecov flagged 12 patch lines. Five were real and are now tested: both branches of
+`_noViewableMonadsMessage` (a run whose monads were all deleted, and one that never recorded a
+generation), and `show(::Calibration)` with no project initialized — the state a stray
+`Calibration(3)` at the REPL lands in, and the one the PR body claims cannot throw.
+
+The other six sat in `tags.jl` and were **pre-existing** untested branches that the extraction
+refactor merely renumbered (`_quietly`'s `@debug` path, `launchingScript`'s frame-skip and `catch`,
+the `script LIKE` provenance lookup, and the trial-level arms of `_simulationIDsMatching` /
+`_monadIDsMatching` / `_inheritedIDs`). One of them was worth covering anyway rather than
+explaining away: `tagValues(MM_CREATED_KEY)` is one of the five sites that iterate `TAG_CLASSES`,
+it is guarded on the `datetime` column alone, and it therefore started including `calibrations` the
+moment the class was added. It had never been exercised. It is now, asserting a calibration's
+creation stamp reads back through it.
+
 ### Rebased onto #31 (trial-ID accessor gaps)
 
 #31 landed first and overlapped in three ways, all resolved in the rebase rather than papered over.
