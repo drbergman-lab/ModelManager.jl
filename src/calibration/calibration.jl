@@ -94,23 +94,20 @@ _generationMonadFiles(calibration::Calibration) =
     calibrationMonadIDs(calibration::Calibration) → Vector{Int}
     calibrationMonadIDs(calibration::Calibration, generation::Integer) → Vector{Int}
 
-Return the monad IDs recorded for this calibration run, as written to
-`generations/generation_{NNN}_monads.csv` before each batch was dispatched.
+Sorted monad IDs recorded for a calibration run, read from
+`generations/generation_{NNN}_monads.csv`.
 
-Ordering is by generation, and ascending by ID within a generation — the record is stored in the
-compressed-range format, which sorts as it writes, so the order proposals were evaluated in within
-one generation is not recoverable from it.
-
-These are the IDs the run *evaluated*. A monad whose every simulation failed has since been
-deleted, so its ID may appear here with no row behind it; `monadIDs(calibration)` returns the
-surviving subset.
+These are the IDs the run *evaluated*, so one whose monad has since been deleted is still listed;
+`monadIDs(calibration)` returns the surviving subset.
 """
 function calibrationMonadIDs(calibration::Calibration)
     files = _generationMonadFiles(calibration)
     ids = reduce(vcat, (constituentIDs(path) for (_, path) in files); init=Int[])
-    #! Generations overlap: a monad reused from the bank (or re-proposed) is recorded in every
-    #! generation that evaluated it.
-    return unique!(ids)
+    #! Generations overlap — a monad reused from the bank is recorded in each one that evaluated it
+    #! — so this dedupes. Sorted rather than grouped by generation: the aggregate answers "which
+    #! monads", and grouping would only imply an evaluation order the storage format cannot carry
+    #! (`compressIDs` sorts as it writes). Ask `calibrationMonadIDs(cal, t)` for one generation.
+    return sort!(unique!(ids))
 end
 
 function calibrationMonadIDs(calibration::Calibration, generation::Integer)
@@ -123,7 +120,7 @@ function calibrationMonadIDs(calibration::Calibration, generation::Integer)
         Recorded generations: $(recorded).
         """))
     end
-    return unique!(constituentIDs(last(files[index])))
+    return sort!(unique!(constituentIDs(last(files[index]))))
 end
 
 #! Drops IDs with no `monads` row, in one query rather than one per ID. Necessary because
@@ -139,18 +136,16 @@ end
     monadIDs(calibration::Calibration)
     monadIDs(calibration::Calibration, generation::Integer)
 
-Return the IDs of the monads this calibration run evaluated, or those of one generation.
+Sorted IDs of the monads a calibration run evaluated, or those of one generation.
 
-Only monads that still exist are returned: a proposed monad whose every simulation failed was
-deleted when it emptied, and is therefore no longer part of the run's addressable output.
-
-Reading this creates nothing — see [`Sampling`](@ref) for the addressable view.
+Monads deleted after losing every simulation are excluded, so this is what the run actually
+produced. It only reads; [`Sampling`](@ref) is what makes a view addressable.
 
 # Examples
 ```julia
 result = runABC(problem)
-monadIDs(result.calibration)        # every surviving monad, in generation order
-monadIDs(result.calibration, 3)     # just generation 3
+monadIDs(result)        # every surviving monad
+monadIDs(result, 3)     # just generation 3
 ```
 """
 monadIDs(calibration::Calibration) = _survivingMonadIDs(calibrationMonadIDs(calibration))
@@ -161,16 +156,13 @@ monadIDs(calibration::Calibration, generation::Integer) =
     simulationIDs(calibration::Calibration)
     simulationIDs(calibration::Calibration, generation::Integer)
 
-Return the IDs of every simulation run under this calibration, or under one generation.
+IDs of every simulation a calibration run produced, or one generation's.
 
-Equivalent to the union over [`monadIDs`](@ref)`(calibration)` of each monad's simulations, and
-equal to `simulationIDs(Sampling(calibration))` — but, unlike that form, it records nothing in the
-database.
+Equal to `simulationIDs(Sampling(calibration))`, but records nothing.
 
 # Examples
 ```julia
-result = runABC(problem)
-simulationsTable(simulationIDs(result.calibration))
+simulationsTable(simulationIDs(result))
 ```
 """
 simulationIDs(calibration::Calibration) =
@@ -185,40 +177,27 @@ simulationIDs(calibration::Calibration, generation::Integer) =
     Sampling(calibration::Calibration)
     Sampling(calibration::Calibration, generation::Integer)
 
-Return a [`Sampling`](@ref) over the monads a calibration run evaluated — all of them, or those of
-one generation.
+A [`Sampling`](@ref) over the monads a calibration run evaluated — all of them, or one
+generation's — so a run can go anywhere a trial can.
 
-A calibration is not a level of the trial hierarchy: it evaluates monads in batches, and each
-batch already becomes a `Sampling` of its own while the run proceeds. But every monad of a
-calibration shares the problem's input folders, which is exactly what defines a `Sampling`, so the
-whole run and each of its generations are valid samplings too — overlapping views over the same
-monads rather than a chain of containers. These views give a calibration the same surface as any
-other trial: [`run`](@ref) it to add replicates, [`simulationsTable`](@ref) it, [`tag!`](@ref) it,
-plot it.
+Monads deleted after losing every simulation are excluded. A sampling is identified by its exact
+monad set, so the same view always resolves to the same database row; when that set happens to be
+one batch's, the view *is* that batch's sampling.
 
-A sampling is identified by its exact monad set, so asking for the same view twice returns the
-same row rather than accumulating duplicates. When a view's monads happen to be exactly one
-batch's — a run that converged in a single generation of a single batch — the view *is* that
-batch's sampling, which is the same property seen from the other side.
+See [Calibration](@ref calibration_man) for why a run has views rather than a place in the
+hierarchy.
 
-Monads that were deleted after losing every simulation are excluded; see [`monadIDs`](@ref).
-
-!!! note "On a run that is still in progress"
-    The view describes the monads evaluated *so far*. Because a sampling is identified by its
-    exact monad set, materializing the run-wide view mid-run records a row for that partial set
-    which the finished run will not reuse — it has a different set, so it gets its own row. Build
-    the view once the run is done, or use [`monadIDs`](@ref) and [`simulationIDs`](@ref), which
-    read without recording anything.
+!!! note "A run still in progress"
+    The view covers the monads evaluated *so far*, and recording it pins that partial set — the
+    finished run has a different one, so it gets its own row. Mid-run, prefer
+    [`monadIDs`](@ref)/[`simulationIDs`](@ref), which record nothing.
 
 # Examples
 ```julia
 result = runABC(problem)
 
-sampling = Sampling(result.calibration)          # the whole run
-gen3     = Sampling(result.calibration, 3)       # one generation
-
-simulationsTable(sampling; tags = true)
-run(gen3; n_replicates = 5)                      # top up the replicates of one generation
+simulationsTable(Sampling(result); tags = true)
+run(Sampling(result, 3); n_replicates = 5)      # top up one generation's replicates
 ```
 """
 function Sampling(calibration::Calibration)
@@ -251,37 +230,48 @@ function _noViewableMonadsMessage(calibration::Calibration, generation::Union{No
     """
 end
 
+################## ABCResult forwarding ##################
+
+#! `runABC` hands back an `ABCResult`, so the run-level surface accepts one directly rather than
+#! making every caller reach for `.calibration` — the same courtesy `MMOutput` already extends for
+#! a trial. Kept as explicit forwards instead of an `AbstractMMOutput` supertype: the three result
+#! wrappers in the package name their payload differently (`MMOutput.trial`,
+#! `GSASampling.sampling`, `ABCResult.calibration`), so unifying them needs a `resultTarget`
+#! accessor for the forwards to be written against, not just a shared supertype. See progress.md.
+Sampling(result::ABCResult) = Sampling(result.calibration)
+Sampling(result::ABCResult, generation::Integer) = Sampling(result.calibration, generation)
+
+monadIDs(result::ABCResult) = monadIDs(result.calibration)
+monadIDs(result::ABCResult, generation::Integer) = monadIDs(result.calibration, generation)
+
+simulationIDs(result::ABCResult) = simulationIDs(result.calibration)
+simulationIDs(result::ABCResult, generation::Integer) = simulationIDs(result.calibration, generation)
+
+calibrationMonadIDs(result::ABCResult) = calibrationMonadIDs(result.calibration)
+calibrationMonadIDs(result::ABCResult, generation::Integer) =
+    calibrationMonadIDs(result.calibration, generation)
+
 ################## Read path ##################
 
 """
     calibrationsTable(; tags=false, include_auto_tags=false)
     calibrationsTable(calibration_ids; kwargs...)
-    calibrationsTable(calibration, calibrations...; kwargs...)
+    calibrationsTable(calibration_or_result, ...; kwargs...)
 
-Return a `DataFrame` with one row per calibration run: `CalibrationID`, `DateTime`, `Method`, and
-`Description`.
+One row per calibration run: `CalibrationID`, `DateTime`, `Method`, `Description`.
 
-This is the run-level listing — what calibrations exist in this project, when they were run, and
-what each was for. Per-generation convergence numbers are a different question, answered by
-[`ConvergenceSummary`](@ref); the parameters themselves by [`posterior`](@ref).
+Per-generation convergence numbers are [`ConvergenceSummary`](@ref); the parameters themselves
+[`posterior`](@ref).
 
 # Keyword Arguments
-- `tags::Bool`: If true, appends one `tag:<key>` column per tag key in use (see
-  [`appendTags!`](@ref)), with `missing` where a run has no value for that key and multiple values
-  joined by `|`. Defaults to false. Only tags placed on the calibration itself appear — a
-  calibration is not a container of simulations, so nothing is inherited into these columns.
-- `include_auto_tags::Bool`: If true, the tag columns also include ModelManager's own `mm:`
-  provenance (creation time, script, git state, and `mm:method`). Defaults to false. Has no effect
-  unless `tags=true`.
+- `tags::Bool`: append one `tag:<key>` column per tag key in use (see [`appendTags!`](@ref)).
+  Only tags on the run itself appear — a calibration contains no simulations to inherit from.
+- `include_auto_tags::Bool`: also pivot the `mm:` provenance keys. Requires `tags=true`.
 
 # Examples
 ```julia
 calibrationsTable()
-```
-```julia
-calibrationsTable(; tags = true)             # what each run was for
-```
-```julia
+calibrationsTable(; tags = true)      # what each run was for
 calibrationsTable([1, 2, 3])
 ```
 """
@@ -302,10 +292,12 @@ calibrationsTable(calibrations::AbstractVector{Calibration}; kwargs...) =
 calibrationsTable(calibration::Calibration, calibrations::Vararg{Calibration}; kwargs...) =
     calibrationsTable([calibration; calibrations...]; kwargs...)
 
+calibrationsTable(result::ABCResult; kwargs...) = calibrationsTable([result.calibration]; kwargs...)
+
 function _calibrationsTableFromQuery(query::String; tags::Bool=false, include_auto_tags::Bool=false)
     df = queryToDataFrame(query)
     #! Built rather than renamed when the result is empty: a query returning no rows need not carry
-    #! the column set, and a caller pattern-matching on names should not have to special-case that.
+    #! the column set, and a caller matching on names should not have to special-case that.
     if isempty(df)
         return DataFrame(CalibrationID=Int[], DateTime=String[], Method=String[], Description=String[])
     end
@@ -322,19 +314,8 @@ end
 """
     printCalibrationsTable(args...; sink=println, kwargs...)
 
-Print the table of calibration runs. See [`calibrationsTable`](@ref).
-
-# Keyword Arguments
-- `sink`: A function to receive the DataFrame (default `println`). Can also use `CSV.write`.
-
-# Examples
-```julia
-printCalibrationsTable(; tags = true)
-```
-```julia
-using CSV
-printCalibrationsTable(; sink=CSV.write("calibrations.csv"))
-```
+Print [`calibrationsTable`](@ref). `sink` receives the DataFrame (default `println`, or e.g.
+`CSV.write("calibrations.csv")`).
 """
 function printCalibrationsTable(args...; sink=println, kwargs...)
     assertInitialized()
@@ -375,39 +356,34 @@ function Base.show(io::IO, calibration::Calibration)
     print(io, join(lines, "\n"))
 end
 
-#! A field the row never carried (`description` defaults to empty) is omitted rather than printed
-#! blank.
+#! A field the database row never carried (`description` defaults to empty) is omitted rather than
+#! printed blank.
 function _pushField!(lines::Vector{String}, label::AbstractString, value)
-    (ismissing(value) || isempty(string(value))) && return lines
+    (ismissing(value) || isempty(string(value))) && return nothing
     push!(lines, "  $(rpad("$(label):", 12)) $(value)")
-    return lines
+    return nothing
 end
 
 ################## Deletion ##################
 
 """
     deleteCalibration(calibration_ids; delete_subs=false)
-    deleteCalibration(calibration_id; kwargs...)
-    deleteCalibration(calibration::Calibration; kwargs...)
+    deleteCalibration(calibration_or_result; kwargs...)
 
-Delete calibration runs: the `calibrations` row, its tags, and its output folder
-(`data/outputs/calibrations/{id}`).
+Delete calibration runs: the `calibrations` database row, its tags, and its output folder.
 
-The monads the run evaluated are **kept** by default. A calibration's monads are not its private
-property — the simulation bank reuses monads across runs, and `use_previous=true` means a monad
-may have been created by ordinary exploration long before the calibration snapped onto it. Pass
-`delete_subs=true` to remove them (and their simulations) as well, once you are sure nothing else
-depends on them.
+`delete_subs` defaults to `false`, unlike the trial-level deleters — a run's monads are shared,
+through the [`SimulationBank`](@ref) and `use_previous`, so they may predate it and outlive it.
+Pass `true` to remove them and their simulations too.
 
-Deleting the run discards its posterior: the generation CSVs, the serialized problem, and the
-method settings all live in the folder, so [`posterior`](@ref) and [`resumeABC`](@ref) will no
-longer work for it.
+Note that the folder holds the generation CSVs, the serialized problem and the method settings, so
+deleting a run discards its posterior: [`posterior`](@ref) and [`resumeABC`](@ref) stop working
+for it.
 
 # Examples
 ```julia
-deleteCalibration(result.calibration)          # keep the simulations, drop the bookkeeping
-deleteCalibration(3; delete_subs = true)       # and every monad it evaluated
-deleteCalibration([1, 2])
+deleteCalibration(result)                  # bookkeeping only
+deleteCalibration(3; delete_subs = true)   # and every monad it evaluated
 ```
 """
 function deleteCalibration(calibration_ids::AbstractVector{<:Integer}; delete_subs::Bool=false)
@@ -435,3 +411,4 @@ deleteCalibration(calibration_id::Integer; kwargs...) = deleteCalibration([calib
 deleteCalibration(calibration::Calibration; kwargs...) = deleteCalibration([calibration.id]; kwargs...)
 deleteCalibration(calibrations::AbstractVector{Calibration}; kwargs...) =
     deleteCalibration([calibration.id for calibration in calibrations]; kwargs...)
+deleteCalibration(result::ABCResult; kwargs...) = deleteCalibration([result.calibration.id]; kwargs...)

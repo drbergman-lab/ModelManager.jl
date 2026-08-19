@@ -626,6 +626,56 @@ index. Left for its own change so this one stays reviewable.
   `simulationIDs` are the public accessors, so no name needed promoting to `@compat public` just to
   keep a docstring hyperlink alive.
 
+### Review follow-ups (PR #32)
+
+**Rowid reuse is a real aliasing risk, and it is repo-wide rather than mine.** Review asked whether
+`_survivingMonadIDs` could let a freshly created monad slip in at the ID of a deleted one. It can:
+no MM table uses `AUTOINCREMENT`, and SQLite reuses the largest freed rowid — verified directly
+(insert 1–3, delete 3, insert → the new row is id 3). But nothing about that is specific to
+calibration; every constituent CSV in the package stores exactly these reusable IDs as durable
+references, so the same aliasing exists for `monads/{id}/simulations.csv` and friends. The fix that
+actually closes it is `AUTOINCREMENT` on the primary keys, which is a schema migration and therefore
+a `AbstractSimulator` milestone every downstream simulator must implement — out of scope here, filed
+as a to-do in CLAUDE.md.
+
+Worth recording what does *not* work, since it looks like it should: subtracting
+`generation_{NNN}_failed_monads.csv` from the recorded IDs. That file holds monads with **at least
+one** failed simulation, whereas the deleted set is monads with **no successful** simulation —
+`_batchOutcome` computes both (`failed_monads` and `without_success`) but only the former is
+persisted. Subtracting it would wrongly drop partially-failed monads that are legitimately part of
+the run. A calibration-local fix means persisting `without_success` too.
+
+**`calibrationMonadIDs` now returns sorted IDs, not generation-grouped.** Review pushed back that
+the name promises "the monad IDs of this calibration", and grouping implies an ordering the storage
+cannot carry anyway (`compressIDs` sorts as it writes, so within-generation order is already lost).
+Sorting also removed a discrepancy this change previously had to document, since
+`monadIDs(Sampling(cal))` reads back sorted from the constituent CSV — the two now simply agree.
+Generation scope is what `calibrationMonadIDs(cal, t)` is for.
+
+**The run-level surface dispatches on `ABCResult`.** Review asked why `tag!` and the accessors take
+`result.calibration` rather than `result`, by analogy with `MMOutput`. They now take either:
+`Sampling`, `monadIDs`, `simulationIDs`, `tag!`, `untag!`, `tags`, `hasTag`, `tagsTable`,
+`calibrationsTable`, `deleteCalibration`.
+
+Review also floated an `AbstractMMOutput` supertype. Not built, and the reason is concrete rather
+than conservative: the package has three result wrappers — `MMOutput`, `GSASampling`, `ABCResult` —
+and each names its payload differently (`.trial`, `.sampling`, `.calibration`). A shared supertype
+alone therefore unifies nothing; the forwards would have to be written against an accessor, e.g.
+`resultTarget(::MMOutput) = x.trial`, and then `monadIDs(x::AbstractMMOutput) = monadIDs(resultTarget(x))`
+once. That is the shape to build if a fourth wrapper appears, and it would let the ~10 forwards per
+wrapper collapse to one line each — but it touches `MMOutput` and `GSASampling`, both public, so it
+belongs in its own change rather than riding along here.
+
+**Where `description` is going.** Review asked for clarity, since the goal had been to drop the
+dedicated column in favour of tags. This change deliberately does not decide it — its job was to
+make the column readable so the question stops being academic — but the docs no longer steer users
+toward it: `docs/src/man/calibration.md` now says to label runs with tags and explains why
+(queryable, multi-valued, retroactive), noting the column is still written and still shown so older
+runs keep what they recorded. `show(::Calibration)` keeps printing it, which review liked. The
+recommendation for brief 05, where the API is unified: keep the column (old rows carry data, and
+dropping it is a breaking change to `runABC(; description=...)`), stop documenting the keyword, and
+have it write a tag so the two stop competing.
+
 ### Coverage follow-up
 
 Codecov flagged 12 patch lines. Five were real and are now tested: both branches of

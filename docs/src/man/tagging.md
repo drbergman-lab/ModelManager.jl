@@ -206,7 +206,7 @@ the four trial types:
 
 ```julia
 result = runABC(problem)
-tag!(result.calibration, "project" => "immune-escape")
+tag!(result, "project" => "immune-escape")   # or tag!(result.calibration, ...)
 
 findTrials(Calibration; tags = ("project" => "immune-escape",))
 findTrials(Calibration; tags = ("mm:method" => "ABCSMC",))
@@ -229,8 +229,8 @@ disappear along with the work it described. The `calibrations` row is never remo
 cascade, so a tag placed on the run survives it:
 
 ```julia
-tag!(result.calibration, "purpose" => "figure")
-deleteMonad(monadIDs(result.calibration))              # the batch tags go with the samplings
+tag!(result, "purpose" => "figure")
+deleteMonad(monadIDs(result))                          # the batch tags go with the samplings
 
 findTrials(Calibration; tags = ("purpose" => "figure",))   # still finds the run
 ```

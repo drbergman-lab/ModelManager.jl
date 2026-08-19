@@ -312,8 +312,8 @@ tag!(calibration, "project" => "x")           # a Calibration from runABC
 A [`Calibration`](@ref) is tagged the same way, but it is a *run* rather than a container of
 simulations, so its tags do not reach the monads it evaluated. Use the `mm:calibration` tag that
 every generation's sampling already carries for that: `findMonads(tags = ("mm:calibration" =>
-string(calibration.id),))`. The trade is durability — the `calibrations` row outlives any monad
-cascade, so a tag placed there survives even when every simulation of the run is deleted.
+string(calibration.id),))`. The trade is durability — the `calibrations` database row outlives any
+monad cascade, so a tag placed there survives even when every simulation of the run is deleted.
 
 # Returns
 The `target`, so calls can be chained or piped.
@@ -366,6 +366,10 @@ end
 
 tag!(::Type{Calibration}, id::Integer, ps...) = (tag!(Calibration, [id], ps...); id)
 tag!(target::Calibration, ps...) = (tag!(Calibration, [target.id], ps...); target)
+
+#! `runABC` returns an `ABCResult`, so it is tagged directly rather than through `.calibration`,
+#! exactly as an `MMOutput` is tagged through its trial.
+tag!(result::ABCResult, ps...) = (tag!(result.calibration, ps...); result)
 
 #! `findTrials(Calibration; ...)` hands back a `Vector{Calibration}`, so labelling a query's
 #! results in one call has to work here as it does for trial objects.
@@ -439,6 +443,7 @@ end
 
 untag!(::Type{Calibration}, id::Integer, ps...) = (untag!(Calibration, [id], ps...); id)
 untag!(target::Calibration, ps...) = (untag!(Calibration, [target.id], ps...); target)
+untag!(result::ABCResult, ps...) = (untag!(result.calibration, ps...); result)
 
 function untag!(targets::AbstractVector{Calibration}, ps...)
     untag!(Calibration, [target.id for target in targets], ps...)
@@ -810,6 +815,7 @@ end
 
 tags(target::AbstractTrial; kwargs...) = tags(typeof(target), target.id; kwargs...)
 tags(target::Calibration; kwargs...) = tags(Calibration, target.id; kwargs...)
+tags(result::ABCResult; kwargs...) = tags(result.calibration; kwargs...)
 
 """
     hasTag(target, tag) -> Bool
@@ -840,6 +846,7 @@ end
 
 hasTag(target::AbstractTrial, tag) = hasTag(typeof(target), target.id, tag)
 hasTag(target::Calibration, tag) = hasTag(Calibration, target.id, tag)
+hasTag(result::ABCResult, tag) = hasTag(result.calibration, tag)
 
 """
     tagsTable(; include_auto::Bool=true) -> DataFrame
@@ -900,6 +907,7 @@ end
 
 tagsTable(target::AbstractTrial; kwargs...) = tagsTable(typeof(target), target.id; kwargs...)
 tagsTable(target::Calibration; kwargs...) = tagsTable(Calibration, target.id; kwargs...)
+tagsTable(result::ABCResult; kwargs...) = tagsTable(result.calibration; kwargs...)
 
 function _countTaggableObjects(class::AbstractString)
     table = _tagTable(class)

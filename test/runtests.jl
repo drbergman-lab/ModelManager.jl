@@ -2926,7 +2926,10 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 recorded = ModelManager.calibrationMonadIDs(cal)
                 @test !isempty(recorded)
                 @test allunique(recorded)              # generations overlap; the record dedupes
+                @test issorted(recorded)               # "which monads", not an evaluation order
                 @test monadIDs(cal) == recorded        # nothing failed here, so all survive
+                @test issorted(monadIDs(cal))
+                @test issorted(ModelManager.calibrationMonadIDs(cal, 1))
 
                 # Every simulation of the run, reachable through the batch tag alone.
                 batch_ids = sort(findSimulationIDs(tags=("mm:calibration" => string(cal.id),)))
@@ -2966,6 +2969,17 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test_throws ArgumentError Sampling(cal, 99)
                 @test_throws ArgumentError monadIDs(cal, 99)
                 @test_throws ArgumentError ModelManager.calibrationMonadIDs(cal, 99)
+
+                # Everything above also takes the ABCResult, so `.calibration` is never required.
+                @test monadIDs(result) == monadIDs(cal)
+                @test monadIDs(result, 1) == monadIDs(cal, 1)
+                @test simulationIDs(result) == simulationIDs(cal)
+                @test simulationIDs(result, 1) == simulationIDs(cal, 1)
+                @test Sampling(result).id == sampling.id
+                @test Sampling(result, 1).id == gen1.id
+                @test ModelManager.calibrationMonadIDs(result) == recorded
+                @test ModelManager.calibrationMonadIDs(result, 1) == ModelManager.calibrationMonadIDs(cal, 1)
+                @test calibrationsTable(result).CalibrationID == [cal.id]
 
                 # The accessors record nothing: only the explicit view constructor inserts a row.
                 n_samplings() = nrow(ModelManager.queryToDataFrame(
@@ -3040,8 +3054,19 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
-                cal = runCalibration(prob, method; description="taggable").calibration
+                result = runCalibration(prob, method; description="taggable")
+                cal = result.calibration
                 waitForDiagnostics()
+
+                # Tagged through the ABCResult, read back off the Calibration — the forward is
+                # the same courtesy `MMOutput` extends for a trial, and it returns the result so
+                # calls can be chained.
+                @test tag!(result, "project" => "immune-escape") === result
+                @test tags(result)["project"] == ["immune-escape"]
+                @test hasTag(result, "project" => "immune-escape")
+                @test !isempty(tagsTable(result))
+                untag!(result, "project")
+                @test !hasTag(cal, "project")
 
                 tag!(cal, "project" => "immune-escape")
                 @test tags(cal)["project"] == ["immune-escape"]

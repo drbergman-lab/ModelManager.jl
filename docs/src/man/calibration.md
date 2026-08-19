@@ -151,7 +151,7 @@ result = resumeABC(Calibration(calibration_id))   # no need to re-supply the pro
 ## Finding your runs again
 
 Every calibration in the project is listed by [`calibrationsTable`](@ref) — when it ran, which
-method, and the description you gave it:
+method, and how it was labelled:
 
 ```julia
 calibrationsTable()
@@ -171,15 +171,20 @@ Calibration (ID=3):
   Final ε:     0.031
 ```
 
-Runs can be [tagged](@ref tagging) like anything else, which is the durable way to record what a
-calibration was *for*:
+Label runs with [tags](@ref tagging) rather than the `description=` keyword. Tags are queryable,
+hold several values per key, and can be applied retroactively — you rarely know what a run was
+*for* until you have looked at it — whereas `description` is a single free-text column that nothing
+can search. It is still written and still displayed, so older runs keep what they recorded.
 
 ```julia
-tag!(result.calibration, "project" => "immune-escape", "purpose" => "figure")
+tag!(result, "project" => "immune-escape", "purpose" => "figure")
 
 findTrials(Calibration; tags = ("project" => "immune-escape",))
 findTrials(Calibration; tags = ("mm:method" => "ABCSMC",))
 ```
+
+`tag!` and the accessors below take the [`ABCResult`](@ref) that [`runABC`](@ref) returns, so
+`result.calibration` is never needed — the same courtesy [`MMOutput`](@ref) extends for a trial.
 
 ## Working with a run's simulations
 
@@ -187,8 +192,8 @@ The monads a run evaluated are addressable as [`Sampling`](@ref) views — over 
 over one generation:
 
 ```julia
-sampling = Sampling(result.calibration)       # every monad the run evaluated
-gen3     = Sampling(result.calibration, 3)    # just generation 3
+sampling = Sampling(result)       # every monad the run evaluated
+gen3     = Sampling(result, 3)    # just generation 3
 
 simulationsTable(sampling; tags = true)
 run(gen3; n_replicates = 5)                   # top up the replicates of one generation
@@ -205,9 +210,9 @@ is why a calibration is addressable this way without being part of the hierarchy
 To read the IDs without recording anything, use the accessors:
 
 ```julia
-monadIDs(result.calibration)         # surviving monads, in generation order
-monadIDs(result.calibration, 3)      # one generation's
-simulationIDs(result.calibration)    # every simulation of the run
+monadIDs(result)         # every surviving monad, sorted
+monadIDs(result, 3)      # one generation's
+simulationIDs(result)    # every simulation of the run
 ```
 
 A monad that lost every one of its simulations was deleted when it emptied, so it is absent from
@@ -224,7 +229,7 @@ all of these — the views describe what the run actually produced.
 [`deleteCalibration`](@ref) removes the record and its folder, keeping the simulations:
 
 ```julia
-deleteCalibration(result.calibration)               # bookkeeping only
+deleteCalibration(result)                           # bookkeeping only
 deleteCalibration(3; delete_subs = true)            # and every monad it evaluated
 ```
 
