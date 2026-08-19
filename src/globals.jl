@@ -167,11 +167,9 @@ function assertInitialized()
     @assert isInitialized() "The model manager has not been initialized for a project. Please run `initializeModelManager` first."
 end
 
-#! Every early return from `initializeModelManager` funnels through here so that a failed
-#! initialization cannot leave a half-configured project behind. Clearing `initialized` is the
-#! load-bearing part: a failure *after* an earlier success would otherwise leave
-#! `isInitialized()` true over an empty in-memory database, and every later query would quietly
-#! read from it instead of reporting that there is no project.
+#! Every early return from `initializeModelManager` funnels through here. `initialized` is already
+#! cleared on entry, so clearing it again is belt-and-braces; the reset that matters here is
+#! dropping `data_dir` and the connection, so a later query cannot read a half-configured project.
 function _abortInitialization()
     close(centralDB())
     mm_globals().db = SQLite.DB()
@@ -223,9 +221,8 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().simulator = simulator
     mm_globals().data_dir = abspath(normpath(data_dir))
 
-    #! Cleared up front, not just on the failure paths: from here until `initializeDatabase`
-    #! succeeds there is no usable project, and a stale `true` left over from a previous
-    #! project would make `isInitialized()` vouch for this one.
+    #! From here until `initializeDatabase` succeeds there is no usable project, so a stale `true`
+    #! left over from a previous one must not make `isInitialized()` vouch for this one.
     mm_globals().initialized = false
 
     #! Provenance, hint, and trash-staging latches are per-project: a new project in the

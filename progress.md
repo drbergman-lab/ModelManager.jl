@@ -355,6 +355,36 @@ Interface surface across the whole PR: **one required method removed** (`package
 name renamed (`getPackageVersion` → `getInstalledVersion`), and none added — having opened by
 proposing a new public hook.
 
+### Final correctness-and-terseness pass
+Reviewed the whole PR across six dimensions with adversarial verification of every candidate;
+45 of 49 findings survived. Most were prose that described an earlier revision — unsurprising after
+five reshapes — but four were substantive:
+
+1. **A warning promised an outcome it could not know.** `_warnLoadedDiffersFromInstalled` said "The
+   database will be migrated to <loaded>", but it fires before `db_version` is read, and the very
+   next branch can refuse and return `false`. A user could be told the database would be migrated
+   and then told the project could not be opened. Now states the policy ("Migrations target
+   <loaded>"), which is true in every branch including the fresh-database stamp.
+2. **A comment asserted an invariant its branch does not establish.** The `loaded < installed`
+   branch claimed the session "already has a new enough package installed", but `installed` can also
+   be below `db_version` (loaded 0.1, installed 0.5, database 0.9), in which case restarting is
+   necessary but not sufficient. The comment now says so.
+3. **`resolvePackageVersion` can throw where the docstring promises `false`.** See the open item
+   below.
+4. **A vacuous assertion.** `@test _milestone_calls[] == 0` after a refused `upgradePackage` was
+   staged with an *empty* milestone list, so `pending` was empty whether the guard fired or not.
+   Given a milestone in range it is now evidence: mutating the guard out fails three assertions
+   where it previously failed two.
+
+Also corrected: the `#!` in the `@ref` guard testset still said the detachment trap was limited to
+one-line definitions, contradicting the CLAUDE.md correction made earlier in the same PR; and
+CLAUDE.md's illustration of that trap was built from `packageName`, which this PR deletes.
+
+PRD.md had two bullets in direct contradiction — one still describing the removed
+installed-version fallback, four lines above the bullet describing the short-circuit that replaced
+it — plus the same claim repeated as an acceptance criterion, a `upgradePackage(sim; auto_upgrade)`
+signature that never existed, and two references to the removed `loadedPackageVersion`.
+
 ### The docstring-detaching comment is not limited to one-line definitions
 Same trap as last round, and this time it exposed an error in what I had written into CLAUDE.md.
 I had recorded that an intervening comment detaches a docstring from a **one-line** definition;

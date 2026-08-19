@@ -20,7 +20,7 @@ simulator type:
 
 - versions match → nothing to do;
 - the database is older → [`upgradePackage`](@ref) runs the migration chain;
-- the database is newer → initialization stops, since the running code is behind the schema;
+- the database is newer → initialization stops;
 - with `auto_upgrade=false` (the default), the backend may prompt before applying large or
   destructive changes.
 
@@ -29,8 +29,8 @@ simulator type:
 Changing the environment while a session runs — `Pkg.update()`, `Pkg.add`, or editing a
 `develop`ed package's `version` — leaves the manifest advertising one version while the session
 still executes another. ModelManager warns and migrates the database to the version it is
-running. **Restart Julia** to load the newer version; the next session migrates the rest of the
-way on its own. `Revise` does not help, as it revises method bodies rather than the version a
+running. **Restart Julia** to pick up the installed version; if it is ahead of the database, the
+next session migrates the rest of the way on its own. `Revise` does not help, as it revises method bodies rather than the version a
 session recorded when it loaded the package.
 
 ## The milestone chain

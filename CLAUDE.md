@@ -145,16 +145,17 @@ holds for **every** definition form; `f(x) = x` and `function f(x) ... end` beha
 
 ```julia
 """
-    packageName(sim)
+    dbVersionTableName(sim)
 ...
 """
 #! This comment detaches the docstring above from the definition below.
-packageName(sim::AbstractSimulator) = string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))
+dbVersionTableName(sim::AbstractSimulator) = "my_version"
 ```
 
-Put the `#!` block **above** the docstring instead. The symptom is otherwise a
-`:cross_references` failure on every `@ref` to that name, which reads as a problem with the
-*referring* docstrings rather than the defining one.
+Put the `#!` block **above** the docstring instead. The symptom is otherwise the
+`"docstrings only @ref public bindings"` testset failing on every `@ref` to that name, reported
+against the *referring* docstrings rather than the defining one — and, if that testset is skipped,
+a `:cross_references` failure in the docs build.
 
 ### Writing a new docstring
 

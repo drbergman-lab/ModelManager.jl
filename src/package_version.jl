@@ -9,9 +9,7 @@ Return the version of `sim`'s package as installed in the active environment —
 Not necessarily the version running: migrations target the version loaded in this session, and
 the two differ when the environment changes while a session is open.
 
-The package is identified by the module defining `typeof(sim)`, and looked up by its UUID. If
-that package is the active project (i.e. running tests from within it), `Pkg.project().version`
-is returned directly; otherwise it is read from the environment's dependencies.
+The package is the one defining `typeof(sim)`.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -33,11 +31,10 @@ function getInstalledVersion(sim::AbstractSimulator)::VersionNumber
         "$(nameof(typeof(sim))) is not defined in a package, so it has no installed version. " *
         "Define it inside the package whose schema the database tracks."
     ))
-    #! Keyed on the UUID rather than the name, which is what makes this exact: two loaded packages
-    #! can share a name, and a name scan would take whichever match it reached first.
-    #! Two contexts, and neither covers the other: running from the package's own project it is
-    #! not among its own dependencies but is `Pkg.project()`; under `Pkg.test()` the temp
-    #! environment has no project name at all and the package appears as a dependency.
+    #! Keyed on the UUID, not the name: two loaded packages can share a name.
+    #! Two contexts, and neither covers the other: from the package's own project it is `Pkg.project()`
+    #! and absent from its own dependencies; under `Pkg.test()` it is a dependency of a temp
+    #! environment whose own uuid is `nothing`.
     proj = Pkg.project()
     proj.uuid == uuid && return proj.version
     deps = Pkg.dependencies()
@@ -47,19 +44,14 @@ function getInstalledVersion(sim::AbstractSimulator)::VersionNumber
     return deps[uuid].version
 end
 
-#! The package whose version the database tracks: the one defining the simulator type. That is not
-#! a choice a backend gets to make — `upgradeMilestones` and `upgradeToMilestone` dispatch on the
-#! simulator type, so the code owning the schema is the code defining that type, and its version is
-#! the schema version. Taking the module directly, rather than looking a name up in
-#! `Base.loaded_modules`, means no name can be ambiguous and no Base registry internals are needed.
-#! `moduleroot` so that a type defined in a submodule reports its package.
-#! Overridable in principle but not part of the interface: the test suite points its stub simulator
-#! at ModelManager, which is the only reason it is a function rather than inlined.
+#! Not a choice a backend gets to make: `upgradeMilestones` and `upgradeToMilestone` dispatch on the
+#! simulator type, so the code owning the schema is the code defining that type. `moduleroot` so a
+#! type in a submodule reports its package. A function rather than inlined only so the test suite can
+#! point its stub simulator at ModelManager.
 _packageModule(sim::AbstractSimulator) = Base.moduleroot(parentmodule(typeof(sim)))
 
-#! `nothing` when the defining module belongs to no versioned package — a simulator written in a
-#! script or at the REPL. Read from the loaded module, never from the environment: substituting the
-#! installed version for the running one is the conflation this machinery exists to avoid.
+#! `nothing` when that module belongs to no versioned package — a simulator written in a script or
+#! at the REPL. Deliberately no fallback to the installed version.
 _loadedPackageVersion(sim::AbstractSimulator) = pkgversion(_packageModule(sim))
 
 ########################################################
@@ -70,10 +62,9 @@ _loadedPackageVersion(sim::AbstractSimulator) = pkgversion(_packageModule(sim))
 #!   installed  — recorded in the active environment's manifest (`getInstalledVersion`)
 #!   loaded     — running in this session (`_loadedPackageVersion`); the migration target
 #!   db_version — recorded in the project database (`getDBPackageVersion`)
-#! Messages are emitted here rather than at their call sites so the level and the phrasing cannot
-#! drift apart, as they did when these were `println`s spread across two files.
-#! Every case below is caused by changing versions with `Pkg` mid-session, so each says so —
-#! without it the user has no way to connect the message to what they did.
+#! Emitted here rather than at the call sites so the level and the phrasing stay consistent.
+#! Where a mid-session `Pkg` change is the cause, the message says so — otherwise the user has no
+#! way to connect it to what they did.
 #! `continueMilestoneUpgrade` is the deliberate exception: a `readline` follows it, and a prompt
 #! cannot go through a logger.
 
@@ -82,8 +73,8 @@ _loadedPackageVersion(sim::AbstractSimulator) = pkgversion(_packageModule(sim))
 #! differ — a mid-session `Pkg` change can move the environment in either direction.
 _warnLoadedDiffersFromInstalled(name, installed, loaded) = @warn """
     $(name) $(installed) is installed but $(loaded) is loaded here, because the environment
-    changed with Pkg after the package was loaded. The database will be migrated to $(loaded),
-    matching the code that is running. Restart Julia to load $(installed).
+    changed with Pkg after the package was loaded. Migrations target $(loaded), matching the code
+    that is running. Restart Julia to load $(installed).
     """ maxlog=1
 
 _warnLoadedBehindDatabase(name, loaded, installed, db_version) = @warn """
@@ -115,9 +106,8 @@ _errorTargetBeyondLoaded(name, target, loaded) = @error """
 
 Return the package version recorded in `db` under [`dbVersionTableName`](@ref)`(sim)`.
 
-If the table does not exist it is created and stamped with the version this session is
-running, which is the version whose code builds the schema. Throws if that version cannot be
-determined, since there is then nothing to record.
+If the table does not exist it is created and stamped with the version this session is running.
+Throws if that version cannot be determined.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -136,7 +126,6 @@ function getDBPackageVersion(sim::AbstractSimulator, db::SQLite.DB)::VersionNumb
     if tableExists(table; db=db)
         return queryToDataFrame("SELECT * FROM $(table);"; db=db) |> x -> VersionNumber(x.version[1])
     end
-    #! The loaded version, since that is the code building this database's schema.
     version = _loadedPackageVersion(sim)
     isnothing(version) && throw(ArgumentError(
         "Cannot record a version for $(nameof(typeof(sim))): it is not defined in a versioned " *
@@ -154,9 +143,8 @@ end
 Compare the version recorded in `db` with the version loaded in this session and upgrade to it
 if needed. Returns `true` when the database is ready to use, `false` when it is not.
 
-Migrations target the loaded version because [`upgradeMilestones`](@ref) comes from the loaded
-code. When it cannot be determined at all, the project opens unmigrated and untracked, with a
-warning — there is no way to tell which milestones belong to the running code.
+When no loaded version can be determined, the project opens unmigrated and untracked, with a
+warning.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -166,8 +154,9 @@ warning — there is no way to tell which milestones belong to the running code.
 - `auto_upgrade::Bool=false`: apply migrations without prompting.
 
 # Returns
-`true` if the database is at the target version (already, or after a successful migration);
-`false` if the database is ahead of the loaded version, or a migration failed.
+`true` if the database is at the loaded version, already or after a successful migration, and
+also when no loaded version can be determined; `false` if the database is ahead of the loaded
+version, or a migration failed.
 
 # Example
 ```julia
@@ -176,8 +165,6 @@ ModelManager.resolvePackageVersion(simulator(), centralDB(); auto_upgrade=true)
 """
 function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
                                auto_upgrade::Bool=false)::Bool
-    #! The package's own name, not a backend-supplied one: messages should never be able to
-    #! disagree with the package whose version they are reporting.
     name   = nameof(_packageModule(sim))
     loaded = _loadedPackageVersion(sim)
 
@@ -196,9 +183,9 @@ function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
     db_version = getDBPackageVersion(sim, db)
 
     if loaded < db_version
-        #! Which remedy applies turns on whether restarting would help: a session running older
-        #! code than the environment holds already has a new enough package installed, so telling
-        #! it to upgrade would send the user in circles.
+        #! A session behind the environment must restart before anything else; telling it to
+        #! upgrade would send the user in circles. Restarting may not be sufficient — `installed`
+        #! can also be below `db_version` — in which case the next session reports that instead.
         if loaded < installed
             _warnLoadedBehindDatabase(name, loaded, installed, db_version)
         else

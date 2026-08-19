@@ -58,8 +58,8 @@ ModelManager._packageModule(::TestSimulator)     = ModelManager
 ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
 
 # Overridable so the migration tests can stage a mid-session package update. Three settings:
-#   :default          — what the real hook resolves to for TestSimulator. Its type lives in Main,
-#                       so the default resolves via _packageModule to the loaded ModelManager.
+#   :default          — what _loadedPackageVersion resolves to for TestSimulator, whose
+#                       _packageModule override above points at ModelManager.
 #   a VersionNumber   — a staged loaded version, i.e. a mid-session Pkg change.
 #   nothing           — genuinely undeterminable, exercising the short-circuit path.
 const _loaded_version_override = Ref{Any}(:default)
@@ -67,7 +67,7 @@ ModelManager._loadedPackageVersion(sim::TestSimulator) =
     _loaded_version_override[] === :default ? pkgversion(ModelManager._packageModule(sim)) :
                                               _loaded_version_override[]
 
-# Overridable so the guard tests can present a milestone the "loaded" version knows about,
+# Overridable so the migration tests can present a milestone the "loaded" version knows about,
 # and count how many times it was applied.
 const _milestone_override = Ref{Vector{VersionNumber}}(VersionNumber[])
 const _milestone_calls    = Ref(0)
@@ -82,8 +82,8 @@ end
 # required.
 struct _NoModuleSimulator <: AbstractSimulator end
 
-# A simulator type inside a submodule, for checking that _packageModule resolves to the
-# enclosing package instead of stopping at the submodule.
+# A simulator type inside a submodule, for checking that _packageModule walks up to the root
+# module instead of stopping at the immediate parent.
 module _NestedSimModule
     import ModelManager
     struct NestedSimulator <: ModelManager.AbstractSimulator end
@@ -2185,17 +2185,11 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 try
                     # --- the default hooks ------------------------------------------------
                     # A type outside any package resolves to Main, which is a loaded module but
-                    # carries no version. That path is what every project in the suite depends on
-                    # behaving predictably.
+                    # carries no version.
                     @test ModelManager._loadedPackageVersion(_NoModuleSimulator()) === nothing
-                    # moduleroot rather than a bare parentmodule is what makes the submodule case
-                    # resolve to the package.
-                    @test parentmodule(_NestedSimModule.NestedSimulator) !=
-                          Base.moduleroot(parentmodule(_NestedSimModule.NestedSimulator))
-                    # The name used in messages comes from that module, so it cannot disagree with
-                    # the package whose version is being reported.
-                    @test nameof(ModelManager._packageModule(TestSimulator())) === :ModelManager
-                    @test nameof(ModelManager._packageModule(_NoModuleSimulator())) === :Main
+                    # The fixture below is a genuine submodule, so resolving it exercises the
+                    # moduleroot walk rather than a bare parentmodule.
+                    @test parentmodule(_NestedSimModule.NestedSimulator) !== Main
 
                     # --- the migration target ---------------------------------------------
                     # The loaded version is the target. For TestSimulator the default resolves via
@@ -2210,7 +2204,9 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # and no version.
                     @test ModelManager._packageModule(_NoModuleSimulator()) === Main
                     @test Base.PkgId(Main).uuid === nothing
-                    # A type in a submodule resolves to the enclosing package, not the submodule.
+                    # A type in a submodule resolves to the root module, not the immediate parent.
+                    # Here that root is Main; the package case is covered by the fixture package
+                    # exercised outside the suite.
                     @test ModelManager._packageModule(_NestedSimModule.NestedSimulator()) === Main
                     # The installed lookup is keyed on that module's UUID, so it agrees with the
                     # module's own reported version rather than searching by name.
@@ -2243,7 +2239,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                             TestSimulator(), centralDB())
                     end
 
-                    # Versions agree: nothing to do.
+                    # Versions agree, so the recorded version is left where it is.
                     _loaded_version_override[] = installed
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()
@@ -2261,8 +2257,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.5.0"
 
                     # A project created for the first time mid-update is stamped with the loaded
-                    # version too. getDBPackageVersion stamps a fresh database itself, so this
-                    # is the route that corrupts with no re-initialization involved at all.
+                    # version too. getDBPackageVersion stamps a fresh database itself, so this route
+                    # never passes through the migration path at all.
                     mktempdir() do fresh_dir
                         _make_test_project(fresh_dir)
                         _loaded_version_override[] = v"0.5.0"
@@ -2308,7 +2304,9 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     ModelManager.DBInterface.execute(centralDB(),
                                                      "UPDATE $(table) SET version='0.1.0';")
                     _loaded_version_override[] = v"0.1.0"
-                    _milestone_override[] = VersionNumber[]
+                    # A milestone *in range*, so the call count is evidence: without the guard,
+                    # pending would be [0.2.0] and upgradeToMilestone would run.
+                    _milestone_override[] = [v"0.2.0"]
                     _milestone_calls[] = 0
                     @test !ModelManager.upgradePackage(TestSimulator(), centralDB(),
                                                        v"0.1.0", v"0.2.0", true)
@@ -4510,10 +4508,9 @@ end
 
         docs_meta = Docs.meta(ModelManager)
         #! Public is necessary but not sufficient: Documenter resolves an `@ref` against a rendered
-        #! *docstring*, so a public binding that carries none fails the docs build just as a private
-        #! one does. That is easy to cause by accident — a comment between a docstring and a
-        #! one-line definition silently detaches it — and it surfaced only in the docs job before
-        #! this check existed.
+        #! *docstring*, so a public binding carrying none fails a build just as a private one does.
+        #! Easy to cause by accident, since a comment between a docstring and its definition
+        #! silently detaches it.
         isDocumented(target) = haskey(docs_meta, Docs.Binding(ModelManager, target))
 
         violations = Tuple{Symbol,String,String}[]
