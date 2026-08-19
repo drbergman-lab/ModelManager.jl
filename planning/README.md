@@ -16,23 +16,42 @@ get sign-off, create its branch ref, and log to `progress.md` as it goes.
 | 2 | [02-id-accessor-symmetry.md](02-id-accessor-symmetry.md) | `monadIDs(::MMOutput)` and accessor gaps | — | **✅ shipped, PR #31.** |
 | 3 | [03-failed-sim-records.md](03-failed-sim-records.md) | Record failed sims for post-hoc inspection | — | **⏭ skipped by the user.** |
 | 4 | [04-calibration-sampling-views.md](04-calibration-sampling-views.md) | Calibration as a poset of `Sampling` views; taggable `Calibration` | — | **✅ shipped, PR #32.** Its gate on #5–#8 is satisfied. |
-| 5 | [05-calibration-api-and-tagging.md](05-calibration-api-and-tagging.md) | Unify `runABC`/`runCalibration`/`resumeABC`/`ABCSMC`; `description` vs tags | Med | **Gate for #6–#8.** Settles the keyword surface. Fixes a live crash. |
-| 6 | [06-distance-distribution-plot.md](06-distance-distribution-plot.md) | Distance histogram with accepted tail; unambiguous epsilon names | Med | Persistence first, recipe second. |
-| 7 | [07-shared-study-objects.md](07-shared-study-objects.md) | Build once, use for sensitivity and calibration | Low→Med per stage | Staged. Stage 1 is independently valuable and gates #8. |
-| 8 | [08-bayesflow-scoping.md](08-bayesflow-scoping.md) | BayesFlow options + training-set export | Low-Med | Last. Decision document plus one concrete increment. |
+| 5 | [05-calibration-api-and-tagging.md](05-calibration-api-and-tagging.md) | Unify `runABC`/`runCalibration`/`resumeABC`/`ABCSMC`; `description` vs tags | Med | **🟡 partially shipped, PR #33 merged.** Remainder listed below. |
+| 6 | [06-distance-distribution-plot.md](06-distance-distribution-plot.md) | Distance histogram with accepted tail; unambiguous epsilon names | Med | **🟡 part 1 open, PR #35** (epsilon naming). Recipe + rejected-distance persistence still to do. |
+| 7 | [07-shared-study-objects.md](07-shared-study-objects.md) | Build once, use for sensitivity and calibration | Low→Med per stage | **🟡 Stage 1 open, PR #34.** Stage 1b (discrete) needs the kernel assessment; Stages 2–4 not started. |
+| 8 | [08-bayesflow-scoping.md](08-bayesflow-scoping.md) | BayesFlow options + training-set export | Low-Med | **Not started.** Unblocked by #34. |
 
-## Remaining work, as of PR #32
+## Status, as of PR #33 merged
 
-Items 1, 2 and 4 are merged. With 4 in `main`, the chain collapses to three independent roots:
+Merged: **#30** (item 1), **#31** (item 2), **#32** (item 4), **#33** (item 5, partial).
+Skipped: item 3. Open: **#34** (item 7 Stage 1), **#35** (item 6 part 1).
 
-```
-main
-├─ 5 ──▶ 6        5 also gates 7's Stage 2+
-└─ 7 Stage 1 ──▶ 8
-```
+### Outstanding, concretely
 
-Three PRs can target `main` directly (3, 5, 7-Stage-1); 6 and 8 follow their parents. Stacking is only worth
-it for `5→6` and `7s1→8`, and even there a plain rebase-on-merge is usually cheaper than maintaining a stack.
+**Item 5 remainder** — brief 05 sections not covered by #33:
+- the duplicated setup block shared by `runCalibration` and `resumeABC` (verbosity, failure policy,
+  param names/priors, bank, batch evaluator, generation callback — still written out twice)
+- `resumeABC` → `resumeCalibration`, method-agnostic, with a `depwarn` shim
+- the `CalibrationProblem` `AbstractMonad` constructor's missing `reference_variation_id` keyword
+- the export manifest in `src/ModelManager.jl` (omits `CalibrationParameter` and `SimulationBank`)
+- *(`docs/src/man/calibration.md:107` self-resolved — #33 made that example true)*
+
+**Item 6 remainder** — the larger half, after #35:
+- persist rejected-proposal distances (`generation_{NNN}_proposals.csv`); they are discarded at
+  acceptance time today, so the requested histogram is not producible from stored data
+- the `_DistanceData` builder and `:distances` recipe, with bin edges computed in the builder
+- first-ever tests for the four existing calibration recipes, none of which is currently tested
+- fix `docs/src/man/calibration.md:158-161` and `README.md:79` (`plot_type=` does not exist)
+
+**Item 7 remainder**:
+- Stage 1b — discrete-parameter convergence. Blocked on assessing the four perturbation kernels:
+  they fit a covariance in ℝᵈ and the importance weights need a proposal density, so a discrete
+  coordinate needs a categorical or random-walk proposal. That assessment decides progress-vs-retreat.
+- Stages 2–4 — `StudySpec`, the `QoI` seam, the simulator-kwargs convention. **Review on #34 raised
+  the framing point that GSA usually comes first, so the shared object must be the light one; that is
+  what `StudySpec` is for, and the vector of `AbstractVariation`s already serves the parameter half.**
+
+**Item 8**: not started; unblocked by #34.
 
 ## Parallelism
 
