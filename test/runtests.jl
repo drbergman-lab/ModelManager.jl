@@ -2914,7 +2914,14 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @testset "coalesced Sampling views over a calibration" begin
                 # _test_nonzero_ss keeps every distance at 1.0, so the run does not converge in
                 # generation 1 and there really are several generations to coalesce over.
-                dv       = DistributedVariation(:config, xp_x, Uniform(30.0, 32.0))
+                #
+                # Ranges for the calibration testsets below live in 100-117, disjoint from each
+                # other and from every value another testset pins as a fixed DiscreteVariation.
+                # Generation 1 proposes Sobol' points and the first CDF draw is exactly 0.5, so
+                # Uniform(a, b) deterministically evaluates a monad at (a+b)/2 and runs it to
+                # completion — which silently hands a later `createTrial` at that value a
+                # completed monad through `use_previous=true`.
+                dv       = DistributedVariation(:config, xp_x, Uniform(100.0, 102.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_nonzero_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
@@ -2994,7 +3001,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # three monad sets coincide. Exact-set matching then returns the row the batch
                 # already created rather than inserting a duplicate for the same monads — which
                 # is the property that makes coalescing safe in the first place.
-                dv       = DistributedVariation(:config, xp_x, Uniform(45.0, 47.0))
+                dv       = DistributedVariation(:config, xp_x, Uniform(115.0, 117.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
@@ -3021,7 +3028,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # every simulation failed — so without the survival filter a run with any total
                 # monad failure could not be viewed at all. This is also the regression test for
                 # the file filter: the deleted IDs are exactly what `_failed_monads.csv` holds.
-                dv       = DistributedVariation(:config, xp_x, Uniform(33.0, 35.0))
+                dv       = DistributedVariation(:config, xp_x, Uniform(103.0, 105.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=6, max_nr_populations=1, minimum_epsilon=0.0)
@@ -3050,7 +3057,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             end
 
             @testset "calibration runs are taggable" begin
-                dv       = DistributedVariation(:config, xp_x, Uniform(36.0, 38.0))
+                dv       = DistributedVariation(:config, xp_x, Uniform(106.0, 108.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
@@ -3179,7 +3186,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             end
 
             @testset "show(::Calibration)" begin
-                dv       = DistributedVariation(:config, xp_x, Uniform(39.0, 41.0))
+                dv       = DistributedVariation(:config, xp_x, Uniform(109.0, 111.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
@@ -3216,7 +3223,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             end
 
             @testset "deleteCalibration" begin
-                dv       = DistributedVariation(:config, xp_x, Uniform(42.0, 44.0))
+                dv       = DistributedVariation(:config, xp_x, Uniform(112.0, 114.0))
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
@@ -3251,6 +3258,24 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # Deleting nothing is a no-op, not an error.
                 @test isnothing(deleteCalibration(Int[]))
+
+                # Every form in the docstring dispatches: an ID, a vector of IDs, a Calibration,
+                # a vector of them, and the ABCResult. Built with `createCalibration` rather than
+                # by running one — these need a row and a folder, not simulations, and later
+                # testsets in this block depend on the monads present (see the reusability filter
+                # testset, which reserves a parameter value for itself).
+                bare3 = ModelManager.createCalibration("ABC-SMC"; description="by result")
+                res3 = ABCResult(bare3, ModelManager.GenerationResult[],
+                                 ModelManager.CalibrationParameter[], method)
+                @test isdir(ModelManager.calibrationFolder(bare3))
+                deleteCalibration(res3)
+                @test isempty(calibrationsTable([bare3.id]))
+                @test !isdir(ModelManager.calibrationFolder(bare3))
+
+                cal4 = ModelManager.createCalibration("ABC-SMC"; description="by vector")
+                cal5 = ModelManager.createCalibration("ABC-SMC"; description="by vector 2")
+                deleteCalibration([cal4, cal5])
+                @test isempty(calibrationsTable([cal4.id, cal5.id]))
             end
 
             @testset "runCalibration progress levels" begin

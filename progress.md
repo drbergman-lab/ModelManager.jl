@@ -626,6 +626,41 @@ index. Left for its own change so this one stays reviewable.
   `simulationIDs` are the public accessors, so no name needed promoting to `@compat public` just to
   keep a docstring hyperlink alive.
 
+### Test isolation: Sobol' determinism, not rowid reuse
+
+A pre-existing testset (`"reusability filter — started or completed simulations"`) broke while
+answering review, and the first read of it was wrong — worth recording both the wrong and the right
+diagnosis, because the wrong one is the tempting one.
+
+The symptom: a monad created *after* another came back with a *lower* ID and was reported as having
+started simulations. That looks exactly like rowid reuse, and rowid reuse is real here — probed
+directly: delete a monad with `delete_subs=true`, create another, and the new monad gets the deleted
+one's ID *and* its simulation IDs (`monad id 1 → 1`, `sims [1,2] → [1,2]`). But that was not the
+cause, and the new monad was still correctly reported as not started, because its simulation rows are
+new and carry `Not Started`.
+
+The actual cause is `Sobol'` determinism. Generation 1 proposes Sobol' points, and the first CDF draw
+is exactly `0.5`, so `Uniform(a, b)` deterministically evaluates a monad at `(a+b)/2` and runs it to
+completion. The testset reserves the fixed value `43.0` for a monad it needs to be *unrun* — and a
+calibration testset added here used `Uniform(42.0, 44.0)`, whose midpoint is exactly `43.0`. The
+completed monad was then handed straight back through `use_previous=true`, so `unrun` was not unrun.
+
+It had been passing only by accident of ordering: the same range's earlier `delete_subs=true` call
+happened to delete that monad again before the reusability testset ran. Adding two more deletion-form
+cases after it removed the accident.
+
+Fixed on the right side of the boundary — the six calibration ranges added here moved into 100–117,
+disjoint from each other and from every value another testset pins as a fixed `DiscreteVariation`
+(0.5, 1, 7, 31, 41, 42, 43, then nothing until 311). Two of the original six were colliding:
+`Uniform(42,44)` → 43.0 (`reusability filter`) and `Uniform(30,32)` → 31.0
+(`_batchOutcome classifies a batch`). The rule is now stated in a comment at the first range, since
+nothing else in the file says that a *continuous* prior in a calibration test still pins an exact
+parameter value.
+
+The deletion-form cases themselves were also rebuilt to use `createCalibration` and a hand-made
+`ABCResult` rather than three more real runs: they need a row and a folder, not simulations, and not
+creating monads is the cheaper way to stay out of a shared project's way.
+
 ### Review follow-ups (PR #32)
 
 **Rowid reuse is a real aliasing risk, and it is repo-wide rather than mine.** Review asked whether

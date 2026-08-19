@@ -91,8 +91,8 @@ _generationMonadFiles(calibration::Calibration) =
                             r"^generation_(\d+)_monads\.csv$")
 
 """
-    calibrationMonadIDs(calibration::Calibration) → Vector{Int}
-    calibrationMonadIDs(calibration::Calibration, generation::Integer) → Vector{Int}
+    calibrationMonadIDs(calibration::Calibration[, generation::Integer]) → Vector{Int}
+    calibrationMonadIDs(result::ABCResult[, generation::Integer]) → Vector{Int}
 
 Sorted monad IDs recorded for a calibration run, read from
 `generations/generation_{NNN}_monads.csv`.
@@ -133,8 +133,8 @@ function _survivingMonadIDs(monad_ids::AbstractVector{<:Integer})
 end
 
 """
-    monadIDs(calibration::Calibration)
-    monadIDs(calibration::Calibration, generation::Integer)
+    monadIDs(calibration::Calibration[, generation::Integer])
+    monadIDs(result::ABCResult[, generation::Integer])
 
 Sorted IDs of the monads a calibration run evaluated, or those of one generation.
 
@@ -153,8 +153,8 @@ monadIDs(calibration::Calibration, generation::Integer) =
     _survivingMonadIDs(calibrationMonadIDs(calibration, generation))
 
 """
-    simulationIDs(calibration::Calibration)
-    simulationIDs(calibration::Calibration, generation::Integer)
+    simulationIDs(calibration::Calibration[, generation::Integer])
+    simulationIDs(result::ABCResult[, generation::Integer])
 
 IDs of every simulation a calibration run produced, or one generation's.
 
@@ -174,8 +174,8 @@ simulationIDs(calibration::Calibration, generation::Integer) =
 ################## Coalesced Sampling views ##################
 
 """
-    Sampling(calibration::Calibration)
-    Sampling(calibration::Calibration, generation::Integer)
+    Sampling(calibration::Calibration[, generation::Integer])
+    Sampling(result::ABCResult[, generation::Integer])
 
 A [`Sampling`](@ref) over the monads a calibration run evaluated — all of them, or one
 generation's — so a run can go anywhere a trial can.
@@ -255,10 +255,12 @@ calibrationMonadIDs(result::ABCResult, generation::Integer) =
 
 """
     calibrationsTable(; tags=false, include_auto_tags=false)
-    calibrationsTable(calibration_ids; kwargs...)
-    calibrationsTable(calibration_or_result, ...; kwargs...)
+    calibrationsTable(target...; kwargs...)
 
 One row per calibration run: `CalibrationID`, `DateTime`, `Method`, `Description`.
+
+`target` may be a vector of calibration IDs, one or more [`Calibration`](@ref)s, a vector of them,
+or the [`ABCResult`](@ref) [`runABC`](@ref) returns. Omitted, every run in the project.
 
 Per-generation convergence numbers are [`ConvergenceSummary`](@ref); the parameters themselves
 [`posterior`](@ref).
@@ -367,10 +369,12 @@ end
 ################## Deletion ##################
 
 """
-    deleteCalibration(calibration_ids; delete_subs=false)
-    deleteCalibration(calibration_or_result; kwargs...)
+    deleteCalibration(target; delete_subs=false)
 
 Delete calibration runs: the `calibrations` database row, its tags, and its output folder.
+
+`target` may be a calibration ID, a vector of IDs, a [`Calibration`](@ref), a vector of them, or
+the [`ABCResult`](@ref) [`runABC`](@ref) returns.
 
 `delete_subs` defaults to `false`, unlike the trial-level deleters — a run's monads are shared,
 through the [`SimulationBank`](@ref) and `use_previous`, so they may predate it and outlive it.
