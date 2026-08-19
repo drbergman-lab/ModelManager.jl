@@ -355,6 +355,19 @@ Interface surface across the whole PR: **one required method removed** (`package
 name renamed (`getPackageVersion` → `getInstalledVersion`), and none added — having opened by
 proposing a new public hook.
 
+### Released as 0.9.0, not a patch
+Two exported/public names disappear here — `getPackageVersion` (renamed `getInstalledVersion`) and
+`packageName` — so under 0.x semver this is a minor bump, not a patch.
+
+The bump is also what decouples this from PCMM. PCMM implements `packageName`, and a qualified
+method definition on a name the host no longer has fails at precompile. With a compat bound of
+`ModelManager = "0.8"` meaning `>=0.8.0, <0.9.0`, releasing 0.9.0 keeps PCMM resolving the old
+version and working untouched, so its maintainer raises the bound and deletes the method together.
+Releasing this as 0.8.5 would instead break PCMM the moment it resolved.
+
+The `v0.8.4` mentions in `src/hpc.jl` and `PRD.md` are unaffected — they name the release the
+`run_on_hpc` auto-detection fix shipped in, not the current version.
+
 ### Final correctness-and-terseness pass
 Reviewed the whole PR across six dimensions with adversarial verification of every candidate;
 45 of 49 findings survived. Most were prose that described an earlier revision — unsurprising after
