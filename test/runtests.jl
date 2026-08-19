@@ -51,10 +51,50 @@ ModelManager.simulatorInfo(::TestSimulator) = "TestSimulator (stub)"
 ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
 
 # ---- Package version / upgrade ----------------------------------------------
-ModelManager.packageName(::TestSimulator)       = "ModelManager"
+# TestSimulator is defined in Main, which carries no version, so point the version machinery at
+# ModelManager itself. This is the seam a real backend never needs: its simulator type lives in
+# the package whose schema the database tracks, so the default already resolves.
+ModelManager._packageModule(::TestSimulator)     = ModelManager
 ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
-ModelManager.upgradeMilestones(::TestSimulator)  = VersionNumber[]
-ModelManager.upgradeToMilestone(::TestSimulator, args...) = true
+
+# Overridable so the migration tests can stage a mid-session package update. Three settings:
+#   :default          — what _loadedPackageVersion resolves to for TestSimulator, whose
+#                       _packageModule override above points at ModelManager.
+#   a VersionNumber   — a staged loaded version, i.e. a mid-session Pkg change.
+#   nothing           — genuinely undeterminable, exercising the short-circuit path.
+const _loaded_version_override = Ref{Any}(:default)
+ModelManager._loadedPackageVersion(sim::TestSimulator) =
+    _loaded_version_override[] === :default ? pkgversion(ModelManager._packageModule(sim)) :
+                                              _loaded_version_override[]
+
+# Overridable so the migration tests can present a milestone the "loaded" version knows about,
+# and count how many times it was applied.
+const _milestone_override = Ref{Vector{VersionNumber}}(VersionNumber[])
+const _milestone_calls    = Ref(0)
+ModelManager.upgradeMilestones(::TestSimulator) = _milestone_override[]
+function ModelManager.upgradeToMilestone(::TestSimulator, args...)
+    _milestone_calls[] += 1
+    return true
+end
+
+# Module-level type with no override, used to exercise the *default* _loadedPackageVersion and
+# _packageModule. The TestSimulator overrides above shadow the defaults, so separate types are
+# required.
+struct _NoModuleSimulator <: AbstractSimulator end
+
+# Reaches getInstalledVersion's throw: a resolvable loaded version (so resolvePackageVersion does
+# not short-circuit) whose package module has no UUID (so the installed lookup cannot succeed).
+# Needs no other interface methods -- resolvePackageVersion runs before the inputs and schema steps.
+struct _UninstalledSimulator <: AbstractSimulator end
+ModelManager._packageModule(::_UninstalledSimulator)        = Main
+ModelManager._loadedPackageVersion(::_UninstalledSimulator) = v"1.0.0"
+
+# A simulator type inside a submodule, for checking that _packageModule walks up to the root
+# module instead of stopping at the immediate parent.
+module _NestedSimModule
+    import ModelManager
+    struct NestedSimulator <: ModelManager.AbstractSimulator end
+end
 
 # ---- Trial execution --------------------------------------------------------
 ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
@@ -2139,6 +2179,182 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # the .trash/ staging path instead of rm.
                     mm_globals().run_on_hpc = detected
                 end
+            end
+
+            # Migrations follow the version loaded in the session, not the one installed in the
+            # environment: the milestone list comes from the loaded code, so the loaded release
+            # is the furthest a session can correctly migrate to. Updating the environment
+            # mid-session therefore delays the schema change to the next session rather than
+            # recording a version whose migration never ran.
+            @testset "migration targets the loaded version" begin
+                installed = ModelManager.getInstalledVersion(TestSimulator())
+                table = ModelManager.dbVersionTableName(TestSimulator())
+                try
+                    # --- the default hooks ------------------------------------------------
+                    # A type outside any package resolves to Main, which is a loaded module but
+                    # carries no version.
+                    @test ModelManager._loadedPackageVersion(_NoModuleSimulator()) === nothing
+                    # The fixture below is a genuine submodule, so resolving it exercises the
+                    # moduleroot walk rather than a bare parentmodule.
+                    @test parentmodule(_NestedSimModule.NestedSimulator) !== Main
+
+                    # --- the migration target ---------------------------------------------
+                    # The loaded version is the target. For TestSimulator the default resolves via
+                    # _packageModule to the loaded ModelManager, which here equals the installed one.
+                    _loaded_version_override[] = :default
+                    @test ModelManager._loadedPackageVersion(TestSimulator()) == installed
+                    _loaded_version_override[] = v"0.4.0"
+                    @test ModelManager._loadedPackageVersion(TestSimulator()) == v"0.4.0"
+
+                    # Identity comes from the module defining the type, so no name is involved and
+                    # none can be ambiguous. _NoModuleSimulator resolves to Main, which has no UUID
+                    # and no version.
+                    @test ModelManager._packageModule(_NoModuleSimulator()) === Main
+                    @test Base.PkgId(Main).uuid === nothing
+                    # A type in a submodule resolves to the root module, not the immediate parent.
+                    # Here that root is Main; the package case is covered by the fixture package
+                    # exercised outside the suite.
+                    @test ModelManager._packageModule(_NestedSimModule.NestedSimulator()) === Main
+                    # The installed lookup is keyed on that module's UUID, so it agrees with the
+                    # module's own reported version rather than searching by name.
+                    @test ModelManager.getInstalledVersion(TestSimulator()) ==
+                          pkgversion(ModelManager)
+                    # No package, no installed version -- and it says why.
+                    @test_throws ArgumentError ModelManager.getInstalledVersion(_NoModuleSimulator())
+
+                    # --- resolvePackageVersion --------------------------------------------
+                    # Resolvable loaded version: behaves as it always did.
+                    _loaded_version_override[] = :default
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == installed
+
+                    # No determinable loaded version: the project still opens, but nothing is
+                    # migrated and nothing is recorded, because which milestones belong to the
+                    # running code is unknowable.
+                    mktempdir() do unversioned_dir
+                        _make_test_project(unversioned_dir)
+                        _loaded_version_override[] = nothing
+                        @test initializeModelManager(TestSimulator(), unversioned_dir;
+                                                     auto_upgrade=true)
+                        waitForDiagnostics()
+                        @test isInitialized()
+                        # No version table was stamped on the way through.
+                        @test !ModelManager.tableExists(table)
+                        # And getDBPackageVersion says why rather than inventing a version.
+                        @test_throws ArgumentError ModelManager.getDBPackageVersion(
+                            TestSimulator(), centralDB())
+                    end
+
+                    # Versions agree, so the recorded version is left where it is.
+                    _loaded_version_override[] = installed
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+
+                    # A mid-session update no longer blocks the session. The database is
+                    # migrated to the *loaded* version rather than the installed one, so the
+                    # recorded version never runs ahead of the milestones actually applied.
+                    ModelManager.DBInterface.execute(centralDB(),
+                                                     "UPDATE $(table) SET version='0.1.0';")
+                    _loaded_version_override[] = v"0.5.0"
+                    _milestone_override[] = VersionNumber[]
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                    @test isInitialized()
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.5.0"
+
+                    # A project created for the first time mid-update is stamped with the loaded
+                    # version too. getDBPackageVersion stamps a fresh database itself, so this route
+                    # never passes through the migration path at all.
+                    mktempdir() do fresh_dir
+                        _make_test_project(fresh_dir)
+                        _loaded_version_override[] = v"0.5.0"
+                        @test initializeModelManager(TestSimulator(), fresh_dir; auto_upgrade=true)
+                        waitForDiagnostics()
+                        @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.5.0"
+                    end
+
+                    # A database ahead of the running code stops initialization: the schema is
+                    # newer than the code about to query it. project_dir's database sits at
+                    # 0.5.0 from the migration above, so 0.2.0 is behind it. The session merely
+                    # lags the environment here, so the remedy printed is to restart Julia.
+                    _loaded_version_override[] = v"0.2.0"
+                    @test !initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    @test !isInitialized()
+                    @test dataDir() == ""
+
+                    # The other remedy: with no mid-session update in play, a database ahead of
+                    # the installed version means the package itself is too old to open it.
+                    mktempdir() do old_pkg_dir
+                        _make_test_project(old_pkg_dir)
+                        stale = ModelManager.SQLite.DB(joinpath(old_pkg_dir, "mm.db"))
+                        ModelManager.DBInterface.execute(stale,
+                            "CREATE TABLE $(table) (version TEXT PRIMARY KEY);")
+                        ModelManager.DBInterface.execute(stale,
+                            "INSERT INTO $(table) (version) VALUES ('99.9.9');")
+                        close(stale)
+                        _loaded_version_override[] = :default   # target == installed
+                        @test !initializeModelManager(TestSimulator(), old_pkg_dir; auto_upgrade=true)
+                        @test !isInitialized()
+                    end
+
+                    # --- upgradePackage ---------------------------------------------------
+                    # Public and callable directly, so it keeps a guard of its own — a direct
+                    # caller supplies to_version, which resolvePackageVersion never would.
+                    _loaded_version_override[] = :default
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+
+                    # Refused: the loaded code cannot know 0.2.0's milestones, so the version
+                    # table must still read 0.1.0 afterwards. This is the assertion that
+                    # fails if the "no schema change" bump ever fires under the guard.
+                    ModelManager.DBInterface.execute(centralDB(),
+                                                     "UPDATE $(table) SET version='0.1.0';")
+                    _loaded_version_override[] = v"0.1.0"
+                    # A milestone *in range*, so the call count is evidence: without the guard,
+                    # pending would be [0.2.0] and upgradeToMilestone would run.
+                    _milestone_override[] = [v"0.2.0"]
+                    _milestone_calls[] = 0
+                    @test !ModelManager.upgradePackage(TestSimulator(), centralDB(),
+                                                       v"0.1.0", v"0.2.0", true)
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.1.0"
+                    @test _milestone_calls[] == 0
+
+                    # A target below the loaded version is legitimate (resuming a partially
+                    # applied chain), so the guard uses `>` rather than `!=`.
+                    _loaded_version_override[] = v"0.3.0"
+                    _milestone_override[] = [v"0.2.0"]
+                    _milestone_calls[] = 0
+                    @test ModelManager.upgradePackage(TestSimulator(), centralDB(),
+                                                      v"0.1.0", v"0.2.0", true)
+                    @test _milestone_calls[] == 1
+                    @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.2.0"
+                    # A throw from version resolution is reported, not propagated:
+                    # initializeModelManager is documented to return false on any initialization
+                    # failure, and getInstalledVersion throws when the package is loaded but absent
+                    # from the active environment.
+                    mktempdir() do throwing_dir
+                        _make_test_project(throwing_dir)
+                        @test_throws ArgumentError ModelManager.getInstalledVersion(
+                            _UninstalledSimulator())
+                        @test !initializeModelManager(_UninstalledSimulator(), throwing_dir;
+                                                      auto_upgrade=true)
+                        @test !isInitialized()
+                        @test dataDir() == ""
+                    end
+
+                finally
+                    # Leave the project initialized and correctly stamped for everything below.
+                    # Re-initializing restores the stamp on its own: the assertions above
+                    # rewound the version table, and with no milestones to cross the upgrade
+                    # path bumps it straight back to the installed version.
+                    _loaded_version_override[] = :default
+                    _milestone_override[] = VersionNumber[]
+                    _milestone_calls[] = 0
+                    initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                end
+                @test isInitialized()
             end
 
             # Shorthand XMLPaths used throughout the section
@@ -4412,21 +4628,32 @@ end
         #! `[`foo`](@ref)` → `foo`; also handles `ModelManager.foo`, `foo(x)`, and `Foo{T}`.
         refTarget(s) = strip(first(split(replace(s, r"^ModelManager\." => ""), r"[({]")))
 
-        violations = Tuple{Symbol,String}[]
-        for (binding, multidoc) in Docs.meta(ModelManager)
+        docs_meta = Docs.meta(ModelManager)
+        #! Public is necessary but not sufficient: Documenter resolves an `@ref` against a rendered
+        #! *docstring*, so a public binding carrying none fails a build just as a private one does.
+        #! Easy to cause by accident, since a comment between a docstring and its definition
+        #! silently detaches it.
+        isDocumented(target) = haskey(docs_meta, Docs.Binding(ModelManager, target))
+
+        violations = Tuple{Symbol,String,String}[]
+        for (binding, multidoc) in docs_meta
             for docstr in values(multidoc.docs)
                 text = join(Iterators.filter(x -> x isa AbstractString, docstr.text), "")
                 for m in eachmatch(r"\[`([^`]+)`\]\(@ref\)", text)
                     target = Symbol(refTarget(m.captures[1]))
-                    Base.ispublic(ModelManager, target) && continue
-                    push!(violations, (binding.var, m.captures[1]))
+                    if !Base.ispublic(ModelManager, target)
+                        push!(violations, (binding.var, m.captures[1], "not public"))
+                    elseif !isDocumented(target)
+                        push!(violations, (binding.var, m.captures[1], "public but has no docstring"))
+                    end
                 end
             end
         end
 
         if !isempty(violations)
-            msg = join(["  $(owner) → [`$(target)`](@ref)" for (owner, target) in sort(violations)], "\n")
-            @info "Docstrings referencing non-public bindings:\n$msg"
+            msg = join(["  $(owner) → [`$(target)`](@ref): $(why)"
+                        for (owner, target, why) in sort(violations)], "\n")
+            @info "Docstrings with unresolvable @refs:\n$msg"
         end
         @test isempty(violations)
     end

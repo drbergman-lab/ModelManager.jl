@@ -54,7 +54,6 @@ them), and `addVariationRows` takes no simulator argument. Both were listed here
 - `clearSimulatorArtifacts(sim)` — remove build artifacts on database reset
 - `postVariationXMLProcessing(sim, location, path)` — after a variation XML file is written
 - `centralDBFileName(sim)` → `String` (default `"mm.db"`)
-- `packageName(sim)` → `String` — for version lookup via `Pkg`
 - `dbVersionTableName(sim)` → `String` — tracks migration state
 - `upgradeMilestones(sim)` → `Vector{VersionNumber}`
 - `upgradeToMilestone(sim, version, auto_upgrade)` → `Bool`
@@ -407,13 +406,28 @@ target location's file type.
 **Priority:** Must-have
 
 **Behavioral specification:**
-- `upgradePackage(sim; auto_upgrade)` walks from the DB's recorded version to the current package version, calling `upgradeToMilestone(sim, v, auto_upgrade)` for each milestone.
-- Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, `dbVersionTableName`, and `packageName`.
+- `upgradePackage(sim, db, from_version, to_version, auto_upgrade)` walks the milestones in `(from_version, to_version]`, calling `upgradeToMilestone(sim, v, auto_upgrade)` for each.
+- Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, and `dbVersionTableName`.
 - `continueMilestoneUpgrade(version, auto_upgrade)` prompts the user for destructive migrations (unless `auto_upgrade=true`).
+- The package whose version the database tracks is **not configurable**: it is the package defining `typeof(sim)`, resolved through `Base.moduleroot` so a type in a submodule reports its package. Both the loaded version (`pkgversion` of that module) and the installed version (`Pkg` keyed on that module's UUID) derive from it, as does the name used in messages. There is no backend hook for any of it.
+- `_loadedPackageVersion` is internal, yielding `nothing` when that module belongs to no versioned package — a simulator written in a script or at the REPL.
+- `getInstalledVersion(sim)` reports the version recorded in the active environment's manifest.
+- **Migrations target the loaded version, not the installed one.** The milestone list comes from the loaded code, so the loaded release is the furthest a session can correctly migrate to; targeting it keeps the recorded version and the applied migrations in step by construction.
+  - `resolvePackageVersion` compares the recorded version against the loaded one and migrates to it. Equal → `true`; loaded newer → `upgradePackage`; loaded older → returns `false`.
+  - With no determinable loaded version, `resolvePackageVersion` warns and returns `true` without migrating: which milestones belong to the running code is unknowable, so there is nothing to migrate with. The project opens and simply gets no version tracking — a simulator prototyped in a script keeps working. The warning states that a database created by a versioned build may not match the running code.
+  - `getDBPackageVersion` stamps a database with no version table using the loaded version, so a project created mid-session records the version whose code built its schema. It throws when that version cannot be determined, rather than inventing one; `resolvePackageVersion` returns before reaching it in that case.
+  - `upgradePackage` refuses a `to_version` above the loaded version. Unreachable from `resolvePackageVersion`; it guards direct callers, which supply `to_version` themselves. Refuses rather than clamping, so a caller is never silently migrated somewhere other than where they asked. A target at or below the loaded version is permitted, since resuming a partly-applied chain is legitimate.
+- Every version diagnostic is emitted from one place, at a consistent level: `@warn` when the loaded version differs from the installed one in either direction (`maxlog=1`, since the loaded version is fixed for a session) and when the loaded version is behind the database; `@error` when the database is ahead of the installed version, and when a migration target is beyond the loaded version; `@info` for migration progress. Each names a mid-session `Pkg` change as the cause. `continueMilestoneUpgrade` remains a `println`, since a `readline` follows it.
+- Every early `false` return from `initializeModelManager` clears `initialized`, `data_dir`, and the central DB handle, so `isInitialized()` reports `false` after a failed initialization — including one that follows an earlier success.
 
 **Acceptance criteria:**
 - A project at version N can be upgraded to version N+2 by walking through N→N+1→N+2.
 - If the user declines at a milestone, the upgrade stops and the DB remains at the last successfully upgraded version.
+- After the environment is updated mid-session, initialization still succeeds and the database is stamped with the *loaded* version, never the installed one — both when re-initializing an existing project and when creating a new one.
+- A session restarted with the newer version loaded applies the deferred milestone and advances the recorded version, so the delay resolves on its own.
+- A database recorded ahead of the loaded version stops initialization with `isInitialized()` `false` and `dataDir()` `""`.
+- A direct `upgradePackage` call to a version beyond the loaded one returns `false`, applies no milestone, and leaves the recorded version unchanged.
+- A simulator type belonging to no package opens its project unmigrated and unstamped, with a warning, rather than being refused.
 
 ---
 

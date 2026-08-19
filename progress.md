@@ -5,6 +5,443 @@
 
 ---
 
+## Session: mid-session package update silently skipped migrations (2026-08-17)
+
+### The bug
+Two sources of truth for "what version is this?", never reconciled. `getPackageVersion`
+(`src/package_version.jl:12`) reads the **on-disk environment** via `Pkg`, while
+`upgradeMilestones`/`upgradeToMilestone` dispatch on the **loaded module**. `pkgversion(::Module)`
+appeared nowhere in `src/`.
+
+The benign half is what was reported: after `Pkg.update()`, the DB is not upgraded until restart.
+That is arguably correct — the new code is not loaded, so migrating to match it would break the
+running session.
+
+The serious half is that the benign half only holds if nothing calls `initializeModelManager`
+again. When it does (opening a second project, or re-running an init cell — a tested flow):
+
+1. `getPackageVersion` → **new** version, from the manifest.
+2. `getDBPackageVersion` → **old** version, from the version table.
+3. `resolvePackageVersion` falls through to `upgradePackage(sim, db, old, new, auto_upgrade)`.
+4. `upgradeMilestones(sim)` comes from the **stale loaded module**, so it lacks the new release's
+   milestone; `pending` is empty and the loop body never runs.
+5. `success` is therefore still at its initialized `true`, and `isempty(pending)` is `true`, so
+   `src/up.jl:85-87` fires as a "no schema change" bump and stamps `version='<new>'`.
+6. Every later session short-circuits on `pkg_version == db_version` (`src/package_version.jl:72`).
+   The migration is skipped **permanently and silently**.
+
+The subtlety worth remembering: `success == true` does **not** mean a migration ran. It means
+nothing in `pending` failed, and an empty `pending` satisfies that trivially. Afterwards a skipped
+migration and a release that genuinely needed none leave byte-identical database state.
+
+There is a second route with **no re-init at all**: create a new project directory after the
+update, in the same session. `getDBPackageVersion` is not a pure read — on a database with no
+version table it creates one and stamps `getPackageVersion(sim)` (`:41-44`) — so the new version
+lands in a database whose schema `createSchema` then builds from the old loaded code. This is why
+the guard sits *above* the `getDBPackageVersion` call rather than merely above the comparison; the
+ordering is load-bearing and has its own test (the fresh-project case asserting no version table
+was written).
+
+### Why this is a ModelManager fix, not a PCMM one
+The ownership split at `src/abstract_simulator.jl` gives the backend *what* the milestones are
+(`packageName`, `dbVersionTableName`, `upgradeMilestones`, `upgradeToMilestone`). ModelManager owns
+*when* to migrate and *what the database claims*: the comparison in `resolvePackageVersion`, the
+milestone filter, and every write to the version table. The bug is entirely in that second half.
+PCMM has no hook to declare "I am actually loaded at version X", and even given one, the filter and
+the stamp are ModelManager's code.
+
+### The fix, after review reshaped it
+The first implementation compared the loaded version against the installed one and **refused** to
+initialize on a mismatch. Review (PR #30) replaced that with the better fix: **use the loaded
+version as the migration target.**
+
+The reasoning is that the installed version was never a legitimate target in the first place.
+`upgradeMilestones` *is* the loaded code, so the loaded release is the furthest point whose schema
+changes a session can actually apply. Targeting it makes the corruption **unrepresentable** rather
+than detected — the recorded version and the applied migrations now come from the same source — and
+it drops the refusal, so a mid-session update no longer blocks the session at all. The database is
+migrated to the schema the running code expects; the next session, loading the new version, applies
+the remainder. Self-healing, and verified as such (Scenario C below).
+
+`getPackageVersion` survives only as the `nothing` fallback and as input to the warning.
+
+**Why the refusal was worse than it looked.** For a backend whose simulator type lives in a
+different package than `packageName` names, `loaded != installed` holds on *every* session, not just
+after an update — so the refusal would have bricked that backend permanently rather than failing
+safe. The retargeting has a real residual risk there (a wrong `loaded` number becomes a wrong stamp)
+but the `@warn` names both versions on every init, and the fix is the override the hook exists for.
+The earlier framing of this as "the one property the old design had" was wrong and was withdrawn.
+
+### Decisions
+- **Migrate to the loaded version; never refuse for a version mismatch.** See above.
+- **`@warn`, `maxlog=1`.** The condition cannot change within a session — the loaded version is
+  fixed at load time — so one notice per session is the right cardinality even across several
+  projects. `maxlog=1` matches the `useHPC` already-on warning.
+- **`nothing` means "cannot determine" → use the installed version.** `pkgversion` returns `nothing`
+  for a module not imported from a versioned package, which is exactly `TestSimulator`, defined in
+  `Main` while declaring `packageName = "ModelManager"`. Hence the unit test on a module-less type
+  (`_NoModuleSimulator`), needed because the `TestSimulator` override shadows the default.
+- **`getDBPackageVersion` stamps the target, not the installed version.** This is the load-bearing
+  half: it stamps a database that has no version table, so it is the *only* code on the
+  new-project-mid-session path. Mutation testing confirmed it — with the retargeting reverted, the
+  re-init path was still caught by `upgradePackage`'s guard, but the fresh-project path corrupted.
+- **`upgradePackage` keeps its own guard, refusing rather than clamping.** Unreachable from
+  `resolvePackageVersion` now, so it exists for direct callers (it is `@compat public`), where
+  `to_version` is whatever was passed. Clamping to the loaded version would silently migrate
+  somewhere other than asked, which is the worse surprise. `>` not `!=`, since a target below the
+  loaded version is legitimate (resuming a partly-applied chain).
+- **Split the "database is newer" remedy.** Restart Julia when the session merely lags the
+  environment; upgrade the package otherwise. Printing "upgrade your package" to someone whose
+  package is already new enough sends them in circles.
+- **Working default, not an `error` stub.** `loadedPackageVersion` follows
+  `getInputFolderDescription`, so no existing backend has to change anything. Declared
+  `@compat public` because overriding it is the documented contract for an unusual package layout.
+- **Hook named `loadedPackageVersion`**, matching `abstract_simulator.jl` (nothing there carries a
+  `get` prefix except the legacy `getInputFolderDescription`), over `getLoadedPackageVersion`,
+  which would have matched call-site symmetry with `getPackageVersion`/`getDBPackageVersion`.
+- **A submodule needs no override.** Measured, not assumed: `pkgversion` resolves through
+  `Base.moduleroot`, so `pkgversion(Pkg.Types) == pkgversion(Pkg)`. The first draft's docstring
+  claimed otherwise and was corrected. (`DataFrames.PrettyTables` returning its own version is not a
+  counterexample — that is a re-exported separate package, which is the actual override case.)
+- **No escape-hatch keyword.** An `allow_version_mismatch=true` was considered while the design
+  still refused. The reshape moots it: there is nothing left to escape from.
+
+### Rejected: do the check in `__init__`
+Proposed during review — detect in `__init__` that the version increased, drop the current state,
+and tell the user to restart. It cannot work, for reasons of timing rather than style:
+
+1. `__init__` runs once, at module load, **before the discrepancy exists**. The sequence is: load at
+   1.3.2 → `Pkg.update()` → user acts. Changing the manifest reloads nothing, so `__init__` never
+   re-fires.
+2. "Already initialized" cannot be true there: `mm_globals_ref[]` is `nothing` until a backend
+   registers globals, so there is no project, no `data_dir`, and no DB to drop.
+3. The version that matters is not ModelManager's but the **backend's** (`packageName(sim)`), and
+   ModelManager's `__init__` does not know which backend will load. The backend's own `__init__` has
+   the same t0 problem.
+
+`resolvePackageVersion` is the earliest point in a session where both a simulator and a database
+exist, so it is not a compromise location — it is the only one.
+
+The half of the proposal that *was* right is "drop the current state", which is the
+`_abortInitialization` change below. What did not survive review was "if they run it anyway, that's
+on them": that reasoning holds when the cost lands on the session the user chose to break, but here
+the artifact is a mis-stamped **file** that outlives the session, skips the migration forever, and
+does so for anyone else sharing the project directory. The user cannot consent on the file's behalf.
+
+### Rejected: a `migrations_applied` audit table
+The only way to *detect* an already-corrupted database, since nothing records which migrations
+actually ran. Dropped, deliberately, with the reasoning corrected mid-discussion:
+
+- The argument first offered for dropping it — that the corrupted set is probably empty depending on
+  release history — was **wrong**, and was withdrawn. There is no observable event "when users began
+  updating mid-session". Release history bounds whether corruption was *possible*; whether any
+  session actually hit load-at-A → update-to-B → re-init is unrecorded and unknowable, and the
+  resulting database is byte-identical to a clean one. The set's size is not small, it is unknown.
+- The honest remaining argument *for* the table is a hole the guard does not close: a milestone added
+  to `upgradeMilestones` **below** a version some database has already recorded is skipped forever,
+  with no mid-session update involved at all, because `pkg_version == db_version` short-circuits
+  before `upgradePackage` is ever called. Shared root cause with the original bug — version equality
+  is treated as proof of schema state.
+- Resolution (user's call): rely on backend discipline rather than build the table, on the grounds
+  that the main downstream backend is the same author's. **Revisit and build the audit table if a
+  release ever ships a schema change without its milestone.** The assumption this now rests on is
+  written into `docs/src/misc/database_upgrades.md` as a warning admonition, so it lives where a
+  backend author reads it rather than only here.
+
+### Also fixed: `initialized` was never reset
+Separate pre-existing bug, folded in because this change makes it strictly more reachable — the new
+guard is a fourth early-`false` path that fires *precisely* on a re-init after a previous success,
+the exact scenario where the flag went stale.
+
+`initializeModelManager` never set `initialized = false` on entry, and none of its early-`false`
+paths did either. A failed re-init after a successful one left `isInitialized() == true` with
+`data_dir == ""` and a fresh in-memory `SQLite.DB()`, so every later query silently read an empty
+database. (`reinitializeDatabase` had always done it correctly.)
+
+Fixed by factoring all four abort blocks into `_abortInitialization()` and clearing `initialized` at
+entry — removing the bug class rather than one instance. Four sites, not the three originally
+scoped: the `catch` around opening the database cleared `data_dir` but left `db` pointing at the
+previous project's connection and `initialized` stale. Closing the previous connection there is
+correct, since that project is being abandoned either way.
+
+Verified safe to clear at entry: nothing on the path to `initializeDatabase` consults
+`isInitialized()`. `createSchema` cannot depend on it, since on a *first* init the flag is already
+`false` while it runs. The `assertInitialized` callers are all in query/deletion/tag code, and
+`databaseDiagnostics` runs `@async` only after init succeeds — behind the `waitForDiagnostics()` at
+entry.
+
+### Not fixed: `currentSimulatorVersionID()` staleness
+`createSchema` re-resolves `simulator().current_version_id` on every `initializeDatabase()`, and that
+ID is embedded in `Simulation`/`Monad` INSERTs and matched by `Sampling`'s find-or-insert, so a
+mid-session change makes previously-created objects stop matching lookups and can mint duplicate
+samplings. It does **not** apply to this session's scenario: `resolveSimulatorVersionID` is keyed on
+the simulator's own version tag, which tracks the simulator build, not the manager package. Distinct,
+pre-existing, backend-driven. Left alone by explicit decision — no fix and no Known Trade-offs entry.
+
+### Second review round (PR #30)
+Mostly a verbosity pass — the docs and docstrings were over-explaining behavior the reviewer
+considered self-evident once the design was right ("I get that having to fix this undermines this
+argument; but now that we have the right thing in place, it is obvious this is correct"). Cut the
+"why the loaded version" justification, the installed-vs-loaded table, and most of the
+`loadedPackageVersion` docstring. Worth remembering as a general pull: the rationale that felt
+necessary while the bug was live reads as padding once the fix is in. It lives here instead.
+
+Substantive changes from that round:
+
+- **`packageName` gained a default** — `string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))`
+  — so it is no longer a required `error` stub. Uses `moduleroot`, not a bare `parentmodule`, for
+  two reasons: a type in a submodule should report its package, and it must name the *same* package
+  whose version `loadedPackageVersion` reports (`pkgversion` resolves through `moduleroot` too). If
+  those two disagreed, the mismatch warning would compare unrelated packages.
+  This makes the "$name is not an installed dependency" error newly reachable — the default names
+  `Main` for a REPL-defined type — so that message now points at overriding `packageName`.
+- **Diagnostic names normalized** to one vocabulary — `installed` / `loaded` / `db_version` — after
+  the reviewer could not map the function names onto the checks ("Does `target` = `Session`? Does
+  `installed` = `Database`?"). The local `target` became `loaded` for the same reason.
+  `_warnLoadedBehindInstalled` was also simply wrong: its caller only establishes that the two
+  differ, and a mid-session `Pkg` change can move the environment in either direction, so it is now
+  `_warnLoadedDiffersFromInstalled`.
+- **`getPackageVersion` → `getInstalledVersion`.** Exported, so this is breaking; the old name is
+  gone rather than deprecated, on the grounds that the package is pre-1.0. PCMM must be checked for
+  callers.
+- **All version diagnostics funnelled** into one block in `src/package_version.jl` with consistent
+  levels, replacing `println`s scattered across `resolvePackageVersion` and `upgradePackage`.
+  `@warn` for the two recoverable-by-restart cases, `@error` for the two unsupported ones,
+  `@info` for progress. `continueMilestoneUpgrade` stays a `println` — a `readline` follows it, and
+  a prompt cannot go through a logger.
+- **Dropped a redundant `IF NOT EXISTS`** in `getDBPackageVersion`, which only runs in the branch
+  where `tableExists` already returned false.
+- **The installed-version fallback was replaced, not kept** (third review round). The reviewer's
+  framing landed it: put the fallback inside `loadedPackageVersion` itself, resolving
+  `packageName` and reading the version from the *loaded* module registry
+  (`Base.loaded_modules`) rather than from the environment. Both routes now report a loaded
+  version, so the substitution being objected to is gone rather than merely defended, and
+  `_migrationTargetVersion` disappeared with it — which also answers their earlier "why do we need
+  this?" about that helper. When neither route finds a version, `resolvePackageVersion` warns and
+  returns `true` without migrating: nothing to migrate *with*, so the project opens untracked
+  rather than being blocked. `getDBPackageVersion` throws in that state instead of inventing a
+  version, and is unreachable from the init path because the short-circuit returns first.
+  The test harness needed a three-way sentinel as a result — `:default` (resolve normally), a
+  `VersionNumber` (staged mid-session change), and `nothing` (genuinely undeterminable) — because
+  `nothing` had previously meant "inert" and now means "short-circuit".
+- Earlier in the same discussion, the fallback **was** defended and kept: The reviewer twice proposed removing it ("if there is
+  no loaded version, how are we even here??"). The answer is that `nothing` does not mean "not
+  loaded" — `pkgversion` returns it for a module that is loaded but not *from a versioned package*,
+  which is a REPL- or script-defined simulator, and `TestSimulator` in `Main`. Removing the fallback
+  would refuse those. Collapsing the interface further (dropping `packageName`, deriving the name
+  from `moduleroot`, requiring simulator types to live in packages) was considered and deferred: it
+  is a breaking interface change needing a coordinated PCMM edit, unrelated to this bug.
+
+### The `@ref` guard test had a blind spot, now closed
+Giving `packageName` a one-line definition broke the docs build, and the existing
+`"docstrings only @ref public bindings"` testset passed anyway. Two things combined:
+
+1. A `#!` comment placed between a docstring and a **one-line** definition silently prevents the
+   docstring from attaching. No error, no warning; `Docs.meta` simply has no entry.
+2. The guard only asked whether an `@ref` target is *public*. `packageName` is public — it just had
+   no docstring left to link to. Documenter resolves `@ref` against a rendered docstring, so a
+   public-but-undocumented binding fails a build exactly as a private one does.
+
+The testset now checks both, reporting `"not public"` and `"public but has no docstring"`
+separately. Verified by re-introducing the detaching comment: it flags
+`getInstalledVersion → packageName`. This is the same gap CLAUDE.md already noted for `@ref`s to
+*nonexistent* names, and the fix covers that case too.
+
+The `#!` comment on `packageName` now sits above its docstring, with a note saying why it must stay
+there.
+
+### Fourth review round: `packageName` became the authority
+The reviewer asked why `packageName` did not overrule, given it already defaults to
+`parentmodule(typeof(sim))`. It should, and the previous ordering was a live bug rather than a
+style preference. `loadedPackageVersion` tried `pkgversion(parentmodule(typeof(sim)))` *first* and
+only fell back to the named package, so a backend overriding only `packageName` got the two
+versions from two different packages.
+
+Demonstrated with a purpose-built package (type in `NestTest` v7.7.7, `packageName` returning
+`"ModelManager"` v0.8.4): `loadedPackageVersion` reported **7.7.7** while `getInstalledVersion`
+reported **0.8.4**. That warns spuriously on every session *and* aims the migration at a version
+belonging to an unrelated package — it would have stamped the database 7.7.7. Resolving through
+`packageName` gives 0.8.4 from both.
+
+`packageName` is now the single place deciding which package is version-checked; both version
+functions resolve through it, so overriding it moves them together. Overriding
+`loadedPackageVersion` is now rarely needed and documented as such.
+
+### `loadedPackageVersion` became internal
+Asked what a backend would actually override it *for*, and none of the cases I had documented
+survived. Enumerated:
+
+| Scenario | Default yields | Real fix |
+| --- | --- | --- |
+| Named package not loaded | `nothing` | Fix `packageName` — the backend's own declaration |
+| Named package has no `version` in Project.toml | `nothing` (measured) | Add one; milestones *are* versions |
+| Simulator defined in a script/REPL | `nothing` | Untracked is the honest state |
+| Schema version decoupled from package version | package version | Overriding *breaks* it — `getInstalledVersion` still reports the real version, so the mismatch warning fires forever |
+
+The last row is the general argument: any override returning something other than the named
+package's real loaded version breaks the installed-vs-loaded comparison everything here rests on,
+so the function is not safely overridable. Renamed `_loadedPackageVersion`, dropped from
+`@compat public`, and moved out of `abstract_simulator.jl` into `package_version.jl` with the rest
+of the version machinery. Free to do because it had never shipped; `packageName` is now the single
+interface method for redirecting which package gets version-checked.
+
+Also fixed while checking this: a `PkgId` is `(uuid, name)`, so two loaded packages can share a
+name, and `_loadedModuleNamed` was returning whichever `Dict` iteration reached first. An
+ambiguous name now resolves to `nothing` — reporting an unrelated package's version is the exact
+failure this machinery exists to prevent, so a guess is worse than admitting ignorance. Not
+directly unit-tested: loading two same-named packages in one session is not something a test can
+readily construct.
+
+### Identity moved from a package *name* to the defining *module*
+Asked whether the accepted collision hole could come from submodules or user-defined modules, and
+whether the UUID would be hard. Measured first, because the premise mattered:
+
+- **Submodules are not in `Base.loaded_modules`.** 269 entries, every one a `require`d package
+  except `Main`/`Base`/`Core`. `Pkg.Types` is absent; `module UserDefined end` in `Main` is absent.
+  (`"PrettyTables"` does appear, but as a separate package DataFrames depends on, not a submodule.)
+  So the hole needed two distinct packages sharing a name — real, but far narrower than feared.
+- The UUID turned out to be *less* code, not more, because the name search was unnecessary:
+  `Base.PkgId(mod)` gives `(name, uuid)` exactly, `pkgversion(mod)` gives the loaded version with no
+  registry scan, and `Pkg` can be keyed on the UUID.
+
+I proposed a new `packageModule` hook to carry the redirect. The reviewer rejected the premise
+instead: it is "a bit crazy to have the simulator defined in one package whose version is not tied
+to the version of the package that runs the database." That is right, and it is provable rather than
+a matter of taste — `upgradeMilestones` and `upgradeToMilestone` dispatch on the simulator type, so
+the code owning the schema *is* the code defining that type. Defining those methods in some other
+package would be piracy. The redirect was capability nobody should want, and the fix was to delete
+the notion rather than give it a better hook.
+
+So identity is now `_packageModule(sim) = Base.moduleroot(parentmodule(typeof(sim)))`, internal and
+not configurable. Consequences:
+
+- `_loadedModuleNamed` deleted outright, and with it the `Base.loaded_modules` dependency that had
+  been flagged as a Julia-upgrade risk. The name-collision hole is gone by construction — there is
+  no name to collide.
+- `getInstalledVersion` had the *same* latent ambiguity (`findfirst(dep -> dep.name == name)` takes
+  the first match) and is now keyed on the module's UUID. Both of its context branches are needed
+  and were verified: from the package's own project it is absent from `Pkg.dependencies()` but is
+  `Pkg.project()`; under `Pkg.test()` the temp environment has no project name and it appears as a
+  dependency.
+- `packageName` survives as a derived display name for messages. PCMM's existing method still
+  agrees with the derived default, so no coordinated change is needed there.
+- No public API was added. The PR started out proposing a new public hook and ends having removed
+  one and added none.
+
+Residual sharp edge, accepted: `packageName` remains overridable and purely cosmetic, so a backend
+could name one package in messages while the version comes from another. Documented in its
+docstring; cosmetic only.
+
+### `packageName` removed outright
+Kept briefly as a derived display name, then cut: "why keep it just for a cosmetic layer?" No good
+reason. Messages now interpolate `nameof(_packageModule(sim))` directly, which has the side benefit
+that the name shown *cannot* disagree with the version reported — the previous arrangement let a
+backend override the name while the version came from elsewhere, which was a footgun sitting in a
+docstring.
+
+**This is a required PCMM change, not a discretionary one.** PCMM defines
+`ModelManager.packageName(::PhysiCellSimulator)`, and a qualified method definition on a name the
+host module no longer has is a hard failure. Verified against a fixture package carrying the same
+override:
+
+```
+ERROR: LoadError: UndefVarError: `packageName` not defined in `ModelManager`
+```
+
+It surfaces at precompile time, so there is no window in which it misbehaves silently. PCMM simply
+deletes the method — the default is what it was returning anyway.
+
+Interface surface across the whole PR: **one required method removed** (`packageName`), one public
+name renamed (`getPackageVersion` → `getInstalledVersion`), and none added — having opened by
+proposing a new public hook.
+
+### Released as 0.9.0, not a patch
+Two exported/public names disappear here — `getPackageVersion` (renamed `getInstalledVersion`) and
+`packageName` — so under 0.x semver this is a minor bump, not a patch.
+
+The bump is also what decouples this from PCMM. PCMM implements `packageName`, and a qualified
+method definition on a name the host no longer has fails at precompile. With a compat bound of
+`ModelManager = "0.8"` meaning `>=0.8.0, <0.9.0`, releasing 0.9.0 keeps PCMM resolving the old
+version and working untouched, so its maintainer raises the bound and deletes the method together.
+Releasing this as 0.8.5 would instead break PCMM the moment it resolved.
+
+The `v0.8.4` mentions in `src/hpc.jl` and `PRD.md` are unaffected — they name the release the
+`run_on_hpc` auto-detection fix shipped in, not the current version.
+
+### Final correctness-and-terseness pass
+Reviewed the whole PR across six dimensions with adversarial verification of every candidate;
+45 of 49 findings survived. Most were prose that described an earlier revision — unsurprising after
+five reshapes — but four were substantive:
+
+1. **A warning promised an outcome it could not know.** `_warnLoadedDiffersFromInstalled` said "The
+   database will be migrated to <loaded>", but it fires before `db_version` is read, and the very
+   next branch can refuse and return `false`. A user could be told the database would be migrated
+   and then told the project could not be opened. Now states the policy ("Migrations target
+   <loaded>"), which is true in every branch including the fresh-database stamp.
+2. **A comment asserted an invariant its branch does not establish.** The `loaded < installed`
+   branch claimed the session "already has a new enough package installed", but `installed` can also
+   be below `db_version` (loaded 0.1, installed 0.5, database 0.9), in which case restarting is
+   necessary but not sufficient. The comment now says so.
+3. **`resolvePackageVersion` could throw where the docstring promises `false`.** Verified reachable
+   with a determinable loaded version, so the unversioned short-circuit does not cover it: after
+   `using SQLite; Pkg.activate(mktempdir())`, `pkgversion(SQLite)` still resolves while the
+   dependency lookup fails, so `getInstalledVersion` throws. The throw escaped
+   `_abortInitialization`, leaving `data_dir` set and the connection open. Worse after the reshape,
+   since `installed` is now used *only* to word two diagnostics — a cosmetic lookup could kill
+   initialization. Fixed on the code side rather than by narrowing the docstring (the user's call):
+   the call is wrapped, reported, and routed through `_abortInitialization`, matching the
+   database-open failure a few lines above. The catch also covers an unparsable version table and a
+   backend milestone that throws mid-migration. `println` rather than `@error` there, to match its
+   sibling; the `@warn`/`@error` split belongs to the version diagnostics.
+   Pinned by a test using a stub whose loaded version resolves while its package module has no UUID
+   — mutating the `try` out turns that test from pass into one error plus one failure.
+4. **A vacuous assertion.** `@test _milestone_calls[] == 0` after a refused `upgradePackage` was
+   staged with an *empty* milestone list, so `pending` was empty whether the guard fired or not.
+   Given a milestone in range it is now evidence: mutating the guard out fails three assertions
+   where it previously failed two.
+
+Also corrected: the `#!` in the `@ref` guard testset still said the detachment trap was limited to
+one-line definitions, contradicting the CLAUDE.md correction made earlier in the same PR; and
+CLAUDE.md's illustration of that trap was built from `packageName`, which this PR deletes.
+
+PRD.md had two bullets in direct contradiction — one still describing the removed
+installed-version fallback, four lines above the bullet describing the short-circuit that replaced
+it — plus the same claim repeated as an acceptance criterion, a `upgradePackage(sim; auto_upgrade)`
+signature that never existed, and two references to the removed `loadedPackageVersion`.
+
+### The docstring-detaching comment is not limited to one-line definitions
+Same trap as last round, and this time it exposed an error in what I had written into CLAUDE.md.
+I had recorded that an intervening comment detaches a docstring from a **one-line** definition;
+it applies to `function ... end` equally. Measured directly:
+
+```
+fA (one-line, comment between)      documented: false
+fB (function...end, comment between) documented: false
+fC (one-line, no comment)            documented: true
+fD (function...end, no comment)      documented: true
+```
+
+CLAUDE.md now says "every definition form". Worth noting the payoff of last round's guard change:
+the strengthened testset caught this on the first run, where previously it would have passed and
+left the failure to CI's docs job.
+
+### A claim corrected mid-review
+The reviewer proposed a nested-module counterexample where `parentmodule(MySim)` returns the inner
+module, expecting the default to break. Measured on a purpose-built package with exactly that shape:
+`parentmodule` does return the inner module, but `pkgversion` resolves through `Base.moduleroot` to
+the package and reports its version, so the default is correct there. The genuine override case is
+narrower — the type living in a *separate package* from the one being upgraded.
+
+### Docs note
+Nearly wrote `[Database upgrades](@ref database_upgrades)` into the `initializeModelManager`
+docstring. That would have been the only manual-page anchor `@ref` in any `src/` docstring, and it
+would have broken **downstream** builds: PCMM renders ModelManager's docstrings but not
+ModelManager's manual pages, so the anchor is unresolvable there. The `"docstrings only @ref public
+bindings"` testset would not have caught it — its regex only matches backticked binding refs. Stated
+the substance inline instead.
+
+---
+
 ## Session: `run_on_hpc` was never auto-detected (2026-08-05)
 
 ### The bug

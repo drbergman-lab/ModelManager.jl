@@ -155,15 +155,39 @@ rendered on ModelManager's own site — so an `@ref` to an internal now breaks `
 too. (They were removed for a different reason: 86 underscore-prefixed entries were 16% of
 the search index and were outranking the prose pages that explain the features.)
 
-Do not rely on the docs build as the guard. It only runs in CI's `docs` job, and it does not
-cover a docstring whose `@ref` happens to point at a *nonexistent* name. The guard is the
+Do not rely on the docs build as the guard. It only runs in CI's `docs` job. The guard is the
 `"docstrings only @ref public bindings"` testset in `test/runtests.jl`, which walks
-`Docs.meta(ModelManager)` and checks each `@ref` target with `Base.ispublic`. It runs with
-the normal test suite, needs no docs build, and is the thing that will actually catch you.
+`Docs.meta(ModelManager)` and checks each `@ref` target two ways: that it is `Base.ispublic`,
+**and** that it actually has a docstring. It runs with the normal test suite, needs no docs
+build, and is the thing that will actually catch you.
+
+Public is necessary but not sufficient. Documenter resolves an `@ref` against a rendered
+*docstring*, so a public binding carrying none fails a build exactly as a private one does —
+which is also why the check covers `@ref`s to names that do not exist.
 
 Note the testset scans **docstrings only** — `@ref`s written in `docs/src/**/*.md` manual
 pages are outside its loop. A manual page that `@ref`s an internal is caught by the docs
 build now, but was not before.
+
+### A `#!` comment can silently detach a docstring
+
+Between a docstring and the definition it documents, a comment prevents the docstring from
+attaching at all — no error, no warning, and `Docs.meta` simply has no entry for the name. This
+holds for **every** definition form; `f(x) = x` and `function f(x) ... end` behave identically:
+
+```julia
+"""
+    dbVersionTableName(sim)
+...
+"""
+#! This comment detaches the docstring above from the definition below.
+dbVersionTableName(sim::AbstractSimulator) = "my_version"
+```
+
+Put the `#!` block **above** the docstring instead. The symptom is otherwise the
+`"docstrings only @ref public bindings"` testset failing on every `@ref` to that name, reported
+against the *referring* docstrings rather than the defining one — and, if that testset is skipped,
+a `:cross_references` failure in the docs build.
 
 ### Writing a new docstring
 

@@ -15,12 +15,23 @@ backend authors implement the hooks described in
 Every project database records the package version it was last migrated to, in a version
 table named by the backend ([`dbVersionTableName`](@ref)). During
 [`initializeModelManager`](@ref), [`resolvePackageVersion`](@ref) compares that stored version
-to the running package version:
+to the version of the backend loaded into the running session, read from the package defining the
+simulator type:
 
 - versions match → nothing to do;
 - the database is older → [`upgradePackage`](@ref) runs the migration chain;
+- the database is newer → initialization stops;
 - with `auto_upgrade=false` (the default), the backend may prompt before applying large or
   destructive changes.
+
+## Updating the package mid-session
+
+Changing the environment while a session runs — `Pkg.update()`, `Pkg.add`, or editing a
+`develop`ed package's `version` — leaves the manifest advertising one version while the session
+still executes another. ModelManager warns and migrates the database to the version it is
+running. **Restart Julia** to pick up the installed version; if it is ahead of the database, the
+next session migrates the rest of the way on its own. `Revise` does not help, as it revises method bodies rather than the version a
+session recorded when it loaded the package.
 
 ## The milestone chain
 
@@ -39,6 +50,11 @@ Each `upgradeToMilestone` implementation is responsible for:
 
 Returning `false` aborts the chain, leaving the database at the last successfully applied
 milestone.
+
+!!! warning "Declare a milestone before the release ships"
+    Add any release that requires an upgrade to [`upgradeMilestones`](@ref) before releasing it.
+    If one ships without its milestone, make a new version and add that to the milestones — the
+    chain is only ever walked forward, so backdating the missed one has no effect.
 
 ## Helpers for writing migrations
 

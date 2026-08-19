@@ -123,13 +123,15 @@ per simulator) and stamp every simulation with the simulator version that produc
 To support schema upgrades as your package evolves:
 
 ```julia
-ModelManager.packageName(sim::MySimulator)::String                 # e.g. "MyModelManager"
 ModelManager.dbVersionTableName(sim::MySimulator)::String          # e.g. "my_version"
 ModelManager.upgradeMilestones(sim::MySimulator)::Vector{VersionNumber}
 ModelManager.upgradeToMilestone(sim::MySimulator, version, auto_upgrade)::Bool
 ```
 
 See [Database upgrades](@ref database_upgrades) for how these are orchestrated by [`upgradePackage`](@ref).
+
+Migrations target the version of your package loaded in the session, read from the package
+defining your simulator type.
 
 ## 5. Override optional hooks as needed
 

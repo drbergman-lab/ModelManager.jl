@@ -179,17 +179,6 @@ end
 ########################################################
 
 """
-    packageName(sim::AbstractSimulator)::String
-
-Return the registered Julia package name for this simulator framework
-(e.g. `"PhysiCellModelManager"`). Used by [`getPackageVersion`](@ref) to look up
-the runtime version via `Pkg`.
-"""
-function packageName(sim::AbstractSimulator)
-    error("$(nameof(typeof(sim))) must implement: packageName(::$(nameof(typeof(sim))))::String")
-end
-
-"""
     dbVersionTableName(sim::AbstractSimulator)::String
 
 Return the name of the SQLite table used to persist the package version in the
@@ -326,7 +315,7 @@ function clearSimulatorArtifacts(sim::AbstractSimulator) end
 @compat public runSimulation, simulatorDir, simulatorVersionSchema, simulatorVersionIDName,
                simulatorVersionTableName, resolveSimulatorVersionID, currentSimulatorVersionID,
                simulatorInfo, setupMonad, setupSampling,
-               packageName, dbVersionTableName, upgradeMilestones, upgradeToMilestone,
+               dbVersionTableName, upgradeMilestones, upgradeToMilestone,
                postSimulationProcessing, postSimulationCleanup, initializeInputFolder,
                getInputFolderDescription, clearSimulatorArtifacts
 
