@@ -1548,6 +1548,24 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         end
     end
 
+    @testset "every ABCSMC field is either a TOML scalar or explicitly handled" begin
+        # method.toml's key list is derived from the struct rather than restated, which is what lets
+        # a new field serialize itself. The risk that buys is a future *non-scalar* field being
+        # silently dropped from the file, so assert the partition still covers the struct exactly.
+        scalars  = ModelManager._abcsmcScalarFields()
+        explicit = ModelManager._ABCSMC_EXPLICIT_TOML_FIELDS
+        @test Set([scalars..., explicit...]) == Set(fieldnames(ABCSMC))
+        @test isempty(intersect(scalars, explicit))
+        # The two explicitly-handled fields are exactly the ones that are not TOML scalars.
+        for f in explicit
+            @test !ModelManager._isTomlScalar(
+                ModelManager._tomlScalarType(fieldtype(ABCSMC, f)))
+        end
+        # Union{Nothing,T} unwraps to T, which is what the loader converts to.
+        @test ModelManager._tomlScalarType(fieldtype(ABCSMC, :cdf_grid_k)) === Int
+        @test ModelManager._tomlScalarType(fieldtype(ABCSMC, :population_size)) === Int
+    end
+
     @testset "runABC keyword forwarding" begin
         # Every ABCSMC field is reachable, including store_rejected, which runABC's hand-written
         # keyword list omitted.
@@ -1565,9 +1583,13 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test err isa ArgumentError
         @test occursin("populaton_size", sprint(showerror, err))
 
-        # The run controls must stay out of the ABCSMC splat.
-        @test :tags in ModelManager._RUN_CONTROL_KEYWORDS
-        @test isempty(intersect(ModelManager._RUN_CONTROL_KEYWORDS, fieldnames(ABCSMC)))
+        # The run controls are derived from runABC's own signature, so they cannot drift from it.
+        controls = ModelManager._runControlKeywords()
+        @test :tags in controls
+        @test :method in controls
+        @test isempty(intersect(controls, fieldnames(ABCSMC)))
+        # The kwargs... splat itself is not a run control.
+        @test !any(k -> endswith(String(k), "..."), controls)
     end
 
     @testset "CDF-grid snapping disabled when cdf_grid_k=nothing" begin

@@ -408,9 +408,15 @@ function runABC(problem::CalibrationProblem;
                           on_monad_failure=on_monad_failure)
 end
 
-#! Not `ABCSMC` fields — named explicitly in `runABC`'s signature so the `kwargs...` splat cannot
-#! swallow them into `ABCSMC(; ...)`. Extend this tuple, not the splat, when adding a run control.
-const _RUN_CONTROL_KEYWORDS = (:method, :run_kwargs, :description, :tags, :progress, :on_monad_failure)
+#! Derived from `runABC`'s own signature rather than restated: the run controls are exactly its
+#! declared keywords that are not `ABCSMC` fields. Adding a run control therefore needs no edit
+#! here, and the two can never drift apart. Used only to build the error message below — the guard
+#! itself is a `setdiff` against `fieldnames(ABCSMC)`, which was always dynamic.
+function _runControlKeywords()
+    declared = Base.kwarg_decl(only(methods(runABC)))
+    return Tuple(k for k in declared
+                 if !(k in fieldnames(ABCSMC)) && !endswith(String(k), "..."))
+end
 
 #! Every method default lives in the `ABCSMC` keyword constructor and nowhere else, so a new field
 #! becomes reachable through `runABC` with no edit here. The `setdiff` is what keeps a typo from
@@ -420,7 +426,7 @@ function _methodFromKeywords(::Type{ABCSMC}, kwargs)
     isempty(unknown) || throw(ArgumentError("""
     runABC received unrecognized keyword argument(s): $(join(unknown, ", ")).
     Method settings are the fields of `ABCSMC`: $(join(fieldnames(ABCSMC), ", ")).
-    Run controls are: $(join(_RUN_CONTROL_KEYWORDS, ", ")).
+    Run controls are: $(join(_runControlKeywords(), ", ")).
     """))
     return ABCSMC(; kwargs...)
 end
@@ -456,18 +462,26 @@ function _deserializeKernel(d)
     end
 end
 
-#! Single source of truth for `method.toml`'s scalar keys. Adding an `ABCSMC` field means touching
-#! exactly three places: the struct, the keyword constructor, and this tuple. `store_rejected` is the
-#! cautionary tale — it was added to the struct, the constructor and the serializer, but not to
-#! `runABC`'s hand-written keyword list, and was therefore unreachable for its whole life.
-const _ABCSMC_TOML_SCALARS = (
-    :population_size      => Int,     :max_nr_populations   => Int,
-    :minimum_epsilon      => Float64, :epsilon_quantile     => Float64,
-    :min_acceptance_rate  => Float64, :min_epsilon_decrease => Float64,
-    :min_ess_fraction     => Float64, :accept_overflow      => Bool,
-    :cdf_grid_k           => Int,     :max_evaluations      => Int,
-    :store_rejected       => Bool,
-)
+#! `method.toml`'s scalar keys are derived from `ABCSMC` itself, so adding a field means touching
+#! only the struct and its keyword constructor — the serializers pick it up automatically. That
+#! matters because the alternative already failed once: `store_rejected` was added to the struct,
+#! the constructor and the serializer, but missed in `runABC`'s hand-written keyword list, and was
+#! unreachable for its whole life.
+#!
+#! `perturbation_kernel` and `epsilon_schedule` exclude themselves by type — a kernel struct and a
+#! vector are not TOML scalars — and are handled explicitly below. The
+#! "every ABCSMC field is either a TOML scalar or explicitly handled" testset asserts that partition
+#! still covers the struct, so a future non-scalar field cannot be silently dropped from the file.
+_tomlScalarType(::Type{T}) where {T} = T
+_tomlScalarType(::Type{Union{Nothing,T}}) where {T} = T
+
+_isTomlScalar(::Type{<:Union{Real,AbstractString}}) = true
+_isTomlScalar(::Type) = false
+
+const _ABCSMC_EXPLICIT_TOML_FIELDS = (:perturbation_kernel, :epsilon_schedule)
+
+_abcsmcScalarFields() =
+    Tuple(f for f in fieldnames(ABCSMC) if _isTomlScalar(_tomlScalarType(fieldtype(ABCSMC, f))))
 
 """
     _saveMethod(calibration::Calibration, method::ABCSMC)
@@ -481,7 +495,7 @@ than reimplementing the key list.
 function _saveMethod(path::String, method::ABCSMC)
     d = Dict{String,Any}("type" => "ABCSMC",
                          "perturbation_kernel" => _serializeKernel(method.perturbation_kernel))
-    for (name, _) in _ABCSMC_TOML_SCALARS
+    for name in _abcsmcScalarFields()
         value = getfield(method, name)
         #! TOML has no null: omit the key rather than inventing a placeholder, and let the keyword
         #! constructor re-supply the default on load.
@@ -1119,8 +1133,9 @@ end
 #! written before a field existed still resumes instead of throwing a `KeyError`.
 function _loadMethod(::Type{ABCSMC}, d::AbstractDict)
     kw = Dict{Symbol,Any}()
-    for (name, T) in _ABCSMC_TOML_SCALARS
-        haskey(d, string(name)) && (kw[name] = convert(T, d[string(name)]))
+    for name in _abcsmcScalarFields()
+        haskey(d, string(name)) || continue
+        kw[name] = convert(_tomlScalarType(fieldtype(ABCSMC, name)), d[string(name)])
     end
     haskey(d, "epsilon_schedule") && (kw[:epsilon_schedule] = Float64.(d["epsilon_schedule"]))
     haskey(d, "perturbation_kernel") &&
