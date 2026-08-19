@@ -9,9 +9,9 @@ Return the version of `sim`'s package as installed in the active environment —
 Not necessarily the version running: migrations target the version loaded in this session, and
 the two differ when the environment changes while a session is open.
 
-If the active project IS that package (i.e. running tests from within the package itself),
-`Pkg.project().version` is returned directly; otherwise the dependency list is searched by
-[`packageName`](@ref).
+The package is identified by the module defining `typeof(sim)`, and looked up by its UUID. If
+that package is the active project (i.e. running tests from within it), `Pkg.project().version`
+is returned directly; otherwise it is read from the environment's dependencies.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -25,55 +25,42 @@ ModelManager.getInstalledVersion(simulator())
 ```
 """
 function getInstalledVersion(sim::AbstractSimulator)::VersionNumber
-    name = packageName(sim)
-    proj = Pkg.project()
-    if proj.name == name
-        return proj.version
-    end
-    deps = Pkg.dependencies()
-    uuid = findfirst(dep -> dep.name == name, deps)
-    #! Reachable via the default `packageName`, which names the package defining the simulator
-    #! type — `Main` for a type defined at the REPL. Point at the override rather than leaving
-    #! the user with a bare lookup failure.
+    mod  = _packageModule(sim)
+    uuid = Base.PkgId(mod).uuid
+    #! `Main`, `Base` and `Core` are the only loaded modules without a UUID, so this is the
+    #! simulator-defined-at-the-REPL case: there is no package to ask about.
     isnothing(uuid) && throw(ArgumentError(
-        "$(name) is not an installed dependency. If $(nameof(typeof(sim))) is not defined in " *
-        "the package whose version the database tracks, define packageName(::$(nameof(typeof(sim))))."
+        "$(nameof(typeof(sim))) is not defined in a package, so it has no installed version. " *
+        "Define it inside the package whose schema the database tracks."
+    ))
+    #! Keyed on the UUID rather than the name, which is what makes this exact: two loaded packages
+    #! can share a name, and a name scan would take whichever match it reached first.
+    #! Two contexts, and neither covers the other: running from the package's own project it is
+    #! not among its own dependencies but is `Pkg.project()`; under `Pkg.test()` the temp
+    #! environment has no project name at all and the package appears as a dependency.
+    proj = Pkg.project()
+    proj.uuid == uuid && return proj.version
+    deps = Pkg.dependencies()
+    haskey(deps, uuid) || throw(ArgumentError(
+        "$(nameof(mod)) ($(uuid)) is not installed in the active environment."
     ))
     return deps[uuid].version
 end
 
-#! Getting from a package *name* to its loaded module needs the module registry, because
-#! `packageName` yields a string. `Base.loaded_modules` is semi-internal Base API — a
-#! `Dict{PkgId,Module}` — and is the only route available. Worth re-checking on Julia upgrades.
-function _loadedModuleNamed(name::AbstractString)
-    found = nothing
-    for (pkgid, mod) in Base.loaded_modules
-        pkgid.name == name || continue
-        #! A `PkgId` is (uuid, name), so two loaded packages can share a name. Returning either one
-        #! would depend on `Dict` iteration order, and reporting an unrelated package's version is
-        #! precisely the failure this machinery exists to prevent — so an ambiguous name resolves
-        #! to nothing, and the project opens untracked rather than on a guess.
-        isnothing(found) || return nothing
-        found = mod
-    end
-    return found
-end
+#! The package whose version the database tracks: the one defining the simulator type. That is not
+#! a choice a backend gets to make — `upgradeMilestones` and `upgradeToMilestone` dispatch on the
+#! simulator type, so the code owning the schema is the code defining that type, and its version is
+#! the schema version. Taking the module directly, rather than looking a name up in
+#! `Base.loaded_modules`, means no name can be ambiguous and no Base registry internals are needed.
+#! `moduleroot` so that a type defined in a submodule reports its package.
+#! Overridable in principle but not part of the interface: the test suite points its stub simulator
+#! at ModelManager, which is the only reason it is a function rather than inlined.
+_packageModule(sim::AbstractSimulator) = Base.moduleroot(parentmodule(typeof(sim)))
 
-#! Resolved through `packageName` rather than `parentmodule(typeof(sim))` directly, so this and
-#! `getInstalledVersion` always describe the *same* package — otherwise a backend overriding only
-#! `packageName` would report its adapter package's loaded version against the core package's
-#! installed version, warning spuriously and aiming the migration at an unrelated package's
-#! version. `packageName` defaults to the type's own package, so the ordinary case is unaffected.
-#! Read from the module registry, never from the environment: substituting the installed version
-#! for the running one is the conflation this machinery exists to avoid.
-#! Internal, and deliberately not an interface hook: every value other than the named package's
-#! real loaded version breaks the installed-vs-loaded comparison that everything here rests on, so
-#! there is no override a backend could usefully supply. Layout problems belong in `packageName`.
-#! `nothing` means the named package is not loaded, carries no version, or is ambiguous.
-function _loadedPackageVersion(sim::AbstractSimulator)
-    mod = _loadedModuleNamed(packageName(sim))
-    return isnothing(mod) ? nothing : pkgversion(mod)
-end
+#! `nothing` when the defining module belongs to no versioned package — a simulator written in a
+#! script or at the REPL. Read from the loaded module, never from the environment: substituting the
+#! installed version for the running one is the conflation this machinery exists to avoid.
+_loadedPackageVersion(sim::AbstractSimulator) = pkgversion(_packageModule(sim))
 
 ########################################################
 ############      Version diagnostics       ############
@@ -110,12 +97,11 @@ _errorInstalledBehindDatabase(name, installed, db_version) = @error """
     $(db_version) or higher before opening this project.
     """
 
-_warnUnversionedSimulator(sim_type, name) = @warn """
-    $(sim_type) is not defined in a versioned package, and no loaded package named $(name) was
-    found, so the schema version cannot be determined. Opening the project without migrating it
-    and without recording a version. If this database was created by a versioned build, its schema
-    may not match the code now running. Defining packageName(::$(sim_type)) to name the package
-    whose schema the database tracks restores version tracking.
+_warnUnversionedSimulator(sim_type) = @warn """
+    $(sim_type) is not defined in a versioned package, so the schema version cannot be determined.
+    Opening the project without migrating it and without recording a version. If this database was
+    created by a versioned build, its schema may not match the code now running. Defining
+    $(sim_type) inside the package whose schema the database tracks restores version tracking.
     """ maxlog=1
 
 _errorTargetBeyondLoaded(name, target, loaded) = @error """
@@ -154,8 +140,8 @@ function getDBPackageVersion(sim::AbstractSimulator, db::SQLite.DB)::VersionNumb
     version = _loadedPackageVersion(sim)
     isnothing(version) && throw(ArgumentError(
         "Cannot record a version for $(nameof(typeof(sim))): it is not defined in a versioned " *
-        "package and no loaded package named $(packageName(sim)) was found. Define " *
-        "packageName(::$(nameof(typeof(sim)))) to name the package whose schema this tracks."
+        "package, so there is no version to record. Define it inside the package whose schema " *
+        "the database tracks."
     ))
     DBInterface.execute(db, "CREATE TABLE $(table) (version TEXT PRIMARY KEY);")
     DBInterface.execute(db, "INSERT INTO $(table) (version) VALUES ('$(version)');")
@@ -198,7 +184,7 @@ function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
     #! prototyped in a script still works — it simply gets no version tracking. Returning before
     #! `getDBPackageVersion` also keeps it from stamping a version table it cannot fill.
     if isnothing(loaded)
-        _warnUnversionedSimulator(nameof(typeof(sim)), name)
+        _warnUnversionedSimulator(nameof(typeof(sim)))
         return true
     end
 

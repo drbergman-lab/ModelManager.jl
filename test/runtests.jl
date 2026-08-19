@@ -51,7 +51,10 @@ ModelManager.simulatorInfo(::TestSimulator) = "TestSimulator (stub)"
 ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
 
 # ---- Package version / upgrade ----------------------------------------------
-ModelManager.packageName(::TestSimulator)       = "ModelManager"
+# TestSimulator is defined in Main, which carries no version, so point the version machinery at
+# ModelManager itself. This is the seam a real backend never needs: its simulator type lives in
+# the package whose schema the database tracks, so the default already resolves.
+ModelManager._packageModule(::TestSimulator)     = ModelManager
 ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
 
 # Overridable so the migration tests can stage a mid-session package update. Three settings:
@@ -60,8 +63,9 @@ ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
 #   a VersionNumber   — a staged loaded version, i.e. a mid-session Pkg change.
 #   nothing           — genuinely undeterminable, exercising the short-circuit path.
 const _loaded_version_override = Ref{Any}(:default)
-ModelManager._loadedPackageVersion(::TestSimulator) =
-    _loaded_version_override[] === :default ? pkgversion(ModelManager) : _loaded_version_override[]
+ModelManager._loadedPackageVersion(sim::TestSimulator) =
+    _loaded_version_override[] === :default ? pkgversion(ModelManager._packageModule(sim)) :
+                                              _loaded_version_override[]
 
 # Overridable so the guard tests can present a milestone the "loaded" version knows about,
 # and count how many times it was applied.
@@ -2184,16 +2188,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     # which is a loaded module but carries no version. That path is what every
                     # project in the suite depends on behaving predictably.
                     @test ModelManager._loadedPackageVersion(_NoModuleSimulator()) === nothing
-                    # packageName defaults to the package defining the type, resolved through
-                    # moduleroot so it names the same package whose version pkgversion reports.
-                    # _NoModuleSimulator is defined here, so that is Main.
+                    # packageName is derived from that module, so it cannot disagree with the
+                    # package whose version is being checked.
                     @test ModelManager.packageName(_NoModuleSimulator()) == "Main"
-                    # A type inside a submodule resolves to the enclosing package rather than
-                    # stopping at the submodule, which is what distinguishes moduleroot from a
-                    # bare parentmodule. Both this module and Main root at Main.
                     @test ModelManager.packageName(_NestedSimModule.NestedSimulator()) == "Main"
+                    # moduleroot rather than a bare parentmodule is what makes the submodule case
+                    # resolve to the package.
                     @test parentmodule(_NestedSimModule.NestedSimulator) !=
                           Base.moduleroot(parentmodule(_NestedSimModule.NestedSimulator))
+                    @test ModelManager.packageName(TestSimulator()) == "ModelManager"
 
                     # --- the migration target ---------------------------------------------
                     # The loaded version is the target. For TestSimulator the default resolves via
@@ -2203,15 +2206,19 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     _loaded_version_override[] = v"0.4.0"
                     @test ModelManager._loadedPackageVersion(TestSimulator()) == v"0.4.0"
 
-                    # The default chains through packageName when the type is not in a versioned
-                    # package: _NoModuleSimulator names Main, which is not a loaded package, so
-                    # there is genuinely no version to find.
-                    @test ModelManager._loadedModuleNamed("ModelManager") === ModelManager
-                    @test ModelManager._loadedModuleNamed("NoSuchPackage") === nothing
-                    # Main is loaded but carries no version, so the chain ends at nothing rather
-                    # than at a module whose version cannot be read.
-                    @test ModelManager._loadedModuleNamed("Main") === Main
-                    @test pkgversion(Main) === nothing
+                    # Identity comes from the module defining the type, so no name is involved and
+                    # none can be ambiguous. _NoModuleSimulator resolves to Main, which has no UUID
+                    # and no version.
+                    @test ModelManager._packageModule(_NoModuleSimulator()) === Main
+                    @test Base.PkgId(Main).uuid === nothing
+                    # A type in a submodule resolves to the enclosing package, not the submodule.
+                    @test ModelManager._packageModule(_NestedSimModule.NestedSimulator()) === Main
+                    # The installed lookup is keyed on that module's UUID, so it agrees with the
+                    # module's own reported version rather than searching by name.
+                    @test ModelManager.getInstalledVersion(TestSimulator()) ==
+                          pkgversion(ModelManager)
+                    # No package, no installed version -- and it says why.
+                    @test_throws ArgumentError ModelManager.getInstalledVersion(_NoModuleSimulator())
 
                     # --- resolvePackageVersion --------------------------------------------
                     # Resolvable loaded version: behaves as it always did.

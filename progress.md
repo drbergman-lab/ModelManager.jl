@@ -292,6 +292,46 @@ failure this machinery exists to prevent, so a guess is worse than admitting ign
 directly unit-tested: loading two same-named packages in one session is not something a test can
 readily construct.
 
+### Identity moved from a package *name* to the defining *module*
+Asked whether the accepted collision hole could come from submodules or user-defined modules, and
+whether the UUID would be hard. Measured first, because the premise mattered:
+
+- **Submodules are not in `Base.loaded_modules`.** 269 entries, every one a `require`d package
+  except `Main`/`Base`/`Core`. `Pkg.Types` is absent; `module UserDefined end` in `Main` is absent.
+  (`"PrettyTables"` does appear, but as a separate package DataFrames depends on, not a submodule.)
+  So the hole needed two distinct packages sharing a name — real, but far narrower than feared.
+- The UUID turned out to be *less* code, not more, because the name search was unnecessary:
+  `Base.PkgId(mod)` gives `(name, uuid)` exactly, `pkgversion(mod)` gives the loaded version with no
+  registry scan, and `Pkg` can be keyed on the UUID.
+
+I proposed a new `packageModule` hook to carry the redirect. The reviewer rejected the premise
+instead: it is "a bit crazy to have the simulator defined in one package whose version is not tied
+to the version of the package that runs the database." That is right, and it is provable rather than
+a matter of taste — `upgradeMilestones` and `upgradeToMilestone` dispatch on the simulator type, so
+the code owning the schema *is* the code defining that type. Defining those methods in some other
+package would be piracy. The redirect was capability nobody should want, and the fix was to delete
+the notion rather than give it a better hook.
+
+So identity is now `_packageModule(sim) = Base.moduleroot(parentmodule(typeof(sim)))`, internal and
+not configurable. Consequences:
+
+- `_loadedModuleNamed` deleted outright, and with it the `Base.loaded_modules` dependency that had
+  been flagged as a Julia-upgrade risk. The name-collision hole is gone by construction — there is
+  no name to collide.
+- `getInstalledVersion` had the *same* latent ambiguity (`findfirst(dep -> dep.name == name)` takes
+  the first match) and is now keyed on the module's UUID. Both of its context branches are needed
+  and were verified: from the package's own project it is absent from `Pkg.dependencies()` but is
+  `Pkg.project()`; under `Pkg.test()` the temp environment has no project name and it appears as a
+  dependency.
+- `packageName` survives as a derived display name for messages. PCMM's existing method still
+  agrees with the derived default, so no coordinated change is needed there.
+- No public API was added. The PR started out proposing a new public hook and ends having removed
+  one and added none.
+
+Residual sharp edge, accepted: `packageName` remains overridable and purely cosmetic, so a backend
+could name one package in messages while the version comes from another. Documented in its
+docstring; cosmetic only.
+
 ### The docstring-detaching comment is not limited to one-line definitions
 Same trap as last round, and this time it exposed an error in what I had written into CLAUDE.md.
 I had recorded that an intervening comment detaches a docstring from a **one-line** definition;

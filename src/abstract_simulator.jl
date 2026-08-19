@@ -178,24 +178,16 @@ end
 ############   Database upgrade interface   ############
 ########################################################
 
-#! `moduleroot` rather than `parentmodule` alone, so that a type defined in a submodule reports
-#! the package rather than the submodule — and so that this names the same package whose version
-#! `_loadedPackageVersion` reports, since `pkgversion` resolves through `moduleroot` too. If the
-#! two disagreed, the mismatch warning would compare unrelated packages.
-#! Keep this comment above the docstring: between the docstring and a one-line definition, it
-#! silently prevents the docstring from attaching, which only surfaces as a docs-build
-#! `:cross_references` failure on every `@ref` to this name.
 """
     packageName(sim::AbstractSimulator)::String
 
-Return the Julia package name for this simulator framework (e.g. `"PhysiCellModelManager"`),
-used to look up the installed version via `Pkg`.
+Return the display name of this simulator framework's package (e.g. `"PhysiCellModelManager"`),
+used in version and migration messages.
 
-Defaults to the package that defines `typeof(sim)`. This is the single place that decides which
-package is version-checked — the version installed in the environment and the version loaded in
-the session are both resolved from this name, so overriding it moves them together. Override when
-the version the database tracks belongs to a different package than the one defining the
-simulator type.
+Defaults to the package defining `typeof(sim)`, which is also the package whose version the
+database tracks — that follows from [`upgradeMilestones`](@ref) and
+[`upgradeToMilestone`](@ref) dispatching on the simulator type, so it is not separately
+configurable. Overriding this changes only the name shown in messages.
 
 # Arguments
 - `sim::AbstractSimulator`: the active simulator backend.
@@ -205,10 +197,10 @@ The package name, as a `String`.
 
 # Example
 ```julia
-ModelManager.packageName(::MySimulator) = "MySimCore"
+ModelManager.packageName(::MySimulator) = "MySim"   # a shorter name for messages
 ```
 """
-packageName(sim::AbstractSimulator) = string(nameof(Base.moduleroot(parentmodule(typeof(sim)))))
+packageName(sim::AbstractSimulator) = string(nameof(_packageModule(sim)))
 
 """
     dbVersionTableName(sim::AbstractSimulator)::String

@@ -131,9 +131,9 @@ ModelManager.upgradeToMilestone(sim::MySimulator, version, auto_upgrade)::Bool
 See [Database upgrades](@ref database_upgrades) for how these are orchestrated by [`upgradePackage`](@ref).
 
 Migrations target the version of your package loaded in the session, since `upgradeMilestones` is
-that loaded code. ModelManager finds it from [`packageName`](@ref), which defaults to the package
-defining your simulator type — override it if that is not the package whose version the database
-should track.
+that loaded code. ModelManager reads it from the package defining your simulator type, so nothing
+here needs configuring: the package that owns these methods is the package whose version the
+database records.
 
 ## 5. Override optional hooks as needed
 
