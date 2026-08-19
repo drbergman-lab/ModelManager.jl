@@ -331,7 +331,10 @@ function _generationSummary(calibration::Calibration)
                                     r"^generation_(\d+)\.toml$")
     isempty(files) && return (0, nothing)
     epsilon = try
-        get(TOML.parsefile(last(last(files))), "epsilon", nothing)
+        #! Either spelling: "epsilon" is what pre-rename runs wrote.
+        let d = TOML.parsefile(last(last(files)))
+            get(d, "max_epsilon_accepted", get(d, "epsilon", nothing))
+        end
     catch
         nothing
     end

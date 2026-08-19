@@ -602,7 +602,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test sum(g.weights) ≈ 1.0 atol=1e-6
         end
         for i in Iterators.drop(eachindex(gens), 1)
-            @test gens[i].epsilon <= gens[i-1].epsilon
+            @test gens[i].max_epsilon_accepted <= gens[i-1].max_epsilon_accepted
         end
     end
 
@@ -722,7 +722,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
         # Epsilon should be non-increasing over generations
         for i in Iterators.drop(eachindex(gens), 1)
-            @test gens[i].epsilon <= gens[i-1].epsilon
+            @test gens[i].max_epsilon_accepted <= gens[i-1].max_epsilon_accepted
         end
 
         # Weights sum to 1 per generation
@@ -746,7 +746,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
         # First generation always runs; subsequent generations skipped because ε = 0 < 0.5
         @test length(gens) == 1
-        @test gens[1].epsilon == 0.0
+        @test gens[1].max_epsilon_accepted == 0.0
     end
 
     @testset "GenerationResult fields" begin
@@ -758,7 +758,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test gen.t == 1
         @test gen.particles.x == [1.0, 2.0, 3.0]
         @test sum(gen.weights) ≈ 1.0
-        @test gen.epsilon == 0.3
+        @test gen.max_epsilon_accepted == 0.3
         @test gen.n_evaluations == 10
         @test gen.acceptance_rate ≈ 0.3
         @test gen.ess ≈ 1 / sum(w.^2)
@@ -811,7 +811,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             # TOML contains generation-level fields
             meta1 = TOML.parsefile(joinpath(dir, "generation_01.toml"))
             @test meta1["t"] == 1
-            @test meta1["epsilon"] ≈ 0.5
+            @test meta1["max_epsilon_accepted"] ≈ 0.5
             @test meta1["n_evaluations"] == 3
             @test meta1["acceptance_rate"] ≈ 1.0
             @test meta1["ess"] ≈ gen1.ess
@@ -825,7 +825,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test loaded[1].particles.beta  ≈ [1.0, 2.0, 3.0]
             @test loaded[1].weights         ≈ w1
             @test loaded[1].distances       ≈ [0.5, 0.4, 0.3]
-            @test loaded[1].epsilon         ≈ 0.5
+            @test loaded[1].max_epsilon_accepted         ≈ 0.5
             @test loaded[1].n_evaluations   == 3
             @test loaded[1].monad_ids       == [10, 11, 12]
             @test loaded[1].acceptance_rate ≈ 1.0
@@ -833,12 +833,47 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
             @test loaded[2].t == 2
             @test loaded[2].particles.alpha ≈ [0.15, 0.25]
-            @test loaded[2].epsilon         ≈ 0.2
+            @test loaded[2].max_epsilon_accepted         ≈ 0.2
             @test loaded[2].n_evaluations   == 6
             @test loaded[2].acceptance_rate ≈ 2/6
 
             # Only 2 files exist → only 2 loaded
             @test length(ModelManager._loadGenerations(dir, param_names, max_pops)) == 2
+
+            # The ten-argument constructor still works, so every existing positional construction
+            # keeps compiling; the two trailing fields default to absent.
+            @test isnothing(gen1.epsilon_threshold)
+            @test isnothing(gen1.proposal_distances)
+
+            # Written keys: the achieved epsilon under its own name, and no threshold for a
+            # generation that had none (TOML has no null, so the key is omitted, not blanked).
+            meta_written = TOML.parsefile(joinpath(dir, "generation_01.toml"))
+            @test haskey(meta_written, "max_epsilon_accepted")
+            @test !haskey(meta_written, "epsilon_threshold")
+            @test !haskey(meta_written, "epsilon")
+
+            # A generation TOML written before the rename must still load: the reader accepts the
+            # old "epsilon" spelling and leaves the threshold absent. Without this fallback every
+            # existing calibration would fail to resume.
+            legacy_dir = joinpath(dir, "legacy")
+            mkpath(joinpath(legacy_dir, "generation_cdfs"))
+            cp(joinpath(dir, "generation_cdfs", "generation_01.csv"),
+               joinpath(legacy_dir, "generation_cdfs", "generation_01.csv"))
+            cp(joinpath(dir, "generation_01.csv"), joinpath(legacy_dir, "generation_01.csv"))
+            legacy_meta = Dict{String,Any}(
+                "t"               => 1,
+                "epsilon"         => 0.5,      # the pre-rename spelling
+                "n_evaluations"   => 3,
+                "acceptance_rate" => 1.0,
+                "ess"             => gen1.ess,
+            )
+            open(joinpath(legacy_dir, "generation_01.toml"), "w") do io
+                TOML.print(io, legacy_meta)
+            end
+            legacy_loaded = ModelManager._loadGenerations(legacy_dir, param_names, max_pops)
+            @test length(legacy_loaded) == 1
+            @test legacy_loaded[1].max_epsilon_accepted ≈ 0.5
+            @test isnothing(legacy_loaded[1].epsilon_threshold)
 
             # Cross-padding: files were written with max_pops=10 (tags "01","02") but
             # loaded with max_pops=5 (which would have generated tags "1","2" under the
@@ -1036,6 +1071,14 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         length(gens) >= 2 && @test all(d <= schedule[1] for d in gens[2].distances)
         length(gens) >= 3 && @test all(d <= schedule[2] for d in gens[3].distances)
         length(gens) >= 4 && @test all(d <= schedule[3] for d in gens[4].distances)
+
+        # The threshold each generation ran against is now recorded, and is not recoverable from
+        # max_epsilon_accepted: it is a quantile of the *previous* generation's accepted distances.
+        for k in 2:length(gens)
+            @test gens[k].epsilon_threshold == schedule[k-1]
+        end
+        # Generation 1 has no threshold — it accepts every proposal it evaluates.
+        @test isnothing(gens[1].epsilon_threshold)
     end
 
     ################## Stopping criteria ##################
@@ -1146,8 +1189,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         gens = ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)],
                                         evaluate_flaky, g -> nothing)
 
-        @test isfinite(gens[1].epsilon)
-        @test gens[1].epsilon ≈ 0.5
+        @test isfinite(gens[1].max_epsilon_accepted)
+        @test gens[1].max_epsilon_accepted ≈ 0.5
         # 4 of 6 survive; weights renormalized over survivors, n_evaluations unchanged.
         @test length(gens[1].weights) == 4
         @test sum(gens[1].weights) ≈ 1.0
@@ -1643,7 +1686,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                         evaluate_batch, g -> nothing)
         # Must have run at least 2 generations, and the final gen must satisfy epsilon ≤ 0.5.
         @test length(gens) >= 2
-        @test gens[end].epsilon <= 0.5
+        @test gens[end].max_epsilon_accepted <= 0.5
         @test all(d <= 0.5 for d in gens[end].distances)
     end
 
@@ -3530,7 +3573,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # Two of six proposals were rejected, so four particles remain.
                 @test nrow(result.generations[1].particles) == 4
                 @test result.generations[1].n_evaluations == 6
-                @test isfinite(result.generations[1].epsilon)
+                @test isfinite(result.generations[1].max_epsilon_accepted)
 
                 # Failures are recorded to the generation's failure files.
                 sim_path = ModelManager._failedSimulationsPath(result.calibration, 1,

@@ -1316,14 +1316,21 @@ function _saveGeneration(dir::String, cdf_dir::String, gen::GenerationResult,
     CSV.write(joinpath(dir, "generation_$tag.csv"), _buildDisplayDF(gen, cps))
 
     # Generation-level TOML.
+    meta = Dict{String,Any}(
+        #! Two distinct quantities, and only the first used to be recorded: `max_epsilon_accepted`
+        #! is the worst distance actually accepted, while `epsilon_threshold` is the cutoff the
+        #! generation was run against. They coincide only when `epsilon_quantile == 1.0`.
+        "t"                    => gen.t,
+        "max_epsilon_accepted" => gen.max_epsilon_accepted,
+        "n_evaluations"        => gen.n_evaluations,
+        "acceptance_rate"      => gen.acceptance_rate,
+        "ess"                  => gen.ess,
+    )
+    #! Omitted rather than written as a placeholder: generation 1 has no threshold, because it
+    #! accepts every proposal it evaluates, and TOML has no null.
+    isnothing(gen.epsilon_threshold) || (meta["epsilon_threshold"] = gen.epsilon_threshold)
     open(joinpath(dir, "generation_$tag.toml"), "w") do io
-        TOML.print(io, Dict{String,Any}(
-            "t"               => gen.t,
-            "epsilon"         => gen.epsilon,
-            "n_evaluations"   => gen.n_evaluations,
-            "acceptance_rate" => gen.acceptance_rate,
-            "ess"             => gen.ess,
-        ))
+        TOML.print(io, meta; sorted=true)
     end
 end
 
@@ -1364,14 +1371,21 @@ function _loadGenerations(dir::String, param_names::Vector{String},
 
         toml_path = joinpath(dir, "generation_$tag.toml")
         meta = TOML.parsefile(toml_path)
-        epsilon         = Float64(meta["epsilon"])
+        #! Pre-rename runs wrote "epsilon"; accept either so they still resume.
+        max_epsilon_accepted = Float64(get(meta, "max_epsilon_accepted",
+                                           get(meta, "epsilon", NaN)))
         n_evaluations   = Int(meta["n_evaluations"])
         acceptance_rate = Float64(meta["acceptance_rate"])
         ess             = Float64(meta["ess"])
 
-        push!(generations, GenerationResult(t, particles, weights, distances, epsilon,
+        #! `nothing` when the key is absent, which is every generation 1 and every pre-rename run.
+        epsilon_threshold = haskey(meta, "epsilon_threshold") ?
+            Float64(meta["epsilon_threshold"]) : nothing
+
+        push!(generations, GenerationResult(t, particles, weights, distances,
+                                            max_epsilon_accepted,
                                             n_evaluations, monad_ids, acceptance_rate, ess,
-                                            nothing))
+                                            nothing, epsilon_threshold, nothing))
     end
 
     return generations

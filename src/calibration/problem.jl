@@ -180,13 +180,22 @@ struct GenerationResult
     particles::DataFrame
     weights::Vector{Float64}
     distances::Vector{Float64}
-    epsilon::Float64
+    max_epsilon_accepted::Float64
     n_evaluations::Int
     monad_ids::Vector{Int}
     acceptance_rate::Float64
     ess::Float64
     rejected_proposals::Union{Nothing,DataFrame}
+    epsilon_threshold::Union{Nothing,Float64}
+    proposal_distances::Union{Nothing,DataFrame}
 end
+
+#! Ten-argument form so existing positional constructions keep working; the two trailing fields are
+#! absent for generations loaded from a run that predates them anyway.
+GenerationResult(t, particles, weights, distances, max_epsilon_accepted, n_evaluations,
+                 monad_ids, acceptance_rate, ess, rejected_proposals) =
+    GenerationResult(t, particles, weights, distances, max_epsilon_accepted, n_evaluations,
+                     monad_ids, acceptance_rate, ess, rejected_proposals, nothing, nothing)
 
 ################## ABCResult ##################
 
@@ -318,7 +327,7 @@ end
 
 Per-generation convergence table for an ABC-SMC run. Supports
 `plot(ConvergenceSummary(result))` via the RecipesBase recipe in `visualize.jl`,
-and behaves like a DataFrame for property access (`cs.epsilon`, etc.).
+and behaves like a DataFrame for property access (`cs.max_epsilon_accepted`, etc.).
 
 # Columns
 - `t`: Generation index.
@@ -354,7 +363,8 @@ function ConvergenceSummary(result::ABCResult)
     isempty(result.generations) && error("No generations in ABCResult.")
     df = DataFrame(
         t               = [g.t                       for g in result.generations],
-        epsilon         = [g.epsilon                 for g in result.generations],
+        max_epsilon_accepted = [g.max_epsilon_accepted for g in result.generations],
+        epsilon_threshold    = [g.epsilon_threshold    for g in result.generations],
         acceptance_rate = [g.acceptance_rate         for g in result.generations],
         n_accepted      = [nrow(g.particles)         for g in result.generations],
         ess             = [g.ess                     for g in result.generations],
@@ -371,6 +381,7 @@ function ConvergenceSummary(cal::Calibration)
     isempty(toml_files) && error("No generation metadata found for Calibration($(cal.id)).")
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
+    thresholds = Union{Nothing,Float64}[]
     n_accepteds = Int[]; esss = Float64[]; ess_fractions = Float64[]
     n_evaluationss = Int[]
 
@@ -380,12 +391,16 @@ function ConvergenceSummary(cal::Calibration)
         n_acc = isfile(csv_path) ?
                 nrow(CSV.read(csv_path, DataFrame; select=[:weight])) :
                 round(Int, d["acceptance_rate"] * d["n_evaluations"])
-        push!(ts, t); push!(epsilons, d["epsilon"])
+        push!(ts, t)
+        #! Pre-rename runs wrote this as "epsilon"; read either spelling so they still load.
+        push!(epsilons, get(d, "max_epsilon_accepted", get(d, "epsilon", NaN)))
+        push!(thresholds, get(d, "epsilon_threshold", nothing))
         push!(acceptance_rates, d["acceptance_rate"]); push!(n_accepteds, n_acc)
         push!(esss, d["ess"]); push!(ess_fractions, d["ess"] / n_acc)
         push!(n_evaluationss, d["n_evaluations"])
     end
-    df = DataFrame(t=ts, epsilon=epsilons, acceptance_rate=acceptance_rates,
+    df = DataFrame(t=ts, max_epsilon_accepted=epsilons, epsilon_threshold=thresholds,
+                   acceptance_rate=acceptance_rates,
                    n_accepted=n_accepteds, ess=esss, ess_fraction=ess_fractions,
                    n_evaluations=n_evaluationss)
     return ConvergenceSummary(df)
