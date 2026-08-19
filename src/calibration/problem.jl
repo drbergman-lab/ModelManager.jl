@@ -70,7 +70,7 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                              summary_statistic, distance;
                              n_replicates::Int=1,
                              reference_variation_id::VariationID=VariationID(inputs))
-    cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(inputs, cps, observed_data,
                               summary_statistic, distance, n_replicates, reference_variation_id)
 end
@@ -78,9 +78,70 @@ end
 function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              observed_data,
                              summary_statistic, distance; n_replicates::Int=1)
-    cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
                               summary_statistic, distance, n_replicates, ref.variation_id)
+end
+
+#! Defined here rather than beside `ParsedVariations` in `variations.jl`: that file is included
+#! before `calibration/problem.jl`, so a method signature naming `CalibrationProblem` there would be
+#! an `UndefVarError` at definition time.
+"""
+    ParsedVariations(problem::CalibrationProblem) → ParsedVariations
+
+Reinterpret a calibration problem's parameters as a sensitivity-analysis variation set.
+
+This is lossless: both workflows normalize user variations through the same `LatentVariation`
+factories, and the problem retains each parameter's latent variation, so nothing is reconstructed.
+The reverse direction is *not* lossless and is deliberately not provided — routing a
+[`DistributedVariation`](@ref) through `LatentVariation` and back loses the friendly display name
+its generation CSVs are keyed by.
+
+# Examples
+```julia
+problem = CalibrationProblem(inputs, [dv1, dv2], observed, summarize, mseDistance)
+pv = ParsedVariations(problem)
+```
+"""
+ParsedVariations(problem::CalibrationProblem) =
+    ParsedVariations(AbstractVariation[cp.lv for cp in problem.parameters])
+
+"""
+    run(method::GSAMethod, problem::CalibrationProblem; functions, kwargs...) → GSASampling
+
+Run a global sensitivity analysis over a calibration problem's parameters and base model.
+
+Answers "which of the parameters I am calibrating actually matter?" without redefining the model,
+the parameters, the replicate count or the reference variation. `problem`'s `observed_data`,
+`summary_statistic` and `distance` are unused — a sensitivity analysis has no observation to compare
+against, so supply what to measure through `functions`.
+
+# Arguments
+- `method::GSAMethod`: [`MOAT`](@ref), [`Sobolʼ`](@ref) or [`RBD`](@ref).
+- `problem::CalibrationProblem`: supplies the inputs, parameters, `n_replicates` and
+  `reference_variation_id`.
+
+# Keywords
+- `functions::AbstractVector{<:Function}=Function[]`: scalar outputs, each called per simulation and
+  averaged over a monad's replicates. Note this differs from `summary_statistic`, which is per monad.
+- other keywords are forwarded to [`run`](@ref).
+
+# Returns
+A `GSASampling` holding the sensitivity indices.
+
+# Examples
+```julia
+problem = CalibrationProblem(inputs, [dv1, dv2], observed, summarize, mseDistance)
+gsa = run(MOAT(15), problem; functions=[finalCount])
+```
+"""
+function run(method::GSAMethod, problem::CalibrationProblem;
+             functions::AbstractVector{<:Function}=Function[], kwargs...)
+    gsa_sampling = runSensitivitySampling(method, problem.inputs, ParsedVariations(problem);
+                                          reference_variation_id=problem.reference_variation_id,
+                                          n_replicates=problem.n_replicates, kwargs...)
+    sensitivityResults!(gsa_sampling, functions)
+    return gsa_sampling
 end
 
 ################## Calibration ##################

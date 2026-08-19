@@ -2979,3 +2979,47 @@ Two findings were refuted and are recorded so they are not re-litigated: that `r
 emptied monad leaves a run simulation with `Int[]` (real mechanism, but pre-existing behavior of
 `simulationFailed`, not introduced here — and now covered by the membership wording), and a
 duplicate of finding 2 filed against PRD.md alone.
+
+
+## 2026-08-19 — Shared study objects, Stage 1: GSA over a CalibrationProblem
+
+Brief: `planning/07-shared-study-objects.md`, Stage 1 of four. The target the user asked for is one
+study definition driving both workflows — `runSensitivity(inputs, priors, ...)` alongside
+`runABC(inputs, priors, data, ...)`. Stage 1 is the half of that which needs no new types.
+
+**The design decision that shapes everything after it.** Both workflows already normalize user
+variations through the *same* `LatentVariation` factories, so converting a `CalibrationProblem` into
+a `ParsedVariations` is one line and loses nothing. The reverse is *not* lossless: a
+`DistributedVariation` routed through `LatentVariation` and back arrives as an `LVSource`, so
+`_displayColumns` emits latent-parameter names plus raw target columns instead of the friendly
+`variationName(dv)` — which changes the shape of the generation CSVs and of `posterior()` output.
+Therefore any shared object must retain the user's *original* variations and let each consumer derive
+its own representation. Stage 2's `StudySpec` is designed on that basis.
+
+**Where the new methods live, and why not beside `ParsedVariations`.** `variations.jl` is included
+before `calibration/problem.jl`, so a method signature naming `CalibrationProblem` in that file is an
+`UndefVarError` at definition time — the same include-order constraint that put `include("tags.jl")`
+at the bottom of the list in #32. Both new methods therefore live in `calibration/problem.jl`.
+
+**All offenders, not the first.** `_toCalibrationParameter` was called inside a comprehension, so a
+user with eight variations and two unusable ones learned about one per run, identified only by type.
+Split into `_calibrationRejection(av) -> Union{Nothing,String}` (the reason, or `nothing`) plus
+`_toCalibrationParameters(parameters)`, which collects every rejection into one `ArgumentError`
+listing each by index and `variationName`. The single-argument throwing methods are one-liners over
+the same reasons, so a direct `_toCalibrationParameter` call still raises the identical message.
+
+**A documentation error worth more than it looks.** `docs/src/man/sensitivity_analysis.md` described
+`functions` as `monad_id -> Real`. The reality in `evaluateFunctionOnSampling` is `f(simulation_id)`
+per simulation, averaged with `mean` over the monad's replicates. That line actively misleads anyone
+trying to share a quantity of interest between the two workflows, because calibration's
+`summary_statistic` genuinely *is* per-monad. Corrected, with an admonition stating that replicate
+aggregation is library-owned for sensitivity and user-owned for calibration — the asymmetry that
+prevents the two conventions from simply being merged, and the thing Stage 3's QoI seam has to
+resolve.
+
+**Deferred, deliberately.** Stage 1b (whether calibration can accept discrete parameters, which the
+user wants converged rather than validated around) needs an assessment of the four perturbation
+kernels before it can be designed: they fit a covariance in ℝᵈ and the importance weights need a
+proposal density, so a discrete coordinate needs a categorical or random-walk proposal. Stages 2–4
+(`StudySpec`, the `QoI` seam, the simulator-kwargs convention) wait on the calibration entry-point
+unification in #33, which settles the keyword surface they must match.

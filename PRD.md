@@ -388,8 +388,10 @@ target location's file type.
 **Behavioral specification:**
 - `MOAT`, `Sobolʼ` (`SobolMM`), and `RBD` are subtypes of `GSAMethod`.
 - `run(method, inputs, avs; functions, kwargs...)` creates the sampling design, runs simulations, computes indices for each function in `functions`, and records the scheme to CSV.
-- `functions` is a `Vector{Function}` where each `f(simulation_id) -> Real`.
+- `functions` is a `Vector{Function}` where each `f(simulation_id) -> Real`. Values are averaged over a monad's replicates by the library, unlike calibration's `summary_statistic`, which is per-monad and aggregates however the user chooses.
 - `kwargs` are forwarded to `run(::Sampling; ...)`.
+- `run(method, problem::CalibrationProblem; functions, kwargs...)` runs the analysis over a calibration problem's parameters and base model, so one study definition serves both workflows. It takes `inputs`, the parameters, `n_replicates` and `reference_variation_id` from the problem; `observed_data`, `summary_statistic` and `distance` are unused, since a sensitivity analysis has no observation to compare against.
+- `ParsedVariations(problem::CalibrationProblem)` is the conversion behind that entry point, and is lossless: both workflows normalize through the same `LatentVariation` factories and the problem retains each parameter's latent variation. The reverse direction is deliberately absent — it would lose a `DistributedVariation`'s display name, which the generation CSVs are keyed by.
 
 **Acceptance criteria:**
 - `run(MOAT(5), inputs, [dv])` creates `5*(d+1)` monads and returns a `MOATSampling`.
