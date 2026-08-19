@@ -663,15 +663,34 @@ creating monads is the cheaper way to stay out of a shared project's way.
 
 ### Review follow-ups (PR #32)
 
-**Rowid reuse is a real aliasing risk, and it is repo-wide rather than mine.** Review asked whether
-`_survivingMonadIDs` could let a freshly created monad slip in at the ID of a deleted one. It can:
-no MM table uses `AUTOINCREMENT`, and SQLite reuses the largest freed rowid — verified directly
-(insert 1–3, delete 3, insert → the new row is id 3). But nothing about that is specific to
-calibration; every constituent CSV in the package stores exactly these reusable IDs as durable
-references, so the same aliasing exists for `monads/{id}/simulations.csv` and friends. The fix that
-actually closes it is `AUTOINCREMENT` on the primary keys, which is a schema migration and therefore
-a `AbstractSimulator` milestone every downstream simulator must implement — out of scope here, filed
-as a to-do in CLAUDE.md.
+**Rowid reuse is a real aliasing risk, and the exposure is narrower than the first draft of this
+entry claimed.** Review asked whether `_survivingMonadIDs` could let a freshly created monad slip in
+at the ID of a deleted one. It can: no MM table uses `AUTOINCREMENT`, so SQLite assigns
+`max(rowid)+1` and hands back a deleted object's ID whenever that row held the maximum — verified
+directly (insert 1–3, delete 3, insert → the new row is id 3, and its simulations get ids 1 and 2
+back too). `AUTOINCREMENT` is the fix and is now a CLAUDE.md to-do, where the severity analysis
+lives; it is a schema migration, so the milestone must be implemented by every downstream simulator,
+which is why it belongs with the next migration rather than on its own.
+
+The first draft said every durable cross-reference in the package is exposed. That is wrong, and the
+correction matters because it is what makes the remaining risk tolerable. Parent constituent CSVs
+*are* filtered and rewritten on deletion, and tag rows are removed at all five choke points — so the
+`tags` store never carries a stale reference, which makes tag-based recovery immune to reuse and is
+why the manual can go on telling users to prefer it over saved ID lists. Only two holes remain:
+`deleteSimulations(ids; delete_supers=false)` returns before the parent-CSV filtering, and
+calibration's per-generation monads record is never rewritten by any deletion path.
+
+Nor can the calibration exposure reach a result, for a structural reason rather than a lucky one. A
+monad is deleted only when every one of its simulations failed; such a monad's distance is `missing`;
+and `missing` is dropped in generation 1 and rejected afterwards. So a deleted monad is never an
+accepted particle, and the accepted-particle files that `posterior`, `ConvergenceSummary` and
+`resumeABC` read cannot contain an alias-prone ID. What is exposed is the monads record: the
+`Calibration` accessors added here, and `_lazyLoadRejectedFromDisk` for the `:transition` plot.
+Ranked by likelihood, reuse by the next batch *in the same generation* is the common case and is
+benign, since the new monad genuinely belongs to that generation; reuse in a later generation
+mis-attributes one monad to the earlier generation's view while the run-wide view stays correct; and
+a hole that survives the run — which needs the total failure in the final batch, since otherwise the
+next batch fills it — lets a later unrelated monad join the run-wide view.
 
 Worth recording what does *not* work, since it looks like it should: subtracting
 `generation_{NNN}_failed_monads.csv` from the recorded IDs. That file holds monads with **at least

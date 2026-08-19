@@ -6,11 +6,14 @@ CurrentModule = ModelManager
 
 Finding simulations by ID is not a robust way to find your own work later. A script that records
 `[41, 42, 43]` is correct exactly once; add replicates, regenerate the sweep, or come back
-in six months and the list means nothing. Parameter values are not much better — they say
+in six months and the list means nothing. An ID is not even a permanent name: delete the
+highest-numbered simulation in a project and the next one created takes its number, so a saved list
+can come back pointing at work you have never seen. Parameter values are not much better — they say
 what a simulation *was*, not what it was *for*.
 
 Tags fix this by letting you attach `key => value` pairs to any trial object — or to a
-[`Calibration`](@ref) run — and then search by them.
+[`Calibration`](@ref) run — and then search by them. A tag row is deleted along with the object it
+describes, so a tag query only ever returns things that still exist and still mean what they meant.
 
 ## The short version
 
