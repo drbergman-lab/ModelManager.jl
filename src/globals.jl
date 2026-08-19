@@ -243,7 +243,20 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
         return _abortInitialization()
     end
 
-    if !resolvePackageVersion(simulator, centralDB(); auto_upgrade=auto_upgrade)
+    #! Reported rather than thrown, so this function keeps its documented contract of returning
+    #! `false` on any initialization failure. Version resolution has several throwing paths: the
+    #! loaded package can be absent from the active environment (loaded through a stacked
+    #! environment, or `Pkg.activate` ran after it was loaded), a version table can hold an
+    #! unparsable version, and a backend milestone can throw part-way through a migration.
+    #! `println` rather than `@error` to match the database-open failure a few lines above; the
+    #! `@warn`/`@error` split belongs to the version diagnostics in `package_version.jl`.
+    version_resolved = try
+        resolvePackageVersion(simulator, centralDB(); auto_upgrade=auto_upgrade)
+    catch e
+        println("Could not resolve the package version: $e")
+        false
+    end
+    if !version_resolved
         return _abortInitialization()
     end
     if !parseProjectInputsConfigurationFile()

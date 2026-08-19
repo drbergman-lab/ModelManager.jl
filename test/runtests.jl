@@ -82,6 +82,13 @@ end
 # required.
 struct _NoModuleSimulator <: AbstractSimulator end
 
+# Reaches getInstalledVersion's throw: a resolvable loaded version (so resolvePackageVersion does
+# not short-circuit) whose package module has no UUID (so the installed lookup cannot succeed).
+# Needs no other interface methods -- resolvePackageVersion runs before the inputs and schema steps.
+struct _UninstalledSimulator <: AbstractSimulator end
+ModelManager._packageModule(::_UninstalledSimulator)        = Main
+ModelManager._loadedPackageVersion(::_UninstalledSimulator) = v"1.0.0"
+
 # A simulator type inside a submodule, for checking that _packageModule walks up to the root
 # module instead of stopping at the immediate parent.
 module _NestedSimModule
@@ -2322,6 +2329,20 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                                       v"0.1.0", v"0.2.0", true)
                     @test _milestone_calls[] == 1
                     @test ModelManager.getDBPackageVersion(TestSimulator(), centralDB()) == v"0.2.0"
+                    # A throw from version resolution is reported, not propagated:
+                    # initializeModelManager is documented to return false on any initialization
+                    # failure, and getInstalledVersion throws when the package is loaded but absent
+                    # from the active environment.
+                    mktempdir() do throwing_dir
+                        _make_test_project(throwing_dir)
+                        @test_throws ArgumentError ModelManager.getInstalledVersion(
+                            _UninstalledSimulator())
+                        @test !initializeModelManager(_UninstalledSimulator(), throwing_dir;
+                                                      auto_upgrade=true)
+                        @test !isInitialized()
+                        @test dataDir() == ""
+                    end
+
                 finally
                     # Leave the project initialized and correctly stamped for everything below.
                     # Re-initializing restores the stamp on its own: the assertions above

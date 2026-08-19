@@ -369,8 +369,19 @@ five reshapes — but four were substantive:
    branch claimed the session "already has a new enough package installed", but `installed` can also
    be below `db_version` (loaded 0.1, installed 0.5, database 0.9), in which case restarting is
    necessary but not sufficient. The comment now says so.
-3. **`resolvePackageVersion` can throw where the docstring promises `false`.** See the open item
-   below.
+3. **`resolvePackageVersion` could throw where the docstring promises `false`.** Verified reachable
+   with a determinable loaded version, so the unversioned short-circuit does not cover it: after
+   `using SQLite; Pkg.activate(mktempdir())`, `pkgversion(SQLite)` still resolves while the
+   dependency lookup fails, so `getInstalledVersion` throws. The throw escaped
+   `_abortInitialization`, leaving `data_dir` set and the connection open. Worse after the reshape,
+   since `installed` is now used *only* to word two diagnostics — a cosmetic lookup could kill
+   initialization. Fixed on the code side rather than by narrowing the docstring (the user's call):
+   the call is wrapped, reported, and routed through `_abortInitialization`, matching the
+   database-open failure a few lines above. The catch also covers an unparsable version table and a
+   backend milestone that throws mid-migration. `println` rather than `@error` there, to match its
+   sibling; the `@warn`/`@error` split belongs to the version diagnostics.
+   Pinned by a test using a stub whose loaded version resolves while its package module has no UUID
+   — mutating the `try` out turns that test from pass into one error plus one failure.
 4. **A vacuous assertion.** `@test _milestone_calls[] == 0` after a refused `upgradePackage` was
    staged with an *empty* milestone list, so `pending` was empty whether the guard fired or not.
    Given a milestone in range it is now evidence: mutating the guard out fails three assertions
