@@ -14,7 +14,7 @@ get sign-off, create its branch ref, and log to `progress.md` as it goes.
 |---|---|---|---|---|
 | 1 | [01-migration-guard.md](01-migration-guard.md) | Mid-session package update skips a DB migration | — | **✅ shipped, PR #30.** |
 | 2 | [02-id-accessor-symmetry.md](02-id-accessor-symmetry.md) | `monadIDs(::MMOutput)` and accessor gaps | — | **✅ shipped, PR #31.** |
-| 3 | [03-failed-sim-records.md](03-failed-sim-records.md) | Record failed sims for post-hoc inspection | Low-Med | **Next up.** `runner.jl` only — anchors unaffected by #30/#31/#32, and zero open questions. |
+| 3 | [03-failed-sim-records.md](03-failed-sim-records.md) | Record failed sims for post-hoc inspection | — | **⏭ skipped by the user.** |
 | 4 | [04-calibration-sampling-views.md](04-calibration-sampling-views.md) | Calibration as a poset of `Sampling` views; taggable `Calibration` | — | **✅ shipped, PR #32.** Its gate on #5–#8 is satisfied. |
 | 5 | [05-calibration-api-and-tagging.md](05-calibration-api-and-tagging.md) | Unify `runABC`/`runCalibration`/`resumeABC`/`ABCSMC`; `description` vs tags | Med | **Gate for #6–#8.** Settles the keyword surface. Fixes a live crash. |
 | 6 | [06-distance-distribution-plot.md](06-distance-distribution-plot.md) | Distance histogram with accepted tail; unambiguous epsilon names | Med | Persistence first, recipe second. |
@@ -27,7 +27,6 @@ Items 1, 2 and 4 are merged. With 4 in `main`, the chain collapses to three inde
 
 ```
 main
-├─ 3              independent (runner.jl only)
 ├─ 5 ──▶ 6        5 also gates 7's Stage 2+
 └─ 7 Stage 1 ──▶ 8
 ```

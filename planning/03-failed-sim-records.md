@@ -1,5 +1,11 @@
 # Design Brief: Preserve failed-simulation context for post-hoc inspection
 
+> **⏭ SKIPPED — the user chose not to pursue this.** Kept for the record. The analysis below still
+> stands, including the two corrected premises in the CLAUDE.md to-do (the `simulations` row and its
+> output folder both survive a failure, so variation IDs are already recoverable) and the finding that
+> `output.err` already sits outside the prunable `output/` directory. Revisit only if the missing
+> sim→monad linkage becomes a real obstacle.
+
 > **Order:** 3 of 8. Independent of every other brief — safe to run in parallel with 01 and 02.
 >
 > **Scope note:** an earlier draft of this brief paired the failure record with an `n_retries` keyword on
