@@ -54,7 +54,6 @@ them), and `addVariationRows` takes no simulator argument. Both were listed here
 - `clearSimulatorArtifacts(sim)` — remove build artifacts on database reset
 - `postVariationXMLProcessing(sim, location, path)` — after a variation XML file is written
 - `centralDBFileName(sim)` → `String` (default `"mm.db"`)
-- `packageName(sim)` → `String` — for version lookup via `Pkg`
 - `dbVersionTableName(sim)` → `String` — tracks migration state
 - `upgradeMilestones(sim)` → `Vector{VersionNumber}`
 - `upgradeToMilestone(sim, version, auto_upgrade)` → `Bool`
@@ -394,10 +393,10 @@ target location's file type.
 
 **Behavioral specification:**
 - `upgradePackage(sim; auto_upgrade)` walks from the DB's recorded version to the current package version, calling `upgradeToMilestone(sim, v, auto_upgrade)` for each milestone.
-- Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, `dbVersionTableName`, and `packageName`.
+- Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, and `dbVersionTableName`. Which package's version is tracked is not configurable — see below.
 - `continueMilestoneUpgrade(version, auto_upgrade)` prompts the user for destructive migrations (unless `auto_upgrade=true`).
 - The package whose version the database tracks is **not configurable**: it is the package defining `typeof(sim)`, resolved through `Base.moduleroot` so a type in a submodule reports its package. This follows from `upgradeMilestones` and `upgradeToMilestone` dispatching on the simulator type — the code owning the schema is the code defining that type. Both the loaded version (`pkgversion` of that module) and the installed version (`Pkg` lookup keyed on that module's UUID) derive from it, so they cannot describe different packages and no package-name search is involved.
-- `packageName(sim)` is a derived display name used in messages, defaulting to that module's name. Overriding it changes only message text, never which version is checked.
+- Messages name that same module, so the name shown can never disagree with the version reported. There is no backend hook for it.
 - `_loadedPackageVersion` is internal and not an interface hook: any value other than the defining package's real loaded version would break the installed-vs-loaded comparison the design rests on. It yields `nothing` when that module belongs to no versioned package — a simulator written in a script or at the REPL.
 - `getInstalledVersion(sim)` reports the version recorded in the active environment's manifest (formerly `getPackageVersion`).
 - **Migrations target the loaded version, not the installed one.** The milestone list comes from the loaded code, so the loaded release is the furthest a session can correctly migrate to; targeting it keeps the recorded version and the applied migrations in step by construction. When `loadedPackageVersion` returns `nothing`, `getInstalledVersion` is the target instead.

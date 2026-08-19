@@ -176,7 +176,9 @@ ModelManager.resolvePackageVersion(simulator(), centralDB(); auto_upgrade=true)
 """
 function resolvePackageVersion(sim::AbstractSimulator, db::SQLite.DB;
                                auto_upgrade::Bool=false)::Bool
-    name   = packageName(sim)
+    #! The package's own name, not a backend-supplied one: messages should never be able to
+    #! disagree with the package whose version they are reporting.
+    name   = nameof(_packageModule(sim))
     loaded = _loadedPackageVersion(sim)
 
     #! No loaded version means there is nothing to migrate *with*: which milestones belong to the

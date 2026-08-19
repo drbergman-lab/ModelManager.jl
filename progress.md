@@ -332,6 +332,29 @@ Residual sharp edge, accepted: `packageName` remains overridable and purely cosm
 could name one package in messages while the version comes from another. Documented in its
 docstring; cosmetic only.
 
+### `packageName` removed outright
+Kept briefly as a derived display name, then cut: "why keep it just for a cosmetic layer?" No good
+reason. Messages now interpolate `nameof(_packageModule(sim))` directly, which has the side benefit
+that the name shown *cannot* disagree with the version reported — the previous arrangement let a
+backend override the name while the version came from elsewhere, which was a footgun sitting in a
+docstring.
+
+**This is a required PCMM change, not a discretionary one.** PCMM defines
+`ModelManager.packageName(::PhysiCellSimulator)`, and a qualified method definition on a name the
+host module no longer has is a hard failure. Verified against a fixture package carrying the same
+override:
+
+```
+ERROR: LoadError: UndefVarError: `packageName` not defined in `ModelManager`
+```
+
+It surfaces at precompile time, so there is no window in which it misbehaves silently. PCMM simply
+deletes the method — the default is what it was returning anyway.
+
+Interface surface across the whole PR: **one required method removed** (`packageName`), one public
+name renamed (`getPackageVersion` → `getInstalledVersion`), and none added — having opened by
+proposing a new public hook.
+
 ### The docstring-detaching comment is not limited to one-line definitions
 Same trap as last round, and this time it exposed an error in what I had written into CLAUDE.md.
 I had recorded that an intervening comment detaches a docstring from a **one-line** definition;

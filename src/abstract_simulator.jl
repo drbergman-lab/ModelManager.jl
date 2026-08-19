@@ -179,30 +179,6 @@ end
 ########################################################
 
 """
-    packageName(sim::AbstractSimulator)::String
-
-Return the display name of this simulator framework's package (e.g. `"PhysiCellModelManager"`),
-used in version and migration messages.
-
-Defaults to the package defining `typeof(sim)`, which is also the package whose version the
-database tracks — that follows from [`upgradeMilestones`](@ref) and
-[`upgradeToMilestone`](@ref) dispatching on the simulator type, so it is not separately
-configurable. Overriding this changes only the name shown in messages.
-
-# Arguments
-- `sim::AbstractSimulator`: the active simulator backend.
-
-# Returns
-The package name, as a `String`.
-
-# Example
-```julia
-ModelManager.packageName(::MySimulator) = "MySim"   # a shorter name for messages
-```
-"""
-packageName(sim::AbstractSimulator) = string(nameof(_packageModule(sim)))
-
-"""
     dbVersionTableName(sim::AbstractSimulator)::String
 
 Return the name of the SQLite table used to persist the package version in the
@@ -339,7 +315,7 @@ function clearSimulatorArtifacts(sim::AbstractSimulator) end
 @compat public runSimulation, simulatorDir, simulatorVersionSchema, simulatorVersionIDName,
                simulatorVersionTableName, resolveSimulatorVersionID, currentSimulatorVersionID,
                simulatorInfo, setupMonad, setupSampling,
-               packageName, dbVersionTableName, upgradeMilestones, upgradeToMilestone,
+               dbVersionTableName, upgradeMilestones, upgradeToMilestone,
                postSimulationProcessing, postSimulationCleanup, initializeInputFolder,
                getInputFolderDescription, clearSimulatorArtifacts
 

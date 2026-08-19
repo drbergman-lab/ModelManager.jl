@@ -59,7 +59,7 @@ ModelManager.dbVersionTableName(::TestSimulator) = "mm_version"
 
 # Overridable so the migration tests can stage a mid-session package update. Three settings:
 #   :default          — what the real hook resolves to for TestSimulator. Its type lives in Main,
-#                       so the default chains through packageName to the loaded ModelManager.
+#                       so the default resolves via _packageModule to the loaded ModelManager.
 #   a VersionNumber   — a staged loaded version, i.e. a mid-session Pkg change.
 #   nothing           — genuinely undeterminable, exercising the short-circuit path.
 const _loaded_version_override = Ref{Any}(:default)
@@ -78,11 +78,11 @@ function ModelManager.upgradeToMilestone(::TestSimulator, args...)
 end
 
 # Module-level type with no override, used to exercise the *default* _loadedPackageVersion and
-# packageName. The TestSimulator overrides above shadow the defaults, so separate types are
+# _packageModule. The TestSimulator overrides above shadow the defaults, so separate types are
 # required.
 struct _NoModuleSimulator <: AbstractSimulator end
 
-# A simulator type inside a submodule, for checking that the packageName default resolves to the
+# A simulator type inside a submodule, for checking that _packageModule resolves to the
 # enclosing package instead of stopping at the submodule.
 module _NestedSimModule
     import ModelManager
@@ -2184,23 +2184,22 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 table = ModelManager.dbVersionTableName(TestSimulator())
                 try
                     # --- the default hooks ------------------------------------------------
-                    # A type outside any package resolves to no version: packageName gives "Main",
-                    # which is a loaded module but carries no version. That path is what every
-                    # project in the suite depends on behaving predictably.
+                    # A type outside any package resolves to Main, which is a loaded module but
+                    # carries no version. That path is what every project in the suite depends on
+                    # behaving predictably.
                     @test ModelManager._loadedPackageVersion(_NoModuleSimulator()) === nothing
-                    # packageName is derived from that module, so it cannot disagree with the
-                    # package whose version is being checked.
-                    @test ModelManager.packageName(_NoModuleSimulator()) == "Main"
-                    @test ModelManager.packageName(_NestedSimModule.NestedSimulator()) == "Main"
                     # moduleroot rather than a bare parentmodule is what makes the submodule case
                     # resolve to the package.
                     @test parentmodule(_NestedSimModule.NestedSimulator) !=
                           Base.moduleroot(parentmodule(_NestedSimModule.NestedSimulator))
-                    @test ModelManager.packageName(TestSimulator()) == "ModelManager"
+                    # The name used in messages comes from that module, so it cannot disagree with
+                    # the package whose version is being reported.
+                    @test nameof(ModelManager._packageModule(TestSimulator())) === :ModelManager
+                    @test nameof(ModelManager._packageModule(_NoModuleSimulator())) === :Main
 
                     # --- the migration target ---------------------------------------------
                     # The loaded version is the target. For TestSimulator the default resolves via
-                    # packageName to the loaded ModelManager, which here equals the installed one.
+                    # _packageModule to the loaded ModelManager, which here equals the installed one.
                     _loaded_version_override[] = :default
                     @test ModelManager._loadedPackageVersion(TestSimulator()) == installed
                     _loaded_version_override[] = v"0.4.0"

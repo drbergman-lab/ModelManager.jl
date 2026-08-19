@@ -80,7 +80,7 @@ function upgradePackage(sim::AbstractSimulator, db::SQLite.DB,
     #! applied chain, or deliberately migrating to an earlier milestone.
     loaded_version = _loadedPackageVersion(sim)
     if !isnothing(loaded_version) && to_version > loaded_version
-        _errorTargetBeyondLoaded(packageName(sim), to_version, loaded_version)
+        _errorTargetBeyondLoaded(nameof(_packageModule(sim)), to_version, loaded_version)
         return false
     end
 
