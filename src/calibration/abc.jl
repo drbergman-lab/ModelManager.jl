@@ -308,7 +308,7 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
     #! Applied before anything is dispatched, so the labels survive an interrupted run and the
     #! calibration is queryable by tag while its simulations are still in flight — the same
     #! reasoning, and the same order, as `run`'s `tags=` keyword.
-    isempty(tags) || tag!(calibration, tags...)
+    tag!(calibration, tags...)
     #! Labels the run itself, mirroring what a sensitivity sweep puts on its sampling. The value is
     #! the method *type*, as it is there, so `findTrials(Calibration; tags=("mm:method" => ...))`
     #! reads the same way across both; the `calibrations.method` column keeps its own
