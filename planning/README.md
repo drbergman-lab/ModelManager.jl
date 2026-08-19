@@ -12,18 +12,32 @@ get sign-off, create its branch ref, and log to `progress.md` as it goes.
 
 | # | Brief | Topic | Risk | Why here |
 |---|---|---|---|---|
-| 1 | [01-migration-guard.md](01-migration-guard.md) | Mid-session package update skips a DB migration | Low | Silent data-integrity corruption. Independent. Do it first, unconditionally. |
-| 2 | [02-id-accessor-symmetry.md](02-id-accessor-symmetry.md) | `monadIDs(::MMOutput)` and accessor gaps | Low | Trivial, zero interaction; also settles `trialID(::Vector{Sampling})`, which #4 may make load-bearing. |
-| 3 | [03-failed-sim-records.md](03-failed-sim-records.md) | Record failed sims for post-hoc inspection | Low-Med | `runner.jl` only. Record-only; automatic retry was considered and rejected. |
-| 4 | [04-calibration-sampling-views.md](04-calibration-sampling-views.md) | Calibration as a poset of `Sampling` views; taggable `Calibration` | Med-High | **Gate for #5–#8.** Settles the types and tagging machinery they build on. |
+| 1 | [01-migration-guard.md](01-migration-guard.md) | Mid-session package update skips a DB migration | — | **✅ shipped, PR #30.** |
+| 2 | [02-id-accessor-symmetry.md](02-id-accessor-symmetry.md) | `monadIDs(::MMOutput)` and accessor gaps | — | **✅ shipped, PR #31.** |
+| 3 | [03-failed-sim-records.md](03-failed-sim-records.md) | Record failed sims for post-hoc inspection | Low-Med | **Next up.** `runner.jl` only — anchors unaffected by #30/#31/#32, and zero open questions. |
+| 4 | [04-calibration-sampling-views.md](04-calibration-sampling-views.md) | Calibration as a poset of `Sampling` views; taggable `Calibration` | — | **✅ shipped, PR #32.** Its gate on #5–#8 is satisfied. |
 | 5 | [05-calibration-api-and-tagging.md](05-calibration-api-and-tagging.md) | Unify `runABC`/`runCalibration`/`resumeABC`/`ABCSMC`; `description` vs tags | Med | **Gate for #6–#8.** Settles the keyword surface. Fixes a live crash. |
 | 6 | [06-distance-distribution-plot.md](06-distance-distribution-plot.md) | Distance histogram with accepted tail; unambiguous epsilon names | Med | Persistence first, recipe second. |
 | 7 | [07-shared-study-objects.md](07-shared-study-objects.md) | Build once, use for sensitivity and calibration | Low→Med per stage | Staged. Stage 1 is independently valuable and gates #8. |
 | 8 | [08-bayesflow-scoping.md](08-bayesflow-scoping.md) | BayesFlow options + training-set export | Low-Med | Last. Decision document plus one concrete increment. |
 
+## Remaining work, as of PR #32
+
+Items 1, 2 and 4 are merged. With 4 in `main`, the chain collapses to three independent roots:
+
+```
+main
+├─ 3              independent (runner.jl only)
+├─ 5 ──▶ 6        5 also gates 7's Stage 2+
+└─ 7 Stage 1 ──▶ 8
+```
+
+Three PRs can target `main` directly (3, 5, 7-Stage-1); 6 and 8 follow their parents. Stacking is only worth
+it for `5→6` and `7s1→8`, and even there a plain rebase-on-merge is usually cheaper than maintaining a stack.
+
 ## Parallelism
 
-- **`{1, 2, 3}` are mutually independent** — run them in three worktrees at once if you like.
+- **`{1, 2, 3}` were mutually independent** — 1 and 2 have shipped.
 - **`{5, 6}` is the only safe pair inside `src/calibration/`.** They touch disjoint regions of `abc.jl`:
   #5 owns the entrypoint section (`~:265-403`) and the serializer section (`~:436-469`, `~:1071-1094`);
   #6 owns the persistence section (`~:1096-1328`) plus `abc_smc.jl` and `visualize.jl`.

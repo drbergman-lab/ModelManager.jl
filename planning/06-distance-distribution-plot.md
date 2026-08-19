@@ -5,6 +5,13 @@
 > serializer section `~:436-469`, `~:1071-1094`). **05 ∥ 06 is the one safe parallel pair** — at worst a
 > trivial merge in `abc.jl`.
 
+> **⚠ Line-number anchors were verified at commit `403530e`, before PRs #30 (migration guard),
+> #31 (accessor gaps) and #32 (calibration `Sampling` views + tagging) merged.** Those PRs added ~237 lines to
+> `src/tags.jl`, ~370 to `src/calibration/calibration.jl`, and touched `src/classes.jl`, `src/sensitivity.jl`,
+> `src/ModelManager.jl`, `src/database.jl` and `src/calibration/abc.jl`. Every **symbol** named below still
+> exists; some **line numbers have shifted**. Locate each anchor by symbol name (`rg 'functionName' src/`) and
+> re-verify before relying on it. `src/runner.jl` is unaffected.
+
 ## Preflight
 
 1. Read `CLAUDE.md`: the design-brief-first workflow, the `@ref`-public-bindings-only rule, and the

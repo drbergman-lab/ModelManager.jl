@@ -1,8 +1,18 @@
 # Design Brief: `monadIDs(::MMOutput)` and trial-ID accessor symmetry
 
+> **✅ SHIPPED — merged as PR #31: "Close trial-ID accessor gaps; make trialID(::Vector{Sampling}) a pure lookup".** Kept for the record; the design rationale below
+> explains what is now in `main`. No further work required.
+
 > **Order:** 2 of 8. Independent — safe to run in parallel with 01 and 03. Small enough to be a good
 > warm-up, but it contains one genuine trap (see "pure SELECT" below) and one decision that needs the
 > user's sign-off.
+
+> **⚠ Line-number anchors were verified at commit `403530e`, before PRs #30 (migration guard),
+> #31 (accessor gaps) and #32 (calibration `Sampling` views + tagging) merged.** Those PRs added ~237 lines to
+> `src/tags.jl`, ~370 to `src/calibration/calibration.jl`, and touched `src/classes.jl`, `src/sensitivity.jl`,
+> `src/ModelManager.jl`, `src/database.jl` and `src/calibration/abc.jl`. Every **symbol** named below still
+> exists; some **line numbers have shifted**. Locate each anchor by symbol name (`rg 'functionName' src/`) and
+> re-verify before relying on it. `src/runner.jl` is unaffected.
 
 ## Preflight
 

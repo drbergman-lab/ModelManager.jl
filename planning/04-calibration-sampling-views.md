@@ -1,5 +1,8 @@
 # Design Brief: Calibration as a poset of `Sampling` views, and a taggable `Calibration`
 
+> **✅ SHIPPED — merged as PR #32: "Address a calibration run as coalesced Sampling views, and bring Calibration into the tag subsystem".** Kept for the record; the design rationale below
+> explains what is now in `main`. No further work required.
+
 > **Order:** 4 of 8. **Gate for briefs 05–08** — it settles the types and the tagging machinery they build
 > on. Land it before them; do not run it beside them.
 >
@@ -7,6 +10,13 @@
 > works when it is done). Brief 05 adds the `tags=` **keyword** to the calibration entry points, and it must
 > come second: brief 05 gives `runABC` a `kwargs...` splat into `ABCSMC(; kwargs...)`, so a `tags=` keyword
 > added before that splat exists would later be silently swallowed and throw from the `ABCSMC` constructor.
+
+> **⚠ Line-number anchors were verified at commit `403530e`, before PRs #30 (migration guard),
+> #31 (accessor gaps) and #32 (calibration `Sampling` views + tagging) merged.** Those PRs added ~237 lines to
+> `src/tags.jl`, ~370 to `src/calibration/calibration.jl`, and touched `src/classes.jl`, `src/sensitivity.jl`,
+> `src/ModelManager.jl`, `src/database.jl` and `src/calibration/abc.jl`. Every **symbol** named below still
+> exists; some **line numbers have shifted**. Locate each anchor by symbol name (`rg 'functionName' src/`) and
+> re-verify before relying on it. `src/runner.jl` is unaffected.
 
 ## Preflight
 

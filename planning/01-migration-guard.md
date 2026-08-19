@@ -1,7 +1,17 @@
 # Design Brief: Guard against a mid-session package update silently skipping a database migration
 
+> **✅ SHIPPED — merged as PR #30: "Refuse to migrate when the loaded package version differs from the installed one".** Kept for the record; the design rationale below
+> explains what is now in `main`. No further work required.
+
 > **Order:** 1 of 8 — do this first, unconditionally. It is the only queued item that is silent
 > data-integrity corruption, and it is independent of every other brief.
+
+> **⚠ Line-number anchors were verified at commit `403530e`, before PRs #30 (migration guard),
+> #31 (accessor gaps) and #32 (calibration `Sampling` views + tagging) merged.** Those PRs added ~237 lines to
+> `src/tags.jl`, ~370 to `src/calibration/calibration.jl`, and touched `src/classes.jl`, `src/sensitivity.jl`,
+> `src/ModelManager.jl`, `src/database.jl` and `src/calibration/abc.jl`. Every **symbol** named below still
+> exists; some **line numbers have shifted**. Locate each anchor by symbol name (`rg 'functionName' src/`) and
+> re-verify before relying on it. `src/runner.jl` is unaffected.
 
 ## Preflight
 

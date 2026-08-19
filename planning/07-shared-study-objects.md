@@ -7,6 +7,13 @@
 > **This brief is staged across multiple sessions.** Stage 1 is independently valuable and non-breaking, and
 > it is a hard prerequisite for brief 08. Do Stage 1, hand back, then continue.
 
+> **⚠ Line-number anchors were verified at commit `403530e`, before PRs #30 (migration guard),
+> #31 (accessor gaps) and #32 (calibration `Sampling` views + tagging) merged.** Those PRs added ~237 lines to
+> `src/tags.jl`, ~370 to `src/calibration/calibration.jl`, and touched `src/classes.jl`, `src/sensitivity.jl`,
+> `src/ModelManager.jl`, `src/database.jl` and `src/calibration/abc.jl`. Every **symbol** named below still
+> exists; some **line numbers have shifted**. Locate each anchor by symbol name (`rg 'functionName' src/`) and
+> re-verify before relying on it. `src/runner.jl` is unaffected.
+
 ## Preflight
 
 1. Read `CLAUDE.md`: the design-brief-first workflow, the `@ref`-public-bindings-only rule with its
