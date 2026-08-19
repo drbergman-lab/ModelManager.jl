@@ -174,11 +174,19 @@ Holds the result of an ABC-SMC calibration run.
   target values in [`posterior`](@ref).
 - `method::ABCSMC`: The settings used for this run.
 
+The run-level accessors take an `ABCResult` directly, so reaching for `.calibration` is optional:
+[`Sampling`](@ref), [`monadIDs`](@ref), [`simulationIDs`](@ref), [`tag!`](@ref), [`untag!`](@ref),
+[`tags`](@ref), [`hasTag`](@ref), [`tagsTable`](@ref), [`calibrationsTable`](@ref) and
+[`deleteCalibration`](@ref) all forward to it.
+
 # Examples
 ```julia
 result = runABC(problem)
 df, weights = posterior(result)                # final generation, target-value format
 df, weights = posterior(result; generation=2)  # specific generation
+
+tag!(result, "project" => "immune-escape")     # same as tag!(result.calibration, ...)
+simulationsTable(Sampling(result))
 ```
 """
 struct ABCResult

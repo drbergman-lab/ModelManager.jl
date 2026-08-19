@@ -148,6 +148,96 @@ under a [`Calibration`](@ref) record in the database, so an interrupted run can 
 result = resumeABC(Calibration(calibration_id))   # no need to re-supply the problem
 ```
 
+## Finding your runs again
+
+Every calibration in the project is listed by [`calibrationsTable`](@ref) — when it ran, which
+method, and how it was labelled:
+
+```julia
+calibrationsTable()
+printCalibrationsTable(; tags = true)
+```
+
+A [`Calibration`](@ref) also prints its own summary, including how many generations completed and
+the ε it reached:
+
+```julia
+julia> Calibration(3)
+Calibration (ID=3):
+  Created:     2026-08-17T10:22:31
+  Method:      ABC-SMC
+  Description: dose-response fit
+  Generations: 4
+  Final ε:     0.031
+```
+
+Label runs with [tags](@ref tagging) rather than the `description=` keyword. Tags are queryable,
+hold several values per key, and can be applied retroactively — you rarely know what a run was
+*for* until you have looked at it — whereas `description` is a single free-text column that nothing
+can search. It is still written and still displayed, so older runs keep what they recorded.
+
+```julia
+tag!(result, "project" => "immune-escape", "purpose" => "figure")
+
+findTrials(Calibration; tags = ("project" => "immune-escape",))
+findTrials(Calibration; tags = ("mm:method" => "ABCSMC",))
+```
+
+`tag!` and the accessors below take the [`ABCResult`](@ref) that [`runABC`](@ref) returns, so
+`result.calibration` is never needed — the same courtesy [`MMOutput`](@ref) extends for a trial.
+
+## Working with a run's simulations
+
+The monads a run evaluated are addressable as [`Sampling`](@ref) views — over the whole run, or
+over one generation:
+
+```julia
+sampling = Sampling(result)       # every monad the run evaluated
+gen3     = Sampling(result, 3)    # just generation 3
+
+simulationsTable(sampling; tags = true)
+run(gen3; n_replicates = 5)                   # top up the replicates of one generation
+```
+
+This is worth a word of explanation, because a calibration is not a level of the trial hierarchy.
+It evaluates monads in batches, and each batch already becomes a `Sampling` while the run
+proceeds — a generation is generally several of them. But a `Sampling` is defined by its monads
+sharing input folders, and every monad of a calibration is built from the same
+[`CalibrationProblem`](@ref) inputs, so the run and each of its generations are valid samplings
+too. They are overlapping *views* over one set of monads rather than a chain of containers, which
+is why a calibration is addressable this way without being part of the hierarchy itself.
+
+To read the IDs without recording anything, use the accessors:
+
+```julia
+monadIDs(result)         # every surviving monad, sorted
+monadIDs(result, 3)      # one generation's
+simulationIDs(result)    # every simulation of the run
+```
+
+A monad that lost every one of its simulations was deleted when it emptied, so it is absent from
+all of these — the views describe what the run actually produced.
+
+!!! note "Views of a run still in progress"
+    A sampling is identified by its exact set of monads. Building the run-wide view part-way
+    through a calibration therefore records a row for the monads evaluated *so far*, and the
+    finished run — a different set — gets a row of its own. Build views once the run is done. The
+    accessors above read without recording anything, so they are safe at any time.
+
+## Deleting a run
+
+[`deleteCalibration`](@ref) removes the record and its folder, keeping the simulations:
+
+```julia
+deleteCalibration(result)                           # bookkeeping only
+deleteCalibration(3; delete_subs = true)            # and every monad it evaluated
+```
+
+The monads are kept by default because they are not the run's private property: the simulation
+bank reuses monads across runs, and a monad the calibration snapped onto may have been created by
+ordinary exploration long beforehand. Note that deleting a run discards its posterior — the
+generation CSVs, the serialized problem, and the method settings all live in the folder.
+
 ## [Visualizing calibration results](@id abc_plots)
 
 When a plotting backend is loaded, [RecipesBase](https://github.com/JuliaPlots/RecipesBase.jl)

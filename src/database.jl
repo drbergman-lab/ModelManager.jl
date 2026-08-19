@@ -151,13 +151,18 @@ end
     calibrationsSchema()
 
 Return the SQL schema string for the `calibrations` table.
+
+`provenance_id` references the `provenances` row recording the session, script, and git state
+that created the run, exactly as on the trial tables. An existing database gains the column
+from `ensureProvenanceColumns` on its next `initializeModelManager`, with no migration.
 """
 function calibrationsSchema()
     return """
     calibration_id INTEGER PRIMARY KEY,
     datetime TEXT,
     description TEXT,
-    method TEXT
+    method TEXT,
+    provenance_id INTEGER
     """
 end
 
