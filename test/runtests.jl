@@ -133,6 +133,8 @@ ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 # Must live here (not inside @testset blocks) so they get stable module-qualified names
 # rather than compiler-generated closures like #249#250.
 _test_named_ss(mid)        = Dict{String,Any}("x" => 1.0)
+_test_named_vec_ss(mid)    = [1.0]
+_test_named_scalar_ss(mid) = 1.0
 _test_named_dist(s, o)     = 0.0
 # Returns x=2.0 so mseDistance vs observed x=1.0 is always 1.0 (non-zero).
 # Used by resumeABC test to prevent premature convergence.
@@ -1485,51 +1487,109 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test_throws ArgumentError ABCSMC(cdf_grid_k=-1)
     end
 
-    @testset "cdf_grid_k save/load round-trip" begin
+    @testset "method.toml round-trip preserves every ABCSMC field" begin
         using TOML
         mktempdir() do dir
-            m = ABCSMC(cdf_grid_k=4)
-            cal_stub = Calibration(999)
-            # _saveMethod writes method.toml; we test the round-trip via the file
-            # by calling _saveMethod/_loadMethod with a temp calibration dir.
-            # Since calibrationFolder(cal_stub) isn't a real path, we write manually.
-            d = Dict{String,Any}(
-                "population_size"     => m.population_size,
-                "max_nr_populations"  => m.max_nr_populations,
-                "minimum_epsilon"     => m.minimum_epsilon,
-                "epsilon_quantile"    => m.epsilon_quantile,
-                "perturbation_kernel" => ModelManager._serializeKernel(m.perturbation_kernel),
-                "min_acceptance_rate" => m.min_acceptance_rate,
-                "min_epsilon_decrease"=> m.min_epsilon_decrease,
-                "min_ess_fraction"    => m.min_ess_fraction,
-                "accept_overflow"     => m.accept_overflow,
-                "cdf_grid_k"          => m.cdf_grid_k,
-            )
-            toml_path = joinpath(dir, "method.toml")
-            open(toml_path, "w") do io; TOML.print(io, d); end
+            # The real serializer, not a hand-built copy of its key list. The two testsets this
+            # replaces each inlined that list because _saveMethod only took a Calibration and
+            # calibrationFolder(stub) is not a real path; the path-taking form removes that excuse,
+            # so a field added to ABCSMC and forgotten in _saveMethod now fails here.
+            m = ABCSMC(population_size=7, max_nr_populations=3, minimum_epsilon=0.02,
+                       epsilon_quantile=0.4, epsilon_schedule=[0.5, 0.25],
+                       min_acceptance_rate=0.1, min_epsilon_decrease=0.05, min_ess_fraction=0.3,
+                       accept_overflow=true, cdf_grid_k=4, max_evaluations=1000,
+                       store_rejected=true, perturbation_kernel=ComponentwiseKernel())
+            path = ModelManager._saveMethod(joinpath(dir, "method.toml"), m)
+            back = ModelManager._loadMethod(TOML.parsefile(path))
 
-            loaded = TOML.parsefile(toml_path)
-            @test haskey(loaded, "cdf_grid_k")
-            @test Int(loaded["cdf_grid_k"]) == 4
+            for f in fieldnames(ABCSMC)
+                f === :perturbation_kernel && continue
+                @test getfield(back, f) == getfield(m, f)
+            end
+            @test typeof(back.perturbation_kernel) === typeof(m.perturbation_kernel)
 
-            # nil case: no key written
-            m_nil = ABCSMC()
-            d_nil = Dict{String,Any}(
-                "population_size" => m_nil.population_size,
-                "max_nr_populations" => m_nil.max_nr_populations,
-                "minimum_epsilon" => m_nil.minimum_epsilon,
-                "epsilon_quantile" => m_nil.epsilon_quantile,
-                "perturbation_kernel" => ModelManager._serializeKernel(m_nil.perturbation_kernel),
-                "min_acceptance_rate" => m_nil.min_acceptance_rate,
-                "min_epsilon_decrease" => m_nil.min_epsilon_decrease,
-                "min_ess_fraction" => m_nil.min_ess_fraction,
-                "accept_overflow" => m_nil.accept_overflow,
+            # store_rejected is the field that was unreachable through runABC for its whole life;
+            # pin that it survives the file too.
+            @test back.store_rejected
+
+            # Nil case: the optional fields write no key rather than a placeholder, since TOML has
+            # no null.
+            nil_path = ModelManager._saveMethod(joinpath(dir, "method_nil.toml"), ABCSMC())
+            raw_nil = TOML.parsefile(nil_path)
+            @test !haskey(raw_nil, "cdf_grid_k")
+            @test !haskey(raw_nil, "max_evaluations")
+            @test !haskey(raw_nil, "epsilon_schedule")
+            @test raw_nil["type"] == "ABCSMC"
+
+            # A file written before these fields (or the type key) existed must still resume: every
+            # key is optional on load and the keyword constructor supplies the rest.
+            legacy = Dict{String,Any}(
+                "population_size"     => 11,
+                "max_nr_populations"  => 2,
+                "minimum_epsilon"     => 0.01,
+                "epsilon_quantile"    => 0.5,
+                "perturbation_kernel" => ModelManager._serializeKernel(GaussianKernel()),
             )
-            toml_nil = joinpath(dir, "method_nil.toml")
-            open(toml_nil, "w") do io; TOML.print(io, d_nil); end
-            loaded_nil = TOML.parsefile(toml_nil)
-            @test !haskey(loaded_nil, "cdf_grid_k")
+            legacy_path = joinpath(dir, "legacy.toml")
+            open(legacy_path, "w") do io; TOML.print(io, legacy); end
+            old = ModelManager._loadMethod(TOML.parsefile(legacy_path))
+            @test old.population_size == 11
+            @test old.max_nr_populations == 2
+            defaults = ABCSMC()
+            for f in (:min_acceptance_rate, :min_epsilon_decrease, :min_ess_fraction,
+                      :accept_overflow, :cdf_grid_k, :max_evaluations, :store_rejected,
+                      :epsilon_schedule)
+                @test getfield(old, f) == getfield(defaults, f)
+            end
+
+            # An unrecognized type is named rather than silently read as ABCSMC.
+            @test_throws ErrorException ModelManager._loadMethod(
+                Dict{String,Any}("type" => "NotAMethod"))
         end
+    end
+
+    @testset "every ABCSMC field is either a TOML scalar or explicitly handled" begin
+        # method.toml's key list is derived from the struct rather than restated, which is what lets
+        # a new field serialize itself. The risk that buys is a future *non-scalar* field being
+        # silently dropped from the file, so assert the partition still covers the struct exactly.
+        scalars  = ModelManager._abcsmcScalarFields()
+        explicit = ModelManager._ABCSMC_EXPLICIT_TOML_FIELDS
+        @test Set([scalars..., explicit...]) == Set(fieldnames(ABCSMC))
+        @test isempty(intersect(scalars, explicit))
+        # The two explicitly-handled fields are exactly the ones that are not TOML scalars.
+        for f in explicit
+            @test !ModelManager._isTomlScalar(
+                ModelManager._tomlScalarType(fieldtype(ABCSMC, f)))
+        end
+        # Union{Nothing,T} unwraps to T, which is what the loader converts to.
+        @test ModelManager._tomlScalarType(fieldtype(ABCSMC, :cdf_grid_k)) === Int
+        @test ModelManager._tomlScalarType(fieldtype(ABCSMC, :population_size)) === Int
+    end
+
+    @testset "runABC keyword forwarding" begin
+        # Every ABCSMC field is reachable, including store_rejected, which runABC's hand-written
+        # keyword list omitted.
+        m = ModelManager._methodFromKeywords(ABCSMC, (; store_rejected=true, population_size=4))
+        @test m.store_rejected
+        @test m.population_size == 4
+
+        # A typo is named, rather than reaching the constructor as an opaque MethodError.
+        err = try
+            ModelManager._methodFromKeywords(ABCSMC, (; populaton_size=4))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("populaton_size", sprint(showerror, err))
+
+        # The run controls are derived from runABC's own signature, so they cannot drift from it.
+        controls = ModelManager._runControlKeywords()
+        @test :tags in controls
+        @test :method in controls
+        @test isempty(intersect(controls, fieldnames(ABCSMC)))
+        # The kwargs... splat itself is not a run control.
+        @test !any(k -> endswith(String(k), "..."), controls)
     end
 
     @testset "CDF-grid snapping disabled when cdf_grid_k=nothing" begin
@@ -1577,46 +1637,6 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test_throws ArgumentError ABCSMC(max_evaluations=-1)
     end
 
-    @testset "max_evaluations save/load round-trip" begin
-        mktempdir() do dir
-            m = ABCSMC(cdf_grid_k=3, max_evaluations=1000)
-            d = Dict{String,Any}(
-                "population_size"     => m.population_size,
-                "max_nr_populations"  => m.max_nr_populations,
-                "minimum_epsilon"     => m.minimum_epsilon,
-                "epsilon_quantile"    => m.epsilon_quantile,
-                "perturbation_kernel" => ModelManager._serializeKernel(m.perturbation_kernel),
-                "min_acceptance_rate" => m.min_acceptance_rate,
-                "min_epsilon_decrease"=> m.min_epsilon_decrease,
-                "min_ess_fraction"    => m.min_ess_fraction,
-                "accept_overflow"     => m.accept_overflow,
-                "cdf_grid_k"          => m.cdf_grid_k,
-                "max_evaluations"     => m.max_evaluations,
-            )
-            toml_path = joinpath(dir, "method.toml")
-            open(toml_path, "w") do io; TOML.print(io, d); end
-            loaded = TOML.parsefile(toml_path)
-            @test Int(loaded["max_evaluations"]) == 1000
-
-            # Neither field set → keys absent
-            m_nil = ABCSMC()
-            d_nil = Dict{String,Any}(
-                "population_size"     => m_nil.population_size,
-                "max_nr_populations"  => m_nil.max_nr_populations,
-                "minimum_epsilon"     => m_nil.minimum_epsilon,
-                "epsilon_quantile"    => m_nil.epsilon_quantile,
-                "perturbation_kernel" => ModelManager._serializeKernel(m_nil.perturbation_kernel),
-                "min_acceptance_rate" => m_nil.min_acceptance_rate,
-                "min_epsilon_decrease"=> m_nil.min_epsilon_decrease,
-                "min_ess_fraction"    => m_nil.min_ess_fraction,
-                "accept_overflow"     => m_nil.accept_overflow,
-            )
-            toml_nil = joinpath(dir, "method_nil.toml")
-            open(toml_nil, "w") do io; TOML.print(io, d_nil); end
-            loaded_nil = TOML.parsefile(toml_nil)
-            @test !haskey(loaded_nil, "max_evaluations")
-        end
-    end
 
     ################## Problem persistence: anonymous function detection ##################
 
@@ -2903,6 +2923,88 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # out-of-range generation throws
                 @test_throws ArgumentError posterior(result; generation=99)
+            end
+
+            @testset "runABC delegates to runCalibration" begin
+                # runABC had no test coverage at all before this, which is how store_rejected came
+                # to be unreachable through it without anything noticing.
+                dv       = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+
+                # Loose keywords reach the ABCSMC constructor, store_rejected included.
+                kw_result = runABC(prob; population_size=4, max_nr_populations=2,
+                                   minimum_epsilon=0.0, store_rejected=true)
+                waitForDiagnostics()
+                @test kw_result isa ABCResult
+                @test kw_result.method.store_rejected
+                @test kw_result.method.population_size == 4
+
+                # method= and the loose form agree.
+                method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+                m_result = runABC(prob; method=method)
+                waitForDiagnostics()
+                @test m_result.method == method
+
+                # Supplying both is an error naming the offending setting.
+                err = try
+                    runABC(prob; method=method, population_size=5)
+                    nothing
+                catch e
+                    e
+                end
+                @test err isa ArgumentError
+                @test occursin("population_size", sprint(showerror, err))
+
+                # An unrecognized keyword is named too.
+                @test_throws ArgumentError runABC(prob; populaton_size=4)
+            end
+
+            @testset "non-Dict observed_data survives runCalibration" begin
+                # _ProblemManifest declared observed_data::Dict{String,Any} while
+                # CalibrationProblem declares it ::Any, and runCalibration saves the problem before
+                # generation 1 — so the Vector and scalar shapes mseDistance documents threw on
+                # conversion. This is the regression whose absence let that ship.
+                dv     = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                method = ABCSMC(population_size=2, max_nr_populations=1, minimum_epsilon=0.0)
+
+                vec_prob = CalibrationProblem(inputs, [dv], [1.0],
+                                              _test_named_vec_ss, mseDistance)
+                vec_result = runCalibration(vec_prob, method)
+                waitForDiagnostics()
+                @test vec_result isa ABCResult
+
+                scalar_prob = CalibrationProblem(inputs, [dv], 1.0,
+                                                 _test_named_scalar_ss, mseDistance)
+                scalar_result = runCalibration(scalar_prob, method)
+                waitForDiagnostics()
+                @test scalar_result isa ABCResult
+            end
+
+            @testset "tags keyword on calibration entry points" begin
+                dv       = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+                method = ABCSMC(population_size=2, max_nr_populations=1, minimum_epsilon=0.0)
+
+                tagged = runCalibration(prob, method;
+                                        description="prose", tags=("project" => "unify",))
+                waitForDiagnostics()
+                cal = tagged.calibration
+                @test tags(cal)["project"] == ["unify"]
+                # Reserved tags from the run itself still land.
+                @test haskey(tags(cal), "mm:method")
+                # The prose column and the queryable tag are independent: tagging does not write
+                # description, and description does not create a tag.
+                @test !haskey(tags(cal), "note")
+                @test findTrials(Calibration; tags=("project" => "unify",)) == [cal]
+
+                # runABC forwards tags too — it must name them explicitly, or the kwargs splat
+                # would swallow them into the ABCSMC constructor.
+                via_abc = runABC(prob; population_size=2, max_nr_populations=1,
+                                 minimum_epsilon=0.0, tags=("purpose" => "smoke",))
+                waitForDiagnostics()
+                @test tags(via_abc.calibration)["purpose"] == ["smoke"]
             end
 
             # ---------- calibration as coalesced Sampling views ----------

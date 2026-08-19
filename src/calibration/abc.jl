@@ -296,12 +296,19 @@ df, weights = posterior(result)
 ```
 """
 function runCalibration(problem::CalibrationProblem, method::ABCSMC;
-                        description::String="", run_kwargs::NamedTuple=(;),
+                        description::String="", tags=(), run_kwargs::NamedTuple=(;),
                         progress::Symbol=:auto,
                         on_monad_failure::Symbol=:reject)
+    #! Both controls are validated before `createCalibration`, so a typo cannot leave behind a stray
+    #! DB row and output folder for a run that never starts.
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
+    refreshProvenance!()
     calibration = createCalibration("ABC-SMC"; description=description)
+    #! Applied before anything is dispatched, so the labels survive an interrupted run and the
+    #! calibration is queryable by tag while its simulations are still in flight — the same
+    #! reasoning, and the same order, as `run`'s `tags=` keyword.
+    tag!(calibration, tags...)
     #! Labels the run itself, mirroring what a sensitivity sweep puts on its sampling. The value is
     #! the method *type*, as it is there, so `findTrials(Calibration; tags=("mm:method" => ...))`
     #! reads the same way across both; the `calibrations.method` column keeps its own
@@ -328,83 +335,100 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
 end
 
 """
-    runABC(problem::CalibrationProblem; kwargs...) → ABCResult
+    runABC(problem::CalibrationProblem; method=nothing, kwargs...) → ABCResult
 
-Run ABC-SMC parameter calibration. Convenience wrapper that constructs an [`ABCSMC`](@ref)
-method from keyword arguments and delegates to [`runCalibration`](@ref).
+Run ABC-SMC calibration on `problem`, a convenience wrapper over
+[`runCalibration`](@ref).
 
-The full `CalibrationProblem` is serialized to `problem.jld2`, enabling
-`resumeABC(Calibration(id))` with no further arguments after a crash or session restart.
+Method settings may be given either as a ready-made [`ABCSMC`](@ref) via `method=`, or as loose
+keyword arguments naming its fields — but not both. The loose form forwards to the `ABCSMC`
+constructor, so every field it accepts is accepted here, with the same defaults.
 
-# Keyword Arguments
-- `population_size::Int=100`, `max_nr_populations::Int=10`, `minimum_epsilon::Float64=0.01`,
-  `epsilon_quantile::Float64=0.5`, `perturbation_kernel::AbstractKernel=GaussianKernel()`
-- `epsilon_schedule::Union{Nothing,Vector{Float64}}=nothing`: explicit decreasing thresholds.
-- `min_acceptance_rate::Float64=0.0`, `min_epsilon_decrease::Float64=0.0`,
-  `min_ess_fraction::Float64=0.0`: early stopping thresholds.
-- `accept_overflow::Bool=false`: when `true`, keep all epsilon-passing particles per batch
-  (population_size becomes a minimum, not an exact target).
-- `cdf_grid_k::Union{Nothing,Int}=nothing`: base CDF-grid resolution for simulation bank
-  snapping. When set, proposals are snapped to a dyadic grid of resolution `2^k` in CDF
-  space, tightening by one level each generation. If a `SimulationBank` has compatible
-  existing monads, they are reused in preference to running new simulations; an empty
-  bank is silently skipped and snapping proceeds normally.
-- `max_evaluations::Union{Nothing,Int}=nothing`: maximum total evaluated particles across
-  the entire run. Enforced *before* each batch is dispatched — a batch that would exceed the
-  budget is trimmed to the remaining allowance, so the run never evaluates more than
-  `max_evaluations` simulations — then the run stops (the final generation may have fewer than
-  `population_size` accepted particles).
+# Arguments
+- `problem::CalibrationProblem`: the model, parameters, observed data and distance to calibrate.
+
+# Keywords
+- `method::Union{Nothing,ABCSMC}=nothing`: the method to run. When `nothing`, one is built from the
+  remaining keyword arguments.
+- any field of [`ABCSMC`](@ref) — `population_size`, `max_nr_populations`, `minimum_epsilon`,
+  `epsilon_quantile`, `perturbation_kernel`, `epsilon_schedule`, `min_acceptance_rate`,
+  `min_epsilon_decrease`, `min_ess_fraction`, `accept_overflow`, `cdf_grid_k`, `max_evaluations`,
+  `store_rejected` — forwarded to its constructor. See [`ABCSMC`](@ref) for the meaning and default
+  of each. An unrecognized keyword raises an `ArgumentError` naming it.
+- `description::String=""`: free-text prose stored in the `calibrations` DB row and shown by
+  `calibrationsTable`. For labels you intend to search on, prefer `tags`.
+- `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
+  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`.
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; ...)` call.
-- `description::String=""`: stored in the `calibrations` DB row.
-- `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`,
-  `:batch`, `:bar`). `:auto` shows a live progress bar on an interactive terminal and
-  per-generation milestones otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
-  simulation. `:reject` records its distance as `missing` (so the particle is never accepted) and
-  continues; `:error` stops the run. Failed simulation and monad IDs are recorded per generation
-  either way, in `generations/generation_{NNN}_failed_simulations.csv` and
+- `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`,
+  `:bar`). `:auto` shows a live progress bar on an interactive terminal and per-generation
+  milestones otherwise.
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful simulation.
+  `:reject` records its distance as `missing` (so the particle is never accepted) and continues;
+  `:error` stops the run. Failed simulation and monad IDs are recorded per generation either way, in
+  `generations/generation_{NNN}_failed_simulations.csv` and
   `generations/generation_{NNN}_failed_monads.csv`.
+
+# Returns
+An [`ABCResult`](@ref) holding the calibration, its generations, the parameters and the method.
 
 # Examples
 ```julia
+# Loose keywords
 result = runABC(problem; population_size=200, max_nr_populations=5)
 df, weights = posterior(result)
 println("Posterior mean: ", sum(df[!, "overall/max_time"] .* weights))
 
-# Resume after crash
-result2 = resumeABC(result.calibration)
+# Or a ready-made method, plus labels to find the run again
+result = runABC(problem; method=ABCSMC(population_size=200, store_rejected=true),
+                tags=("project" => "immune-escape",))
+
+# Resume after a crash
+result2 = resumeCalibration(result.calibration)
 ```
 """
 function runABC(problem::CalibrationProblem;
-                population_size::Int=100, max_nr_populations::Int=10,
-                minimum_epsilon::Float64=0.01, epsilon_quantile::Float64=0.5,
-                perturbation_kernel::AbstractKernel=GaussianKernel(),
-                epsilon_schedule::Union{Nothing,Vector{Float64}}=nothing,
-                min_acceptance_rate::Float64=0.0,
-                min_epsilon_decrease::Float64=0.0,
-                min_ess_fraction::Float64=0.0,
-                accept_overflow::Bool=false,
-                cdf_grid_k::Union{Nothing,Int}=nothing,
-                max_evaluations::Union{Nothing,Int}=nothing,
+                method::Union{Nothing,ABCSMC}=nothing,
                 run_kwargs::NamedTuple=(;),
                 description::String="",
+                tags=(),
                 progress::Symbol=:auto,
-                on_monad_failure::Symbol=:reject)
-    method = ABCSMC(; population_size=population_size,
-                      max_nr_populations=max_nr_populations,
-                      minimum_epsilon=minimum_epsilon,
-                      epsilon_quantile=epsilon_quantile,
-                      perturbation_kernel=perturbation_kernel,
-                      epsilon_schedule=epsilon_schedule,
-                      min_acceptance_rate=min_acceptance_rate,
-                      min_epsilon_decrease=min_epsilon_decrease,
-                      min_ess_fraction=min_ess_fraction,
-                      accept_overflow=accept_overflow,
-                      cdf_grid_k=cdf_grid_k,
-                      max_evaluations=max_evaluations)
-    return runCalibration(problem, method; description=description, run_kwargs=run_kwargs,
-                          progress=progress,
+                on_monad_failure::Symbol=:reject,
+                kwargs...)
+    resolved = if isnothing(method)
+        _methodFromKeywords(ABCSMC, kwargs)
+    else
+        isempty(kwargs) || throw(ArgumentError(
+            "runABC received both `method=` and method setting(s) " *
+            "$(join(keys(kwargs), ", ")). Pass one or the other, not both."))
+        method
+    end
+    return runCalibration(problem, resolved; description=description, tags=tags,
+                          run_kwargs=run_kwargs, progress=progress,
                           on_monad_failure=on_monad_failure)
+end
+
+#! Derived from `runABC`'s own signature rather than restated: the run controls are exactly its
+#! declared keywords that are not `ABCSMC` fields. Adding a run control therefore needs no edit
+#! here, and the two can never drift apart. Used only to build the error message below — the guard
+#! itself is a `setdiff` against `fieldnames(ABCSMC)`, which was always dynamic.
+function _runControlKeywords()
+    declared = Base.kwarg_decl(only(methods(runABC)))
+    return Tuple(k for k in declared
+                 if !(k in fieldnames(ABCSMC)) && !endswith(String(k), "..."))
+end
+
+#! Every method default lives in the `ABCSMC` keyword constructor and nowhere else, so a new field
+#! becomes reachable through `runABC` with no edit here. The `setdiff` is what keeps a typo from
+#! becoming an opaque `MethodError` inside the constructor.
+function _methodFromKeywords(::Type{ABCSMC}, kwargs)
+    unknown = setdiff(keys(kwargs), fieldnames(ABCSMC))
+    isempty(unknown) || throw(ArgumentError("""
+    runABC received unrecognized keyword argument(s): $(join(unknown, ", ")).
+    Method settings are the fields of `ABCSMC`: $(join(fieldnames(ABCSMC), ", ")).
+    Run controls are: $(join(_runControlKeywords(), ", ")).
+    """))
+    return ABCSMC(; kwargs...)
 end
 
 ################## Method Persistence ##################
@@ -438,40 +462,54 @@ function _deserializeKernel(d)
     end
 end
 
+#! `method.toml`'s scalar keys are derived from `ABCSMC` itself, so adding a field means touching
+#! only the struct and its keyword constructor — the serializers pick it up automatically. That
+#! matters because the alternative already failed once: `store_rejected` was added to the struct,
+#! the constructor and the serializer, but missed in `runABC`'s hand-written keyword list, and was
+#! unreachable for its whole life.
+#!
+#! `perturbation_kernel` and `epsilon_schedule` exclude themselves by type — a kernel struct and a
+#! vector are not TOML scalars — and are handled explicitly below. The
+#! "every ABCSMC field is either a TOML scalar or explicitly handled" testset asserts that partition
+#! still covers the struct, so a future non-scalar field cannot be silently dropped from the file.
+_tomlScalarType(::Type{T}) where {T} = T
+_tomlScalarType(::Type{Union{Nothing,T}}) where {T} = T
+
+_isTomlScalar(::Type{<:Union{Real,AbstractString}}) = true
+_isTomlScalar(::Type) = false
+
+const _ABCSMC_EXPLICIT_TOML_FIELDS = (:perturbation_kernel, :epsilon_schedule)
+
+_abcsmcScalarFields() =
+    Tuple(f for f in fieldnames(ABCSMC) if _isTomlScalar(_tomlScalarType(fieldtype(ABCSMC, f))))
+
 """
     _saveMethod(calibration::Calibration, method::ABCSMC)
+    _saveMethod(path::String, method::ABCSMC)
 
-Save the ABCSMC settings to `method.toml` for resume support.
+Save the calibration method's settings to `method.toml` for resume support.
+
+The `path` form exists so tests can round-trip the real serializer in a temporary directory rather
+than reimplementing the key list.
 """
-function _saveMethod(calibration::Calibration, method::ABCSMC)
-    path = joinpath(calibrationFolder(calibration), "method.toml")
-    d = Dict{String,Any}(
-        "population_size"     => method.population_size,
-        "max_nr_populations"  => method.max_nr_populations,
-        "minimum_epsilon"     => method.minimum_epsilon,
-        "epsilon_quantile"    => method.epsilon_quantile,
-        "perturbation_kernel" => _serializeKernel(method.perturbation_kernel),
-        "min_acceptance_rate" => method.min_acceptance_rate,
-        "min_epsilon_decrease"=> method.min_epsilon_decrease,
-        "min_ess_fraction"    => method.min_ess_fraction,
-        "accept_overflow"     => method.accept_overflow,
-    )
-    if !isnothing(method.epsilon_schedule)
-        d["epsilon_schedule"] = method.epsilon_schedule
+function _saveMethod(path::String, method::ABCSMC)
+    d = Dict{String,Any}("type" => "ABCSMC",
+                         "perturbation_kernel" => _serializeKernel(method.perturbation_kernel))
+    for name in _abcsmcScalarFields()
+        value = getfield(method, name)
+        #! TOML has no null: omit the key rather than inventing a placeholder, and let the keyword
+        #! constructor re-supply the default on load.
+        isnothing(value) || (d[string(name)] = value)
     end
-    if !isnothing(method.cdf_grid_k)
-        d["cdf_grid_k"] = method.cdf_grid_k
-    end
-    if !isnothing(method.max_evaluations)
-        d["max_evaluations"] = method.max_evaluations
-    end
-    if method.store_rejected
-        d["store_rejected"] = true
-    end
+    isnothing(method.epsilon_schedule) || (d["epsilon_schedule"] = method.epsilon_schedule)
     open(path, "w") do io
-        TOML.print(io, d)
+        TOML.print(io, d; sorted=true)
     end
+    return path
 end
+
+_saveMethod(calibration::Calibration, method::ABCSMC) =
+    _saveMethod(joinpath(calibrationFolder(calibration), "method.toml"), method)
 
 ################## Problem Persistence ##################
 
@@ -500,7 +538,10 @@ At resume time:
 struct _ProblemManifest
     inputs::InputFolders
     sources::Vector{Any}       # DVSource | CVSource | LVSource | _StrippedLVSource
-    observed_data::Dict{String,Any}
+    #! Untyped to match `CalibrationProblem.observed_data`: `mseDistance` accepts a `Dict`, a
+    #! `Vector` or a scalar, and `_saveProblem` runs before generation 1, so a narrower type here
+    #! rejects two of the three documented shapes before a run can start.
+    observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID
     summary_statistic          # named Function or nothing (anonymous/not restorable)
@@ -1069,33 +1110,37 @@ function resumeABC(calibration::Calibration;
 end
 
 """
-    _loadMethod(calibration::Calibration) → ABCSMC
+    _loadMethod(calibration::Calibration) → AbstractCalibrationMethod
 
-Load saved ABCSMC settings from `method.toml`.
+Load saved method settings from `method.toml`.
+
+The file's `type` key selects the method. It is absent from files written before the key existed,
+which are therefore read as `ABCSMC` — the only method that could have written them.
 """
 function _loadMethod(calibration::Calibration)
     path = joinpath(calibrationFolder(calibration), "method.toml")
     isfile(path) || error("Cannot resume: $path not found. Pass `method=ABCSMC(...)` explicitly.")
-    d = TOML.parsefile(path)
-    epsilon_schedule  = haskey(d, "epsilon_schedule") ?
-        Float64.(d["epsilon_schedule"]) : nothing
-    cdf_grid_k        = haskey(d, "cdf_grid_k")        ? Int(d["cdf_grid_k"])        : nothing
-    max_evaluations   = haskey(d, "max_evaluations")   ? Int(d["max_evaluations"])   : nothing
-    return ABCSMC(
-        population_size      = Int(d["population_size"]),
-        max_nr_populations   = Int(d["max_nr_populations"]),
-        minimum_epsilon      = Float64(d["minimum_epsilon"]),
-        epsilon_quantile     = Float64(d["epsilon_quantile"]),
-        perturbation_kernel  = _deserializeKernel(d["perturbation_kernel"]),
-        epsilon_schedule     = epsilon_schedule,
-        min_acceptance_rate  = Float64(get(d, "min_acceptance_rate",  0.0)),
-        min_epsilon_decrease = Float64(get(d, "min_epsilon_decrease", 0.0)),
-        min_ess_fraction     = Float64(get(d, "min_ess_fraction",     0.0)),
-        accept_overflow      = Bool(get(d, "accept_overflow",         false)),
-        cdf_grid_k           = cdf_grid_k,
-        max_evaluations      = max_evaluations,
-        store_rejected       = Bool(get(d, "store_rejected",          false)),
-    )
+    return _loadMethod(TOML.parsefile(path))
+end
+
+function _loadMethod(d::AbstractDict)
+    type = get(d, "type", "ABCSMC")
+    type == "ABCSMC" && return _loadMethod(ABCSMC, d)
+    error("Unknown method type in method.toml: \"$type\". Known types: ABCSMC.")
+end
+
+#! Every key is optional and the keyword constructor supplies what is missing, so a `method.toml`
+#! written before a field existed still resumes instead of throwing a `KeyError`.
+function _loadMethod(::Type{ABCSMC}, d::AbstractDict)
+    kw = Dict{Symbol,Any}()
+    for name in _abcsmcScalarFields()
+        haskey(d, string(name)) || continue
+        kw[name] = convert(_tomlScalarType(fieldtype(ABCSMC, name)), d[string(name)])
+    end
+    haskey(d, "epsilon_schedule") && (kw[:epsilon_schedule] = Float64.(d["epsilon_schedule"]))
+    haskey(d, "perturbation_kernel") &&
+        (kw[:perturbation_kernel] = _deserializeKernel(d["perturbation_kernel"]))
+    return ABCSMC(; kw...)
 end
 
 ################## Generation Persistence ##################

@@ -259,7 +259,7 @@ function run(T::AbstractTrial; quiet::Bool=false,
     #! Applied before anything is dispatched, so tags survive an interrupted run and the
     #! trial is queryable by tag while its simulations are still in flight.
     refreshProvenance!()
-    isempty(tags) || tag!(T, tags...)
+    tag!(T, tags...)
     setup_success = prepareTrialHierarchy(T; kwargs...)
     specs = setup_success ? pendingSimulationSpecs(T) : SimulationSpec[]
     n_simulation_tasks = length(specs)
