@@ -106,43 +106,12 @@ pv = ParsedVariations(problem)
 ParsedVariations(problem::CalibrationProblem) =
     ParsedVariations(AbstractVariation[cp.lv for cp in problem.parameters])
 
-"""
-    run(method::GSAMethod, problem::CalibrationProblem; functions, kwargs...) → GSASampling
-
-Run a global sensitivity analysis over a calibration problem's parameters and base model.
-
-Answers "which of the parameters I am calibrating actually matter?" without redefining the model,
-the parameters, the replicate count or the reference variation. `problem`'s `observed_data`,
-`summary_statistic` and `distance` are unused — a sensitivity analysis has no observation to compare
-against, so supply what to measure through `functions`.
-
-# Arguments
-- `method::GSAMethod`: [`MOAT`](@ref), [`Sobolʼ`](@ref) or [`RBD`](@ref).
-- `problem::CalibrationProblem`: supplies the inputs, parameters, `n_replicates` and
-  `reference_variation_id`.
-
-# Keywords
-- `functions::AbstractVector{<:Function}=Function[]`: scalar outputs, each called per simulation and
-  averaged over a monad's replicates. Note this differs from `summary_statistic`, which is per monad.
-- other keywords are forwarded to [`run`](@ref).
-
-# Returns
-A `GSASampling` holding the sensitivity indices.
-
-# Examples
-```julia
-problem = CalibrationProblem(inputs, [dv1, dv2], observed, summarize, mseDistance)
-gsa = run(MOAT(15), problem; functions=[finalCount])
-```
-"""
-function run(method::GSAMethod, problem::CalibrationProblem;
-             functions::AbstractVector{<:Function}=Function[], kwargs...)
-    gsa_sampling = runSensitivitySampling(method, problem.inputs, ParsedVariations(problem);
-                                          reference_variation_id=problem.reference_variation_id,
-                                          n_replicates=problem.n_replicates, kwargs...)
-    sensitivityResults!(gsa_sampling, functions)
-    return gsa_sampling
-end
+#! Deliberately no `run(::GSAMethod, ::CalibrationProblem)`. Sensitivity analysis normally comes
+#! *before* calibration, so dispatching a GSA method on the heavier object inverts the usual order and
+#! would ask a user who only wants a screening run to invent `observed_data`, a `summary_statistic` and
+#! a `distance` first. The shared object is the vector of variations, which both entry points already
+#! accept: build `priors` once, pass it to `run(method, inputs, priors; functions=...)`, and pass the
+#! same vector to `CalibrationProblem` later.
 
 ################## Calibration ##################
 

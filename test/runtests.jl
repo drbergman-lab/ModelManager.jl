@@ -3753,14 +3753,13 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test samp isa ModelManager.GSASampling
                 @test size(samp.monad_ids_df, 2) == 3   # intercept + 2 factors
 
-                # The same study, expressed as a CalibrationProblem, runs through GSA unchanged:
-                # "which of the parameters I am calibrating actually matter?"
+                # The same parameter vector is the shared object: it feeds GSA directly (above) and a
+                # CalibrationProblem later, with no GSA-on-problem dispatch in between.
                 problem = CalibrationProblem(inputs, [dv1, dv2], Dict{String,Any}("x" => 1.0),
                                              _test_named_ss, mseDistance)
-                @test ModelManager.ParsedVariations(problem) isa ModelManager.ParsedVariations
-                samp_from_problem = run(MOAT(3), problem; functions=[gs_fn])
-                @test samp_from_problem isa ModelManager.GSASampling
-                @test size(samp_from_problem.monad_ids_df, 2) == size(samp.monad_ids_df, 2)
+                pv = ModelManager.ParsedVariations(problem)
+                @test pv isa ModelManager.ParsedVariations
+                @test ModelManager.nLatentDims(pv) == 2
 
                 # The flat monad-ID accessor agrees with the design matrix it was built from.
                 design_ids = ModelManager.getMonadIDDataFrame(samp) |> Matrix |> vec |> unique
