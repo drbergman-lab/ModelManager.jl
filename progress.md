@@ -3023,3 +3023,45 @@ kernels before it can be designed: they fit a covariance in ℝᵈ and the impor
 proposal density, so a discrete coordinate needs a categorical or random-walk proposal. Stages 2–4
 (`StudySpec`, the `QoI` seam, the simulator-kwargs convention) wait on the calibration entry-point
 unification in #33, which settles the keyword surface they must match.
+
+## 2026-08-19 — Discrete variations ride the Distribution branch (and a GSA bug this fixes)
+
+Brief: `planning/07-shared-study-objects.md`, Stage 1b. The user asked for discrete and continuous
+parameters to converge rather than be validated apart, with the direction decided by what the existing
+structures support. They support it, and the investigation turned up a live bug on the way.
+
+**The bug.** `LatentVariation(dv::DiscreteVariation)` stored the raw value list as its latent parameter
+with `first` as the map. The grid path passes the map `lps[i]` — a value — so it returned values. The
+CDF path computes `floor(Int, cdf * length(lp)) + 1` — an *index* — and passed that to the same map, so
+it returned the index. Every space-filling design reaches the CDF path through `addCDFVariations`, and
+`MOAT`, `Sobolʼ` and `RBD` each wrap one, so a discrete parameter in any sensitivity analysis had its
+*index* written into the model rather than its value. At `cdf = 1.0` the computation gave `4` for a
+three-value parameter: an out-of-range index that only failed to throw because `first` never indexed
+with it.
+
+It was invisible because of a gap in the tests, not luck: the grid testset used a `DiscreteVariation`
+and the LHS testset used a `UniformDistributedVariation`, so discrete-plus-space-filling was covered
+nowhere. Notably `CoVariation{<:DiscreteVariation}` was already correct — it stored `collect(1:n)`
+indices and mapped through them, which is the convention the single-parameter case should have used.
+
+**The representation.** A discrete parameter is now `DiscreteUniform(1, k)` over its value indices,
+with the map indexing into the values and an inverse map recovering the index. That puts it on the same
+branch as a continuous parameter, so both sampling paths agree by construction rather than by matching
+conventions in two places. `quantile(DiscreteUniform(1,k), 1.0)` is `k`, which is also why the endpoint
+stops being a special case.
+
+The same representation is what makes a discrete parameter *calibratable*: ABC-SMC accepts a
+`LatentVariation{<:Distribution}`, and the perturbation kernels never see a target value — they work
+purely in [0,1] CDF space, and the quantile does the quantising. Letting `_toCalibrationParameter`
+accept discrete inputs is the next step and is deliberately not in this change.
+
+**Keeping the grid honest.** `GridVariation` rejects distributions by asserting no latent parameter
+reports `size == -1`. Moving discrete onto the Distribution branch would have made it unenumerable, so
+`size` now reports support cardinality via `_supportSize`, and there is a matching no-argument
+`variationValues` that enumerates a finite support. The `DiscreteUnivariateDistribution` test in
+`_supportSize` is load-bearing: `Uniform(0,1)` is finitely *bounded* but not finitely *enumerable*, and
+treating bounds as sufficient would have let the grid try to walk a continuous prior.
+
+**Prerequisite already in place.** `_validateInverseMaps` now tests `insupport` rather than
+`0 < cdf < 1`. The old proxy rejected `cdf(DiscreteUniform(1,k), k) == 1.0`, so the top value of every
+discrete parameter would have failed validation.
