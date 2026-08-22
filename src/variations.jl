@@ -644,7 +644,10 @@ function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) whe
     latent_parameters = [DiscreteUniform(1, length(values))]
     targets = [variationTarget(dv)]
     locations = [variationLocation(dv)]
-    maps = [I -> values[Int(I[1])]]
+    #! `Fix1(getindex, values) ∘ first` rather than a closure: the map is handed the whole
+    #! latent-parameter vector, so it takes `first` before indexing. `Fix1` alone would return a
+    #! one-element vector instead of the scalar value.
+    maps = [Base.Fix1(getindex, values) ∘ first]
     inverse_maps = [tv -> _discreteValueIndex(values, tv[1])]
     resolved_name = isnothing(name) ? variationName(dv) : String(name)
     tnames = [variationName(dv)]
@@ -677,7 +680,7 @@ function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}
     latent_parameters = [DiscreteUniform(1, length(cv))]
     targets = variationTarget(cv)
     locations = variationLocation(cv)
-    maps = [I -> variation.values[Int(I[1])] for variation in cv.variations]
+    maps = [Base.Fix1(getindex, variation.values) ∘ first for variation in cv.variations]
     first_values = cv.variations[1].values
     inverse_maps = [tv -> _discreteValueIndex(first_values, tv[1])]
     resolved_name = isnothing(name) ? variationName(cv) : String(name)
