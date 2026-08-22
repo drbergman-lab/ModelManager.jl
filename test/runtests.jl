@@ -875,6 +875,28 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test legacy_loaded[1].max_epsilon_accepted ≈ 0.5
             @test isnothing(legacy_loaded[1].epsilon_threshold)
 
+            # ...and the file is upgraded in place, so the next read takes the current path. Resuming
+            # already writes into this folder, so nothing here was read-only.
+            upgraded = TOML.parsefile(joinpath(legacy_dir, "generation_01.toml"))
+            @test haskey(upgraded, "max_epsilon_accepted")
+            @test upgraded["max_epsilon_accepted"] ≈ 0.5
+            @test !haskey(upgraded, "epsilon")
+            # The threshold was never recorded then, so it stays absent rather than being invented.
+            @test !haskey(upgraded, "epsilon_threshold")
+            # Every other key survives the rewrite untouched.
+            @test upgraded["n_evaluations"] == 3
+            @test upgraded["acceptance_rate"] ≈ 1.0
+            @test upgraded["ess"] ≈ gen1.ess
+            # Idempotent: a second load changes nothing and re-reads the same value.
+            again = ModelManager._loadGenerations(legacy_dir, param_names, max_pops)
+            @test again[1].max_epsilon_accepted ≈ 0.5
+            @test TOML.parsefile(joinpath(legacy_dir, "generation_01.toml")) == upgraded
+            # No stray temp file left behind.
+            @test !isfile(joinpath(legacy_dir, "generation_01.toml.upgrading"))
+            # A no-op on an already-current file.
+            @test ModelManager._upgradeGenerationMetadata!(
+                joinpath(legacy_dir, "generation_01.toml"), upgraded) == false
+
             # Cross-padding: files were written with max_pops=10 (tags "01","02") but
             # loaded with max_pops=5 (which would have generated tags "1","2" under the
             # old loop). The scan-based loader must find the files regardless.
