@@ -632,14 +632,35 @@ function _validateInverseMaps(lv::LatentVariation{<:Distribution};
     return nothing
 end
 
+#! A discrete parameter is represented as `DiscreteUniform` over its *value indices*, not as the raw
+#! value list. Two reasons. It puts discrete parameters on the same branch as continuous ones, so the
+#! CDF sampling path (LHS/Sobol/RBD) and the grid path agree — storing values with `first` as the map
+#! made the CDF path return the index while the grid path returned the value. And ABC-SMC accepts a
+#! `LatentVariation{<:Distribution}`, so the same representation makes a discrete parameter
+#! calibratable without the sampler needing to know it is discrete: the coordinate stays a CDF value
+#! in [0,1] and the quantile does the quantising.
 function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DiscreteVariation
-    latent_parameters = [dv.values]
+    values = dv.values
+    latent_parameters = [DiscreteUniform(1, length(values))]
     targets = [variationTarget(dv)]
     locations = [variationLocation(dv)]
-    maps = [first]
+    #! `Fix1(getindex, values) ∘ first` rather than a closure: the map is handed the whole
+    #! latent-parameter vector, so it takes `first` before indexing. `Fix1` alone would return a
+    #! one-element vector instead of the scalar value.
+    maps = [Base.Fix1(getindex, values) ∘ first]
+    inverse_maps = [tv -> _discreteValueIndex(values, tv[1])]
     resolved_name = isnothing(name) ? variationName(dv) : String(name)
     tnames = [variationName(dv)]
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, name=resolved_name)
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
+end
+
+#! Inverse of the index map. Errors rather than returning a sentinel, so a value that was never in the
+#! list is reported where it happens instead of surfacing later as an out-of-support assertion.
+function _discreteValueIndex(values::AbstractVector, target_value)
+    idx = findfirst(==(target_value), values)
+    isnothing(idx) && throw(ArgumentError(
+        "Cannot invert discrete variation: $(target_value) is not one of $(values)."))
+    return idx
 end
 
 function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
@@ -653,14 +674,18 @@ function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) whe
     return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
+#! Same representation as the single-parameter case: one `DiscreteUniform` index driving every
+#! co-varied target. The maps already indexed by position, so only the latent parameter's type changes.
 function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DiscreteVariation
-    latent_parameters = [collect(1:length(cv))]
+    latent_parameters = [DiscreteUniform(1, length(cv))]
     targets = variationTarget(cv)
     locations = variationLocation(cv)
-    maps = [I -> variation.values[I[1]] for variation in cv.variations]
+    maps = [Base.Fix1(getindex, variation.values) ∘ first for variation in cv.variations]
+    first_values = cv.variations[1].values
+    inverse_maps = [tv -> _discreteValueIndex(first_values, tv[1])]
     resolved_name = isnothing(name) ? variationName(cv) : String(name)
     tnames = [variationName(v) for v in cv.variations]
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, name=resolved_name)
+    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
 function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
@@ -691,7 +716,19 @@ LatentVariation(lv::LatentVariation) = lv
 variationName(lv::LatentVariation) = lv.name
 
 Base.size(lv::LatentVariation{<:Vector{<:Real}}) = length.(lv.latent_parameters)
-Base.size(lv::LatentVariation{<:Distribution}) = -ones(Int, length(lv.latent_parameters))
+
+#! Cardinality of a latent parameter's support, or `-1` when it cannot be enumerated. `-1` is the
+#! sentinel `GridVariation` checks: a continuous prior has no grid to walk, a discrete one does.
+#! The `DiscreteUnivariateDistribution` test is load-bearing — `Uniform(0,1)` is finitely *bounded*
+#! but not finitely *enumerable*, so bounds alone are not enough.
+_supportSize(::Distribution) = -1
+function _supportSize(d::DiscreteUnivariateDistribution)
+    lo, hi = minimum(d), maximum(d)
+    (isfinite(lo) && isfinite(hi)) || return -1
+    return Int(hi - lo + 1)
+end
+
+Base.size(lv::LatentVariation{<:Distribution}) = [_supportSize(d) for d in lv.latent_parameters]
 nLatentDims(lv::LatentVariation) = length(lv.latent_parameters)
 
 variationTarget(lv::LatentVariation) = lv.targets
@@ -757,6 +794,26 @@ function variationValues(lv::LatentVariation{<:Vector{<:Real}}, cdfs::AbstractVe
     @assert length(cdfs) == nLatentDims(lv) "CDF vector length must match number of latent parameters."
     latent_pars = [floor(Int, cdf * length(lp)) + 1 for (cdf, lp) in zip(cdfs, lv.latent_parameters)]
     return [fn(latent_pars) for fn in lv.maps]
+end
+
+#! The grid counterpart of the CDF form below, for latent parameters whose support is finite — which
+#! is how a discrete parameter is represented (`DiscreteUniform` over its value indices). Continuous
+#! priors have nothing to enumerate and are rejected here as they are in `GridVariation`.
+function variationValues(lv::LatentVariation{<:Distribution})
+    szs = size(lv)
+    @assert all(!=(-1), szs) """
+    variationValues(lv) enumerates a LatentVariation, which requires every latent parameter to have a
+    finite support. At least one is continuous. Pass CDF values instead: variationValues(lv, cdfs).
+    """
+    supports = [collect(support(d)) for d in lv.latent_parameters]
+    cart_inds = CartesianIndices(Dims(szs))
+    lin_inds = LinearIndices(Dims(szs))
+    ret_val = Array{Float64}(undef, length(lv.maps), prod(szs))
+    for (I, li) in zip(cart_inds, lin_inds)
+        lp_vals = [sup[i] for (i, sup) in zip(I.I, supports)]
+        ret_val[:, li] .= [fn(lp_vals) for fn in lv.maps]
+    end
+    return ret_val
 end
 
 function variationValues(lv::LatentVariation{<:Distribution}, cdfs::AbstractVector{<:Real})

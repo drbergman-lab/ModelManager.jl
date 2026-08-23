@@ -379,6 +379,9 @@ target location's file type.
 
 ---
 
+- **Discrete parameters are represented as `DiscreteUniform` over their value indices.** This is internal — a user passes a `DiscreteVariation` and never sees the distribution — but it is what makes the grid and CDF sampling paths agree. Storing the raw value list with `first` as the map made the CDF path (`LHSVariation`, `SobolVariation`, `RBDVariation`, and therefore every `GSAMethod`) yield the *index* rather than the value, and produced an out-of-range index at `cdf = 1.0`. The same representation is what lets ABC-SMC accept a discrete parameter, since its kernels work purely in [0,1] CDF space and the quantile does the quantising.
+- **`size(lv)` reports support cardinality, or `-1` when a latent parameter cannot be enumerated.** `GridVariation` checks for that sentinel. The test is `DiscreteUnivariateDistribution` with finite bounds, not finite bounds alone: `Uniform(0,1)` is finitely *bounded* but not finitely *enumerable*, so the grid must keep rejecting it.
+
 ## Feature: Global Sensitivity Analysis
 
 **One-line description:** Run MOAT, Sobol', and RBD sensitivity analyses on any scalar output function.

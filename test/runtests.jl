@@ -2433,6 +2433,79 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test length(unique(res.variation_ids)) == 3
             end
 
+            @testset "discrete variations agree across the grid and CDF paths" begin
+                # Regression. A DiscreteVariation used to store its raw values as the latent
+                # parameter with `first` as the map, so the grid path returned a value while the CDF
+                # path — LHS, Sobol and RBD all reach it via addCDFVariations — returned the *index*.
+                # Discrete parameters are now DiscreteUniform over value indices, so both agree.
+                values = [3.0, 4.0, 5.0]
+                dv  = DiscreteVariation(:config, xp_x, values)
+                lv  = ModelManager.ParsedVariations([dv]).latent_variations[1]
+
+                @test lv.latent_parameters[1] isa DiscreteUniform
+                @test size(lv) == [3]                      # enumerable, so not the -1 sentinel
+
+                grid = vec(ModelManager.variationValues(lv))
+                @test grid == values
+
+                # The CDF path returns values, not indices, and lands in the right bin.
+                @test ModelManager.variationValues(lv, [0.0])[1] == 3.0
+                @test ModelManager.variationValues(lv, [0.4])[1] == 4.0
+                @test ModelManager.variationValues(lv, [0.9])[1] == 5.0
+                # cdf = 1.0 used to compute floor(Int, 1.0*3)+1 = 4, an out-of-range index.
+                @test ModelManager.variationValues(lv, [1.0])[1] == 5.0
+                # Every CDF in [0,1] yields a real value from the list.
+                @test all(ModelManager.variationValues(lv, [c])[1] in values for c in 0:0.05:1)
+
+                # Same through ParsedVariations, which is what the sampling designs call.
+                pv = ModelManager.ParsedVariations([dv])
+                @test ModelManager.variationValues(pv, [0.4])[1] == 4.0
+
+                # A co-variation of discrete parameters uses one index for all targets.
+                dv2 = DiscreteVariation(:config, xp_y, [30.0, 40.0, 50.0])
+                cv  = CoVariation(dv, dv2)
+                clv = ModelManager.ParsedVariations([cv]).latent_variations[1]
+                @test clv.latent_parameters[1] isa DiscreteUniform
+                @test ModelManager.variationValues(clv, [0.4]) == [4.0, 40.0]
+                @test vec(ModelManager.variationValues(clv)) == [3.0, 30.0, 4.0, 40.0, 5.0, 50.0]
+
+                # The inverse map recovers the index, and says so plainly when it cannot.
+                @test lv.inverse_maps[1]([4.0]) == 2
+                @test_throws ArgumentError lv.inverse_maps[1]([99.0])
+            end
+
+            @testset "grid enumeration still rejects continuous priors" begin
+                # The -1 sentinel is what GridVariation checks. Generalising `size` to report support
+                # cardinality must not make a continuous prior look enumerable: Uniform is finitely
+                # *bounded* but not finitely *enumerable*.
+                cont = ModelManager.ParsedVariations([
+                    UniformDistributedVariation(:config, xp_x, 1.0, 5.0)]).latent_variations[1]
+                @test size(cont) == [-1]
+                @test_throws AssertionError ModelManager.variationValues(cont)
+                @test_throws AssertionError ModelManager.addVariations(
+                    GridVariation(), inputs, [UniformDistributedVariation(:config, xp_x, 1.0, 5.0)])
+                # ...while a discrete one is enumerable and grids fine.
+                res = ModelManager.addVariations(GridVariation(), inputs,
+                                                 [DiscreteVariation(:config, xp_x, [6.0, 7.0])])
+                @test length(res.variation_ids) == 2
+            end
+
+            @testset "LHS over a discrete parameter maps to values" begin
+                # End to end through the design that used to write indices: take the CDFs LHS
+                # actually drew and push them through the same mapping addCDFVariations uses.
+                values = [11.0, 12.0, 13.0]
+                dv  = DiscreteVariation(:config, xp_x, values)
+                pv  = ModelManager.ParsedVariations([dv])
+                res = ModelManager.addVariations(LHSVariation(6), inputs, [dv])
+                @test res isa AddLHSVariationsResult
+                @test length(res.variation_ids) == 6
+                @test size(res.cdfs, 2) == 6
+                for cdf_col in eachcol(res.cdfs)
+                    mapped = ModelManager.variationValues(pv, collect(cdf_col))
+                    @test only(mapped) in values
+                end
+            end
+
             @testset "addVariations — LHSVariation" begin
                 dv  = UniformDistributedVariation(:config, xp_x, 1.0, 5.0)
                 res = ModelManager.addVariations(LHSVariation(4), inputs, [dv])
