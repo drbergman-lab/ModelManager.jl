@@ -160,7 +160,8 @@ Result of a single ABC-SMC generation.
   coordinates** (internal representation used by the ABC-SMC algorithm).
 - `weights::Vector{Float64}`: Normalized importance weights (sum to 1).
 - `distances::Vector{Float64}`: Distance for each accepted particle.
-- `epsilon::Float64`: Maximum distance among accepted particles (≤ the threshold used).
+- `max_epsilon_accepted::Float64`: The largest distance this generation accepted. Never exceeds
+  `epsilon_threshold`, and is what the stopping criteria compare against.
 - `n_evaluations::Int`: Total proposals evaluated, including rejected ones.
 - `monad_ids::Vector{Int}`: Monad IDs for each accepted particle.
 - `acceptance_rate::Float64`: Fraction of proposals that passed the epsilon threshold
@@ -169,6 +170,15 @@ Result of a single ABC-SMC generation.
   higher because overflow particles are counted but `n_evaluations` includes the full batch.
 - `ess::Float64`: Effective sample size, `1 / Σwᵢ²`. Equals `population_size` when
   weights are uniform (generation 1) and decreases as weights concentrate.
+- `epsilon_threshold::Union{Nothing,Float64}`: The cutoff this generation was run against —
+  `epsilon_schedule[t-1]` if one was supplied, otherwise
+  `max(minimum_epsilon, quantile(previous_distances, epsilon_quantile))`. `nothing` for generation 1,
+  which accepts every proposal it evaluates, and for generations recorded before this was stored.
+  Distinct from `max_epsilon_accepted`: at the default `epsilon_quantile` of `0.5` the threshold is a
+  *median* of the previous generation's distances while `max_epsilon_accepted` is a *maximum* of this
+  one's, so the two coincide only when `epsilon_quantile == 1.0`.
+- `proposal_distances::Union{Nothing,DataFrame}`: Reserved for the per-generation distance of every
+  evaluated proposal, accepted or not. Currently always `nothing` — nothing populates it yet.
 - `rejected_proposals::Union{Nothing,DataFrame}`: CDF-coordinate DataFrame of all
   rejected proposals in this generation (same column names as `particles`). Populated
   only when `ABCSMC(store_rejected=true)`; always `nothing` for generation 1 (all Sobol
@@ -336,7 +346,9 @@ and behaves like a DataFrame for property access (`cs.max_epsilon_accepted`, etc
 
 # Columns
 - `t`: Generation index.
-- `epsilon`: Maximum accepted distance.
+- `max_epsilon_accepted`: The largest distance the generation accepted.
+- `epsilon_threshold`: The cutoff it was run against; `nothing` for generation 1 and for generations
+  recorded before this was stored.
 - `acceptance_rate`: Fraction of proposals accepted.
 - `n_accepted`: Number of accepted particles (equals `population_size` when
   `accept_overflow=false`; may be larger when `accept_overflow=true`).
