@@ -1316,14 +1316,21 @@ function _saveGeneration(dir::String, cdf_dir::String, gen::GenerationResult,
     CSV.write(joinpath(dir, "generation_$tag.csv"), _buildDisplayDF(gen, cps))
 
     # Generation-level TOML.
+    meta = Dict{String,Any}(
+        #! Two distinct quantities, and only the first used to be recorded: `max_epsilon_accepted`
+        #! is the worst distance actually accepted, while `epsilon_threshold` is the cutoff the
+        #! generation was run against. They coincide only when `epsilon_quantile == 1.0`.
+        "t"                    => gen.t,
+        "max_epsilon_accepted" => gen.max_epsilon_accepted,
+        "n_evaluations"        => gen.n_evaluations,
+        "acceptance_rate"      => gen.acceptance_rate,
+        "ess"                  => gen.ess,
+    )
+    #! Omitted rather than written as a placeholder: generation 1 has no threshold, because it
+    #! accepts every proposal it evaluates, and TOML has no null.
+    isnothing(gen.epsilon_threshold) || (meta["epsilon_threshold"] = gen.epsilon_threshold)
     open(joinpath(dir, "generation_$tag.toml"), "w") do io
-        TOML.print(io, Dict{String,Any}(
-            "t"               => gen.t,
-            "epsilon"         => gen.epsilon,
-            "n_evaluations"   => gen.n_evaluations,
-            "acceptance_rate" => gen.acceptance_rate,
-            "ess"             => gen.ess,
-        ))
+        TOML.print(io, meta; sorted=true)
     end
 end
 
@@ -1351,6 +1358,7 @@ function _loadGenerations(dir::String, param_names::Vector{String},
     sort!(csv_files, by = f -> parse(Int, match(r"\d+", f).match))
 
     generations = GenerationResult[]
+    n_upgraded = 0
     for csv_file in csv_files
         tag      = match(r"generation_(\d+)\.csv", csv_file).captures[1]
         t        = parse(Int, tag)
@@ -1364,15 +1372,63 @@ function _loadGenerations(dir::String, param_names::Vector{String},
 
         toml_path = joinpath(dir, "generation_$tag.toml")
         meta = TOML.parsefile(toml_path)
-        epsilon         = Float64(meta["epsilon"])
+        #! Older runs recorded a single `epsilon`. Read it, and upgrade the file in place so the next
+        #! read takes the current path — resuming already writes into this folder, so there is nothing
+        #! read-only about it here.
+        _upgradeGenerationMetadata!(toml_path, meta) && (n_upgraded += 1)
+        max_epsilon_accepted = Float64(get(meta, "max_epsilon_accepted",
+                                           get(meta, "epsilon", NaN)))
         n_evaluations   = Int(meta["n_evaluations"])
         acceptance_rate = Float64(meta["acceptance_rate"])
         ess             = Float64(meta["ess"])
 
-        push!(generations, GenerationResult(t, particles, weights, distances, epsilon,
+        #! `nothing` when the key is absent, which is every generation 1 and every pre-rename run.
+        epsilon_threshold = haskey(meta, "epsilon_threshold") ?
+            Float64(meta["epsilon_threshold"]) : nothing
+
+        push!(generations, GenerationResult(t, particles, weights, distances,
+                                            max_epsilon_accepted,
                                             n_evaluations, monad_ids, acceptance_rate, ess,
-                                            nothing))
+                                            nothing; epsilon_threshold=epsilon_threshold))
     end
 
+    if n_upgraded > 0
+        @warn """
+        Upgraded $(n_upgraded) generation metadata file$(n_upgraded == 1 ? "" : "s") in $(dir) to the \
+        current key names. The recorded value is preserved as `max_epsilon_accepted`, the largest \
+        distance a generation accepted. `epsilon_threshold` — the cutoff a generation was run \
+        against — is absent for these generations because it was not recorded when they ran.
+        """ maxlog=1
+    end
     return generations
+end
+
+"""
+    _upgradeGenerationMetadata!(path, meta) → Bool
+
+Rewrite one `generation_{NNN}.toml` in place to the current key names, mutating `meta` to match.
+Returns whether anything changed.
+"""
+function _upgradeGenerationMetadata!(path::String, meta::AbstractDict)
+    #! Only the rename. The threshold a generation ran against genuinely was not recorded, so it is
+    #! left absent rather than invented — `nothing` is the honest value, and a wrong number here would
+    #! silently mislabel an acceptance boundary.
+    (haskey(meta, "epsilon") && !haskey(meta, "max_epsilon_accepted")) || return false
+    meta["max_epsilon_accepted"] = meta["epsilon"]
+    delete!(meta, "epsilon")
+    try
+        #! Write-then-rename: a rename within one directory is atomic on POSIX, so an interrupted
+        #! upgrade cannot leave a half-written file where a readable one used to be.
+        tmp = path * ".upgrading"
+        open(tmp, "w") do io
+            TOML.print(io, meta; sorted=true)
+        end
+        mv(tmp, path; force=true)
+        return true
+    catch e
+        #! A read-only or full filesystem must not break the resume: the in-memory `meta` is already
+        #! correct, so carry on and let the next writable run upgrade the file.
+        @warn "Could not upgrade $(path) to the current key names; continuing with the value read from it." exception=(e, catch_backtrace())
+        return false
+    end
 end

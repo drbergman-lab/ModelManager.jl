@@ -160,7 +160,8 @@ Result of a single ABC-SMC generation.
   coordinates** (internal representation used by the ABC-SMC algorithm).
 - `weights::Vector{Float64}`: Normalized importance weights (sum to 1).
 - `distances::Vector{Float64}`: Distance for each accepted particle.
-- `epsilon::Float64`: Maximum distance among accepted particles (≤ the threshold used).
+- `max_epsilon_accepted::Float64`: The largest distance this generation accepted. Never exceeds
+  `epsilon_threshold`, and is what the stopping criteria compare against.
 - `n_evaluations::Int`: Total proposals evaluated, including rejected ones.
 - `monad_ids::Vector{Int}`: Monad IDs for each accepted particle.
 - `acceptance_rate::Float64`: Fraction of proposals that passed the epsilon threshold
@@ -169,6 +170,15 @@ Result of a single ABC-SMC generation.
   higher because overflow particles are counted but `n_evaluations` includes the full batch.
 - `ess::Float64`: Effective sample size, `1 / Σwᵢ²`. Equals `population_size` when
   weights are uniform (generation 1) and decreases as weights concentrate.
+- `epsilon_threshold::Union{Nothing,Float64}`: The cutoff this generation was run against —
+  `epsilon_schedule[t-1]` if one was supplied, otherwise
+  `max(minimum_epsilon, quantile(previous_distances, epsilon_quantile))`. `nothing` for generation 1,
+  which accepts every proposal it evaluates, and for generations recorded before this was stored.
+  Distinct from `max_epsilon_accepted`: at the default `epsilon_quantile` of `0.5` the threshold is a
+  *median* of the previous generation's distances while `max_epsilon_accepted` is a *maximum* of this
+  one's, so the two coincide only when `epsilon_quantile == 1.0`.
+- `proposal_distances::Union{Nothing,DataFrame}`: Reserved for the per-generation distance of every
+  evaluated proposal, accepted or not. Currently always `nothing` — nothing populates it yet.
 - `rejected_proposals::Union{Nothing,DataFrame}`: CDF-coordinate DataFrame of all
   rejected proposals in this generation (same column names as `particles`). Populated
   only when `ABCSMC(store_rejected=true)`; always `nothing` for generation 1 (all Sobol
@@ -180,13 +190,27 @@ struct GenerationResult
     particles::DataFrame
     weights::Vector{Float64}
     distances::Vector{Float64}
-    epsilon::Float64
+    max_epsilon_accepted::Float64
     n_evaluations::Int
     monad_ids::Vector{Int}
     acceptance_rate::Float64
     ess::Float64
     rejected_proposals::Union{Nothing,DataFrame}
+    epsilon_threshold::Union{Nothing,Float64}
+    proposal_distances::Union{Nothing,DataFrame}
 end
+
+#! The two trailing fields are named rather than positional. Twelve positional arguments ending in
+#! three `nothing`s is hard to read, and — unlike a compatibility shim — this is not something to
+#! deprecate later: it is how the type is meant to be constructed. Both are genuinely absent for a
+#! generation loaded from a run that predates them, so `nothing` is the right default rather than a
+#! placeholder.
+GenerationResult(t, particles, weights, distances, max_epsilon_accepted, n_evaluations,
+                 monad_ids, acceptance_rate, ess, rejected_proposals;
+                 epsilon_threshold=nothing, proposal_distances=nothing) =
+    GenerationResult(t, particles, weights, distances, max_epsilon_accepted, n_evaluations,
+                     monad_ids, acceptance_rate, ess, rejected_proposals,
+                     epsilon_threshold, proposal_distances)
 
 ################## ABCResult ##################
 
@@ -318,11 +342,13 @@ end
 
 Per-generation convergence table for an ABC-SMC run. Supports
 `plot(ConvergenceSummary(result))` via the RecipesBase recipe in `visualize.jl`,
-and behaves like a DataFrame for property access (`cs.epsilon`, etc.).
+and behaves like a DataFrame for property access (`cs.max_epsilon_accepted`, etc.).
 
 # Columns
 - `t`: Generation index.
-- `epsilon`: Maximum accepted distance.
+- `max_epsilon_accepted`: The largest distance the generation accepted.
+- `epsilon_threshold`: The cutoff it was run against; `nothing` for generation 1 and for generations
+  recorded before this was stored.
 - `acceptance_rate`: Fraction of proposals accepted.
 - `n_accepted`: Number of accepted particles (equals `population_size` when
   `accept_overflow=false`; may be larger when `accept_overflow=true`).
@@ -354,7 +380,8 @@ function ConvergenceSummary(result::ABCResult)
     isempty(result.generations) && error("No generations in ABCResult.")
     df = DataFrame(
         t               = [g.t                       for g in result.generations],
-        epsilon         = [g.epsilon                 for g in result.generations],
+        max_epsilon_accepted = [g.max_epsilon_accepted for g in result.generations],
+        epsilon_threshold    = [g.epsilon_threshold    for g in result.generations],
         acceptance_rate = [g.acceptance_rate         for g in result.generations],
         n_accepted      = [nrow(g.particles)         for g in result.generations],
         ess             = [g.ess                     for g in result.generations],
@@ -371,6 +398,7 @@ function ConvergenceSummary(cal::Calibration)
     isempty(toml_files) && error("No generation metadata found for Calibration($(cal.id)).")
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
+    thresholds = Union{Nothing,Float64}[]
     n_accepteds = Int[]; esss = Float64[]; ess_fractions = Float64[]
     n_evaluationss = Int[]
 
@@ -380,12 +408,16 @@ function ConvergenceSummary(cal::Calibration)
         n_acc = isfile(csv_path) ?
                 nrow(CSV.read(csv_path, DataFrame; select=[:weight])) :
                 round(Int, d["acceptance_rate"] * d["n_evaluations"])
-        push!(ts, t); push!(epsilons, d["epsilon"])
+        push!(ts, t)
+        #! Pre-rename runs wrote this as "epsilon"; read either spelling so they still load.
+        push!(epsilons, get(d, "max_epsilon_accepted", get(d, "epsilon", NaN)))
+        push!(thresholds, get(d, "epsilon_threshold", nothing))
         push!(acceptance_rates, d["acceptance_rate"]); push!(n_accepteds, n_acc)
         push!(esss, d["ess"]); push!(ess_fractions, d["ess"] / n_acc)
         push!(n_evaluationss, d["n_evaluations"])
     end
-    df = DataFrame(t=ts, epsilon=epsilons, acceptance_rate=acceptance_rates,
+    df = DataFrame(t=ts, max_epsilon_accepted=epsilons, epsilon_threshold=thresholds,
+                   acceptance_rate=acceptance_rates,
                    n_accepted=n_accepteds, ess=esss, ess_fraction=ess_fractions,
                    n_evaluations=n_evaluationss)
     return ConvergenceSummary(df)

@@ -388,7 +388,7 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
         if _verbosityRank(verbosity) >= _verbosityRank(:generation)
             n_accepted = length(gen.distances)
             @info "ABC-SMC generation $(gen.t): " *
-                  "ε=$(round(gen.epsilon; digits=6)), " *
+                  "ε=$(round(gen.max_epsilon_accepted; digits=6)), " *
                   "$(n_accepted)/$(gen.n_evaluations) proposals accepted " *
                   "($(round(100*gen.acceptance_rate; digits=1))%), " *
                   "ESS=$(round(gen.ess; digits=1)) " *
@@ -423,8 +423,8 @@ function _stoppingReason(method::ABCSMC, generations::Vector{GenerationResult};
 
     gen = generations[end]
 
-    gen.epsilon <= method.minimum_epsilon &&
-        return "ε=$(round(gen.epsilon; digits=6)) reached minimum_epsilon ($(method.minimum_epsilon))"
+    gen.max_epsilon_accepted <= method.minimum_epsilon &&
+        return "ε=$(round(gen.max_epsilon_accepted; digits=6)) reached minimum_epsilon ($(method.minimum_epsilon))"
 
     method.min_acceptance_rate > 0.0 &&
         gen.acceptance_rate < method.min_acceptance_rate &&
@@ -450,9 +450,9 @@ function _stoppingReason(method::ABCSMC, generations::Vector{GenerationResult};
     end
 
     if method.min_epsilon_decrease > 0.0 && length(generations) > 1
-        prev_eps = generations[end - 1].epsilon
+        prev_eps = generations[end - 1].max_epsilon_accepted
         if prev_eps > 0.0
-            rel_decrease = (prev_eps - gen.epsilon) / prev_eps
+            rel_decrease = (prev_eps - gen.max_epsilon_accepted) / prev_eps
             rel_decrease < method.min_epsilon_decrease &&
                 return "relative ε decrease ($(round(rel_decrease; digits=4))) " *
                        "below min_epsilon_decrease ($(method.min_epsilon_decrease))"
@@ -674,8 +674,13 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
     weights = _computeWeights(accepted, param_names, prev, fitted)
     rejected_df = isnothing(rejected_coords) ? nothing :
         DataFrame(Dict(name => [p[name] for p in rejected_coords] for name in param_names))
+    #! `epsilon` is the threshold this generation was run against; record it, because it cannot be
+    #! recovered from the result. The previous generation's `max_epsilon_accepted` is not it: the
+    #! threshold is `quantile(prev.distances, epsilon_quantile)`, which equals the previous maximum
+    #! only when `epsilon_quantile == 1.0`.
     return _buildGenerationResult(t, accepted, weights, n_evaluations, n_accepted_total,
-                                  param_names; rejected_proposals=rejected_df)
+                                  param_names; rejected_proposals=rejected_df,
+                                  epsilon_threshold=epsilon)
 end
 
 ################## Sampling ##################
@@ -998,17 +1003,23 @@ gives the correct (unbiased) acceptance rate for the proposal-distribution/epsil
 function _buildGenerationResult(t::Int, accepted::Vector{_ParticleResult},
                                  weights::Vector{Float64}, n_evaluations::Int,
                                  n_accepted::Int, param_names::Vector{String};
-                                 rejected_proposals::Union{Nothing,DataFrame}=nothing)
+                                 rejected_proposals::Union{Nothing,DataFrame}=nothing,
+                                 epsilon_threshold::Union{Nothing,Float64}=nothing,
+                                 proposal_distances::Union{Nothing,DataFrame}=nothing)
     N = length(accepted)
     particles = DataFrame(Dict(name => [p.latent_cdfs[name] for p in accepted]
                                for name in param_names))
     distances        = [p.distance for p in accepted]
     monad_ids        = [p.metadata isa Integer ? Int(p.metadata) : 0 for p in accepted]
-    epsilon          = maximum(distances)
+    #! The *achieved* epsilon: the worst distance actually accepted. Distinct from the threshold the
+    #! generation was run against, which is `epsilon_threshold` and is `nothing` for generation 1
+    #! because generation 1 accepts every proposal it evaluates.
+    max_epsilon_accepted = maximum(distances)
     acceptance_rate  = n_evaluations > 0 ? n_accepted / n_evaluations : 1.0
     ess              = 1.0 / sum(w^2 for w in weights)
 
-    return GenerationResult(t, particles, weights, distances, epsilon,
-                            n_evaluations, monad_ids, acceptance_rate, ess,
-                            rejected_proposals)
+    return GenerationResult(t, particles, weights, distances, max_epsilon_accepted,
+                            n_evaluations, monad_ids, acceptance_rate, ess, rejected_proposals;
+                            epsilon_threshold=epsilon_threshold,
+                            proposal_distances=proposal_distances)
 end

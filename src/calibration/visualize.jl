@@ -356,8 +356,8 @@ end
     @series begin
         subplot    := 1
         seriestype := :path
-        ylabel     := "epsilon"
-        df.t, df.epsilon
+        ylabel     := "max epsilon accepted"
+        df.t, df.max_epsilon_accepted
     end
     @series begin
         subplot    := 2

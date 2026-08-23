@@ -71,6 +71,7 @@ threshold (epsilon) toward `minimum_epsilon`. By default the next threshold is t
 accepted distances (`epsilon_quantile`); you can instead supply an explicit
 `epsilon_schedule`.
 
+
 ### Stopping criteria
 
 Beyond `minimum_epsilon` and `max_nr_populations`, you can stop early when the run stops
@@ -140,6 +141,10 @@ post = posterior(result)                 # final-generation posterior
 post = posterior(result; generation=3)   # a specific generation
 summary = ConvergenceSummary(result)
 ```
+
+Each generation records two epsilons: `max_epsilon_accepted`, the largest distance it accepted, and
+`epsilon_threshold`, the cutoff it was run against. Generation 1 accepts everything, so it has no
+threshold.
 
 Calibration state is persisted (generation CSVs, the problem manifest, and `method.toml`)
 under a [`Calibration`](@ref) record in the database, so an interrupted run can be resumed:
