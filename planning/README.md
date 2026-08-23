@@ -17,14 +17,15 @@ get sign-off, create its branch ref, and log to `progress.md` as it goes.
 | 3 | [03-failed-sim-records.md](03-failed-sim-records.md) | Record failed sims for post-hoc inspection | — | **⏭ skipped by the user.** |
 | 4 | [04-calibration-sampling-views.md](04-calibration-sampling-views.md) | Calibration as a poset of `Sampling` views; taggable `Calibration` | — | **✅ shipped, PR #32.** Its gate on #5–#8 is satisfied. |
 | 5 | [05-calibration-api-and-tagging.md](05-calibration-api-and-tagging.md) | Unify `runABC`/`runCalibration`/`resumeABC`/`ABCSMC`; `description` vs tags | Med | **🟡 partially shipped, PR #33 merged.** Remainder listed below. |
-| 6 | [06-distance-distribution-plot.md](06-distance-distribution-plot.md) | Distance histogram with accepted tail; unambiguous epsilon names | Med | **🟡 part 1 open, PR #35** (epsilon naming). Recipe + rejected-distance persistence still to do. |
-| 7 | [07-shared-study-objects.md](07-shared-study-objects.md) | Build once, use for sensitivity and calibration | Low→Med per stage | **🟡 Stage 1 open, PR #34.** Stage 1b (discrete) needs the kernel assessment; Stages 2–4 not started. |
-| 8 | [08-bayesflow-scoping.md](08-bayesflow-scoping.md) | BayesFlow options + training-set export | Low-Med | **Not started.** Unblocked by #34. |
+| 6 | [06-distance-distribution-plot.md](06-distance-distribution-plot.md) | Distance histogram with accepted tail; unambiguous epsilon names | Med | **🟡 part 1 merged (#35). Part 2 open, PR #37** (recipe + persistence). |
+| 7 | [07-shared-study-objects.md](07-shared-study-objects.md) | Build once, use for sensitivity and calibration | Low→Med per stage | **🟡 Stage 1 merged (#34); Stage 1b open, PR #38.** Stages 2–4 not started. |
+| 8 | [08-bayesflow-scoping.md](08-bayesflow-scoping.md) | BayesFlow options + training-set export | Low-Med | **Not started.** Unblocked now that #34 has merged. |
 
-## Status, as of PR #33 merged
+## Status, as of PR #38 opened
 
-Merged: **#30** (item 1), **#31** (item 2), **#32** (item 4), **#33** (item 5, partial).
-Skipped: item 3. Open: **#34** (item 7 Stage 1), **#35** (item 6 part 1).
+Merged: **#30** (item 1), **#31** (item 2), **#32** (item 4), **#33** (item 5, partial),
+**#34** (item 7 Stage 1), **#35** (item 6 part 1), **#36** (discrete variations on the `Distribution` branch).
+Skipped: item 3. Open: **#37** (item 6 part 2), **#38** (item 7 Stage 1b).
 
 ### Outstanding, concretely
 
@@ -44,9 +45,10 @@ Skipped: item 3. Open: **#34** (item 7 Stage 1), **#35** (item 6 part 1).
 - fix `docs/src/man/calibration.md:158-161` and `README.md:79` (`plot_type=` does not exist)
 
 **Item 7 remainder**:
-- Stage 1b — discrete-parameter convergence. Blocked on assessing the four perturbation kernels:
-  they fit a covariance in ℝᵈ and the importance weights need a proposal density, so a discrete
-  coordinate needs a categorical or random-walk proposal. That assessment decides progress-vs-retreat.
+- ~~Stage 1b — discrete-parameter convergence.~~ **Done, PR #38.** The kernel assessment that gated it
+  came back "no work needed": all four kernels operate on `Dict{String,Float64}` CDF coordinates and never
+  see a target value, so the `DiscreteUniform`-over-indices representation from #36 was the whole fix.
+  `_minDiagVar` already handles the one degenerate case (all particles in one bin).
 - Stages 2–4 — `StudySpec`, the `QoI` seam, the simulator-kwargs convention. **Review on #34 raised
   the framing point that GSA usually comes first, so the shared object must be the light one; that is
   what `StudySpec` is for, and the vector of `AbstractVariation`s already serves the parameter half.**
