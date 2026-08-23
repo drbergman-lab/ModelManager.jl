@@ -596,14 +596,19 @@ function _validateInverseMaps(lv::LatentVariation{<:Distribution};
         target_vals = Float64[fn(lp_vals) for fn in lv.maps]
         lp′ = [inv_map(target_vals) for inv_map in lv.inverse_maps]
 
-        # Check that cdf(dist_i, lp′_i) ∈ (0,1) (lp′ is in distribution support)
+        #! `insupport`, not `0 < cdf < 1`. The intent is to catch an inverse map that returns a value
+        #! outside the distribution's support, and `cdf` was standing in for that test. The proxy holds
+        #! for an unbounded distribution, where `cdf` reaches 0 or 1 only in the limit — but it wrongly
+        #! rejects the legitimate extreme values of a bounded or discrete one. `cdf(Uniform(0,1), 1.0)`
+        #! and `cdf(DiscreteUniform(1,k), k)` are both exactly `1.0`, so the top value of any such
+        #! parameter tripped a guard that was never aimed at it.
         for (i, (d, lp_i)) in enumerate(zip(lv.latent_parameters, lp′))
-            u_i = cdf(d, lp_i)
-            if !(0 < u_i < 1)
+            if !insupport(d, lp_i)
                 throw(ArgumentError(
-                    "_validateInverseMaps: cdf(dist_$(i), inverse_maps[$(i)](target_vals)) = $(u_i) " *
-                    "for target_vals=$(target_vals), which is outside (0,1). " *
-                    "Inverse maps must return latent parameter values in the distribution support."))
+                    "_validateInverseMaps: inverse_maps[$(i)](target_vals) = $(lp_i) " *
+                    "for target_vals=$(target_vals), which is outside the support of dist_$(i) " *
+                    "($(d)). Inverse maps must return latent parameter values in the distribution " *
+                    "support."))
             end
         end
 

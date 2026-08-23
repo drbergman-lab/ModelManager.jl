@@ -90,24 +90,65 @@ function _toCalibrationParameter(lv::LatentVariation{<:Distribution})
     return CalibrationParameter(LVSource(lv), lv)
 end
 
-_toCalibrationParameter(::DiscreteVariation) =
-    throw(ArgumentError(
-        "DiscreteVariation cannot be used as a calibration parameter. " *
-        "Use DistributedVariation(location, xml_path, prior) instead."))
+#! Why a reason-returning function rather than throwing directly: `CalibrationProblem` converts its
+#! parameters in a comprehension, so a throwing converter reports only the *first* offender. A user
+#! with eight variations, two of them unusable, learns about one per run. The throwing methods below
+#! are one-liners over this, so a direct `_toCalibrationParameter` call still raises the same message.
+"""
+    _calibrationRejection(av::AbstractVariation) → Union{Nothing,String}
 
-_toCalibrationParameter(::CoVariation{<:DiscreteVariation}) =
-    throw(ArgumentError(
-        "CoVariation{DiscreteVariation} cannot be used as a calibration parameter. " *
-        "Use CoVariation{DistributedVariation} instead."))
+Return why `av` cannot be a calibration parameter, or `nothing` if it can.
+"""
+_calibrationRejection(::DistributedVariation) = nothing
+_calibrationRejection(::CoVariation{DistributedVariation}) = nothing
+_calibrationRejection(::LatentVariation{<:Distribution}) = nothing
 
-_toCalibrationParameter(::LatentVariation) =
-    throw(ArgumentError(
-        "LatentVariation for ABC-SMC calibration must have Distribution latent parameters, " *
-        "not discrete values. Use LatentVariation{<:Distribution}."))
+_calibrationRejection(::DiscreteVariation) =
+    "DiscreteVariation cannot be used as a calibration parameter. " *
+    "Use DistributedVariation(location, xml_path, prior) instead."
 
-_toCalibrationParameter(av::AbstractVariation) =
-    throw(ArgumentError(
-        "Unsupported variation type for calibration: $(typeof(av))."))
+_calibrationRejection(::CoVariation{<:DiscreteVariation}) =
+    "CoVariation{DiscreteVariation} cannot be used as a calibration parameter. " *
+    "Use CoVariation{DistributedVariation} instead."
+
+_calibrationRejection(::LatentVariation) =
+    "LatentVariation for ABC-SMC calibration must have Distribution latent parameters, " *
+    "not discrete values. Use LatentVariation{<:Distribution}."
+
+_calibrationRejection(av::AbstractVariation) =
+    "Unsupported variation type for calibration: $(typeof(av))."
+
+_toCalibrationParameter(av::DiscreteVariation) = throw(ArgumentError(_calibrationRejection(av)))
+_toCalibrationParameter(av::CoVariation{<:DiscreteVariation}) = throw(ArgumentError(_calibrationRejection(av)))
+_toCalibrationParameter(av::LatentVariation) = throw(ArgumentError(_calibrationRejection(av)))
+_toCalibrationParameter(av::AbstractVariation) = throw(ArgumentError(_calibrationRejection(av)))
+
+#! `variationName` covers ElementaryVariation, CoVariation and LatentVariation; anything else is by
+#! definition an unsupported type, and naming it by type is the more useful message there anyway.
+_variationLabel(av) = applicable(variationName, av) ? variationName(av) : string(typeof(av))
+
+"""
+    _toCalibrationParameters(parameters::AbstractVector) → Vector{CalibrationParameter}
+
+Convert every element, reporting **all** unusable parameters in one error rather than the first.
+"""
+function _toCalibrationParameters(parameters::AbstractVector)
+    rejected = Tuple{Int,String,String}[]
+    for (i, av) in enumerate(parameters)
+        reason = _calibrationRejection(av)
+        isnothing(reason) || push!(rejected, (i, _variationLabel(av), reason))
+    end
+    if !isempty(rejected)
+        lines = ["  [$(i)] $(name): $(reason)" for (i, name, reason) in rejected]
+        throw(ArgumentError("""
+        $(length(rejected)) of $(length(parameters)) parameters cannot be used for calibration:
+        $(join(lines, "\n"))
+        These are usable for sensitivity analysis, which accepts discrete variations; ABC-SMC needs a
+        continuous prior for every parameter in order to weight and perturb particles.
+        """))
+    end
+    return CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+end
 
 ################## Display column helpers ##################
 

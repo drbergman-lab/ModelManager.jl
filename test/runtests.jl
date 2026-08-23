@@ -364,6 +364,28 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test all(cp -> cp isa CalibrationParameter, cps)
         @test length(cps) == 2
 
+        # Every unusable parameter is reported at once, by index and name — not just the first.
+        disc1 = DiscreteVariation(:config, xp2, [1.0, 2.0])
+        disc2 = DiscreteVariation(:config, xp3, [3.0, 4.0])
+        err = try
+            ModelManager._toCalibrationParameters([dv, disc1, disc2])
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        msg = sprint(showerror, err)
+        @test occursin("[2]", msg)          # the second parameter
+        @test occursin("[3]", msg)          # ...and the third, in the same error
+        @test occursin("2 of 3 parameters", msg)
+        @test occursin(ModelManager.variationName(disc1), msg)
+        # An accepted set still converts, and reports nothing.
+        @test length(ModelManager._toCalibrationParameters([dv, cv])) == 2
+
+        # ParsedVariations(problem) is lossless: it holds the very same LatentVariation objects,
+        # so nothing is reconstructed and no display name is lost.
+        pv = ModelManager.ParsedVariations(AbstractVariation[cp.lv for cp in cps])
+        @test all(pv.latent_variations[i] === cps[i].lv for i in eachindex(cps))
     end
 
     ################## ABCSMC ##################
@@ -3832,6 +3854,14 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 samp = run(MOAT(3), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
                 @test size(samp.monad_ids_df, 2) == 3   # intercept + 2 factors
+
+                # The same parameter vector is the shared object: it feeds GSA directly (above) and a
+                # CalibrationProblem later, with no GSA-on-problem dispatch in between.
+                problem = CalibrationProblem(inputs, [dv1, dv2], Dict{String,Any}("x" => 1.0),
+                                             _test_named_ss, mseDistance)
+                pv = ModelManager.ParsedVariations(problem)
+                @test pv isa ModelManager.ParsedVariations
+                @test ModelManager.nLatentDims(pv) == 2
 
                 # The flat monad-ID accessor agrees with the design matrix it was built from.
                 design_ids = ModelManager.getMonadIDDataFrame(samp) |> Matrix |> vec |> unique

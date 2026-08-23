@@ -70,7 +70,7 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                              summary_statistic, distance;
                              n_replicates::Int=1,
                              reference_variation_id::VariationID=VariationID(inputs))
-    cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(inputs, cps, observed_data,
                               summary_statistic, distance, n_replicates, reference_variation_id)
 end
@@ -78,10 +78,40 @@ end
 function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              observed_data,
                              summary_statistic, distance; n_replicates::Int=1)
-    cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
                               summary_statistic, distance, n_replicates, ref.variation_id)
 end
+
+#! Defined here rather than beside `ParsedVariations` in `variations.jl`: that file is included
+#! before `calibration/problem.jl`, so a method signature naming `CalibrationProblem` there would be
+#! an `UndefVarError` at definition time.
+"""
+    ParsedVariations(problem::CalibrationProblem) → ParsedVariations
+
+Reinterpret a calibration problem's parameters as a sensitivity-analysis variation set.
+
+This is lossless: both workflows normalize user variations through the same `LatentVariation`
+factories, and the problem retains each parameter's latent variation, so nothing is reconstructed.
+The reverse direction is *not* lossless and is deliberately not provided — routing a
+[`DistributedVariation`](@ref) through `LatentVariation` and back loses the friendly display name
+its generation CSVs are keyed by.
+
+# Examples
+```julia
+problem = CalibrationProblem(inputs, [dv1, dv2], observed, summarize, mseDistance)
+pv = ParsedVariations(problem)
+```
+"""
+ParsedVariations(problem::CalibrationProblem) =
+    ParsedVariations(AbstractVariation[cp.lv for cp in problem.parameters])
+
+#! Deliberately no `run(::GSAMethod, ::CalibrationProblem)`. Sensitivity analysis normally comes
+#! *before* calibration, so dispatching a GSA method on the heavier object inverts the usual order and
+#! would ask a user who only wants a screening run to invent `observed_data`, a `summary_statistic` and
+#! a `distance` first. The shared object is the vector of variations, which both entry points already
+#! accept: build `priors` once, pass it to `run(method, inputs, priors; functions=...)`, and pass the
+#! same vector to `CalibrationProblem` later.
 
 ################## Calibration ##################
 
