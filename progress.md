@@ -3065,3 +3065,50 @@ treating bounds as sufficient would have let the grid try to walk a continuous p
 **Prerequisite already in place.** `_validateInverseMaps` now tests `insupport` rather than
 `0 < cdf < 1`. The old proxy rejected `cdf(DiscreteUniform(1,k), k) == 1.0`, so the top value of every
 discrete parameter would have failed validation.
+
+## 2026-08-19 — Naming the two epsilons apart, and upgrading old metadata on read
+
+Brief: `planning/06-distance-distribution-plot.md`, part 1 of two. The distance histogram itself needs
+rejected-proposal distances persisted, which is part 2; this is the naming and metadata groundwork it
+builds on, split out so the rename could be reviewed before anything was built on it.
+
+**The word meant three things and the file recorded one.** `generation_{NNN}.toml` stored `epsilon` =
+`maximum(distances)` over accepted particles — the *achieved* value. The *threshold* a generation ran
+against was never written, and is not recoverable from what was: it is
+`max(minimum_epsilon, quantile(prev.distances, epsilon_quantile))`, so at the default quantile it is the
+previous generation's *median* while the stored number is this generation's *maximum*. They coincide only
+at `epsilon_quantile == 1.0`, and generation 1 has no threshold at all. So `GenerationResult.epsilon`
+became `max_epsilon_accepted`, and a new `epsilon_threshold` records the cutoff.
+
+Renaming was chosen over preserving — the user's call, the ambiguity being worse than the churn. The sweep
+reaches `_stoppingReason`, `ConvergenceSummary` (including its user-visible column),
+`_saveGeneration`/`_loadGenerations`, `show(::Calibration)` and the convergence recipe. One trap along the
+way: `_loadGenerations` had its assignment renamed but still passed the old variable into the constructor,
+which three tests caught as `UndefVarError`. A read-fallback cannot protect against that.
+
+**Old files are upgraded, not merely tolerated.** Every reader accepts the old spelling, but a warning
+with no remedy is a nag, and ModelManager has no migration channel of its own. So `_loadGenerations`
+rewrites the file in place and the warning reports what it did — chosen over asking the user to run a
+migration helper, since it needs no public name and no action from them.
+
+Only from `_loadGenerations`: resuming already writes into that folder. `ConvergenceSummary` is a
+repeatable read-only call, and `show(::Calibration)` would both mutate and nag on every REPL display — a
+mutating `show` is worse than a nagging one. Write-then-rename, a rename within one directory being atomic
+on POSIX; a read-only filesystem warns and continues, the in-memory value already being correct. Only the
+rename: `epsilon_threshold` genuinely was not recorded for those generations, and a plausible-looking
+number there would silently mislabel an acceptance boundary.
+
+**A pattern worth noting for the migration to-do.** This is upgrade-on-read, and it may be the right shape
+for MM-owned artifacts generally. The CLAUDE.md to-do frames the missing channel as needing a version row
+plus a milestone list, mirroring the simulator's — but that suits the *database*, where there is one schema
+in one place to check. Per-run folders are read lazily and often never read again; upgrading the ones you
+actually touch, when you touch them, needs no version row.
+
+**`GenerationResult`'s two new fields are keyword arguments.** Review flagged the ten-argument
+compatibility shim as something to deprecate later; making the fields keywords removes the thing to
+deprecate rather than scheduling its removal. Twelve positional arguments ending in three `nothing`s reads
+badly, and every existing ten-argument construction keeps working unchanged.
+
+**Deferred to part 2:** rejected-distance persistence, the `:distances` recipe, and the wrong `plot_type=`
+examples in `docs/src/man/calibration.md` and `README.md` — those sit inside the block the recipe work
+rewrites.

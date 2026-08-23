@@ -1389,7 +1389,7 @@ function _loadGenerations(dir::String, param_names::Vector{String},
         push!(generations, GenerationResult(t, particles, weights, distances,
                                             max_epsilon_accepted,
                                             n_evaluations, monad_ids, acceptance_rate, ess,
-                                            nothing, epsilon_threshold, nothing))
+                                            nothing; epsilon_threshold=epsilon_threshold))
     end
 
     if n_upgraded > 0

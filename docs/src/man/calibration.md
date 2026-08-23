@@ -71,6 +71,21 @@ threshold (epsilon) toward `minimum_epsilon`. By default the next threshold is t
 accepted distances (`epsilon_quantile`); you can instead supply an explicit
 `epsilon_schedule`.
 
+!!! note "Two epsilons, and they are different numbers"
+    Each generation records both:
+
+    - `max_epsilon_accepted` — the largest distance that generation actually accepted.
+    - `epsilon_threshold` — the cutoff it was run against.
+
+    These coincide only when `epsilon_quantile == 1.0`. At the default of `0.5` the threshold is the
+    *median* of the previous generation's accepted distances, while `max_epsilon_accepted` is the
+    *maximum* of this one's. Generation 1 accepts every proposal it evaluates, so it has no threshold
+    and `epsilon_threshold` is absent for it.
+
+    Both appear in `generations/generation_{NNN}.toml` and as columns of
+    [`ConvergenceSummary`](@ref). Stopping criteria compare against `max_epsilon_accepted`, since that
+    is what the generation achieved.
+
 ### Stopping criteria
 
 Beyond `minimum_epsilon` and `max_nr_populations`, you can stop early when the run stops

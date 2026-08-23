@@ -190,12 +190,17 @@ struct GenerationResult
     proposal_distances::Union{Nothing,DataFrame}
 end
 
-#! Ten-argument form so existing positional constructions keep working; the two trailing fields are
-#! absent for generations loaded from a run that predates them anyway.
+#! The two trailing fields are named rather than positional. Twelve positional arguments ending in
+#! three `nothing`s is hard to read, and — unlike a compatibility shim — this is not something to
+#! deprecate later: it is how the type is meant to be constructed. Both are genuinely absent for a
+#! generation loaded from a run that predates them, so `nothing` is the right default rather than a
+#! placeholder.
 GenerationResult(t, particles, weights, distances, max_epsilon_accepted, n_evaluations,
-                 monad_ids, acceptance_rate, ess, rejected_proposals) =
+                 monad_ids, acceptance_rate, ess, rejected_proposals;
+                 epsilon_threshold=nothing, proposal_distances=nothing) =
     GenerationResult(t, particles, weights, distances, max_epsilon_accepted, n_evaluations,
-                     monad_ids, acceptance_rate, ess, rejected_proposals, nothing, nothing)
+                     monad_ids, acceptance_rate, ess, rejected_proposals,
+                     epsilon_threshold, proposal_distances)
 
 ################## ABCResult ##################
 

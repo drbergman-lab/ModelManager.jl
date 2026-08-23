@@ -1019,6 +1019,7 @@ function _buildGenerationResult(t::Int, accepted::Vector{_ParticleResult},
     ess              = 1.0 / sum(w^2 for w in weights)
 
     return GenerationResult(t, particles, weights, distances, max_epsilon_accepted,
-                            n_evaluations, monad_ids, acceptance_rate, ess,
-                            rejected_proposals, epsilon_threshold, proposal_distances)
+                            n_evaluations, monad_ids, acceptance_rate, ess, rejected_proposals;
+                            epsilon_threshold=epsilon_threshold,
+                            proposal_distances=proposal_distances)
 end
