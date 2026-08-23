@@ -4445,6 +4445,98 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         end
     end
 
+    @testset "calibration plot recipes" begin
+        apply(d) = RecipesBase.apply_recipe(Dict{Symbol,Any}(), d)
+        nseries(applied) = length(applied)
+
+        @testset "distance distribution: binning" begin
+            # Accepted below the threshold, rejected above — the shape the plot exists to show.
+            acc = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+            rej = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
+            dd  = ModelManager._buildDistanceData(acc, rej, 0.5, 0.5, 3)
+
+            # Uniform width, with the threshold falling exactly on a bin edge.
+            w = dd.edges[2] - dd.edges[1]
+            @test all(isapprox(dd.edges[i+1] - dd.edges[i], w; atol=1e-9)
+                      for i in 1:(length(dd.edges) - 1))
+            @test any(e -> isapprox(e, 0.5; atol=1e-12), dd.edges)
+
+            # The property the shared binning exists for: the two series never share a bin. A
+            # distance exactly equal to ε was accepted (acceptance is `<=`), but searchsortedlast
+            # puts it in the bin *starting* at ε, so the split is enforced rather than assumed.
+            acc_bins = findall(>(0), dd.accepted_counts)
+            rej_bins = findall(>(0), dd.rejected_counts)
+            @test isempty(intersect(acc_bins, rej_bins))
+            @test maximum(acc_bins) < minimum(rej_bins)
+
+            # Nothing is lost or double-counted.
+            @test sum(dd.accepted_counts) == length(acc)
+            @test sum(dd.rejected_counts) == length(rej)
+
+            # Two bar series plus the threshold line.
+            @test nseries(apply(dd)) == 3
+        end
+
+        @testset "distance distribution: degenerate and log cases" begin
+            acc = [0.1, 0.2, 0.3]
+            # Generation 1 has no threshold: one series, no threshold line.
+            d1 = ModelManager._buildDistanceData(acc, Float64[], nothing, 0.3, 1)
+            @test sum(d1.accepted_counts) == length(acc)
+            @test isnothing(d1.epsilon_threshold)
+            @test nseries(apply(d1)) == 1
+
+            # A single distinct value still bins.
+            dsingle = ModelManager._buildDistanceData([0.4, 0.4], Float64[], nothing, 0.4, 1)
+            @test sum(dsingle.accepted_counts) == 2
+
+            # mseDistance legitimately returns 0.0; log10(0) is -Inf, so it is dropped and reported.
+            dl = ModelManager._buildDistanceData([0.0, 0.01, 0.1], [1.0, 10.0], 0.1, 0.1, 2;
+                                                 logscale=true)
+            @test occursin("non-positive", dl.note)
+            @test sum(dl.accepted_counts) == 2      # the 0.0 is gone, the other two remain
+
+            # Empty input is an error with a clear message, not a BoundsError.
+            @test_throws ErrorException ModelManager._buildDistanceData(Float64[], Float64[],
+                                                                        nothing, 0.0, 1)
+        end
+
+        @testset "distance distribution: legacy runs degrade" begin
+            # A run recorded before proposal distances were kept still plots, from the accepted
+            # distances alone, and says so.
+            acc, rej, note = ModelManager._distanceSeries(nothing, [0.1, 0.2])
+            @test acc == [0.1, 0.2]
+            @test isempty(rej)
+            @test occursin("not recorded", note)
+
+            # With a frame, the two series are split on the accepted flag.
+            frame = DataFrame(monad_id = [1, 2, 3], distance = [0.1, 0.5, 0.9],
+                              accepted = [true, true, false])
+            a, r, n = ModelManager._distanceSeries(frame, Float64[])
+            @test a == [0.1, 0.5]
+            @test r == [0.9]
+            @test isempty(n)
+        end
+
+        @testset "existing calibration recipes still apply" begin
+            # None of these four had any coverage; these are smoke tests that the recipes build a
+            # series list rather than throwing, plus the guards for empty input.
+            pnames = ["alpha", "beta"]
+            df  = DataFrame(alpha = [0.1, 0.2, 0.3], beta = [1.0, 2.0, 3.0])
+            wts = [0.2, 0.3, 0.5]
+
+            corner = ModelManager._CornerPlotData(df, wts)
+            @test nseries(apply(corner)) > 0
+            @test_throws ErrorException apply(ModelManager._CornerPlotData(DataFrame(), Float64[]))
+
+            ridge = ModelManager._RidgelineData([df, df], [wts, wts], nothing, nothing, pnames)
+            @test nseries(apply(ridge)) > 0
+
+            trans = ModelManager._TransitionData(df, wts, df, wts, nothing, pnames, 3, "",
+                                                 false, true)
+            @test nseries(apply(trans)) > 0
+        end
+    end
+
     ################## Tagging ##################
 
     @testset "tag key and value normalization" begin

@@ -3112,3 +3112,56 @@ badly, and every existing ten-argument construction keeps working unchanged.
 **Deferred to part 2:** rejected-distance persistence, the `:distances` recipe, and the wrong `plot_type=`
 examples in `docs/src/man/calibration.md` and `README.md` — those sit inside the block the recipe work
 rewrites.
+
+## 2026-08-23 — Proposal-distance histogram (item 6, part 2)
+
+Brief: `planning/06-distance-distribution-plot.md`, the second half. Part 1 named the two epsilons and
+recorded the threshold; this adds the plot that was the original request — the distribution of a
+generation's proposal distances with the accepted tail coloured.
+
+**Why it needed persistence first.** The distances of rejected proposals were discarded at acceptance
+time. `store_rejected` keeps CDF *coordinates*, not distances, and is documented as never persisted; the
+only disk route to rejected particles reconstructs parameter values by set-differencing monad IDs. So the
+plot was not producible from stored data at all, and recomputing was out — the summary statistic is
+arbitrarily expensive user code, and monads whose simulations all failed have been deleted.
+
+Now every evaluated proposal is recorded in `generation_{NNN}_proposals.csv`. A separate file rather
+than extra rows in the display CSV: `posterior(::Calibration)` reads that one and strips exactly
+`weight`/`distance`/`monad_id`, so rejected rows there would come back as posterior samples with
+meaningless weights — silent statistical corruption. `missing` distances are left out, since they mean
+the monad had no successful simulation and are already recorded in the failed-monads file; keeping them
+out also keeps `distance` a plain `Float64` column.
+
+`accepted` means "passed ε", not "reached the posterior". With `accept_overflow=false` a particle can
+pass ε and still be dropped because the batch overshot `population_size`. Recording it as accepted
+describes the acceptance *process*, which is what the histogram is about, so `sum(accepted)` equals
+`n_accepted_total` and can exceed the posterior's row count.
+
+**Binning is computed in the builder, and the disjointness had to be enforced.** Emitting two
+`:histogram` series would let the backend pick each one's bins independently, and because the rejected
+distances extend well past the accepted ones the two would not line up — which is the entire point of
+the plot. So the builder computes shared uniform edges with the threshold falling exactly on one.
+
+That was not sufficient on its own, and a functional check caught it: acceptance is `distance <= ε`, so
+a distance exactly equal to ε *was* accepted, but `searchsortedlast` places it in the bin that
+*starts* at ε — the first rejected bin. Each series is now constrained to its own side of the threshold
+edge, which makes the two provably disjoint rather than almost disjoint. There is a test asserting
+`maximum(accepted_bins) < minimum(rejected_bins)`.
+
+Drawn with `:bar` and `:path` only, no `bar_position := :stack` — that is a Plots-level attribute a
+backend-agnostic recipe should not require, and `sensitivity_visualize.jl` already keeps to the same
+restricted set for the same reason.
+
+**Degradation rather than errors.** Generation 1 has no threshold, so it draws one series and no line.
+A run recorded before proposal distances were kept plots from its accepted distances alone and says so
+in the title. `logscale=true` drops non-positive distances — `mseDistance` legitimately returns `0.0` on
+a perfect match — and reports how many rather than failing.
+
+**First coverage for the four existing calibration recipes.** `_CornerPlotData`, `_RidgelineData`,
+`ConvergenceSummary` and `_TransitionData` had none. Added as smoke tests alongside the new ones, since
+this was the natural moment and the marginal cost was small.
+
+**Docs that were wrong are now right.** `docs/src/man/calibration.md` and `README.md` advertised
+`plot(result; plot_type=:corner)`; the style has always been a *positional* argument, corner is the
+no-style default, and convergence is `plot(ConvergenceSummary(result))`. Those examples would have
+thrown for anyone who copied them.

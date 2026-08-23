@@ -1154,6 +1154,14 @@ _generationTag(t::Int, max_nr_populations::Int) =
     lpad(string(t), ndigits(max_nr_populations), '0')
 
 """
+    _generationProposalsPath(dir, t, max_nr_populations) → String
+
+Path to a generation's proposal-distance CSV (`monad_id`, `distance`, `accepted`).
+"""
+_generationProposalsPath(dir::String, t::Int, max_nr_populations::Int) =
+    joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_proposals.csv")
+
+"""
     _generationMonadsPath(calibration, t, max_nr_populations) → String
 
 Path to the monad-ID record for generation `t`: `generations/generation_{NNN}_monads.csv`.
@@ -1315,6 +1323,14 @@ function _saveGeneration(dir::String, cdf_dir::String, gen::GenerationResult,
     # Human-readable display CSV.
     CSV.write(joinpath(dir, "generation_$tag.csv"), _buildDisplayDF(gen, cps))
 
+    #! Every evaluated proposal and whether it passed ε. Deliberately a separate file rather than
+    #! extra rows in the display CSV: `posterior(::Calibration)` reads that one and strips exactly
+    #! `weight`/`distance`/`monad_id`, so rejected rows there would come back as posterior samples
+    #! with meaningless weights. Written unconditionally — this is three numbers per proposal on
+    #! disk, unlike `store_rejected`, which holds a full CDF-coordinate frame in memory.
+    isnothing(gen.proposal_distances) ||
+        CSV.write(_generationProposalsPath(dir, gen.t, max_nr_populations), gen.proposal_distances)
+
     # Generation-level TOML.
     meta = Dict{String,Any}(
         #! Two distinct quantities, and only the first used to be recorded: `max_epsilon_accepted`
@@ -1386,10 +1402,19 @@ function _loadGenerations(dir::String, param_names::Vector{String},
         epsilon_threshold = haskey(meta, "epsilon_threshold") ?
             Float64(meta["epsilon_threshold"]) : nothing
 
+        #! Absent for a run that predates the file, in which case the recipe degrades to the
+        #! accepted distances it can still read from the generation CSV.
+        proposals_path = joinpath(dir, "generation_$(tag)_proposals.csv")
+        proposal_distances = isfile(proposals_path) ?
+            CSV.read(proposals_path, DataFrame;
+                     types=Dict(:monad_id => Int, :distance => Float64, :accepted => Bool)) :
+            nothing
+
         push!(generations, GenerationResult(t, particles, weights, distances,
                                             max_epsilon_accepted,
                                             n_evaluations, monad_ids, acceptance_rate, ess,
-                                            nothing; epsilon_threshold=epsilon_threshold))
+                                            nothing; epsilon_threshold=epsilon_threshold,
+                                            proposal_distances=proposal_distances))
     end
 
     if n_upgraded > 0
