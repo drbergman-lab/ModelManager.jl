@@ -89,4 +89,5 @@ end
 ### Remaining
 
 - [ ] `createProject` generic entry point
+- [x] Calibration over discrete and mixed parameter spaces — a `DiscreteVariation` or `CoVariation{<:DiscreteVariation}` may be passed to `CalibrationProblem` alongside continuous parameters. Represented internally as a `DiscreteUniform` over value indices, so a particle coordinate stays a CDF value in [0, 1] and the quantile does the quantising; the four perturbation kernels operate purely on CDF coordinates and need no discrete counterpart. Posterior CSVs and the recipes report the level rather than the index, and the `SimulationBank` bounds-checks a discrete column against its own levels. A `LatentVariation` built from a raw value vector is still rejected, with the error naming the conversion to use
 - [ ] GP-accelerated ABC — `GPAcceleratedABC <: AbstractCalibrationMethod` using a surrogate to reduce simulator evaluations; `AbstractCalibrationMethod` hierarchy is already in place.

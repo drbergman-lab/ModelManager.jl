@@ -3112,3 +3112,49 @@ badly, and every existing ten-argument construction keeps working unchanged.
 **Deferred to part 2:** rejected-distance persistence, the `:distances` recipe, and the wrong `plot_type=`
 examples in `docs/src/man/calibration.md` and `README.md` — those sit inside the block the recipe work
 rewrites.
+
+## 2026-08-22 — Calibration accepts discrete parameters
+
+Item 7 Stage 1b. `#36` made discrete variations ride the `Distribution` branch as a `DiscreteUniform` over
+value indices; this removes calibration's refusal to accept them.
+
+**The kernels needed nothing.** That was the open question the brief flagged as deciding progress-vs-retreat,
+and the answer was that it had already been settled by the representation. All four perturbation kernels take
+and return `Dict{String,Float64}` of CDF coordinates — they never see a target value, so there is no discrete
+coordinate for them to perturb. `_minDiagVar` already floors a variance that collapses when a generation's
+particles all land in one bin, which is the one degenerate case discrete adds. No categorical proposal, no
+matching density, no rework.
+
+**New source types rather than widening the existing ones.** `DVSource`/`CVSource` could have been
+re-parameterised to accept any `ElementaryVariation`, which would have been less code. They are JLD2-serialised
+inside `_ProblemManifest`, though, and JLD2 stores the concrete parameterisation: widening a *field* type is
+compatible, but re-parameterising the struct makes an older `problem.jld2` load as a `ReconstructedMutable`
+that fails dispatch, breaking `resumeABC` on existing runs. Tested both ways before choosing. `DiscreteSource`
+and `DiscreteCoSource` are therefore additions to the `AbstractCalibrationSource` union.
+
+**Three things only the end-to-end test found.** The unit conversions passed while a real two-generation ABC run
+over a discrete parameter did not, which is worth recording because the brief listed the end-to-end test first
+and I wrote it last:
+
+1. `_parameterTOMLEntry` had no method for either new source — generation metadata is written per parameter.
+   These record `"values"`, the levels, rather than the internal `DiscreteUniform`: the levels tell a reader
+   which values the run could have visited, where the distribution would say only how many.
+2. `_bankColDistribution` had no method either. Returning `nothing` to match `LVSource` would have been wrong
+   in a quiet way — the bank treats `nothing` as "please report this as a bug", warns, and returns an empty
+   bank, silently disabling monad reuse. The caller only ever asks for `minimum`/`maximum` to bounds-check a
+   base config value, so a `DiscreteNonParametric` over the sorted levels answers it exactly.
+3. `_discreteValueIndex` threw on a value that is not one of the levels. That was my own choice in `#36`, on the
+   reasoning that a bad value is better reported where it happens. It is wrong here: the `SimulationBank` inverts
+   *speculatively*, over whatever values the database already holds, and a base config value need not be one of
+   the levels being calibrated. There, "not a level" means "this monad is not reusable". It now returns `0`,
+   which `insupport` rejects and whose `cdf` is `0.0` — outside `(0, 1)`, which is already how the bank excludes
+   a non-invertible row, and still enough for `_validateInverseMaps` to catch a genuinely broken user map.
+
+**Still rejected:** a `LatentVariation` whose latent parameters are a raw `Vector{<:Real}`. That branch treats
+its latent values as indices in the CDF path, a different convention from the one ABC-SMC needs. The error now
+names the fix — pass the `DiscreteVariation` — instead of only stating the constraint.
+
+**Known cost, not a defect:** a discrete parameter loses resolution, not correctness. The sampler explores
+within-bin variation that cannot affect the simulation. `cdf_grid_k` snapping and the bank already mitigate it
+by collapsing repeated grid points onto monads that have run.
+

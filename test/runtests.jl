@@ -351,12 +351,31 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test cp3.source isa ModelManager.LVSource
         @test cp3.lv === lv3
 
-        # Discrete inputs → ArgumentError
-        @test_throws ArgumentError ModelManager._toCalibrationParameter(
-            DiscreteVariation(:config, xp, [1.0, 2.0]))
-        @test_throws ArgumentError ModelManager._toCalibrationParameter(
+        # Discrete inputs are accepted, as DiscreteUniform over their value indices. Previously
+        # rejected; the kernels work purely in [0,1] CDF space and never see a target value, so a
+        # discrete parameter needs no discrete kernel.
+        disc_cp = ModelManager._toCalibrationParameter(DiscreteVariation(:config, xp, [1.0, 2.0]))
+        @test disc_cp isa CalibrationParameter
+        @test disc_cp.source isa ModelManager.DiscreteSource
+        @test disc_cp.lv.latent_parameters[1] isa DiscreteUniform
+        # Display columns and values are the friendly name and the real value, not an index.
+        @test ModelManager._displayColumns(disc_cp) ==
+              [ModelManager.variationName(DiscreteVariation(:config, xp, [1.0, 2.0]))]
+        @test only(ModelManager._particleRowToDisplay(disc_cp, [0.9])) == 2.0
+
+        disc_cv_cp = ModelManager._toCalibrationParameter(
             CoVariation(DiscreteVariation(:config, xp2, [1.0, 2.0]),
                         DiscreteVariation(:config, xp3, [3.0, 4.0])))
+        @test disc_cv_cp.source isa ModelManager.DiscreteCoSource
+        @test disc_cv_cp.lv.latent_parameters[1] isa DiscreteUniform
+        # One index drives both targets, so the row pairs them.
+        @test ModelManager._particleRowToDisplay(disc_cv_cp, [0.1]) == [1.0, 3.0]
+
+        # Still rejected: a LatentVariation whose latent parameters are a raw value vector. That
+        # branch treats its latent values as indices in the CDF path, a different convention.
+        @test_throws ArgumentError ModelManager._toCalibrationParameter(
+            LatentVariation(DiscreteVariation(:config, xp, [1.0, 2.0])).latent_parameters |>
+            _ -> LatentVariation([[1.0, 2.0]], [xp], [first], ["z"], [:config]))
 
         # CalibrationProblem stores CalibrationParameter objects
         cps = [ModelManager._toCalibrationParameter(dv),
@@ -365,10 +384,11 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test length(cps) == 2
 
         # Every unusable parameter is reported at once, by index and name — not just the first.
-        disc1 = DiscreteVariation(:config, xp2, [1.0, 2.0])
-        disc2 = DiscreteVariation(:config, xp3, [3.0, 4.0])
+        # Discrete variations are usable now, so the offenders are raw-value LatentVariations.
+        bad1 = LatentVariation([[1.0, 2.0]], [xp2], [first], ["b1"], [:config])
+        bad2 = LatentVariation([[3.0, 4.0]], [xp3], [first], ["b2"], [:config])
         err = try
-            ModelManager._toCalibrationParameters([dv, disc1, disc2])
+            ModelManager._toCalibrationParameters([dv, bad1, bad2])
             nothing
         catch e
             e
@@ -378,9 +398,11 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test occursin("[2]", msg)          # the second parameter
         @test occursin("[3]", msg)          # ...and the third, in the same error
         @test occursin("2 of 3 parameters", msg)
-        @test occursin(ModelManager.variationName(disc1), msg)
-        # An accepted set still converts, and reports nothing.
-        @test length(ModelManager._toCalibrationParameters([dv, cv])) == 2
+        # A mixed continuous/discrete set converts, which is the point of the change.
+        mixed = ModelManager._toCalibrationParameters(
+            [dv, cv, DiscreteVariation(:config, xp2, [5.0, 6.0])])
+        @test length(mixed) == 3
+        @test mixed[3].source isa ModelManager.DiscreteSource
 
         # ParsedVariations(problem) is lossless: it holds the very same LatentVariation objects,
         # so nothing is reconstructed and no display name is lost.
@@ -2534,9 +2556,13 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test ModelManager.variationValues(clv, [0.4]) == [4.0, 40.0]
                 @test vec(ModelManager.variationValues(clv)) == [3.0, 30.0, 4.0, 40.0, 5.0, 50.0]
 
-                # The inverse map recovers the index, and says so plainly when it cannot.
+                # The inverse map recovers the index, and returns an out-of-support 0 for a value
+                # that is not a level — the SimulationBank inverts speculatively over whatever the
+                # database holds, where "not a level" means "not reusable", not "broken".
                 @test lv.inverse_maps[1]([4.0]) == 2
-                @test_throws ArgumentError lv.inverse_maps[1]([99.0])
+                @test lv.inverse_maps[1]([99.0]) == 0
+                @test !insupport(lv.latent_parameters[1], 0)
+                @test cdf(lv.latent_parameters[1], 0) == 0.0
             end
 
             @testset "grid enumeration still rejects continuous priors" begin
@@ -3083,6 +3109,47 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # out-of-range generation throws
                 @test_throws ArgumentError posterior(result; generation=99)
+            end
+
+            @testset "calibration over discrete and mixed parameters" begin
+                # The empirical half of the discrete assessment: the code-path argument said the
+                # kernels never see a target value, so a discrete parameter should just work. This
+                # runs one to confirm it, rather than reasoning about it.
+                observed = Dict{String,Any}("x" => 1.0)
+                method   = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
+
+                disc = DiscreteVariation(:config, xp_x, [0.5, 1.5, 2.5])
+                dprob = CalibrationProblem(inputs, [disc], observed, _test_named_ss, mseDistance)
+                dres  = runCalibration(dprob, method)
+                waitForDiagnostics()
+                @test dres isa ABCResult
+                @test !isempty(dres.generations)
+
+                # The posterior is over real values, not indices, and only over the declared levels.
+                post_df, weights = posterior(dres)
+                @test sum(weights) ≈ 1.0 atol=1e-6
+                col = only(intersect(names(post_df), [string(columnName(xp_x))]))
+                @test all(v -> v in [0.5, 1.5, 2.5], post_df[!, col])
+
+                # Mixed continuous + discrete in one problem: each coordinate is independently a
+                # [0,1] CDF value, so the kernel handles them together without knowing which is which.
+                cont  = DistributedVariation(:config, xp_y, Uniform(0.5, 3.0))
+                mprob = CalibrationProblem(inputs, [disc, cont], observed,
+                                           _test_named_ss, mseDistance)
+                mres  = runCalibration(mprob, method)
+                waitForDiagnostics()
+                @test mres isa ABCResult
+                mpost, mw = posterior(mres)
+                @test sum(mw) ≈ 1.0 atol=1e-6
+                dcol = only(intersect(names(mpost), [string(columnName(xp_x))]))
+                ccol = only(intersect(names(mpost), [string(columnName(xp_y))]))
+                @test all(v -> v in [0.5, 1.5, 2.5], mpost[!, dcol])   # still snapped to levels
+                @test all(v -> 0.5 <= v <= 3.0, mpost[!, ccol])        # still continuous
+
+                # The problem manifest round-trips a discrete source, so a discrete run can resume.
+                loaded = ModelManager._loadProblem(dres.calibration)
+                @test loaded isa ModelManager._ProblemManifest
+                @test loaded.sources[1] isa ModelManager.DiscreteSource
             end
 
             @testset "runABC delegates to runCalibration" begin

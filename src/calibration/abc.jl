@@ -550,6 +550,10 @@ end
 
 _toManifestSource(src::DVSource) = src
 _toManifestSource(src::CVSource) = src
+#! No anonymous functions to strip: a discrete source's maps are built from its own value
+#! list, so the whole source round-trips through JLD2 as itself.
+_toManifestSource(src::DiscreteSource) = src
+_toManifestSource(src::DiscreteCoSource) = src
 function _toManifestSource(src::LVSource)
     lv = src.lv
     has_anon = any(_isAnonymousFunction, lv.maps) ||
@@ -749,6 +753,28 @@ function _parameterTOMLEntry(s::CVSource, lv::LatentVariation)
         "display_names"     => [variationName(v) for v in s.cv.variations],
         "db_columns"        => [columnName(variationTarget(v)) for v in s.cv.variations],
         "priors"            => [_distString(v.distribution) for v in s.cv.variations],
+    )
+end
+
+#! A discrete parameter's "prior" is its list of levels, which is the useful thing to record: it is
+#! what the CDF is quantised against, and reading it back tells you exactly which values the run could
+#! have visited. Recording the internal `DiscreteUniform` instead would say only how many.
+function _parameterTOMLEntry(s::DiscreteSource, lv::LatentVariation)
+    return Dict{String,Any}(
+        "source_type"  => "DiscreteSource",
+        "display_name" => variationName(s.dv),
+        "db_column"    => columnName(lv.targets[1]),
+        "values"       => collect(s.dv.values),
+    )
+end
+
+function _parameterTOMLEntry(s::DiscreteCoSource, lv::LatentVariation)
+    return Dict{String,Any}(
+        "source_type"      => "DiscreteCoSource",
+        "covariation_name" => variationName(s.cv),
+        "display_names"    => [variationName(v) for v in s.cv.variations],
+        "db_columns"       => [columnName(variationTarget(v)) for v in s.cv.variations],
+        "values"           => [collect(v.values) for v in s.cv.variations],
     )
 end
 

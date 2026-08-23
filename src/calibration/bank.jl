@@ -376,6 +376,26 @@ function _bankColDistribution(s::CVSource, lv::LatentVariation, col::String)
     return s.cv.variations[idx].distribution
 end
 
+#! A real distribution over the *levels*, not `nothing`. The caller treats `nothing` as a bug — it
+#! warns and returns an empty bank — and it only ever asks for `minimum`/`maximum` to bounds-check a
+#! base config value, which a `DiscreteNonParametric` over the sorted levels answers exactly.
+function _discreteLevelDistribution(values)
+    support = sort(unique(Float64.(values)))
+    return DiscreteNonParametric(support, fill(1 / length(support), length(support)))
+end
+
+function _bankColDistribution(s::DiscreteSource, lv::LatentVariation, col::String)
+    columnName(lv.targets[1]) == col || return nothing
+    return _discreteLevelDistribution(s.dv.values)
+end
+
+function _bankColDistribution(s::DiscreteCoSource, lv::LatentVariation, col::String)
+    for v in s.cv.variations
+        columnName(variationTarget(v)) == col && return _discreteLevelDistribution(v.values)
+    end
+    return nothing
+end
+
 _bankColDistribution(::LVSource, ::LatentVariation, ::String) = nothing
 
 ################## CDF inversion helpers ##################
