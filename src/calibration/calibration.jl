@@ -76,15 +76,15 @@ function _indexedGenerationFiles(dir::AbstractString, pattern::Regex)
     return out
 end
 
+#! Addressing by *role* rather than by filename is what lets one set of call sites serve both the
+#! historical flat layout and the current per-generation folders. Under the flat layout a generation's
+#! artifacts were siblings distinguished by a filename prefix (`generation_05_monads.csv`); now they
+#! are constants inside `generations/05/`. Only `_flatGenerationArtifact` still knows the old names.
 """
     _GENERATION_ARTIFACTS
 
 The per-generation artifacts, keyed by role, with the basename each takes inside a generation folder.
 """
-#! Addressing by *role* rather than by filename is what lets one set of call sites serve both the
-#! historical flat layout and the current per-generation folders. Under the flat layout a generation's
-#! artifacts were siblings distinguished by a filename prefix (`generation_05_monads.csv`); now they
-#! are constants inside `generations/05/`. Only `_flatGenerationArtifact` still knows the old names.
 const _GENERATION_ARTIFACTS = (
     particles          = "particles.csv",
     cdfs               = "cdfs.csv",
@@ -109,14 +109,14 @@ function _generationSubdir(gen_dir::AbstractString, t::Int)
     return nothing
 end
 
+#! Kept solely so a calibration written before the folder layout stays readable. There is no migration
+#! channel for on-disk calibration artifacts — `upgradeMilestones` covers database rows — so old runs
+#! are read in place rather than being required to migrate before they can be plotted.
 """
     _flatGenerationArtifact(gen_dir, t, role) → String or nothing
 
 Locate generation `t`'s `role` artifact under the historical flat layout, at any padding width.
 """
-#! Kept solely so a calibration written before the folder layout stays readable. There is no migration
-#! channel for on-disk calibration artifacts — `upgradeMilestones` covers database rows — so old runs
-#! are read in place rather than being required to migrate before they can be plotted.
 function _flatGenerationArtifact(gen_dir::AbstractString, t::Int, role::Symbol)
     role === :cdfs      && return _findGenerationFile(joinpath(gen_dir, "generation_cdfs"), t, ".csv")
     role === :particles && return _findGenerationFile(gen_dir, t, ".csv")
@@ -139,15 +139,15 @@ function _generationArtifact(gen_dir::AbstractString, t::Int, role::Symbol)
     return _flatGenerationArtifact(gen_dir, t, role)
 end
 
+#! An existing artifact wins, in either layout. Appenders (`monads`, the two failure records) must land
+#! in the file that is already there: a generation retried after a resume changed `max_nr_populations`
+#! would otherwise start a second record under a different name and split one generation's history in
+#! two, and nothing scans for those files to notice.
 """
     _generationArtifactToWrite(gen_dir, t, role, max_nr_populations) → String
 
 Resolve generation `t`'s `role` artifact for **writing**, creating its folder if needed.
 """
-#! An existing artifact wins, in either layout. Appenders (`monads`, the two failure records) must land
-#! in the file that is already there: a generation retried after a resume changed `max_nr_populations`
-#! would otherwise start a second record under a different name and split one generation's history in
-#! two, and nothing scans for those files to notice.
 function _generationArtifactToWrite(gen_dir::AbstractString, t::Int, role::Symbol,
                                     max_nr_populations::Int)
     existing = _generationArtifact(gen_dir, t, role)
@@ -170,14 +170,14 @@ function _generationFolderToWrite(gen_dir::AbstractString, t::Int, max_nr_popula
     return d
 end
 
+#! A generation counts as present if *any* of its artifacts is, so an interrupted write is reported
+#! rather than skipped — the caller decides what a partial generation means. Both the flat metadata and
+#! the flat CDF file are considered because either can be the one that survived.
 """
     _generationIndices(gen_dir) → Vector{Int}
 
 Every generation present under `gen_dir`, ascending, across both layouts.
 """
-#! A generation counts as present if *any* of its artifacts is, so an interrupted write is reported
-#! rather than skipped — the caller decides what a partial generation means. Both the flat metadata and
-#! the flat CDF file are considered because either can be the one that survived.
 function _generationIndices(gen_dir::AbstractString)
     isdir(gen_dir) || return Int[]
     out = Set{Int}()
@@ -199,12 +199,6 @@ function _generationIndices(gen_dir::AbstractString)
     return sort!(collect(out))
 end
 
-"""
-    _findGenerationFile(dir, t, suffix) → String or nothing
-
-Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padding its name carries.
-`nothing` if it is absent.
-"""
 #! The single-generation counterpart to `_indexedGenerationFiles`, and it exists for the same reason:
 #! reading must never assume a padding width. `_generationTag` takes that width from
 #! `max_nr_populations`, which a resume is free to change, so a name computed *now* need not match the
@@ -212,6 +206,12 @@ Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padd
 #! `generation_005_monads.csv` once the cap is raised to 100, and the two entry points disagree in
 #! opposite directions (`ABCResult` carries the live cap, `method.toml` keeps the original, and resume
 #! never rewrites it). Writing may pick a width; reading may not assume one.
+"""
+    _findGenerationFile(dir, t, suffix) → String or nothing
+
+Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padding its name carries.
+`nothing` if it is absent.
+"""
 function _findGenerationFile(dir::AbstractString, t::Int, suffix::String)
     pat  = Regex("^generation_(\\d+)" * replace(suffix, "." => "\\.") * "\$")
     hits = _indexedGenerationFiles(dir, pat)
@@ -219,14 +219,6 @@ function _findGenerationFile(dir::AbstractString, t::Int, suffix::String)
     return isnothing(idx) ? nothing : last(hits[idx])
 end
 
-"""
-    _migrateGenerationLayout!(calibration, max_nr_populations) → Int
-
-Bring a calibration's `generations/` directory to the current layout, returning how many files moved.
-
-Each generation's artifacts end up in `generations/<t>/` under the names in `_GENERATION_ARTIFACTS`,
-with `<t>` zero-padded to `ndigits(max(max_nr_populations, highest existing generation))`.
-"""
 #! Two jobs, because they are the same walk: move a flat-layout generation into its folder, and re-pad
 #! folder names when the cap has changed. The width takes the max of the two so the awkward directions
 #! stay answerable:
@@ -240,6 +232,14 @@ with `<t>` zero-padded to `ndigits(max(max_nr_populations, highest existing gene
 #! Reading never depends on any of this — `_generationArtifact` resolves both layouts at any width — so
 #! a failed move is logged and skipped rather than aborting the resume. That is also why migration is
 #! only attempted on resume: a calibration that is merely plotted is read where it lies.
+"""
+    _migrateGenerationLayout!(calibration, max_nr_populations) → Int
+
+Bring a calibration's `generations/` directory to the current layout, returning how many files moved.
+
+Each generation's artifacts end up in `generations/<t>/` under the names in `_GENERATION_ARTIFACTS`,
+with `<t>` zero-padded to `ndigits(max(max_nr_populations, highest existing generation))`.
+"""
 function _migrateGenerationLayout!(calibration::Calibration, max_nr_populations::Int)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
     isdir(gen_dir) || return 0

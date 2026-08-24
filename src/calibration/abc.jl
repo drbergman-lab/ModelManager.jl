@@ -765,15 +765,15 @@ end
 
 ################## Resume — validation helpers ##################
 
+#! Ordered by index, never by name — `_generationIndices` parses it, so mixed padding widths and both
+#! layouts order alike. Sorting the names instead would put `generation_006.csv` before
+#! `generation_05.csv` and answer generation 5 for a run that reached 10.
 """
     _findLastGenerationCSVs(calibration) → Union{Nothing, Tuple{String,String}}
 
 Return `(cdf_csv_path, display_csv_path)` for the last saved generation, or `nothing`
 if no generations have been written yet.
 """
-#! Ordered by index, never by name — `_generationIndices` parses it, so mixed padding widths and both
-#! layouts order alike. Sorting the names instead would put `generation_006.csv` before
-#! `generation_05.csv` and answer generation 5 for a run that reached 10.
 function _findLastGenerationCSVs(calibration::Calibration)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
     indices = _generationIndices(gen_dir)
@@ -1163,30 +1163,43 @@ Zero-padded generation index string, e.g. `"03"` for t=3, max=10 or `"003"` for 
 _generationTag(t::Int, max_nr_populations::Int) =
     lpad(string(t), ndigits(max_nr_populations), '0')
 
-"""
-    _generationProposalsPath(dir, t, max_nr_populations) → String
-    _generationMonadsPath(calibration, t, max_nr_populations) → String
-    _failedSimulationsPath(calibration, t, max_nr_populations) → String
-    _failedMonadsPath(calibration, t, max_nr_populations) → String
-
-Paths to generation `t`'s proposal-distance, monad-ID, failed-simulation and failed-monad records,
-for writing. Each is a constant basename inside `generations/<t>/`.
-"""
 #! All four are `_generationArtifactToWrite` with the role filled in, which is where the two rules that
 #! used to be repeated per builder now live: an existing artifact wins over a computed path (so an
 #! appender cannot split one generation's record across two files after a resume changes the padding),
 #! and the folder is created on demand.
+#! One docstring each: a docstring attaches to the single expression that follows it, so one block
+#! listing all four signatures would document only the first of them.
+"""
+    _generationProposalsPath(dir, t, max_nr_populations) → String
+
+Path to generation `t`'s proposal-distance record, for writing.
+"""
 _generationProposalsPath(dir::String, t::Int, max_nr_populations::Int) =
     _generationArtifactToWrite(dir, t, :proposals, max_nr_populations)
 
+"""
+    _generationMonadsPath(calibration, t, max_nr_populations) → String
+
+Path to generation `t`'s evaluated-monad record, for writing.
+"""
 _generationMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int) =
     _generationArtifactToWrite(joinpath(calibrationFolder(calibration), "generations"),
                                t, :monads, max_nr_populations)
 
+"""
+    _failedSimulationsPath(calibration, t, max_nr_populations) → String
+
+Path to generation `t`'s failed-simulation record, for writing.
+"""
 _failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populations::Int) =
     _generationArtifactToWrite(joinpath(calibrationFolder(calibration), "generations"),
                                t, :failed_simulations, max_nr_populations)
 
+"""
+    _failedMonadsPath(calibration, t, max_nr_populations) → String
+
+Path to generation `t`'s failed-monad record, for writing.
+"""
 _failedMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int) =
     _generationArtifactToWrite(joinpath(calibrationFolder(calibration), "generations"),
                                t, :failed_monads, max_nr_populations)
