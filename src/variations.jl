@@ -654,18 +654,16 @@ function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) whe
     return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
-#! Inverse of the index map, returning an out-of-support index rather than throwing when the value is
-#! not one of the levels. It used to throw, on the reasoning that a bad value is better reported where
-#! it happens — but the `SimulationBank` inverts *speculatively*, over whatever values the database
-#! already holds, and a base config value need not be one of the levels being calibrated. There, "not
-#! a level" means "this monad is not reusable", not "something is wrong".
-#!
-#! `0` is deliberate: `insupport(DiscreteUniform(1, k), 0)` is `false`, so `_validateInverseMaps` still
-#! rejects a genuinely broken user-supplied map, and `cdf(DiscreteUniform(1, k), 0) == 0.0` falls
-#! outside `(0, 1)`, which is exactly how the bank already excludes a non-invertible row.
+#! Inverse of the index map. Throws for a value that was never one of the levels, so a caller passing
+#! a nonsense value is told at the point it happens rather than receiving a sentinel that silently
+#! becomes an out-of-support CDF. The `SimulationBank` inverts *speculatively*, over whatever values the
+#! database already holds, where a non-level is ordinary rather than an error -- `_bankCdfCoords` catches
+#! this and reports the monad as not reusable.
 function _discreteValueIndex(values::AbstractVector, target_value)
     idx = findfirst(==(target_value), values)
-    return isnothing(idx) ? 0 : idx
+    isnothing(idx) && throw(ArgumentError(
+        "Cannot invert discrete variation: $(target_value) is not one of $(values)."))
+    return idx
 end
 
 function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation

@@ -2556,13 +2556,17 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test ModelManager.variationValues(clv, [0.4]) == [4.0, 40.0]
                 @test vec(ModelManager.variationValues(clv)) == [3.0, 30.0, 4.0, 40.0, 5.0, 50.0]
 
-                # The inverse map recovers the index, and returns an out-of-support 0 for a value
-                # that is not a level — the SimulationBank inverts speculatively over whatever the
-                # database holds, where "not a level" means "not reusable", not "broken".
+                # The inverse map recovers the index, and throws for a value that was never a level
+                # rather than handing back a sentinel that would silently become a valid-looking CDF.
                 @test lv.inverse_maps[1]([4.0]) == 2
-                @test lv.inverse_maps[1]([99.0]) == 0
-                @test !insupport(lv.latent_parameters[1], 0)
-                @test cdf(lv.latent_parameters[1], 0) == 0.0
+                @test_throws ArgumentError lv.inverse_maps[1]([99.0])
+
+                # The SimulationBank inverts speculatively over whatever the database already holds,
+                # so a non-level there is ordinary, not an error: _bankCdfCoords catches the throw and
+                # reports the monad as not reusable via its existing `nothing` contract.
+                col = ModelManager.columnName(lv.targets[1])
+                @test ModelManager._bankCdfCoords(lv, Dict(col => 4.0)) !== nothing
+                @test ModelManager._bankCdfCoords(lv, Dict(col => 99.0)) === nothing
             end
 
             @testset "grid enumeration still rejects continuous priors" begin
@@ -3150,6 +3154,38 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 loaded = ModelManager._loadProblem(dres.calibration)
                 @test loaded isa ModelManager._ProblemManifest
                 @test loaded.sources[1] isa ModelManager.DiscreteSource
+
+                # A CoVariation of discrete variations: one latent coordinate driving two targets
+                # in lockstep. Runs the DiscreteCoSource methods -- the TOML entry, the bank's
+                # level distribution, the display columns -- which unit conversions never reach.
+                cv = CoVariation(DiscreteVariation(:config, xp_x, [0.5, 1.5, 2.5]),
+                                 DiscreteVariation(:config, xp_y, [1.0, 2.0, 3.0]))
+                cvprob = CalibrationProblem(inputs, [cv], observed, _test_named_ss, mseDistance)
+                cvres  = runCalibration(cvprob, method)
+                waitForDiagnostics()
+                @test cvres isa ABCResult
+                cvpost, cvw = posterior(cvres)
+                @test sum(cvw) ≈ 1.0 atol=1e-6
+
+                # Both targets land on their own levels, and stay paired by index.
+                xcol = only(intersect(names(cvpost), [string(columnName(xp_x))]))
+                ycol = only(intersect(names(cvpost), [string(columnName(xp_y))]))
+                @test all(v -> v in [0.5, 1.5, 2.5], cvpost[!, xcol])
+                @test all(v -> v in [1.0, 2.0, 3.0], cvpost[!, ycol])
+                for r in eachrow(cvpost)
+                    @test findfirst(==(r[xcol]), [0.5, 1.5, 2.5]) ==
+                          findfirst(==(r[ycol]), [1.0, 2.0, 3.0])
+                end
+
+                # The co-source round-trips, and its parameters.toml records the levels of both
+                # targets rather than the internal DiscreteUniform.
+                cvloaded = ModelManager._loadProblem(cvres.calibration)
+                @test cvloaded.sources[1] isa ModelManager.DiscreteCoSource
+                ptoml = TOML.parsefile(joinpath(ModelManager.calibrationFolder(cvres.calibration),
+                                                "parameters.toml"))
+                entry = only(ptoml["parameters"])
+                @test entry["source_type"] == "DiscreteCoSource"
+                @test entry["values"] == [[0.5, 1.5, 2.5], [1.0, 2.0, 3.0]]
             end
 
             @testset "runABC delegates to runCalibration" begin

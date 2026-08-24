@@ -376,9 +376,15 @@ function _bankColDistribution(s::CVSource, lv::LatentVariation, col::String)
     return s.cv.variations[idx].distribution
 end
 
-#! A real distribution over the *levels*, not `nothing`. The caller treats `nothing` as a bug — it
-#! warns and returns an empty bank — and it only ever asks for `minimum`/`maximum` to bounds-check a
-#! base config value, which a `DiscreteNonParametric` over the sorted levels answers exactly.
+#! Target space, not the `DiscreteUniform`-over-indices latent representation used elsewhere. Every
+#! `_bankColDistribution` method returns a *target-space* prior — `DVSource` returns `s.dv.distribution`
+#! — because the caller compares `minimum(dist) ≤ v ≤ maximum(dist)` against `v`, a base config value
+#! parsed straight out of the XML. For levels `[0.5, 1.5, 2.5]` the latent `DiscreteUniform(1, 3)` would
+#! bound that check by `[1, 3]`, rejecting a base value of 0.5 and admitting 3.0 — both wrong. This is
+#! the same discrete representation pushed through the forward map, which is what target space means here.
+#!
+#! A real distribution rather than `nothing`, too: the caller reads `nothing` as "this should not happen",
+#! warns asking for a bug report, and returns an empty bank, silently disabling monad reuse.
 function _discreteLevelDistribution(values)
     support = sort(unique(Float64.(values)))
     return DiscreteNonParametric(support, fill(1 / length(support), length(support)))
@@ -429,7 +435,16 @@ function _bankCdfCoords(lv::LatentVariation, vals::Dict{String, Float64})
         haskey(vals, col) || return nothing
         push!(target_vals, vals[col])
     end
-    lp_vals = [inv_map(target_vals) for inv_map in lv.inverse_maps]
+    #! A discrete inverse map throws when the value is not one of its levels, which is the ordinary
+    #! case here rather than an error: the bank inverts speculatively over whatever the database
+    #! already holds, and a base config value need not be one of the levels being calibrated. `nothing`
+    #! is this function's existing "not invertible, so not reusable" signal, so it is the answer here
+    #! too -- and keeping the throw means a user calling an inverse map directly still gets told.
+    lp_vals = try
+        [inv_map(target_vals) for inv_map in lv.inverse_maps]
+    catch
+        return nothing
+    end
     any(isnan, lp_vals) && return nothing   # e.g. CVSource consistency check failed
     cdfs = [cdf(d, lp) for (d, lp) in zip(lv.latent_parameters, lp_vals)]
     return cdfs

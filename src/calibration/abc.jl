@@ -548,12 +548,11 @@ struct _ProblemManifest
     distance                   # named Function or nothing (anonymous/not restorable)
 end
 
-_toManifestSource(src::DVSource) = src
-_toManifestSource(src::CVSource) = src
-#! No anonymous functions to strip: a discrete source's maps are built from its own value
-#! list, so the whole source round-trips through JLD2 as itself.
-_toManifestSource(src::DiscreteSource) = src
-_toManifestSource(src::DiscreteCoSource) = src
+#! Every source whose maps are derived from data it already carries -- a distribution, or its own
+#! value list -- round-trips through JLD2 as itself, with no anonymous functions to strip. Listed as
+#! one union rather than a bare fallback deliberately: a source type added later should MethodError
+#! here and be forced to declare which case it is, not be saved unstripped by default.
+_toManifestSource(src::Union{DVSource, CVSource, DiscreteSource, DiscreteCoSource}) = src
 function _toManifestSource(src::LVSource)
     lv = src.lv
     has_anon = any(_isAnonymousFunction, lv.maps) ||

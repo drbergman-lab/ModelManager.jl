@@ -3143,12 +3143,24 @@ and I wrote it last:
    in a quiet way — the bank treats `nothing` as "please report this as a bug", warns, and returns an empty
    bank, silently disabling monad reuse. The caller only ever asks for `minimum`/`maximum` to bounds-check a
    base config value, so a `DiscreteNonParametric` over the sorted levels answers it exactly.
-3. `_discreteValueIndex` threw on a value that is not one of the levels. That was my own choice in `#36`, on the
-   reasoning that a bad value is better reported where it happens. It is wrong here: the `SimulationBank` inverts
+3. `_discreteValueIndex` threw on a value that is not one of the levels. The `SimulationBank` inverts
    *speculatively*, over whatever values the database already holds, and a base config value need not be one of
-   the levels being calibrated. There, "not a level" means "this monad is not reusable". It now returns `0`,
-   which `insupport` rejects and whose `cdf` is `0.0` — outside `(0, 1)`, which is already how the bank excludes
-   a non-invertible row, and still enough for `_validateInverseMaps` to catch a genuinely broken user map.
+   the levels being calibrated — there, "not a level" means "this monad is not reusable", and the throw aborted
+   the whole run on an ordinary database row.
+
+   My first fix returned an out-of-support `0` instead. Review rejected it, correctly: a sentinel that is also a
+   perfectly good number flows onward into `cdf` and only fails much later, if at all. **The throw stays and
+   `_bankCdfCoords` catches it**, which is better than either — a caller passing a nonsense value is still told
+   at the point it happens, and `nothing` is already that function's established "not invertible, so not
+   reusable" signal, shared with the missing-column and CVSource-consistency paths.
+
+**Why the bank's discrete distribution is not a `DiscreteUniform`.** Review asked why `_bankColDistribution`
+returns a `DiscreteNonParametric` over the levels when the representation everywhere else is a `DiscreteUniform`
+over indices. Because this one function answers in **target space**: `DVSource` returns `s.dv.distribution`, and
+the caller compares `minimum(dist) ≤ v ≤ maximum(dist)` against a base config value parsed out of the XML. For
+levels `[0.5, 1.5, 2.5]` the latent `DiscreteUniform(1, 3)` would bound that check by `[1, 3]` — rejecting a base
+value of 0.5 and admitting 3.0, both wrong. It is the same discrete representation pushed through the forward map,
+which is what target space means here. Recorded in a `#!` at the definition so the question is answered in place.
 
 **Still rejected:** a `LatentVariation` whose latent parameters are a raw `Vector{<:Real}`. That branch treats
 its latent values as indices in the CDF path, a different convention from the one ABC-SMC needs. The error now
