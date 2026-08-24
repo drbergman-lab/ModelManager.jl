@@ -371,6 +371,30 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         # One index drives both targets, so the row pairs them.
         @test ModelManager._particleRowToDisplay(disc_cv_cp, [0.1]) == [1.0, 3.0]
 
+        # AbstractCalibrationSource is a real abstract type, so the `<: AbstractCalibrationSource`
+        # the source docstrings advertise is actually true, and _toManifestSource can dispatch on it.
+        @test isabstracttype(ModelManager.AbstractCalibrationSource)
+        for T in (ModelManager.DVSource, ModelManager.CVSource, ModelManager.LVSource,
+                  ModelManager.DiscreteSource, ModelManager.DiscreteCoSource)
+            @test T <: ModelManager.AbstractCalibrationSource
+        end
+        @test ModelManager._toManifestSource(disc_cp.source) === disc_cp.source
+
+        # The bank asks `insupport` of a base config value, not a min/max range: for levels the two
+        # disagree on every value, since a range admits the gaps between levels.
+        levels  = [0.5, 1.5, 2.5]
+        leveldist = ModelManager._discreteLevelDistribution(levels)
+        for v in levels
+            @test insupport(leveldist, v)
+        end
+        for v in (1.0, 2.0)                          # inside the range, but between levels
+            @test minimum(leveldist) <= v <= maximum(leveldist)
+            @test !insupport(leveldist, v)
+        end
+        @test !insupport(leveldist, 3.0)             # outside the range entirely
+        # Unsorted and duplicated input still yields the sorted unique support.
+        @test support(ModelManager._discreteLevelDistribution([2.5, 0.5, 1.5, 0.5])) == levels
+
         # Still rejected: a LatentVariation whose latent parameters are a raw value vector. That
         # branch treats its latent values as indices in the CDF path, a different convention.
         @test_throws ArgumentError ModelManager._toCalibrationParameter(

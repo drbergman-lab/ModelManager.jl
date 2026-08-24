@@ -3170,3 +3170,24 @@ names the fix — pass the `DiscreteVariation` — instead of only stating the c
 within-bin variation that cannot affect the simulation. `cdf_grid_k` snapping and the bank already mitigate it
 by collapsing repeated grid points onto monads that have run.
 
+### Review round 2
+
+**`AbstractCalibrationSource` is now a real abstract type**, not a `Union`. The source docstrings had always
+advertised `DVSource <: AbstractCalibrationSource`, which was simply false while the name was a union alias —
+so this makes the documented type tree true rather than inventing one. `_toManifestSource` collapses onto the
+abstract type, with `LVSource` the single override.
+
+The reason to check before doing it was JLD2: the sources are serialised in `problem.jld2`, and re-parameterising
+a stored struct makes it come back as a `ReconstructedMutable` that fails dispatch. **Gaining a supertype is not
+that kind of change** — verified by loading a `problem.jld2` written before the structs subtyped anything and
+confirming the sources come back as real `DVSource` values, satisfy `isa AbstractCalibrationSource`, and dispatch.
+Field layout is what JLD2 commits; the supertype is not part of it.
+
+**The bank's no-DB-column check uses `insupport`, not a min/max range.** For a continuous prior the two agree.
+For a discrete one the range admits every gap between the levels: with levels `[0.5, 1.5, 2.5]`, a base config
+value of `1.0` passes a range test while no monad can ever match it. The two answers are exactly complementary
+across the levels and the gaps, which is now a test.
+
+This is the second half of the answer to "why not `DiscreteUniform` here": with `insupport` the target-space
+distribution is not merely a convenient carrier of bounds, it is the actual set membership being asked about.
+

@@ -3,12 +3,26 @@ export CalibrationParameter
 ################## Source types ##################
 
 """
+    AbstractCalibrationSource
+
+Supertype of the records tracking which variation a [`CalibrationParameter`](@ref) came from.
+
+A source exists so a particle can be reported in the user's own terms — display names, priors,
+target values — rather than as the bare CDF coordinates the sampler works in.
+
+Sources are serialised into `problem.jld2` so a run can resume. A source whose maps are derived
+from data it already carries round-trips as itself; one holding user-supplied functions may not,
+and overrides `_toManifestSource` to strip what JLD2 cannot store.
+"""
+abstract type AbstractCalibrationSource end
+
+"""
     DVSource <: AbstractCalibrationSource
 
 Tracks that a [`CalibrationParameter`](@ref) originated from a [`DistributedVariation`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct DVSource
+struct DVSource <: AbstractCalibrationSource
     dv::DistributedVariation
 end
 
@@ -19,7 +33,7 @@ Tracks that a [`CalibrationParameter`](@ref) originated from a
 [`CoVariation{DistributedVariation}`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct CVSource
+struct CVSource <: AbstractCalibrationSource
     cv::CoVariation{DistributedVariation}
 end
 
@@ -30,7 +44,7 @@ Tracks that a [`CalibrationParameter`](@ref) originated from a user-supplied
 [`LatentVariation{<:Distribution}`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct LVSource
+struct LVSource <: AbstractCalibrationSource
     lv::LatentVariation{<:Distribution}
 end
 
@@ -40,7 +54,7 @@ end
 Tracks that a [`CalibrationParameter`](@ref) originated from a [`DiscreteVariation`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct DiscreteSource
+struct DiscreteSource <: AbstractCalibrationSource
     dv::DiscreteVariation
 end
 
@@ -51,16 +65,16 @@ Tracks that a [`CalibrationParameter`](@ref) originated from a
 [`CoVariation`](@ref) of [`DiscreteVariation`](@ref)s.
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct DiscreteCoSource
+struct DiscreteCoSource <: AbstractCalibrationSource
     cv::CoVariation{<:DiscreteVariation}
 end
 
-#! New types rather than widening `DVSource`/`CVSource` to accept any `ElementaryVariation`. The
-#! sources are JLD2-serialised inside `_ProblemManifest`, which stores the concrete type, so
-#! re-parameterising an existing one would stop older `problem.jld2` files from loading as themselves
-#! and break resume. Adding types is compatible; changing them is not.
-const AbstractCalibrationSource = Union{DVSource, CVSource, LVSource,
-                                        DiscreteSource, DiscreteCoSource}
+#! `DiscreteSource`/`DiscreteCoSource` are new types rather than a widening of `DVSource`/`CVSource`
+#! to accept any `ElementaryVariation`. The sources are JLD2-serialised inside `_ProblemManifest`,
+#! which stores the concrete type, so re-parameterising an existing one would stop older
+#! `problem.jld2` files from loading as themselves and break resume. Adding types is compatible;
+#! changing them is not. Gaining a supertype is also compatible — verified against a `problem.jld2`
+#! written before these structs subtyped anything.
 
 ################## CalibrationParameter ##################
 

@@ -310,6 +310,19 @@ Deliberate decisions whose symptoms would otherwise look like bugs. Check here b
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
+- Merge `DiscreteVariation` into `DistributedVariation`, with a discrete variation becoming the special case
+  carrying a `DiscreteNonParametric` distribution over its value vector. Today the two are separate types with
+  parallel machinery: `LatentVariation` has one branch per kind, calibration has `DVSource`/`CVSource` alongside
+  `DiscreteSource`/`DiscreteCoSource` (four near-identical sets of `_displayColumns`, `_particleRowToDisplay`,
+  `_parameterTOMLEntry`, `_bankColDistribution` methods), and the discrete path reaches the sampler only by being
+  converted to a `DiscreteUniform` over value indices. One distribution-shaped type would collapse all of that:
+  `_bankColDistribution` would need no discrete method at all, `insupport` would already do the right thing, and
+  the grid/CDF paths would stop needing to agree by hand. Blocking questions: whether `variationValues` can keep
+  the index convention it uses for the raw-vector `LatentVariation` branch; whether the DB stores the value or an
+  index; and JLD2 compatibility, since re-parameterising a serialised source type breaks `resumeABC` on existing
+  runs (adding a supertype does not — verified). Almost certainly needs a migration, so it depends on the MM
+  upgrade path above.
+
 - Wire the `post_processor` QoI builders (e.g. `populationCountQoI`) into sensitivity analysis and calibration workflows, so a builder's output can feed `run(::GSAMethod, ...)`/`CalibrationProblem` directly instead of only landing in the post-processing sink. Not yet done — these builders currently only target `run(...; post_processor=...)`.
 - **Add `AUTOINCREMENT` to the primary keys.** Every MM table declares `<class>_id INTEGER PRIMARY KEY` with no `AUTOINCREMENT`, so SQLite assigns `max(rowid)+1` and hands a deleted object's ID to the next insert whenever the deleted row held the maximum (verified: insert 1–3, `DELETE` 3, insert → the new row *is* id 3, and its simulations get ids 1 and 2 back too). `AUTOINCREMENT` makes SQLite track a high-water mark in `sqlite_sequence` and never reuse. Cost is a schema migration, and `upgradeMilestones`/`upgradeToMilestone` are `AbstractSimulator` methods, so the milestone must be implemented by every downstream simulator — which is why this is worth folding into the next migration rather than doing on its own.
 
