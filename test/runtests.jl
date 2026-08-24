@@ -5584,15 +5584,16 @@ end
 # longer renders the private API either, so ModelManager's own build would catch this too —
 # but only in CI's `docs` job, and only for names that exist. This runs with the ordinary
 # test suite and needs no docs build. See CLAUDE.md, "Docstring cross-references".
-# A comment between a docstring and the definition it documents makes Julia drop the docstring
-# silently: it is simply absent from `Docs.meta`, with no warning at any point. The `#!` convention
-# makes this easy to walk into, since a rationale comment naturally wants to sit right above the
-# thing it explains — put it above the *docstring* instead. This is a source scan rather than a
+# Anything between a docstring and the definition it documents makes Julia drop the docstring
+# silently: it is simply absent from `Docs.meta`, with no warning at any point. A comment does it —
+# which the `#!` convention walks straight into, since a rationale comment naturally wants to sit
+# right above the thing it explains, and the fix is to put it above the *docstring* instead. So does
+# a bare blank line, with no comment involved at all. This is a source scan rather than a
 # `Docs.meta` check because the failure mode is an absence, and you cannot look up what is not there.
-@testset "no comment separates a docstring from its definition" begin
+@testset "nothing separates a docstring from its definition" begin
     src_dir = joinpath(pkgdir(ModelManager), "src")
-    #! A closing `"""` alone on its line, then one or more comment lines, then a definition.
-    pattern = r"^\"\"\"[ \t]*\n(?:[ \t]*#[^\n]*\n)+(?=[ \t]*[^\s#])"m
+    #! A closing `"""` alone on its line, then any run of blank or comment lines, then a definition.
+    pattern = r"^\"\"\"[ \t]*\n(?:[ \t]*(?:#[^\n]*)?\n)+(?=[ \t]*[^\s#])"m
 
     detached = String[]
     for (root, _, files) in walkdir(src_dir), file in files
@@ -5606,7 +5607,7 @@ end
     end
 
     isempty(detached) ||
-        @info "Docstrings detached from their definitions by an intervening comment:\n" *
+        @info "Docstrings detached from their definitions by intervening blank or comment lines:\n" *
               join(detached, "\n")
     @test isempty(detached)
 end
