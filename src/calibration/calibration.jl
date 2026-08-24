@@ -76,12 +76,6 @@ function _indexedGenerationFiles(dir::AbstractString, pattern::Regex)
     return out
 end
 
-"""
-    _findGenerationFile(dir, t, suffix) → String or nothing
-
-Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padding its name carries.
-`nothing` if it is absent.
-"""
 #! The single-generation counterpart to `_indexedGenerationFiles`, and it exists for the same reason:
 #! reading must never assume a padding width. `_generationTag` takes that width from
 #! `max_nr_populations`, which a resume is free to change, so a name computed *now* need not match the
@@ -89,6 +83,12 @@ Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padd
 #! `generation_005_monads.csv` once the cap is raised to 100, and the two entry points disagree in
 #! opposite directions (`ABCResult` carries the live cap, `method.toml` keeps the original, and resume
 #! never rewrites it). Writing may pick a width; reading may not assume one.
+"""
+    _findGenerationFile(dir, t, suffix) → String or nothing
+
+Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padding its name carries.
+`nothing` if it is absent.
+"""
 function _findGenerationFile(dir::AbstractString, t::Int, suffix::String)
     pat  = Regex("^generation_(\\d+)" * replace(suffix, "." => "\\.") * "\$")
     hits = _indexedGenerationFiles(dir, pat)
@@ -96,14 +96,6 @@ function _findGenerationFile(dir::AbstractString, t::Int, suffix::String)
     return isnothing(idx) ? nothing : last(hits[idx])
 end
 
-"""
-    _normalizeGenerationPadding!(calibration, max_nr_populations) → Int
-
-Re-pad every generation filename to one consistent width, returning how many files were renamed.
-
-The width is `ndigits(max(max_nr_populations, highest existing generation))`, so it is wide enough for
-the run's cap *and* for anything already written.
-"""
 #! Cosmetic, not load-bearing: every reader locates generation files by pattern and orders them by the
 #! parsed index, so mixed widths are already read correctly. This exists so the directory stays
 #! browsable after a resume changes the cap, and it is why the width takes the max of the two rather
@@ -117,6 +109,14 @@ the run's cap *and* for anything already written.
 #!
 #! A failed rename is logged and skipped rather than aborting the resume: the files are still readable
 #! at whatever width they carry, so a half-normalized directory costs nothing but tidiness.
+"""
+    _normalizeGenerationPadding!(calibration, max_nr_populations) → Int
+
+Re-pad every generation filename to one consistent width, returning how many files were renamed.
+
+The width is `ndigits(max(max_nr_populations, highest existing generation))`, so it is wide enough for
+the run's cap *and* for anything already written.
+"""
 function _normalizeGenerationPadding!(calibration::Calibration, max_nr_populations::Int)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
     isdir(gen_dir) || return 0

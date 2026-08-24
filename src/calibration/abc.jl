@@ -1172,16 +1172,16 @@ Path to a generation's proposal-distance CSV (`monad_id`, `distance`, `accepted`
 _generationProposalsPath(dir::String, t::Int, max_nr_populations::Int) =
     joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_proposals.csv")
 
+#! Appending must land in the file that is already there. A generation interrupted mid-run leaves a
+#! monads file but no particles file, so it is not counted as loaded and a resume re-runs it — and if
+#! the resume also changed `max_nr_populations`, computing the name afresh would open a *second* file
+#! under the new padding and split one generation's monad record across two.
 """
     _generationMonadsPath(calibration, t, max_nr_populations) → String
 
 Path to the monad-ID record for generation `t`, e.g. `generations/generation_05_monads.csv`. An
 existing file for that generation wins over the computed name, whatever padding it carries.
 """
-#! Appending must land in the file that is already there. A generation interrupted mid-run leaves a
-#! monads file but no particles file, so it is not counted as loaded and a resume re-runs it — and if
-#! the resume also changed `max_nr_populations`, computing the name afresh would open a *second* file
-#! under the new padding and split one generation's monad record across two.
 function _generationMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
     dir      = joinpath(calibrationFolder(calibration), "generations")
     existing = _findGenerationFile(dir, t, "_monads.csv")
@@ -1189,15 +1189,15 @@ function _generationMonadsPath(calibration::Calibration, t::Int, max_nr_populati
     return joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_monads.csv")
 end
 
+#! Prefers an existing file for the same reason `_generationMonadsPath` does: a generation
+#! retried after a resume changed the padding would otherwise split its failure record across
+#! two differently-named files, and nothing scans for these.
 """
     _failedSimulationsPath(calibration, t, max_nr_populations) → String
 
 Path to the failed-simulation record for generation `t`:
 `generations/generation_{NNN}_failed_simulations.csv`.
 """
-#! Prefers an existing file for the same reason `_generationMonadsPath` does: a generation
-#! retried after a resume changed the padding would otherwise split its failure record across
-#! two differently-named files, and nothing scans for these.
 function _failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
     dir      = joinpath(calibrationFolder(calibration), "generations")
     existing = _findGenerationFile(dir, t, "_failed_simulations.csv")
@@ -1205,15 +1205,15 @@ function _failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populat
     return joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_failed_simulations.csv")
 end
 
+#! Prefers an existing file for the same reason `_generationMonadsPath` does: a generation
+#! retried after a resume changed the padding would otherwise split its failure record across
+#! two differently-named files, and nothing scans for these.
 """
     _failedMonadsPath(calibration, t, max_nr_populations) → String
 
 Path to the record of monads with at least one failed simulation in generation `t`:
 `generations/generation_{NNN}_failed_monads.csv`.
 """
-#! Prefers an existing file for the same reason `_generationMonadsPath` does: a generation
-#! retried after a resume changed the padding would otherwise split its failure record across
-#! two differently-named files, and nothing scans for these.
 function _failedMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
     dir      = joinpath(calibrationFolder(calibration), "generations")
     existing = _findGenerationFile(dir, t, "_failed_monads.csv")

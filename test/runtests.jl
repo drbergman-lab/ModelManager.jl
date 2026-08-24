@@ -5513,6 +5513,33 @@ end
 # longer renders the private API either, so ModelManager's own build would catch this too —
 # but only in CI's `docs` job, and only for names that exist. This runs with the ordinary
 # test suite and needs no docs build. See CLAUDE.md, "Docstring cross-references".
+# A comment between a docstring and the definition it documents makes Julia drop the docstring
+# silently: it is simply absent from `Docs.meta`, with no warning at any point. The `#!` convention
+# makes this easy to walk into, since a rationale comment naturally wants to sit right above the
+# thing it explains — put it above the *docstring* instead. This is a source scan rather than a
+# `Docs.meta` check because the failure mode is an absence, and you cannot look up what is not there.
+@testset "no comment separates a docstring from its definition" begin
+    src_dir = joinpath(pkgdir(ModelManager), "src")
+    #! A closing `"""` alone on its line, then one or more comment lines, then a definition.
+    pattern = r"^\"\"\"[ \t]*\n(?:[ \t]*#[^\n]*\n)+(?=[ \t]*[^\s#])"m
+
+    detached = String[]
+    for (root, _, files) in walkdir(src_dir), file in files
+        endswith(file, ".jl") || continue
+        path = joinpath(root, file)
+        text = read(path, String)
+        for m in eachmatch(pattern, text)
+            line = count(==('\n'), text[1:m.offset]) + 1
+            push!(detached, "$(relpath(path, src_dir)):$(line)")
+        end
+    end
+
+    isempty(detached) ||
+        @info "Docstrings detached from their definitions by an intervening comment:\n" *
+              join(detached, "\n")
+    @test isempty(detached)
+end
+
 #! Julia 1.10 (our compat floor) has neither `Base.ispublic` nor the `public` keyword, so
 #! `@compat public` is a no-op there and *every* name would look private. The check is only
 #! meaningful — and only runnable — on 1.11+. Docs CI must therefore run 1.11+ as well, or
