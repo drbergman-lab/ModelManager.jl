@@ -780,43 +780,42 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 w2, [0.2, 0.1], 0.2, 6, [13, 14],
                 2/6, 1/sum(w2.^2), nothing)
 
-            # _saveGeneration(dir, gen, max_pops) writes:
-            #   display CSV to dir/generation_NNN.csv
-            #   CDF CSV to dir/generation_cdfs/generation_NNN.csv
-            #   TOML to dir/generation_NNN.toml
+            # _saveGeneration(dir, gen, max_pops) writes one folder per generation, with each
+            # artifact under a constant basename inside it: no generation number in any filename.
             ModelManager._saveGeneration(dir, gen1, max_pops)
             ModelManager._saveGeneration(dir, gen2, max_pops)
 
-            # Display files are zero-padded and present in dir/
-            @test isfile(joinpath(dir, "generation_01.csv"))
-            @test isfile(joinpath(dir, "generation_01.toml"))
-            @test isfile(joinpath(dir, "generation_02.csv"))
-            @test isfile(joinpath(dir, "generation_02.toml"))
-
-            # CDF files are in the generation_cdfs/ subdir
-            cdf_dir = joinpath(dir, "generation_cdfs")
-            @test isfile(joinpath(cdf_dir, "generation_01.csv"))
-            @test isfile(joinpath(cdf_dir, "generation_02.csv"))
+            g1 = joinpath(dir, "01")
+            g2 = joinpath(dir, "02")
+            @test isdir(g1) && isdir(g2)
+            for g in (g1, g2)
+                @test isfile(joinpath(g, "particles.csv"))
+                @test isfile(joinpath(g, "cdfs.csv"))
+                @test isfile(joinpath(g, "metadata.toml"))
+            end
+            # No flat-layout leftovers, and no separate cdf directory.
+            @test !isfile(joinpath(dir, "generation_01.csv"))
+            @test !isdir(joinpath(dir, "generation_cdfs"))
 
             # Display CSV: with empty cps, equals particles + weight + distance + monad_id
-            csv1 = CSV.read(joinpath(dir, "generation_01.csv"), DataFrame)
+            csv1 = CSV.read(joinpath(g1, "particles.csv"), DataFrame)
             @test "acceptance_rate" ∉ names(csv1)
             @test "ess" ∉ names(csv1)
             @test Set(names(csv1)) == Set(["alpha", "beta", "weight", "distance", "monad_id"])
 
             # CDF CSV has the same columns (no CalibrationParameters → identity transform)
-            cdf1 = CSV.read(joinpath(cdf_dir, "generation_01.csv"), DataFrame)
+            cdf1 = CSV.read(joinpath(g1, "cdfs.csv"), DataFrame)
             @test Set(names(cdf1)) == Set(["alpha", "beta", "weight", "distance", "monad_id"])
 
             # TOML contains generation-level fields
-            meta1 = TOML.parsefile(joinpath(dir, "generation_01.toml"))
+            meta1 = TOML.parsefile(joinpath(g1, "metadata.toml"))
             @test meta1["t"] == 1
             @test meta1["max_epsilon_accepted"] ≈ 0.5
             @test meta1["n_evaluations"] == 3
             @test meta1["acceptance_rate"] ≈ 1.0
             @test meta1["ess"] ≈ gen1.ess
 
-            # Round-trip: _loadGenerations reads from generation_cdfs/ subdir
+            # Round-trip: _loadGenerations reads each generation folder's cdfs.csv
             loaded = ModelManager._loadGenerations(dir, param_names, max_pops)
             @test length(loaded) == 2
 
@@ -847,19 +846,20 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
             # Written keys: the achieved epsilon under its own name, and no threshold for a
             # generation that had none (TOML has no null, so the key is omitted, not blanked).
-            meta_written = TOML.parsefile(joinpath(dir, "generation_01.toml"))
+            meta_written = TOML.parsefile(joinpath(g1, "metadata.toml"))
             @test haskey(meta_written, "max_epsilon_accepted")
             @test !haskey(meta_written, "epsilon_threshold")
             @test !haskey(meta_written, "epsilon")
 
-            # A generation TOML written before the rename must still load: the reader accepts the
-            # old "epsilon" spelling and leaves the threshold absent. Without this fallback every
-            # existing calibration would fail to resume.
+            # A calibration written under the flat layout, before the rename, must still load
+            # exactly as it lies: the old "epsilon" spelling is accepted, the threshold stays absent,
+            # and no migration is required first. Without this every existing calibration would need
+            # to be converted before it could be read at all.
             legacy_dir = joinpath(dir, "legacy")
             mkpath(joinpath(legacy_dir, "generation_cdfs"))
-            cp(joinpath(dir, "generation_cdfs", "generation_01.csv"),
+            cp(joinpath(g1, "cdfs.csv"),
                joinpath(legacy_dir, "generation_cdfs", "generation_01.csv"))
-            cp(joinpath(dir, "generation_01.csv"), joinpath(legacy_dir, "generation_01.csv"))
+            cp(joinpath(g1, "particles.csv"), joinpath(legacy_dir, "generation_01.csv"))
             legacy_meta = Dict{String,Any}(
                 "t"               => 1,
                 "epsilon"         => 0.5,      # the pre-rename spelling
@@ -915,9 +915,9 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
     end
 
     @testset "resume path: _loadGenerations reads raw CDF coords, not display values" begin
-        # _saveGeneration writes CDF coords to generation_cdfs/ and display-transformed
-        # values to the display CSV. _loadGenerations must read from generation_cdfs/ so
-        # the raw CDF coords are recovered exactly, not the display values.
+        # _saveGeneration writes CDF coords to cdfs.csv and display-transformed values to
+        # particles.csv. _loadGenerations must read cdfs.csv so the raw CDF coords are
+        # recovered exactly, not the display values.
         xp  = XMLPath(["a", "x"])
         dv  = DistributedVariation(:config, xp, Uniform(0.0, 2.0))
         cp  = ModelManager._toCalibrationParameter(dv)
@@ -933,8 +933,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
             ModelManager._saveGeneration(dir, gen, 5, [cp])
 
-            @test isdir(joinpath(dir, "generation_cdfs"))
-            @test isfile(joinpath(dir, "generation_cdfs", "generation_1.csv"))
+            @test isfile(joinpath(dir, "1", "cdfs.csv"))
+            @test isfile(joinpath(dir, "1", "particles.csv"))
 
             loaded = ModelManager._loadGenerations(dir, [col], 5)
             @test length(loaded) == 1
@@ -3073,7 +3073,9 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 gen_dir = joinpath(ModelManager.calibrationFolder(result.calibration),
                                    "generations")
                 @test isdir(gen_dir)
-                @test isfile(joinpath(gen_dir, "generation_1.csv"))
+                @test isfile(joinpath(gen_dir, "1", "particles.csv"))
+                @test isfile(joinpath(gen_dir, "1", "cdfs.csv"))
+                @test isfile(joinpath(gen_dir, "1", "metadata.toml"))
 
                 # posterior
                 post_df, weights = posterior(result)
@@ -3400,7 +3402,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # A run that never recorded a generation reports the same way, naming the
                 # directory it looked in.
                 bare = ModelManager.createCalibration("ABC-SMC")
-                @test_throws "generation_{NNN}_monads.csv" Sampling(bare)
+                @test_throws "per-generation monads.csv files" Sampling(bare)
 
                 # mm:created is column-backed, so `tagValues` reads it out of each class's own
                 # table. That loop covers `calibrations` too, guarded only on the datetime
@@ -3730,35 +3732,37 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     ModelManager._failedSimulationsPath(cal, 2, 10)) == [5, 6, 7]
                 @test ModelManager.constituentIDs(
                     ModelManager._failedMonadsPath(cal, 2, 10)) == [11, 12]
-                # An existing record for that generation wins over a recomputed name, whatever
-                # padding it carries. Without this, a generation retried after a resume raised
-                # max_nr_populations would split its failures across two differently-named files,
-                # and nothing scans for these — the old ones would simply be lost.
-                @test basename(ModelManager._failedSimulationsPath(cal, 2, 100)) ==
-                      "generation_02_failed_simulations.csv"
-                @test basename(ModelManager._failedMonadsPath(cal, 2, 100)) ==
-                      "generation_02_failed_monads.csv"
-                # Appending under the wider cap lands in that same file rather than a new one.
+                # Artifacts live under a constant basename inside the generation's folder, so the
+                # generation number appears once — in the folder name — instead of in every filename.
+                gdir = joinpath(ModelManager.calibrationFolder(cal), "generations")
+                @test ModelManager._failedSimulationsPath(cal, 2, 10) ==
+                      joinpath(gdir, "02", "failed_simulations.csv")
+                @test ModelManager._failedMonadsPath(cal, 2, 10) ==
+                      joinpath(gdir, "02", "failed_monads.csv")
+
+                # An existing record wins over a recomputed path, whatever padding its folder carries.
+                # Without this, a generation retried after a resume raised max_nr_populations would
+                # split its failures across two folders, and nothing scans for these.
+                @test ModelManager._failedSimulationsPath(cal, 2, 100) ==
+                      joinpath(gdir, "02", "failed_simulations.csv")
                 ModelManager._recordBatchFailures(cal, 2, 100, :none, Set{Int}(), [8], [13])
                 @test ModelManager.constituentIDs(
                     ModelManager._failedSimulationsPath(cal, 2, 100)) == [5, 6, 7, 8]
-                @test !isfile(joinpath(ModelManager.calibrationFolder(cal), "generations",
-                                       "generation_002_failed_simulations.csv"))
+                @test !isdir(joinpath(gdir, "002"))
 
-                # With no existing record, the computed padding does apply.
-                @test basename(ModelManager._failedSimulationsPath(cal, 7, 100)) ==
-                      "generation_007_failed_simulations.csv"
-                @test basename(ModelManager._failedSimulationsPath(cal, 7, 10)) ==
-                      "generation_07_failed_simulations.csv"
+                # With no existing folder, the computed padding does apply.
+                @test ModelManager._failedSimulationsPath(cal, 7, 100) ==
+                      joinpath(gdir, "007", "failed_simulations.csv")
             end
 
-            @testset "generation filename padding is normalized and never assumed" begin
-                cal  = ModelManager.createCalibration("ABC-SMC"; description="padding")
+            @testset "generation layout: folders, migration, and padding" begin
+                cal  = ModelManager.createCalibration("ABC-SMC"; description="layout")
                 gdir = joinpath(ModelManager.calibrationFolder(cal), "generations")
                 cdir = joinpath(gdir, "generation_cdfs")
                 mkpath(cdir)
 
-                # A directory left mixed-width by a resume that raised max_nr_populations.
+                # A calibration written under the historical flat layout, left mixed-width by a
+                # resume that raised max_nr_populations.
                 for (n, w) in ((1, 2), (2, 2), (3, 3), (10, 3))
                     tag = lpad(string(n), w, '0')
                     for suffix in (".csv", ".toml", "_monads.csv", "_proposals.csv")
@@ -3767,38 +3771,51 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     touch(joinpath(cdir, "generation_$(tag).csv"))
                 end
 
-                # Reading never assumes a width: each generation is found at whichever it carries.
+                # Reading finds every generation without assuming a layout or a width.
+                @test ModelManager._generationIndices(gdir) == [1, 2, 3, 10]
                 for n in (1, 2, 3, 10)
-                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, "_monads.csv"))
-                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, "_proposals.csv"))
+                    for role in (:particles, :metadata, :monads, :proposals, :cdfs)
+                        @test !isnothing(ModelManager._generationArtifact(gdir, n, role))
+                    end
                 end
-                @test isnothing(ModelManager._findGenerationFile(gdir, 4, "_monads.csv"))
+                @test isnothing(ModelManager._generationArtifact(gdir, 4, :monads))
 
-                # Raising the cap widens everything to three digits, cdfs included.
-                @test ModelManager._normalizeGenerationPadding!(cal, 100) > 0
+                # Migrating moves each artifact into generations/<t>/ under its role basename, with
+                # the width covering both the cap and the highest existing generation.
+                @test ModelManager._migrateGenerationLayout!(cal, 100) > 0
                 for n in (1, 2, 3, 10)
-                    @test isfile(joinpath(gdir, "generation_$(lpad(n, 3, '0'))_monads.csv"))
-                    @test isfile(joinpath(cdir, "generation_$(lpad(n, 3, '0')).csv"))
+                    d = joinpath(gdir, lpad(string(n), 3, '0'))
+                    @test isdir(d)
+                    @test isfile(joinpath(d, "particles.csv"))
+                    @test isfile(joinpath(d, "metadata.toml"))
+                    @test isfile(joinpath(d, "monads.csv"))
+                    @test isfile(joinpath(d, "proposals.csv"))
+                    @test isfile(joinpath(d, "cdfs.csv"))
                 end
-                @test !isfile(joinpath(gdir, "generation_01_monads.csv"))
-                # Idempotent.
-                @test ModelManager._normalizeGenerationPadding!(cal, 100) == 0
+                # The flat files and the old cdf directory are gone.
+                @test isempty(filter(f -> startswith(f, "generation_"), readdir(gdir)))
+                @test !isdir(cdir)
+                # Indices unchanged, and idempotent.
+                @test ModelManager._generationIndices(gdir) == [1, 2, 3, 10]
+                @test ModelManager._migrateGenerationLayout!(cal, 100) == 0
 
-                # Lowering the cap narrows back, but only to what the existing generations need:
-                # generation 10 holds the width at 2 however small the cap gets.
-                ModelManager._normalizeGenerationPadding!(cal, 3)
+                # Lowering the cap narrows folder names, but only to what the existing generations
+                # need: generation 10 holds the width at 2 however small the cap goes.
+                ModelManager._migrateGenerationLayout!(cal, 3)
                 for n in (1, 2, 3, 10)
-                    @test isfile(joinpath(gdir, "generation_$(lpad(n, 2, '0'))_monads.csv"))
+                    @test isdir(joinpath(gdir, lpad(string(n), 2, '0')))
                 end
-                @test !isfile(joinpath(gdir, "generation_001_monads.csv"))
+                @test !isdir(joinpath(gdir, "001"))
+                @test ModelManager._generationIndices(gdir) == [1, 2, 3, 10]
 
-                # The cdfs directory is never itself renamed — "cdfs" is not digits.
-                @test isdir(cdir)
-
-                # Whatever the width, the files are still discoverable by index.
-                for n in (1, 2, 3, 10)
-                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, ".toml"))
-                end
+                # Writing prefers an existing folder over a recomputed name, so a generation retried
+                # after the cap changed cannot end up with two folders.
+                @test ModelManager._generationArtifactToWrite(gdir, 10, :monads, 1000) ==
+                      joinpath(gdir, "10", "monads.csv")
+                @test !isdir(joinpath(gdir, "0010"))
+                # A generation with no folder yet gets one at the computed width.
+                @test ModelManager._generationArtifactToWrite(gdir, 11, :monads, 1000) ==
+                      joinpath(gdir, "0011", "monads.csv")
             end
 
             @testset "reusability filter — started or completed simulations" begin
