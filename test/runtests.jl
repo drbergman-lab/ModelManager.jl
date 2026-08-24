@@ -3818,6 +3818,60 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       joinpath(gdir, "0011", "monads.csv")
             end
 
+            @testset "generation index is the index, not a listing position" begin
+                # The bug this pins down: posterior, ConvergenceSummary and the recipes each used a
+                # generation's POSITION in a sorted filename listing as its index. That is only
+                # correct while every name is one width and the generations are contiguous from 1.
+                # Generations 1, 2 and 10 at mixed padding break both assumptions at once.
+                cal  = ModelManager.createCalibration("ABC-SMC"; description="index vs position")
+                gdir = joinpath(ModelManager.calibrationFolder(cal), "generations")
+                cdir = joinpath(gdir, "generation_cdfs")
+                mkpath(cdir)
+
+                gens = ((1, 2, 0.90, 30), (2, 2, 0.50, 20), (10, 3, 0.01, 10))
+                for (t, w, eps, nev) in gens
+                    tag = lpad(string(t), w, '0')
+                    # One particle whose parameter value encodes its generation, so a wrong lookup
+                    # is visible in the value rather than only in the count.
+                    df = DataFrame("p" => [Float64(t)], "weight" => [1.0],
+                                   "distance" => [eps], "monad_id" => [100 + t])
+                    CSV.write(joinpath(gdir, "generation_$(tag).csv"), df)
+                    CSV.write(joinpath(cdir, "generation_$(tag).csv"), df)
+                    open(joinpath(gdir, "generation_$(tag).toml"), "w") do io
+                        TOML.print(io, Dict{String,Any}(
+                            "t" => t, "max_epsilon_accepted" => eps, "n_evaluations" => nev,
+                            "acceptance_rate" => 1 / nev, "ess" => 1.0); sorted=true)
+                    end
+                end
+
+                # ConvergenceSummary reports the real indices, not 1:3.
+                cs = ConvergenceSummary(cal)
+                @test cs.df.t == [1, 2, 10]
+                @test cs.df.max_epsilon_accepted ≈ [0.90, 0.50, 0.01]
+                @test cs.df.n_evaluations == [30, 20, 10]
+
+                # posterior addresses generations by index. Generation 10 exists; 3 does not.
+                df10, w10 = posterior(cal; generation=10)
+                @test df10.p == [10.0]
+                @test w10 == [1.0]
+                @test posterior(cal; generation=2)[1].p == [2.0]
+                @test_throws ArgumentError posterior(cal; generation=3)
+                # :final is the highest index, not the last name in a sorted list.
+                @test posterior(cal)[1].p == [10.0]
+
+                # show reports the count and the final generation's epsilon.
+                shown = sprint(show, cal)
+                @test occursin("Generations: 3", shown)
+                @test occursin("0.01", shown)
+
+                # After migration all of the above still holds, and the folders carry the indices.
+                ModelManager._migrateGenerationLayout!(cal, 10)
+                @test sort(filter(f -> isdir(joinpath(gdir, f)), readdir(gdir))) == ["01", "02", "10"]
+                @test ConvergenceSummary(cal).df.t == [1, 2, 10]
+                @test posterior(cal; generation=10)[1].p == [10.0]
+                @test posterior(cal)[1].p == [10.0]
+            end
+
             @testset "reusability filter — started or completed simulations" begin
                 # A monad that has run is reusable; one whose simulations have not started is
                 # not (nothing to snap onto), and neither is a monad that does not exist.

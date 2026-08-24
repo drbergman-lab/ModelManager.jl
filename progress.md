@@ -3226,10 +3226,27 @@ could either strand every existing calibration or require converting before read
 files a user may just want to plot. Reading both layouts means an old run works untouched; `_migrateGenerationLayout!`
 then tidies it on the next resume, where we are already writing in that directory anyway.
 
-**What the change exposed.** Four sites used a listing's *position* as the generation index, which is only correct
-while every name is the same width and no generation is missing: `posterior`, `ConvergenceSummary`, and the
+**What the change exposed.** Four sites used a listing's *position* as the generation index, which is only
+correct while every name is the same width and no generation is missing: `posterior`, `ConvergenceSummary`, and the
 `:ridgeline` and `:transition` branches of the `Calibration` recipe. All four now take the index from
-`_generationIndices`. `ConvergenceSummary` additionally derived the particles path by swapping the metadata
+`_generationIndices`.
+
+Measured on the parent branch with generations 1, 2, 10 on disk (the mixed widths a resume produces):
+
+| call | before | correct |
+|---|---|---|
+| `ConvergenceSummary(cal).df.t` | `[1, 2, 3]` | `[1, 2, 10]` |
+| `…max_epsilon_accepted` | `[0.9, 0.01, 0.5]` | `[0.9, 0.5, 0.01]` |
+| `posterior(cal; generation=10)` | throws "out of range [1, 3]" | generation 10 |
+| `posterior(cal)` | generation **2** | generation 10 |
+
+The epsilon column is misordered because `generation_010.toml` sorts *between* `generation_01.toml` and
+`generation_02.toml`, so a convergence plot showed ε going 0.9 → 0.01 → 0.5 — non-monotonic, which reads as a
+diverging run. And `posterior(cal)` silently returned the wrong generation's posterior rather than failing.
+
+These four were the least-tested paths in the file, which is why the bugs survived: codecov put the rewritten
+regions at 0% covered. The new "generation index is the index, not a listing position" testset pins all of it,
+using generations 1, 2, 10 at mixed widths so both assumptions break at once. `ConvergenceSummary` additionally derived the particles path by swapping the metadata
 file's extension — `metadata.toml` and `particles.csv` share no stem, so that had to become a real lookup.
 
 **Collapsed rather than ported.** The four per-generation path builders were each a hand-rolled
