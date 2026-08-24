@@ -3730,11 +3730,75 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     ModelManager._failedSimulationsPath(cal, 2, 10)) == [5, 6, 7]
                 @test ModelManager.constituentIDs(
                     ModelManager._failedMonadsPath(cal, 2, 10)) == [11, 12]
-                # Zero-padded generation tag, alongside the existing monads record.
+                # An existing record for that generation wins over a recomputed name, whatever
+                # padding it carries. Without this, a generation retried after a resume raised
+                # max_nr_populations would split its failures across two differently-named files,
+                # and nothing scans for these — the old ones would simply be lost.
                 @test basename(ModelManager._failedSimulationsPath(cal, 2, 100)) ==
-                      "generation_002_failed_simulations.csv"
+                      "generation_02_failed_simulations.csv"
                 @test basename(ModelManager._failedMonadsPath(cal, 2, 100)) ==
-                      "generation_002_failed_monads.csv"
+                      "generation_02_failed_monads.csv"
+                # Appending under the wider cap lands in that same file rather than a new one.
+                ModelManager._recordBatchFailures(cal, 2, 100, :none, Set{Int}(), [8], [13])
+                @test ModelManager.constituentIDs(
+                    ModelManager._failedSimulationsPath(cal, 2, 100)) == [5, 6, 7, 8]
+                @test !isfile(joinpath(ModelManager.calibrationFolder(cal), "generations",
+                                       "generation_002_failed_simulations.csv"))
+
+                # With no existing record, the computed padding does apply.
+                @test basename(ModelManager._failedSimulationsPath(cal, 7, 100)) ==
+                      "generation_007_failed_simulations.csv"
+                @test basename(ModelManager._failedSimulationsPath(cal, 7, 10)) ==
+                      "generation_07_failed_simulations.csv"
+            end
+
+            @testset "generation filename padding is normalized and never assumed" begin
+                cal  = ModelManager.createCalibration("ABC-SMC"; description="padding")
+                gdir = joinpath(ModelManager.calibrationFolder(cal), "generations")
+                cdir = joinpath(gdir, "generation_cdfs")
+                mkpath(cdir)
+
+                # A directory left mixed-width by a resume that raised max_nr_populations.
+                for (n, w) in ((1, 2), (2, 2), (3, 3), (10, 3))
+                    tag = lpad(string(n), w, '0')
+                    for suffix in (".csv", ".toml", "_monads.csv", "_proposals.csv")
+                        touch(joinpath(gdir, "generation_$(tag)$(suffix)"))
+                    end
+                    touch(joinpath(cdir, "generation_$(tag).csv"))
+                end
+
+                # Reading never assumes a width: each generation is found at whichever it carries.
+                for n in (1, 2, 3, 10)
+                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, "_monads.csv"))
+                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, "_proposals.csv"))
+                end
+                @test isnothing(ModelManager._findGenerationFile(gdir, 4, "_monads.csv"))
+
+                # Raising the cap widens everything to three digits, cdfs included.
+                @test ModelManager._normalizeGenerationPadding!(cal, 100) > 0
+                for n in (1, 2, 3, 10)
+                    @test isfile(joinpath(gdir, "generation_$(lpad(n, 3, '0'))_monads.csv"))
+                    @test isfile(joinpath(cdir, "generation_$(lpad(n, 3, '0')).csv"))
+                end
+                @test !isfile(joinpath(gdir, "generation_01_monads.csv"))
+                # Idempotent.
+                @test ModelManager._normalizeGenerationPadding!(cal, 100) == 0
+
+                # Lowering the cap narrows back, but only to what the existing generations need:
+                # generation 10 holds the width at 2 however small the cap gets.
+                ModelManager._normalizeGenerationPadding!(cal, 3)
+                for n in (1, 2, 3, 10)
+                    @test isfile(joinpath(gdir, "generation_$(lpad(n, 2, '0'))_monads.csv"))
+                end
+                @test !isfile(joinpath(gdir, "generation_001_monads.csv"))
+
+                # The cdfs directory is never itself renamed — "cdfs" is not digits.
+                @test isdir(cdir)
+
+                # Whatever the width, the files are still discoverable by index.
+                for n in (1, 2, 3, 10)
+                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, ".toml"))
+                end
             end
 
             @testset "reusability filter — started or completed simulations" begin
@@ -4511,10 +4575,26 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             # With a frame, the two series are split on the accepted flag.
             frame = DataFrame(monad_id = [1, 2, 3], distance = [0.1, 0.5, 0.9],
                               accepted = [true, true, false])
+            # No particle set supplied, so there is nothing to reconcile and no note.
             a, r, n = ModelManager._distanceSeries(frame, Float64[])
             @test a == [0.1, 0.5]
             @test r == [0.9]
             @test isempty(n)
+
+            # Counts agree with the posterior: still no note.
+            _, _, n_ok = ModelManager._distanceSeries(frame, [0.1, 0.5])
+            @test isempty(n_ok)
+
+            # More proposals passed ε than were kept as particles — accept_overflow=false trimmed the
+            # surplus. The green bars legitimately outnumber the posterior, so the plot says so.
+            over = DataFrame(monad_id = [1, 2, 3, 4], distance = [0.1, 0.2, 0.3, 0.9],
+                             accepted = [true, true, true, false])
+            a_o, r_o, n_o = ModelManager._distanceSeries(over, [0.1, 0.2])
+            @test length(a_o) == 3          # all three flagged accepted are plotted as accepted
+            @test r_o == [0.9]
+            @test occursin("3 passed ε", n_o)
+            @test occursin("2 kept as particles", n_o)
+            @test occursin("overflow trimmed", n_o)
         end
 
         @testset "existing calibration recipes still apply" begin

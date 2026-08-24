@@ -3165,3 +3165,47 @@ this was the natural moment and the marginal cost was small.
 `plot(result; plot_type=:corner)`; the style has always been a *positional* argument, corner is the
 no-style default, and convergence is `plot(ConvergenceSummary(result))`. Those examples would have
 thrown for anyone who copied them.
+
+### Review: the legend, and four padding bugs behind it
+
+**The legend now says what it means.** The split was never wrong — `_distanceSeries` masks on the proposals
+frame's `accepted` column, so a proposal that passed ε and was then trimmed as overflow already plotted on the
+accepted side, which is the honest picture of the acceptance *process*. What was wrong was the label: a bare
+`"accepted"` invites the reader to expect the green bars to sum to `population_size`, and with
+`accept_overflow=false` they routinely do not. In a 10-generation reference run, six generations had more
+proposals pass ε than were kept — 21 against 8 in one. So the labels now carry counts (`passed ε (13)` /
+`rejected (46)`) and the title gains a note whenever the two differ: *"13 passed ε, 8 kept as particles
+(overflow trimmed)"*.
+
+**Reading a generation file must never assume a padding width.** `_generationTag` takes its width from
+`max_nr_populations`, which a resume is free to change, so a name computed now need not match the name written
+then. Four separate places got this wrong, and none of them failed loudly:
+
+1. `_lazyLoadRejected` built the monads path from `result.method.max_nr_populations` — the *live* cap. After a
+   resume that raised it, every pre-resume generation resolved to a name that does not exist, and the miss is
+   silent: the transition plot loses its rejected points and captions itself "(rejected proposals unavailable)",
+   which reads as "this run never recorded them".
+2. `_lazyLoadRejectedFromDisk` took the width from `method.toml`, which `resumeABC` never rewrites — so it fails
+   in the *opposite* direction, resolving the old generations correctly and missing the new ones.
+3. `_findLastGenerationCSVs` sorted names lexicographically and took the last. Mixed widths break that:
+   `generation_006.csv` sorts *before* `generation_05.csv`, so a run that reached 10 reported generation 5.
+4. The monads and two failure-record *write* paths computed a fresh name, so a generation retried after a width
+   change appended to a second file and split one generation's record in two. `calibrationMonadIDs(cal, t)`
+   takes the first match, so half the record simply disappears.
+
+All four now go through `_findGenerationFile(dir, t, suffix)`, which is built on the existing
+`_indexedGenerationFiles` rather than duplicating its scan — that helper's docstring had already named this exact
+hazard, and the `:distances` recipe had already sidestepped it with a local `0*` regex, now folded in. The write
+paths prefer an existing file for that generation over a recomputed name.
+
+**Padding is normalized on resume**, by `_normalizeGenerationPadding!`. The width is
+`ndigits(max(max_nr_populations, highest existing generation))`, which is what makes the awkward directions
+answerable: raising the cap widens everything; lowering it narrows back but only to what the existing generations
+still need, so 11 completed generations hold the width at 2 however small the cap goes; and asking for fewer
+generations than already exist changes nothing. This is cosmetic by design — every reader is now padding-agnostic,
+so a failed rename is logged and skipped rather than aborting the resume.
+
+**A resume that cannot run anything now says so.** `max_nr_populations` is a cumulative cap, not a per-resume
+budget, so `t_start:cap` is empty whenever a resume asks for no more generations than already exist — and an
+empty range runs nothing, silently, returning the same generations a finished run would. `_runABCSMC` warns.
+

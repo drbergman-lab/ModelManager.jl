@@ -77,6 +77,79 @@ function _indexedGenerationFiles(dir::AbstractString, pattern::Regex)
 end
 
 """
+    _findGenerationFile(dir, t, suffix) → String or nothing
+
+Locate generation `t`'s file ending in `suffix` inside `dir`, whatever zero-padding its name carries.
+`nothing` if it is absent.
+"""
+#! The single-generation counterpart to `_indexedGenerationFiles`, and it exists for the same reason:
+#! reading must never assume a padding width. `_generationTag` takes that width from
+#! `max_nr_populations`, which a resume is free to change, so a name computed *now* need not match the
+#! name written *then* — `generation_05_monads.csv` from a run capped at 10 is looked for as
+#! `generation_005_monads.csv` once the cap is raised to 100, and the two entry points disagree in
+#! opposite directions (`ABCResult` carries the live cap, `method.toml` keeps the original, and resume
+#! never rewrites it). Writing may pick a width; reading may not assume one.
+function _findGenerationFile(dir::AbstractString, t::Int, suffix::String)
+    pat  = Regex("^generation_(\\d+)" * replace(suffix, "." => "\\.") * "\$")
+    hits = _indexedGenerationFiles(dir, pat)
+    idx  = findfirst(h -> first(h) == t, hits)
+    return isnothing(idx) ? nothing : last(hits[idx])
+end
+
+"""
+    _normalizeGenerationPadding!(calibration, max_nr_populations) → Int
+
+Re-pad every generation filename to one consistent width, returning how many files were renamed.
+
+The width is `ndigits(max(max_nr_populations, highest existing generation))`, so it is wide enough for
+the run's cap *and* for anything already written.
+"""
+#! Cosmetic, not load-bearing: every reader locates generation files by pattern and orders them by the
+#! parsed index, so mixed widths are already read correctly. This exists so the directory stays
+#! browsable after a resume changes the cap, and it is why the width takes the max of the two rather
+#! than just `ndigits(max_nr_populations)`:
+#!
+#!   - Raising the cap (10 → 100) widens everything to 3. Consistent.
+#!   - Lowering it (100 → 10) narrows back to 2, but only down to what the existing generations need —
+#!     11 completed generations hold the width at 2 no matter how small the cap goes.
+#!   - Asking for fewer generations than already exist changes nothing here; that case is a no-op run,
+#!     and `_runABCSMC` warns about it separately.
+#!
+#! A failed rename is logged and skipped rather than aborting the resume: the files are still readable
+#! at whatever width they carry, so a half-normalized directory costs nothing but tidiness.
+function _normalizeGenerationPadding!(calibration::Calibration, max_nr_populations::Int)
+    gen_dir = joinpath(calibrationFolder(calibration), "generations")
+    isdir(gen_dir) || return 0
+    #! Matches `generation_<digits><anything>`, which covers all six per-generation artifacts at once.
+    #! The `generation_cdfs` directory does not match — `cdfs` is not digits — so it is never renamed.
+    pat     = r"^generation_(\d+)(.*)$"
+    highest = 0
+    for name in readdir(gen_dir)
+        m = match(pat, name)
+        isnothing(m) || (highest = max(highest, parse(Int, m.captures[1])))
+    end
+    width   = ndigits(max(max_nr_populations, highest, 1))
+    renamed = 0
+    for d in (gen_dir, joinpath(gen_dir, "generation_cdfs"))
+        isdir(d) || continue
+        for name in readdir(d)
+            m = match(pat, name)
+            isnothing(m) && continue
+            new_name = "generation_" * lpad(string(parse(Int, m.captures[1])), width, '0') *
+                       m.captures[2]
+            new_name == name && continue
+            try
+                mv(joinpath(d, name), joinpath(d, new_name))
+                renamed += 1
+            catch e
+                @warn "Could not re-pad $(name) to width $(width); leaving it as it is." exception=e
+            end
+        end
+    end
+    return renamed
+end
+
+"""
     _generationMonadFiles(calibration) → Vector{Tuple{Int,String}}
 
 Return `(generation, path)` for each `generations/generation_{NNN}_monads.csv`, in generation

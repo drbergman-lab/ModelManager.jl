@@ -349,6 +349,18 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
     t_start = length(generations) + 1
     snap_active = !isnothing(k_base_eff)
 
+    #! `max_nr_populations` is a cumulative cap, not a per-resume budget, so `t_start:cap` is empty
+    #! whenever a resume asks for no more generations than already exist — and an empty range runs
+    #! nothing, silently. The caller cannot otherwise tell "already finished" from "my override was
+    #! too small to do anything", since both return the same generations unchanged.
+    if t_start > method.max_nr_populations && !isempty(generations)
+        @warn "Resuming a calibration that already has $(length(generations)) generation" *
+              "$(length(generations) == 1 ? "" : "s") with max_nr_populations=" *
+              "$(method.max_nr_populations): no further generations will run, since the cap counts " *
+              "all generations rather than only new ones. Pass a larger max_nr_populations to " *
+              "continue the run."
+    end
+
     # mid_gen_additions: new grid snaps from the current generation, used within the
     # generation for lightweight intra-generation reuse and absorbed into the bank
     # between generations via _updateBankFromGeneration.

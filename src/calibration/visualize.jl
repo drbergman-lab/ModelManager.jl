@@ -58,8 +58,11 @@ end
 function _lazyLoadRejectedFromDisk(cal::Calibration, t_next::Int, max_nr_populations::Int,
                                     accepted_monad_ids, pnames::Vector{String},
                                     mapping::Dict{String,String})
-    monads_path = _generationMonadsPath(cal, t_next, max_nr_populations)
-    isfile(monads_path) || return nothing
+    #! Located by pattern, not rebuilt from `max_nr_populations`: a resume may have changed the
+    #! padding, and the miss here is silent — it degrades to an accepted-only plot with no error.
+    monads_path = _findGenerationFile(joinpath(calibrationFolder(cal), "generations"),
+                                      t_next, "_monads.csv")
+    isnothing(monads_path) && return nothing
 
     all_ids      = constituentIDs(monads_path)
     accepted_set = Set(accepted_monad_ids)
@@ -102,9 +105,12 @@ end
 
 # Lazy-load rejected proposals for generation t_next in target-parameter space.
 function _lazyLoadRejected(result::ABCResult, t_next::Int)
-    monads_path = _generationMonadsPath(result.calibration, t_next,
-                                         result.method.max_nr_populations)
-    isfile(monads_path) || return nothing
+    #! By pattern, not from `result.method.max_nr_populations`. That is the *in-memory* cap, which a
+    #! `method=` override on resume can have raised above the one the existing files were named under
+    #! — and `method.toml` is never rewritten, so the two genuinely disagree.
+    monads_path = _findGenerationFile(joinpath(calibrationFolder(result.calibration), "generations"),
+                                      t_next, "_monads.csv")
+    isnothing(monads_path) && return nothing
 
     all_ids      = constituentIDs(monads_path)
     accepted_set = Set(result.generations[t_next].monad_ids)
@@ -690,7 +696,7 @@ end
             bar_width  := step
             linewidth  := 0
             fillcolor  := :seagreen
-            label      := "accepted"
+            label      := "passed ε ($(Int(sum(dd.accepted_counts))))"
             mids, dd.accepted_counts
         end
     end
@@ -700,7 +706,7 @@ end
             bar_width  := step
             linewidth  := 0
             fillcolor  := :indianred
-            label      := "rejected"
+            label      := "rejected ($(Int(sum(dd.rejected_counts))))"
             mids, dd.rejected_counts
         end
     end
@@ -730,7 +736,17 @@ function _distanceSeries(proposal_distances::Union{Nothing,DataFrame},
     end
     acc = Float64.(proposal_distances[proposal_distances.accepted, :distance])
     rej = Float64.(proposal_distances[.!proposal_distances.accepted, :distance])
-    return acc, rej, ""
+    #! `accepted` means "passed ε", which is not the same as "kept as a particle": with
+    #! `accept_overflow=false` a batch can overshoot `population_size`, and the surplus passed ε but
+    #! was trimmed. The green bars are therefore the honest picture of the *acceptance process*, and
+    #! can outnumber the posterior. Say so on the plot rather than leaving the reader to reconcile
+    #! the legend against a particle count the figure never shows.
+    #! `n_kept == 0` means the caller did not supply a particle set to compare against, not that a
+    #! generation kept nothing — so there is nothing to reconcile and no note to write.
+    n_kept = length(accepted_distances)
+    note = (n_kept > 0 && length(acc) > n_kept) ?
+        " — $(length(acc)) passed ε, $(n_kept) kept as particles (overflow trimmed)" : ""
+    return acc, rej, note
 end
 
 """
@@ -907,12 +923,9 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
                         show_particles, aggregate_duplicates)
     elseif style === :distances
         t = isnothing(generation) ? length(csv_names) : Int(generation)
-        #! Discovered by regex rather than rebuilt from `method.toml`'s `max_nr_populations`, which a
-        #! resume may have changed — the same reason `_loadGenerations` scans.
-        prop_name = only_or_nothing(filter(f -> occursin(Regex("^generation_0*$(t)_proposals\\.csv\$"), f),
-                                           readdir(gen_dir)))
-        prop_df = isnothing(prop_name) ? nothing :
-            CSV.read(joinpath(gen_dir, prop_name), DataFrame;
+        prop_path = _findGenerationFile(gen_dir, t, "_proposals.csv")
+        prop_df = isnothing(prop_path) ? nothing :
+            CSV.read(prop_path, DataFrame;
                      types=Dict(:monad_id => Int, :distance => Float64, :accepted => Bool))
         gen_name = only_or_nothing(filter(f -> occursin(Regex("^generation_0*$(t)\\.csv\$"), f), csv_names))
         isnothing(gen_name) && error("No generation $(t) for Calibration($(cal.id)).")
