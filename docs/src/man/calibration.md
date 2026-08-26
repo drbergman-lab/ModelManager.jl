@@ -250,11 +250,38 @@ recipes turn an [`ABCResult`](@ref) or [`Calibration`](@ref) into standard diagn
 
 ```julia
 using Plots
-plot(result; plot_type=:corner)        # pairwise posterior
-plot(result; plot_type=:ridgeline)     # posterior narrowing across generations
-plot(result; plot_type=:convergence)   # epsilon / acceptance / ESS over generations
-plot(result; plot_type=:transition)    # accepted vs. rejected proposals per generation
+plot(result)                          # pairwise posterior — the default, no style needed
+plot(result, :ridgeline)              # posterior narrowing across generations
+plot(result, :transition)             # accepted vs. rejected proposals for one generation
+plot(result, :distances)              # proposal-distance histogram, accepted tail highlighted
+plot(ConvergenceSummary(result))      # epsilon / acceptance / ESS over generations
 ```
+
+The style is a **positional** argument, and any of these also works on a `Calibration` loaded from
+the database, so you can plot a finished run without re-running it:
+
+```julia
+plot(Calibration(42), :distances; generation=3)
+```
+
+### Proposal distances
+
+`:distances` bins every proposal a generation evaluated and colours the accepted ones separately, so
+you can see how much of the proposal distribution is landing inside the threshold:
+
+```julia
+plot(result, :distances)                    # final generation
+plot(result, :distances; generation=2)      # a specific one
+plot(result, :distances; logscale=true)     # squared-error distances often span decades
+```
+
+The threshold is drawn as a dashed line and falls exactly on a bin boundary, so the accepted and
+rejected bars never share a bin. A shrinking accepted fraction across generations is the sampler
+working; an accepted fraction that collapses toward zero means the threshold is tightening faster
+than the proposals can follow.
+
+Generation 1 accepts everything it evaluates, so it has no threshold line. Runs recorded before
+proposal distances were kept still plot, from the accepted distances alone, and say so in the title.
 
 ## [When things go wrong](@id calibration_troubleshooting)
 
@@ -328,7 +355,7 @@ the likeliest reason otherwise-correct code trips.
 ### The run isn't converging
 
 Nothing failed, but the posterior is not tightening. [`ConvergenceSummary`](@ref) and
-`plot(result; plot_type=:convergence)` show ε, acceptance rate, and ESS per generation; the
+`plot(ConvergenceSummary(result))` shows ε, acceptance rate, and ESS per generation; the
 ridgeline plot shows whether successive posteriors are actually narrowing (stagnant adjacent
 curves are the ABC-SMC analog of a flat MCMC chain).
 

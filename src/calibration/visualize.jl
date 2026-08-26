@@ -58,8 +58,11 @@ end
 function _lazyLoadRejectedFromDisk(cal::Calibration, t_next::Int, max_nr_populations::Int,
                                     accepted_monad_ids, pnames::Vector{String},
                                     mapping::Dict{String,String})
-    monads_path = _generationMonadsPath(cal, t_next, max_nr_populations)
-    isfile(monads_path) || return nothing
+    #! Located by pattern, not rebuilt from `max_nr_populations`: a resume may have changed the
+    #! padding, and the miss here is silent — it degrades to an accepted-only plot with no error.
+    monads_path = _findGenerationFile(joinpath(calibrationFolder(cal), "generations"),
+                                      t_next, "_monads.csv")
+    isnothing(monads_path) && return nothing
 
     all_ids      = constituentIDs(monads_path)
     accepted_set = Set(accepted_monad_ids)
@@ -102,9 +105,12 @@ end
 
 # Lazy-load rejected proposals for generation t_next in target-parameter space.
 function _lazyLoadRejected(result::ABCResult, t_next::Int)
-    monads_path = _generationMonadsPath(result.calibration, t_next,
-                                         result.method.max_nr_populations)
-    isfile(monads_path) || return nothing
+    #! By pattern, not from `result.method.max_nr_populations`. That is the *in-memory* cap, which a
+    #! `method=` override on resume can have raised above the one the existing files were named under
+    #! — and `method.toml` is never rewritten, so the two genuinely disagree.
+    monads_path = _findGenerationFile(joinpath(calibrationFolder(result.calibration), "generations"),
+                                      t_next, "_monads.csv")
+    isnothing(monads_path) && return nothing
 
     all_ids      = constituentIDs(monads_path)
     accepted_set = Set(result.generations[t_next].monad_ids)
@@ -577,6 +583,172 @@ end
 
 ################## Dispatch recipes ##################
 
+
+################## Distance distribution ##################
+
+#! `only` throws on an empty collection; this returns `nothing` so callers can decide.
+only_or_nothing(v) = length(v) == 1 ? first(v) : nothing
+
+#! One generation's TOML metadata, or an empty Dict when it is missing.
+function _calibrationGenerationMeta(cal::Calibration, t::Int)
+    gen_dir = joinpath(calibrationFolder(cal), "generations")
+    isdir(gen_dir) || return Dict{String,Any}()
+    name = only_or_nothing(filter(f -> occursin(Regex("^generation_0*$(t)\\.toml\$"), f),
+                                  readdir(gen_dir)))
+    isnothing(name) && return Dict{String,Any}()
+    return TOML.parsefile(joinpath(gen_dir, name))
+end
+
+"""
+    _DistanceData
+
+Binned proposal distances for one generation, split at the acceptance threshold.
+"""
+struct _DistanceData
+    edges::Vector{Float64}
+    accepted_counts::Vector{Float64}
+    rejected_counts::Vector{Float64}
+    epsilon_threshold::Union{Nothing,Float64}
+    max_epsilon_accepted::Float64
+    t::Int
+    logscale::Bool
+    note::String
+end
+
+#! Binning happens here rather than in the backend. Two `:histogram` series would each pick their own
+#! bins, and because the rejected distances extend well to the right of the accepted ones the two
+#! would not line up — which is the whole point of the plot. Computing shared edges also lets the
+#! threshold land exactly *on* an edge: acceptance is `distance <= ε`, so the two sets are disjoint
+#! except in whichever bin straddles ε, and putting ε on a boundary makes them occupy disjoint bins.
+#! Plain overlaid `:bar` series then render correctly on any backend, with no `bar_position := :stack`
+#! (a Plots-level attribute a backend-agnostic recipe should not require).
+function _buildDistanceData(accepted::Vector{Float64}, rejected::Vector{Float64},
+                            epsilon_threshold::Union{Nothing,Float64},
+                            max_epsilon_accepted::Float64, t::Int;
+                            logscale::Bool=false, note::String="")
+    vals = vcat(accepted, rejected)
+    isempty(vals) && error("No proposal distances to plot for generation $t.")
+
+    acc, rej, thr, extra = accepted, rejected, epsilon_threshold, note
+    if logscale
+        #! `mseDistance` legitimately returns 0.0 on a perfect match, and log10(0) is -Inf. Drop
+        #! non-positive distances and say how many rather than failing the plot.
+        n_before = length(accepted) + length(rejected)
+        acc = log10.(filter(>(0.0), accepted))
+        rej = log10.(filter(>(0.0), rejected))
+        n_dropped = n_before - length(acc) - length(rej)
+        n_dropped > 0 && (extra *= " ($(n_dropped) non-positive distance$(n_dropped == 1 ? "" : "s") omitted)")
+        thr = isnothing(epsilon_threshold) || epsilon_threshold <= 0 ? nothing : log10(epsilon_threshold)
+        vals = vcat(acc, rej)
+        isempty(vals) && error("No positive proposal distances to plot on a log scale for generation $t.")
+    end
+
+    lo, hi = extrema(vals)
+    nbins  = clamp(round(Int, sqrt(length(vals))), 10, 50)
+    #! A single distinct value has no range to bin; widen it so the bar is visible.
+    hi <= lo && (lo -= 0.5; hi += 0.5)
+    w = (hi - lo) / nbins
+
+    edges = if isnothing(thr) || !(lo < thr < hi)
+        collect(range(lo, hi; length = nbins + 1))
+    else
+        #! Uniform width, ε exactly on an edge, covering [lo, hi].
+        k_left  = max(ceil(Int, (thr - lo) / w), 1)
+        k_right = max(ceil(Int, (hi - thr) / w), 1)
+        collect(thr .+ w .* (-k_left:k_right))
+    end
+
+    nb = length(edges) - 1
+    acc_counts = zeros(Float64, nb)
+    rej_counts = zeros(Float64, nb)
+
+    #! Acceptance is `distance <= ε`, so a distance exactly *equal* to ε was accepted — but
+    #! `searchsortedlast` puts it in the bin that *starts* at ε, which is the first rejected bin.
+    #! Constraining each series to its own side of the threshold edge makes the two provably disjoint
+    #! instead of almost disjoint, which is the whole point of putting ε on an edge.
+    split = isnothing(thr) ? nothing : searchsortedlast(edges, thr)
+    for x in acc
+        i = clamp(searchsortedlast(edges, x), 1, nb)
+        isnothing(split) || (i = min(i, max(split - 1, 1)))
+        acc_counts[i] += 1
+    end
+    for x in rej
+        i = clamp(searchsortedlast(edges, x), 1, nb)
+        isnothing(split) || (i = max(i, min(split, nb)))
+        rej_counts[i] += 1
+    end
+    return _DistanceData(edges, acc_counts, rej_counts, thr, max_epsilon_accepted, t,
+                         logscale, extra)
+end
+
+@recipe function f(dd::_DistanceData)
+    mids = [(dd.edges[i] + dd.edges[i+1]) / 2 for i in 1:(length(dd.edges) - 1)]
+    step = length(dd.edges) > 1 ? dd.edges[2] - dd.edges[1] : 1.0
+
+    legend --> :topright
+    xlabel --> (dd.logscale ? "log10(distance)" : "distance")
+    ylabel --> "proposals"
+    title  --> "Generation $(dd.t) proposal distances$(dd.note)"
+
+    if any(>(0), dd.accepted_counts)
+        @series begin
+            seriestype := :bar
+            bar_width  := step
+            linewidth  := 0
+            fillcolor  := :seagreen
+            label      := "passed ε ($(Int(sum(dd.accepted_counts))))"
+            mids, dd.accepted_counts
+        end
+    end
+    if any(>(0), dd.rejected_counts)
+        @series begin
+            seriestype := :bar
+            bar_width  := step
+            linewidth  := 0
+            fillcolor  := :indianred
+            label      := "rejected ($(Int(sum(dd.rejected_counts))))"
+            mids, dd.rejected_counts
+        end
+    end
+    if !isnothing(dd.epsilon_threshold)
+        #! `:path`, not `:vline` — `sensitivity_visualize.jl` keeps to `:bar`/`:scatter`/`:path` so a
+        #! recipe does not require a particular backend's series types.
+        @series begin
+            seriestype := :path
+            linestyle  := :dash
+            linewidth  := 2
+            linecolor  := :black
+            label      := "threshold"
+            top = maximum(vcat(dd.accepted_counts, dd.rejected_counts); init=1.0)
+            [dd.epsilon_threshold, dd.epsilon_threshold], [0.0, top]
+        end
+    end
+end
+
+#! Splits one generation's proposal frame into the two series. Falls back to the accepted distances
+#! alone for a run recorded before proposal distances were kept — a degraded plot beats an error, and
+#! the note says which one you are looking at.
+function _distanceSeries(proposal_distances::Union{Nothing,DataFrame},
+                         accepted_distances::Vector{Float64})
+    if isnothing(proposal_distances) || nrow(proposal_distances) == 0
+        return Float64.(accepted_distances), Float64[],
+               " — rejected distances were not recorded for this run"
+    end
+    acc = Float64.(proposal_distances[proposal_distances.accepted, :distance])
+    rej = Float64.(proposal_distances[.!proposal_distances.accepted, :distance])
+    #! `accepted` means "passed ε", which is not the same as "kept as a particle": with
+    #! `accept_overflow=false` a batch can overshoot `population_size`, and the surplus passed ε but
+    #! was trimmed. The green bars are therefore the honest picture of the *acceptance process*, and
+    #! can outnumber the posterior. Say so on the plot rather than leaving the reader to reconcile
+    #! the legend against a particle count the figure never shows.
+    #! `n_kept == 0` means the caller did not supply a particle set to compare against, not that a
+    #! generation kept nothing — so there is nothing to reconcile and no note to write.
+    n_kept = length(accepted_distances)
+    note = (n_kept > 0 && length(acc) > n_kept) ?
+        " — $(length(acc)) passed ε, $(n_kept) kept as particles (overflow trimmed)" : ""
+    return acc, rej, note
+end
+
 """
     plot(result::ABCResult, style::Symbol; kwargs...)
 
@@ -598,7 +770,8 @@ Dispatch to specialized visualization recipes for `ABCResult`:
                    space               = :target,
                    generation          = nothing,
                    show_particles      = false,
-                   aggregate_duplicates = true)
+                   aggregate_duplicates = true,
+                   logscale            = false)
     isempty(result.generations) && error("No generations in ABCResult.")
     T = length(result.generations)
     resolved_gen = if isnothing(generation)
@@ -651,8 +824,13 @@ Dispatch to specialized visualization recipes for `ABCResult`:
                         result.method.population_size, note,
                         show_particles, aggregate_duplicates)
 
+    elseif style === :distances
+        gen = result.generations[resolved_gen]
+        acc, rej, note = _distanceSeries(gen.proposal_distances, gen.distances)
+        _buildDistanceData(acc, rej, gen.epsilon_threshold, gen.max_epsilon_accepted,
+                           resolved_gen; logscale=logscale, note=note)
     else
-        error("Unknown ABCResult plot style :$style. Use :ridgeline or :transition.")
+        error("Unknown ABCResult plot style :$style. Use :ridgeline, :transition or :distances.")
     end
 end
 
@@ -673,7 +851,8 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
 @recipe function f(cal::Calibration, style::Symbol;
                    generation           = nothing,
                    show_particles       = false,
-                   aggregate_duplicates = true)
+                   aggregate_duplicates = true,
+                   logscale             = false)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
     csv_names = sort(filter(f -> occursin(r"^generation_\d+\.csv$", f), readdir(gen_dir)))
@@ -742,7 +921,23 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
                         rej_df_filt, pnames,
                         pop_size, note,
                         show_particles, aggregate_duplicates)
+    elseif style === :distances
+        t = isnothing(generation) ? length(csv_names) : Int(generation)
+        prop_path = _findGenerationFile(gen_dir, t, "_proposals.csv")
+        prop_df = isnothing(prop_path) ? nothing :
+            CSV.read(prop_path, DataFrame;
+                     types=Dict(:monad_id => Int, :distance => Float64, :accepted => Bool))
+        gen_name = only_or_nothing(filter(f -> occursin(Regex("^generation_0*$(t)\\.csv\$"), f), csv_names))
+        isnothing(gen_name) && error("No generation $(t) for Calibration($(cal.id)).")
+        _, _, raw = _readGenCSV(gen_name)
+        acc_dists = hasproperty(raw, :distance) ? Float64.(raw[!, :distance]) : Float64[]
+        meta = _calibrationGenerationMeta(cal, t)
+        acc, rej, note = _distanceSeries(prop_df, acc_dists)
+        _buildDistanceData(acc, rej, get(meta, "epsilon_threshold", nothing),
+                           Float64(get(meta, "max_epsilon_accepted",
+                                       get(meta, "epsilon", NaN))),
+                           t; logscale=logscale, note=note)
     else
-        error("Unknown Calibration plot style :$style. Use :ridgeline or :transition.")
+        error("Unknown Calibration plot style :$style. Use :ridgeline, :transition or :distances.")
     end
 end

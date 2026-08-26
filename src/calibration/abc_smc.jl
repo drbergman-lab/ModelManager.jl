@@ -349,6 +349,18 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
     t_start = length(generations) + 1
     snap_active = !isnothing(k_base_eff)
 
+    #! `max_nr_populations` is a cumulative cap, not a per-resume budget, so `t_start:cap` is empty
+    #! whenever a resume asks for no more generations than already exist — and an empty range runs
+    #! nothing, silently. The caller cannot otherwise tell "already finished" from "my override was
+    #! too small to do anything", since both return the same generations unchanged.
+    if t_start > method.max_nr_populations && !isempty(generations)
+        @warn "Resuming a calibration that already has $(length(generations)) generation" *
+              "$(length(generations) == 1 ? "" : "s") with max_nr_populations=" *
+              "$(method.max_nr_populations): no further generations will run, since the cap counts " *
+              "all generations rather than only new ones. Pass a larger max_nr_populations to " *
+              "continue the run."
+    end
+
     # mid_gen_additions: new grid snaps from the current generation, used within the
     # generation for lightweight intra-generation reuse and absorbed into the bank
     # between generations via _updateBankFromGeneration.
@@ -506,7 +518,8 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
         accepted  = _acceptFirstGeneration(proposals, results)
         weights   = fill(1.0 / length(accepted), length(accepted))
         _updateBudget!(budget, budget_hit, M, method.max_evaluations)
-        return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names)
+        return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names;
+                                      proposal_distances=_firstGenerationProposals(results))
     end
 
     # ── CDF-grid snapping: snap each Sobol point, accumulate N proposals. ───────
@@ -528,8 +541,13 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
     _updateMidGenAdditions!(mid_gen_additions, proposals, results, bank, param_names)
     _updateBudget!(budget, budget_hit, M, method.max_evaluations)
     weights = fill(1.0 / length(accepted), length(accepted))
-    return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names)
+    return _buildGenerationResult(1, accepted, weights, M, length(accepted), param_names;
+                                  proposal_distances=_firstGenerationProposals(results))
 end
+
+#! Generation 1 has no threshold, so every proposal that produced a real distance was accepted.
+_firstGenerationProposals(results) =
+    _proposalFrame([_proposalRow(d, mid, true) for (d, mid) in results if !ismissing(d)])
 
 """
     _acceptFirstGeneration(proposals, results) → Vector{_ParticleResult}
@@ -612,6 +630,7 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                         k_eff=snap_active ? k_eff : nothing)
     radius      = snap_active ? _bankBoxRadius(k_eff)      : 0.0
 
+    proposal_rows = NamedTuple{(:monad_id, :distance, :accepted), Tuple{Int,Float64,Bool}}[]
     while length(accepted) < method.population_size
         n_needed     = method.population_size - length(accepted)
         n_to_propose = max(n_needed, ceil(Int, n_needed / acceptance_rate_est))
@@ -656,10 +675,14 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
             #! nothing to compare against ε — the particle is rejected outright.
             if !ismissing(distance) && distance <= epsilon
                 n_accepted_this_round += 1
+                push!(proposal_rows, _proposalRow(distance, metadata, true))
                 can_add = method.accept_overflow || length(accepted) < method.population_size
                 can_add && push!(accepted, _ParticleResult(proposals[i][1], distance, metadata))
-            elseif !isnothing(rejected_coords)
-                push!(rejected_coords, proposals[i][1])
+            else
+                #! `else` with an inner guard rather than `elseif`, so a `missing`-distance proposal
+                #! still reaches `rejected_coords` exactly as before while contributing no row here.
+                ismissing(distance) || push!(proposal_rows, _proposalRow(distance, metadata, false))
+                isnothing(rejected_coords) || push!(rejected_coords, proposals[i][1])
             end
         end
         n_accepted_total += n_accepted_this_round
@@ -680,7 +703,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
     #! only when `epsilon_quantile == 1.0`.
     return _buildGenerationResult(t, accepted, weights, n_evaluations, n_accepted_total,
                                   param_names; rejected_proposals=rejected_df,
-                                  epsilon_threshold=epsilon)
+                                  epsilon_threshold=epsilon,
+                                  proposal_distances=_proposalFrame(proposal_rows))
 end
 
 ################## Sampling ##################
@@ -987,6 +1011,23 @@ function _adaptEpsilon(distances::Vector{Float64}, quantile_val::Float64,
                         minimum_epsilon::Float64)
     return max(minimum_epsilon, quantile(distances, quantile_val))
 end
+
+#! Every proposal that produced a real distance, accepted or not. `missing` distances are left out:
+#! they mean the monad had no successful simulation, which is not a distance and cannot be binned —
+#! those monad IDs are already recorded in the generation's failed-monads file. Keeping them out also
+#! keeps `distance` a plain `Float64` column, so the reader needs no type hint.
+#!
+#! `accepted` means "passed ε", not "ended up in the posterior". With `accept_overflow=false` a
+#! particle can pass ε and still be dropped because the batch overshot `population_size`; recording it
+#! as accepted describes the acceptance *process*, which is what the histogram is about. So
+#! `sum(accepted)` equals `n_accepted_total` and can exceed the posterior's row count.
+function _proposalRow(distance, metadata, accepted::Bool)
+    mid = metadata isa Integer ? Int(metadata) : 0
+    return (monad_id = mid, distance = Float64(distance), accepted = accepted)
+end
+
+_proposalFrame(rows) = isempty(rows) ?
+    DataFrame(monad_id = Int[], distance = Float64[], accepted = Bool[]) : DataFrame(rows)
 
 ################## Result Construction ##################
 

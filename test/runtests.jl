@@ -3730,11 +3730,75 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     ModelManager._failedSimulationsPath(cal, 2, 10)) == [5, 6, 7]
                 @test ModelManager.constituentIDs(
                     ModelManager._failedMonadsPath(cal, 2, 10)) == [11, 12]
-                # Zero-padded generation tag, alongside the existing monads record.
+                # An existing record for that generation wins over a recomputed name, whatever
+                # padding it carries. Without this, a generation retried after a resume raised
+                # max_nr_populations would split its failures across two differently-named files,
+                # and nothing scans for these — the old ones would simply be lost.
                 @test basename(ModelManager._failedSimulationsPath(cal, 2, 100)) ==
-                      "generation_002_failed_simulations.csv"
+                      "generation_02_failed_simulations.csv"
                 @test basename(ModelManager._failedMonadsPath(cal, 2, 100)) ==
-                      "generation_002_failed_monads.csv"
+                      "generation_02_failed_monads.csv"
+                # Appending under the wider cap lands in that same file rather than a new one.
+                ModelManager._recordBatchFailures(cal, 2, 100, :none, Set{Int}(), [8], [13])
+                @test ModelManager.constituentIDs(
+                    ModelManager._failedSimulationsPath(cal, 2, 100)) == [5, 6, 7, 8]
+                @test !isfile(joinpath(ModelManager.calibrationFolder(cal), "generations",
+                                       "generation_002_failed_simulations.csv"))
+
+                # With no existing record, the computed padding does apply.
+                @test basename(ModelManager._failedSimulationsPath(cal, 7, 100)) ==
+                      "generation_007_failed_simulations.csv"
+                @test basename(ModelManager._failedSimulationsPath(cal, 7, 10)) ==
+                      "generation_07_failed_simulations.csv"
+            end
+
+            @testset "generation filename padding is normalized and never assumed" begin
+                cal  = ModelManager.createCalibration("ABC-SMC"; description="padding")
+                gdir = joinpath(ModelManager.calibrationFolder(cal), "generations")
+                cdir = joinpath(gdir, "generation_cdfs")
+                mkpath(cdir)
+
+                # A directory left mixed-width by a resume that raised max_nr_populations.
+                for (n, w) in ((1, 2), (2, 2), (3, 3), (10, 3))
+                    tag = lpad(string(n), w, '0')
+                    for suffix in (".csv", ".toml", "_monads.csv", "_proposals.csv")
+                        touch(joinpath(gdir, "generation_$(tag)$(suffix)"))
+                    end
+                    touch(joinpath(cdir, "generation_$(tag).csv"))
+                end
+
+                # Reading never assumes a width: each generation is found at whichever it carries.
+                for n in (1, 2, 3, 10)
+                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, "_monads.csv"))
+                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, "_proposals.csv"))
+                end
+                @test isnothing(ModelManager._findGenerationFile(gdir, 4, "_monads.csv"))
+
+                # Raising the cap widens everything to three digits, cdfs included.
+                @test ModelManager._normalizeGenerationPadding!(cal, 100) > 0
+                for n in (1, 2, 3, 10)
+                    @test isfile(joinpath(gdir, "generation_$(lpad(n, 3, '0'))_monads.csv"))
+                    @test isfile(joinpath(cdir, "generation_$(lpad(n, 3, '0')).csv"))
+                end
+                @test !isfile(joinpath(gdir, "generation_01_monads.csv"))
+                # Idempotent.
+                @test ModelManager._normalizeGenerationPadding!(cal, 100) == 0
+
+                # Lowering the cap narrows back, but only to what the existing generations need:
+                # generation 10 holds the width at 2 however small the cap gets.
+                ModelManager._normalizeGenerationPadding!(cal, 3)
+                for n in (1, 2, 3, 10)
+                    @test isfile(joinpath(gdir, "generation_$(lpad(n, 2, '0'))_monads.csv"))
+                end
+                @test !isfile(joinpath(gdir, "generation_001_monads.csv"))
+
+                # The cdfs directory is never itself renamed — "cdfs" is not digits.
+                @test isdir(cdir)
+
+                # Whatever the width, the files are still discoverable by index.
+                for n in (1, 2, 3, 10)
+                    @test !isnothing(ModelManager._findGenerationFile(gdir, n, ".toml"))
+                end
             end
 
             @testset "reusability filter — started or completed simulations" begin
@@ -4442,6 +4506,114 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test_throws ErrorException apply(ModelManager._GSABarData(String[], [ModelManager._GSABarGroup("f", Float64[], 1.0, nothing)]))
             @test_throws ErrorException apply(ModelManager._GSAViolinData(String[], [("f", zeros(0, 0))]))
             @test_throws ErrorException apply(ModelManager._GSAScatterData(String[], [("f", Float64[], Float64[])]))
+        end
+    end
+
+    @testset "calibration plot recipes" begin
+        apply(d) = RecipesBase.apply_recipe(Dict{Symbol,Any}(), d)
+        nseries(applied) = length(applied)
+
+        @testset "distance distribution: binning" begin
+            # Accepted below the threshold, rejected above — the shape the plot exists to show.
+            acc = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+            rej = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
+            dd  = ModelManager._buildDistanceData(acc, rej, 0.5, 0.5, 3)
+
+            # Uniform width, with the threshold falling exactly on a bin edge.
+            w = dd.edges[2] - dd.edges[1]
+            @test all(isapprox(dd.edges[i+1] - dd.edges[i], w; atol=1e-9)
+                      for i in 1:(length(dd.edges) - 1))
+            @test any(e -> isapprox(e, 0.5; atol=1e-12), dd.edges)
+
+            # The property the shared binning exists for: the two series never share a bin. A
+            # distance exactly equal to ε was accepted (acceptance is `<=`), but searchsortedlast
+            # puts it in the bin *starting* at ε, so the split is enforced rather than assumed.
+            acc_bins = findall(>(0), dd.accepted_counts)
+            rej_bins = findall(>(0), dd.rejected_counts)
+            @test isempty(intersect(acc_bins, rej_bins))
+            @test maximum(acc_bins) < minimum(rej_bins)
+
+            # Nothing is lost or double-counted.
+            @test sum(dd.accepted_counts) == length(acc)
+            @test sum(dd.rejected_counts) == length(rej)
+
+            # Two bar series plus the threshold line.
+            @test nseries(apply(dd)) == 3
+        end
+
+        @testset "distance distribution: degenerate and log cases" begin
+            acc = [0.1, 0.2, 0.3]
+            # Generation 1 has no threshold: one series, no threshold line.
+            d1 = ModelManager._buildDistanceData(acc, Float64[], nothing, 0.3, 1)
+            @test sum(d1.accepted_counts) == length(acc)
+            @test isnothing(d1.epsilon_threshold)
+            @test nseries(apply(d1)) == 1
+
+            # A single distinct value still bins.
+            dsingle = ModelManager._buildDistanceData([0.4, 0.4], Float64[], nothing, 0.4, 1)
+            @test sum(dsingle.accepted_counts) == 2
+
+            # mseDistance legitimately returns 0.0; log10(0) is -Inf, so it is dropped and reported.
+            dl = ModelManager._buildDistanceData([0.0, 0.01, 0.1], [1.0, 10.0], 0.1, 0.1, 2;
+                                                 logscale=true)
+            @test occursin("non-positive", dl.note)
+            @test sum(dl.accepted_counts) == 2      # the 0.0 is gone, the other two remain
+
+            # Empty input is an error with a clear message, not a BoundsError.
+            @test_throws ErrorException ModelManager._buildDistanceData(Float64[], Float64[],
+                                                                        nothing, 0.0, 1)
+        end
+
+        @testset "distance distribution: legacy runs degrade" begin
+            # A run recorded before proposal distances were kept still plots, from the accepted
+            # distances alone, and says so.
+            acc, rej, note = ModelManager._distanceSeries(nothing, [0.1, 0.2])
+            @test acc == [0.1, 0.2]
+            @test isempty(rej)
+            @test occursin("not recorded", note)
+
+            # With a frame, the two series are split on the accepted flag.
+            frame = DataFrame(monad_id = [1, 2, 3], distance = [0.1, 0.5, 0.9],
+                              accepted = [true, true, false])
+            # No particle set supplied, so there is nothing to reconcile and no note.
+            a, r, n = ModelManager._distanceSeries(frame, Float64[])
+            @test a == [0.1, 0.5]
+            @test r == [0.9]
+            @test isempty(n)
+
+            # Counts agree with the posterior: still no note.
+            _, _, n_ok = ModelManager._distanceSeries(frame, [0.1, 0.5])
+            @test isempty(n_ok)
+
+            # More proposals passed ε than were kept as particles — accept_overflow=false trimmed the
+            # surplus. The green bars legitimately outnumber the posterior, so the plot says so.
+            over = DataFrame(monad_id = [1, 2, 3, 4], distance = [0.1, 0.2, 0.3, 0.9],
+                             accepted = [true, true, true, false])
+            a_o, r_o, n_o = ModelManager._distanceSeries(over, [0.1, 0.2])
+            @test length(a_o) == 3          # all three flagged accepted are plotted as accepted
+            @test r_o == [0.9]
+            @test occursin("3 passed ε", n_o)
+            @test occursin("2 kept as particles", n_o)
+            @test occursin("overflow trimmed", n_o)
+        end
+
+        @testset "existing calibration recipes still apply" begin
+            # None of these four had any coverage; these are smoke tests that the recipes build a
+            # series list rather than throwing, plus the guards for empty input.
+            pnames = ["alpha", "beta"]
+            df  = DataFrame(alpha = [0.1, 0.2, 0.3], beta = [1.0, 2.0, 3.0])
+            wts = [0.2, 0.3, 0.5]
+
+            corner = ModelManager._CornerPlotData(df, wts)
+            @test nseries(apply(corner)) > 0
+            @test_throws ErrorException apply(ModelManager._CornerPlotData(DataFrame(), Float64[]))
+
+            ridge = ModelManager._RidgelineData([df, df], [wts, wts], nothing, nothing, pnames)
+            @test nseries(apply(ridge)) > 0
+
+            trans = ModelManager._TransitionData(df, wts, df, wts, nothing, pnames, 3, "",
+                                                 false, true)
+            @test nseries(apply(trans)) > 0
         end
     end
 
@@ -5341,6 +5513,34 @@ end
 # longer renders the private API either, so ModelManager's own build would catch this too —
 # but only in CI's `docs` job, and only for names that exist. This runs with the ordinary
 # test suite and needs no docs build. See CLAUDE.md, "Docstring cross-references".
+# Anything between a docstring and the definition it documents makes Julia drop the docstring
+# silently: it is simply absent from `Docs.meta`, with no warning at any point. A comment does it —
+# which the `#!` convention walks straight into, since a rationale comment naturally wants to sit
+# right above the thing it explains, and the fix is to put it above the *docstring* instead. So does
+# a bare blank line, with no comment involved at all. This is a source scan rather than a
+# `Docs.meta` check because the failure mode is an absence, and you cannot look up what is not there.
+@testset "nothing separates a docstring from its definition" begin
+    src_dir = joinpath(pkgdir(ModelManager), "src")
+    #! A closing `"""` alone on its line, then any run of blank or comment lines, then a definition.
+    pattern = r"^\"\"\"[ \t]*\n(?:[ \t]*(?:#[^\n]*)?\n)+(?=[ \t]*[^\s#])"m
+
+    detached = String[]
+    for (root, _, files) in walkdir(src_dir), file in files
+        endswith(file, ".jl") || continue
+        path = joinpath(root, file)
+        text = read(path, String)
+        for m in eachmatch(pattern, text)
+            line = count(==('\n'), text[1:m.offset]) + 1
+            push!(detached, "$(relpath(path, src_dir)):$(line)")
+        end
+    end
+
+    isempty(detached) ||
+        @info "Docstrings detached from their definitions by intervening blank or comment lines:\n" *
+              join(detached, "\n")
+    @test isempty(detached)
+end
+
 #! Julia 1.10 (our compat floor) has neither `Base.ispublic` nor the `public` keyword, so
 #! `@compat public` is a no-op there and *every* name would look private. The check is only
 #! meaningful — and only runnable — on 1.11+. Docs CI must therefore run 1.11+ as well, or
