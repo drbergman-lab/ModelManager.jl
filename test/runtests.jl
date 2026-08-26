@@ -4170,6 +4170,54 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test p2.inputs == ref.inputs
             end
 
+            @testset "run dispatches on the calibration structs" begin
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_nonzero_ss, mseDistance)
+
+                # Fresh run through `run`, method first, mirroring run(::GSAMethod, inputs, avs).
+                res = run(ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0), prob)
+                waitForDiagnostics()
+                @test res isa ABCResult
+                @test length(res.generations) == 1
+
+                # Continuing one through `run`. Calibration is deliberately not an AbstractTrial,
+                # which is what keeps this unambiguous against run(::AbstractTrial).
+                @test !(res.calibration isa ModelManager.AbstractTrial)
+                res2 = run(res.calibration; problem=prob, max_nr_populations=2)
+                waitForDiagnostics()
+                @test res2 isa ABCResult
+                @test res2.calibration.id == res.calibration.id
+                @test res2.method.max_nr_populations == 2
+                @test res2.method.population_size    == 4   # patched, not reset
+
+                # And with an explicit method object, positionally.
+                res3 = run(res.calibration, ABCSMC(population_size=4, max_nr_populations=3,
+                                                   minimum_epsilon=0.0); problem=prob)
+                waitForDiagnostics()
+                @test res3 isa ABCResult
+            end
+
+            @testset "epsilon_schedule on resume is warned about when too short" begin
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_nonzero_ss, mseDistance)
+                base = runCalibration(prob, ABCSMC(population_size=4, max_nr_populations=2,
+                                                   minimum_epsilon=0.0);
+                                      description="schedule warn")
+                waitForDiagnostics()
+                n_done = length(base.generations)
+                @test n_done >= 1
+
+                # A schedule sized for the remaining generations, not the whole run: it is indexed by
+                # absolute generation, so every new generation would silently use epsilon_quantile.
+                @test_logs (:warn, r"epsilon_schedule has 1 entries") match_mode=:any begin
+                    resumeCalibration(base.calibration; problem=prob,
+                                      max_nr_populations=n_done + 1, epsilon_schedule=[0.5])
+                end
+                waitForDiagnostics()
+            end
+
             @testset "_methodWithOverrides patches rather than rebuilds" begin
                 saved = ABCSMC(population_size=64, max_nr_populations=10, minimum_epsilon=1e-4,
                                epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel(),

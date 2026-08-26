@@ -1137,6 +1137,25 @@ new definition is used silently. Passing `problem=` in this case forces full val
 - Any `ABCSMC` field may be given as a keyword; it patches the saved value for that one field.
   Whenever the effective settings differ from `method.toml`, the file is rewritten to match and the
   changed keys are reported, so a later resume does not revert to the original run's values.
+
+# What a changed setting does to a resumed run
+
+Nothing already on disk is recomputed — a resume only ever appends generations — so a changed setting
+takes effect from the next generation onward. What that means in practice differs by field:
+
+| Setting | Effect from the next generation |
+|---|---|
+| `max_nr_populations` | New total cap. It counts *all* generations, not just new ones. |
+| `minimum_epsilon`, `min_acceptance_rate`, `min_epsilon_decrease`, `min_ess_fraction` | Checked after each new generation, as usual. |
+| `epsilon_quantile` | Sets the next threshold from the previous generation's accepted distances. |
+| `accept_overflow`, `max_evaluations`, `store_rejected` | Apply per generation; no interaction with what came before. |
+| `population_size` | New generations get the new size; earlier ones keep theirs. Legal — weights are normalised per generation, so resampling from a differently-sized parent is well defined — but the run ends up with generations of different sizes. |
+| `perturbation_kernel` | Refitted from the previous generation each time, so every generation stays internally consistent. The proposal simply changes from here on. |
+| `cdf_grid_k` | Resolved once when the loop starts, so turning snapping on or off applies only to new generations. Earlier particles were never snapped, so bank reuse differs either side of the resume. |
+| `epsilon_schedule` | **Indexed by absolute generation**, not by position within the resumed segment: generation `t` reads `epsilon_schedule[t - 1]`. A schedule supplied on resume must therefore cover the whole run. One too short for the generations already completed is warned about, and those generations fall back to the quantile rule. |
+
+No setting is refused. A generation is the unit of change, and none of these can take effect part-way
+through one — so the honest description is "from the next generation", not "immediately".
 - `run_kwargs`: Forwarded to each `run(sampling; ...)` call.
 - `progress`: Console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`, `:bar`);
   same semantics as in [`runABC`](@ref).
@@ -1182,6 +1201,19 @@ function resumeCalibration(calibration::Calibration,
         method
     end
 
+    #! The one setting whose misalignment would otherwise be silent. `epsilon_schedule` is read as
+    #! `epsilon_schedule[t - 1]` behind a length guard, so a schedule sized for the *remaining*
+    #! generations rather than the whole run does not error — those generations quietly fall back to
+    #! the quantile rule, and the run looks like it honoured a schedule it never saw.
+    if !isnothing(m.epsilon_schedule)
+        n_done = length(_generationIndices(joinpath(calibrationFolder(calibration), "generations")))
+        length(m.epsilon_schedule) <= n_done && @warn "epsilon_schedule has " *
+            "$(length(m.epsilon_schedule)) entries but $(n_done) generation" *
+            "$(n_done == 1 ? "" : "s") already exist, and it is indexed by absolute generation " *
+            "(generation t reads entry t-1). Every new generation will fall back to " *
+            "epsilon_quantile. Supply a schedule covering the whole run to avoid this."
+    end
+
     changed = _persistEffectiveMethod(calibration, m)
     isempty(changed) || @info "Updated method.toml to the settings this resume is running with: " *
                               "$(join(sort(changed), ", ")). The file described the original run, " *
@@ -1225,6 +1257,28 @@ end
 ABC-specific alias for [`resumeCalibration`](@ref); every argument has the same meaning.
 """
 resumeABC(calibration::Calibration; method::Union{Nothing,ABCSMC}=nothing, kwargs...) =
+    resumeCalibration(calibration, method; kwargs...)
+
+#! `Calibration` is deliberately not an `AbstractTrial` (see the containment discussion in
+#! `calibration.jl`), which is what makes `run(::Calibration)` unambiguous against `run(::AbstractTrial)`.
+#! Method-first mirrors `run(::GSAMethod, inputs, avs)`, and returning an `ABCResult` mirrors that
+#! method returning a `GSASampling` — a `run` that hands back an analysis object is already the
+#! precedent here, not a new idea.
+"""
+    run(method::ABCSMC, problem::CalibrationProblem; kwargs...) → ABCResult
+    run(calibration::Calibration[, method]; kwargs...) → ABCResult
+
+Run or continue a calibration through `run`, alongside `run(::AbstractTrial)` and
+`run(::GSAMethod, ...)`.
+
+The first form starts a fresh run and is `runCalibration(problem, method)`. The second continues an
+existing one and is `resumeCalibration(calibration, method)`; as there, an `ABCSMC` field passed as a
+keyword patches the saved method rather than replacing it.
+"""
+run(method::ABCSMC, problem::CalibrationProblem; kwargs...) =
+    runCalibration(problem, method; kwargs...)
+
+run(calibration::Calibration, method::Union{Nothing,ABCSMC}=nothing; kwargs...) =
     resumeCalibration(calibration, method; kwargs...)
 
 """

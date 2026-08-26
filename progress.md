@@ -3284,6 +3284,25 @@ reasoning as upgrading a generation TOML on read, and the changed keys are repor
 silent. Comparison is on the serialised dict rather than the struct, so `_saveMethod` was split into
 `_methodDict` plus a writer.
 
+**Everything flows through `run` now.** `run(method::ABCSMC, problem)` and
+`run(calibration[, method])` sit beside `run(::AbstractTrial)` and `run(::GSAMethod, ...)`. Two prior
+decisions made this free rather than fiddly: `run(::GSAMethod, ...)` already returns an analysis object
+(`GSASampling`), so returning an `ABCResult` is precedent rather than novelty; and `Calibration` was
+deliberately kept *out* of the containment hierarchy in #32, which is exactly what makes
+`run(::Calibration)` unambiguous against `run(::AbstractTrial)`. Method-first matches GSA.
+
+**What a changed setting actually does on resume**, since "patches the saved method" says nothing about
+whether the patch is meaningful. A resume only appends generations, so every change takes effect from the
+next generation — a generation is the unit of change and nothing can take effect part-way through one.
+Most fields are therefore uninteresting: the cap, the four stopping criteria, `epsilon_quantile`,
+`accept_overflow`, `max_evaluations`, `store_rejected`. Three deserve naming: `population_size` leaves the
+run with generations of different sizes (legal, since weights normalise per generation, but worth knowing);
+`cdf_grid_k` is resolved once at loop entry, so snapping applies only to new generations and bank reuse
+differs either side of the resume; and `epsilon_schedule` is indexed by **absolute** generation, so a
+schedule sized for the remaining generations silently falls through the length guard to the quantile rule.
+That last one is the only silent failure among the thirteen, so it now warns. Nothing is refused — the
+right response to "can I change this?" is a description, not a veto.
+
 **On not deprecating `resumeABC`.** The brief proposed deprecating it in favour of a method-agnostic
 `resumeCalibration`, which would have left `runABC` standing with no partner. The surface now has two
 complete pairs — `runCalibration`/`resumeCalibration` reading like `run(::GSAMethod, ...)`, and
