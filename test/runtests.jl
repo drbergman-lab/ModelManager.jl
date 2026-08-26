@@ -4194,6 +4194,36 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                                    minimum_epsilon=0.0); problem=prob)
                 waitForDiagnostics()
                 @test res3 isa ABCResult
+
+                # The bare form: run(::Calibration) with nothing else, reloading both the problem
+                # and the method from disk. This is the shape a session restart actually uses.
+                @test hasmethod(run, Tuple{Calibration})
+                res4 = run(res.calibration)
+                waitForDiagnostics()
+                @test res4 isa ABCResult
+                @test res4.calibration.id == res.calibration.id
+            end
+
+            @testset "a reference monad's variation cannot be overridden" begin
+                # createTrial has always refused this (no kwargs splat to carry it). GSA accepted it
+                # by accident: reference_variation_id was passed before kwargs..., and Julia lets the
+                # rightmost duplicate win, so a caller's value silently beat the reference.
+                ref = createTrial(inputs, [DiscreteVariation(:config, xp_x, 11.0)]; n_replicates=1)
+                dv  = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                other = VariationID(inputs)
+
+                @test_throws ArgumentError run(MOAT(), ref, [dv]; reference_variation_id=other)
+                @test_throws MethodError createTrial(GridVariation(), ref, [dv];
+                                                     reference_variation_id=other)
+                # The CalibrationProblem monad form likewise takes it from the reference only.
+                @test_throws MethodError CalibrationProblem(ref, [dv], Dict{String,Any}("x" => 1.0),
+                                                            _test_named_ss, mseDistance;
+                                                            reference_variation_id=other)
+                # The InputFolders forms are where a variation ID is an independent argument.
+                p = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                       _test_named_ss, mseDistance;
+                                       reference_variation_id=other)
+                @test p.reference_variation_id == other
             end
 
             @testset "epsilon_schedule on resume is warned about when too short" begin

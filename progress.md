@@ -3325,6 +3325,18 @@ Worth recording separately: `run(::GSAMethod, reference::AbstractMonad, avs; ...
 `reference_variation_id`, but only because the user's value lands rightmost in the `kwargs...` splat and
 Julia lets the rightmost duplicate win — accident, not design, and undocumented.
 
+**The accidental GSA override is now an error.** `run(::GSAMethod, reference::AbstractMonad, avs; ...)`
+passed `reference_variation_id=reference.variation_id` *before* `kwargs...`, and Julia lets the rightmost
+duplicate win, so a caller's value silently beat the reference. Undeclared and undocumented, which is the
+argument for removing rather than documenting it: `createTrial` has always refused the same thing (it has
+no splat to carry it), so the accident was the only place the package was inconsistent with itself. It now
+throws, naming the `InputFolders` form as where a variation ID is an independent argument.
+
+Checked while there: the `run(::AddVariationMethod, args...)` path forwards unrecognised keywords to
+`run(trial; kwargs...)` and thence to the simulator, so `reference_variation_id` there does not override
+anything — it just reaches the simulator as an unknown keyword. Broader issue, different from this one, and
+left alone.
+
 **On not deprecating `resumeABC`.** The brief proposed deprecating it in favour of a method-agnostic
 `resumeCalibration`, which would have left `runABC` standing with no partner. The surface now has two
 complete pairs — `runCalibration`/`resumeCalibration` reading like `run(::GSAMethod, ...)`, and
