@@ -4090,6 +4090,67 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       result1.generations[1].particles
             end
 
+            @testset "resume keeps the saved settings it was not asked to change" begin
+                # A method object supplies EVERY field, so `method=ABCSMC(max_nr_populations=15)`
+                # silently reset population_size, both epsilon controls and the kernel to their
+                # constructor defaults. Keywords patch one field and carry the rest over.
+                dv    = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob  = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                           _test_nonzero_ss, mseDistance)
+                saved = ABCSMC(population_size=6, max_nr_populations=1, minimum_epsilon=0.0,
+                               epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel())
+                base  = runCalibration(prob, saved; description="resume overrides")
+                cal   = base.calibration
+
+                # Keyword form: only the named field moves.
+                r = resumeCalibration(cal; problem=prob, max_nr_populations=2)
+                waitForDiagnostics()
+                @test r.method.max_nr_populations == 2
+                @test r.method.population_size    == 6
+                @test r.method.epsilon_quantile   ≈ 0.3
+                @test r.method.perturbation_kernel isa ComponentwiseKernel
+
+                # The rewritten method.toml holds the effective settings, so a later bare resume
+                # does not revert to the original run's cap.
+                stored = TOML.parsefile(joinpath(ModelManager.calibrationFolder(cal), "method.toml"))
+                @test stored["max_nr_populations"] == 2
+                @test stored["population_size"]    == 6
+                @test stored["epsilon_quantile"]   ≈ 0.3
+                @test stored["perturbation_kernel"]["type"] == "ComponentwiseKernel"
+
+                # An unknown setting names the valid ones instead of failing inside the constructor.
+                @test_throws ArgumentError resumeCalibration(cal; problem=prob, populaton_size=4)
+                # A method object and individual settings are two ways to say the same thing.
+                @test_throws ArgumentError resumeCalibration(cal, ABCSMC(); problem=prob,
+                                                             max_nr_populations=9)
+
+                # resumeABC is the same call under its ABC-specific name.
+                @test length(methods(resumeABC)) == 1
+                r2 = resumeABC(cal; problem=prob, max_nr_populations=3)
+                waitForDiagnostics()
+                @test r2.method.max_nr_populations == 3
+                @test r2.method.population_size    == 6
+            end
+
+            @testset "_methodWithOverrides patches rather than rebuilds" begin
+                saved = ABCSMC(population_size=64, max_nr_populations=10, minimum_epsilon=1e-4,
+                               epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel(),
+                               accept_overflow=true)
+                patched = ModelManager._methodWithOverrides(saved, (; max_nr_populations=15))
+                @test patched.max_nr_populations == 15
+                # Every other field carried over, including the non-default ones.
+                for f in setdiff(fieldnames(ABCSMC), (:max_nr_populations,))
+                    @test getfield(patched, f) == getfield(saved, f)
+                end
+                # For contrast: a fresh object keeps none of them.
+                fresh = ABCSMC(max_nr_populations=15)
+                @test fresh.population_size != saved.population_size
+                @test fresh.epsilon_quantile != saved.epsilon_quantile
+                @test !(fresh.perturbation_kernel isa ComponentwiseKernel)
+
+                @test_throws ArgumentError ModelManager._methodWithOverrides(saved, (; nope=1))
+            end
+
             # ---------- deletion ----------
             @testset "deleteSimulations" begin
                 dv   = DiscreteVariation(:config, xp_x, [50.0, 51.0])

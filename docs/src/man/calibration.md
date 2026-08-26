@@ -150,7 +150,15 @@ Calibration state is persisted (generation CSVs, the problem manifest, and `meth
 under a [`Calibration`](@ref) record in the database, so an interrupted run can be resumed:
 
 ```julia
-result = resumeABC(Calibration(calibration_id))   # no need to re-supply the problem
+result = resumeCalibration(Calibration(calibration_id))   # no need to re-supply the problem
+```
+
+`resumeABC` is the same call under its ABC-specific name, matching `runABC` against `runCalibration`.
+
+To change some of the saved settings and keep the rest, pass them as keywords:
+
+```julia
+result = resumeCalibration(Calibration(calibration_id); max_nr_populations=15)
 ```
 
 ## What a run leaves on disk
@@ -381,7 +389,7 @@ the likeliest reason otherwise-correct code trips.
 | ``Calibration failed while evaluating monad N: `summary_statistic` or `distance` raised`` | Your function threw on a monad that has output. | The original exception and backtrace follow the message. |
 | ``distance returned a T, but a `Real` is required`` | `distance` returned a `Dict`, `missing`, `nothing`, … | Return a real number. If you are guarding against missing output yourself, you no longer need to — see the table above. |
 | `simulation(s) X … have no row in the simulations table` | A monad's constituent record and the database disagree. | Run `ModelManager.databaseDiagnostics()`. This indicates corrupted bookkeeping, not a failed simulation. |
-| `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used anonymous functions, which JLD2 cannot serialize. | Pass the original problem: `resumeABC(cal; problem=my_problem)`. Define `summary_statistic`/`distance` as named functions to avoid it next time. |
+| `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used anonymous functions, which JLD2 cannot serialize. | Pass the original problem: `resumeCalibration(cal; problem=my_problem)`. Define `summary_statistic`/`distance` as named functions to avoid it next time. |
 
 ### The run isn't converging
 

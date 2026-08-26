@@ -3262,3 +3262,49 @@ before and after.
 **Deliberately kept:** the padding. Plain integer folder names (`generations/5/`) are viable now that nothing
 sorts lexicographically, but `ls` would show `1 10 2 3`. Padding costs nothing given the index is always parsed.
 
+## 2026-08-24 — Calibration entry points made symmetric, and `method=` stopped resetting the run
+
+Item 5's remainder, plus the `method=` bug that came out of the #37 path audit.
+
+**`method=` was a whole-object swap, and that is not what anyone means by it.** `resumeABC(cal;
+method=ABCSMC(max_nr_populations=15))` reads as "raise the cap"; what it did was hand the resume a fresh
+`ABCSMC` whose other twelve fields were constructor defaults. Measured on a saved method of
+`population_size=64, epsilon_quantile=0.3, minimum_epsilon=1e-4, ComponentwiseKernel`: the override
+silently produced `100, 0.5, 0.01, GaussianKernel`.
+
+The fix keeps both forms and makes the distinction explicit. A keyword *patches* — `_methodWithOverrides`
+copies the saved method and replaces only the named fields — while a method object still replaces
+wholesale, which is a legitimate thing to want. Passing both is an `ArgumentError`, since they are two
+ways to say the same thing and letting one win silently is how this started. `_methodFromKeywords` could
+not be reused: it builds a fresh `ABCSMC`, which is precisely the behaviour being fixed.
+
+**The effective method is now written back to `method.toml`.** Otherwise the file describes a run it no
+longer matches, and the *next* resume reverts to it — the override would silently un-apply. Same
+reasoning as upgrading a generation TOML on read, and the changed keys are reported so it is never
+silent. Comparison is on the serialised dict rather than the struct, so `_saveMethod` was split into
+`_methodDict` plus a writer.
+
+**On not deprecating `resumeABC`.** The brief proposed deprecating it in favour of a method-agnostic
+`resumeCalibration`, which would have left `runABC` standing with no partner. The surface now has two
+complete pairs — `runCalibration`/`resumeCalibration` reading like `run(::GSAMethod, ...)`, and
+`runABC`/`resumeABC` as the ABC shorthand — and `resumeABC` is a one-line alias, so the cost of keeping
+it is a line. Whether to retire the ABC-specific pair entirely is a separate call, and it is now a
+clean one to make because nothing depends on the asymmetry.
+
+**Two brief items turned out not to need doing.** `CalibrationParameter` and `SimulationBank` are both
+already exported, so the export-manifest gap is stale. And the `AbstractMonad` `CalibrationProblem`
+constructor's "missing" `reference_variation_id` keyword is arguably correct as-is: it takes the
+reference variation *from the monad*, which is the reason to pass a monad at all — a keyword letting you
+override it would mean passing a reference and then ignoring it. Left alone, and recorded here rather
+than silently skipped.
+
+**The duplication was real.** `runCalibration` and `resumeCalibration` shared the bank, the batch
+evaluator, the generation callback, the `_runABCSMC` call and the result construction verbatim; they
+differ only in what comes before. That tail is now `_executeCalibration`, taking `start_generations` to
+cover the difference. `_latentNamesAndPriors` splits out separately because resume needs the names
+*before* it can load generations.
+
+**The docstring guard from #37 caught me immediately** — the `#!` explaining `_executeCalibration` landed
+between its docstring and the function on the first attempt. Worth noting: the guard's value showed up
+within minutes of adding it, on new code, not on a legacy sweep.
+

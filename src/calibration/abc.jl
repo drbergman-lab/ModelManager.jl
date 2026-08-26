@@ -265,6 +265,44 @@ end
 ################## Public API ##################
 
 """
+    _latentNamesAndPriors(cps) → (Vector{String}, Vector)
+
+Flatten the latent parameter names and their priors across all calibration parameters, in order.
+"""
+_latentNamesAndPriors(cps::Vector{CalibrationParameter}) =
+    (vcat([cp.lv.latent_parameter_names for cp in cps]...),
+     vcat([cp.lv.latent_parameters      for cp in cps]...))
+
+#! The half that a fresh run and a resume share verbatim. They differ only in what comes *before* —
+#! one creates the calibration and writes the run-level files, the other loads them back and decides
+#! whether there is anything left to do — so everything from the bank onward lives here once. Keeping
+#! it in both was how the two drifted on `max_nr_populations` handling in the first place.
+"""
+    _executeCalibration(problem, calibration, method, run_kwargs; kwargs...) → ABCResult
+
+Build the bank, batch evaluator and generation callback, run the SMC loop, and wrap the result.
+"""
+function _executeCalibration(problem::CalibrationProblem, calibration::Calibration,
+                             method::ABCSMC, run_kwargs::NamedTuple;
+                             verbosity::Symbol,
+                             on_monad_failure::Symbol,
+                             start_generations::Vector{GenerationResult}=GenerationResult[])
+    cps = problem.parameters
+    param_names, priors = _latentNamesAndPriors(cps)
+
+    bank           = _buildSimulationBank(problem)
+    evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations,
+                                         run_kwargs; verbosity=verbosity,
+                                         on_monad_failure=on_monad_failure)
+    on_generation  = gen -> _saveGeneration(calibration, gen, method.max_nr_populations, cps)
+
+    generations = _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
+                             bank=bank, start_generations=start_generations,
+                             verbosity=verbosity)
+    return ABCResult(calibration, generations, cps, method)
+end
+
+"""
     runCalibration(problem::CalibrationProblem, method::ABCSMC; description="") → ABCResult
 
 Run ABC-SMC calibration. See [`ABCSMC`](@ref) for method settings.
@@ -318,20 +356,8 @@ function runCalibration(problem::CalibrationProblem, method::ABCSMC;
     _saveProblem(calibration, problem)
     _writeParametersTOML(calibration, problem.parameters)
 
-    param_names = vcat([cp.lv.latent_parameter_names for cp in problem.parameters]...)
-    priors      = vcat([cp.lv.latent_parameters      for cp in problem.parameters]...)
-    cps         = problem.parameters
-
-    bank           = _buildSimulationBank(problem)
-    evaluate_batch = _buildEvaluateBatch(problem, calibration, method.max_nr_populations,
-                                         run_kwargs; verbosity=verbosity,
-                                         on_monad_failure=on_monad_failure)
-    on_generation  = gen -> _saveGeneration(calibration, gen, method.max_nr_populations, cps)
-
-    generations = _runABCSMC(method, param_names, priors, evaluate_batch, on_generation;
-                              bank=bank, verbosity=verbosity)
-
-    return ABCResult(calibration, generations, problem.parameters, method)
+    return _executeCalibration(problem, calibration, method, run_kwargs;
+                               verbosity=verbosity, on_monad_failure=on_monad_failure)
 end
 
 """
@@ -431,6 +457,49 @@ function _methodFromKeywords(::Type{ABCSMC}, kwargs)
     return ABCSMC(; kwargs...)
 end
 
+#! On resume the *saved* method is the base and a keyword patches one field of it. `_methodFromKeywords`
+#! cannot serve here: it builds a fresh `ABCSMC`, so every field the caller did not name would revert
+#! to a constructor default rather than keeping what the run actually used — which is exactly the trap
+#! `method=ABCSMC(max_nr_populations=15)` fell into, silently resetting population size, kernel and
+#! both epsilon controls.
+"""
+    _methodWithOverrides(m::ABCSMC, kwargs) → ABCSMC
+
+Copy of `m` with the fields named in `kwargs` replaced and every other field carried over.
+"""
+function _methodWithOverrides(m::ABCSMC, kwargs)
+    unknown = setdiff(keys(kwargs), fieldnames(ABCSMC))
+    isempty(unknown) || throw(ArgumentError("""
+    Unrecognized method setting(s) on resume: $(join(unknown, ", ")).
+    Method settings are the fields of `ABCSMC`: $(join(fieldnames(ABCSMC), ", ")).
+    """))
+    return ABCSMC(; (f => get(kwargs, f, getfield(m, f)) for f in fieldnames(ABCSMC))...)
+end
+
+#! Resuming with different settings makes `method.toml` wrong about the run it describes, and the next
+#! resume would silently revert to it. Rewriting is the honest option — the same reasoning as upgrading
+#! a generation TOML on read — and the caller reports which keys moved so the change is never silent.
+"""
+    _persistEffectiveMethod(calibration, m) → Vector{String}
+
+Write `m` to `method.toml` if it differs from what is stored, returning the names of the keys that
+changed (empty when nothing did).
+"""
+function _persistEffectiveMethod(calibration::Calibration, m::ABCSMC)
+    path = joinpath(calibrationFolder(calibration), "method.toml")
+    changed = String[]
+    if isfile(path)
+        stored = TOML.parsefile(path)
+        wanted = _methodDict(m)
+        for k in union(keys(stored), keys(wanted))
+            isequal(get(stored, k, nothing), get(wanted, k, nothing)) || push!(changed, k)
+        end
+        isempty(changed) && return changed
+    end
+    _saveMethod(calibration, m)
+    return changed
+end
+
 ################## Method Persistence ##################
 
 # ── Kernel serialization ─────────────────────────────────────────────────────
@@ -492,7 +561,7 @@ Save the calibration method's settings to `method.toml` for resume support.
 The `path` form exists so tests can round-trip the real serializer in a temporary directory rather
 than reimplementing the key list.
 """
-function _saveMethod(path::String, method::ABCSMC)
+function _methodDict(method::ABCSMC)
     d = Dict{String,Any}("type" => "ABCSMC",
                          "perturbation_kernel" => _serializeKernel(method.perturbation_kernel))
     for name in _abcsmcScalarFields()
@@ -502,8 +571,12 @@ function _saveMethod(path::String, method::ABCSMC)
         isnothing(value) || (d[string(name)] = value)
     end
     isnothing(method.epsilon_schedule) || (d["epsilon_schedule"] = method.epsilon_schedule)
+    return d
+end
+
+function _saveMethod(path::String, method::ABCSMC)
     open(path, "w") do io
-        TOML.print(io, d; sorted=true)
+        TOML.print(io, _methodDict(method); sorted=true)
     end
     return path
 end
@@ -1015,7 +1088,8 @@ end
 ################## Resume — public API ##################
 
 """
-    resumeABC(calibration::Calibration;
+    resumeCalibration(calibration::Calibration, method=nothing; kwargs...)
+    resumeABC(calibration::Calibration; method=nothing, kwargs...)
               problem::Union{Nothing,CalibrationProblem}=nothing,
               method::Union{Nothing,ABCSMC}=nothing,
               run_kwargs::NamedTuple=(;)) → ABCResult
@@ -1051,7 +1125,14 @@ new definition is used silently. Passing `problem=` in this case forces full val
 # Arguments
 - `problem`: The original `CalibrationProblem`. Required when anonymous functions were
   present at save time; optional otherwise (loads from `problem.jld2`).
-- `method`: Override the saved ABCSMC settings. If `nothing`, loads from `method.toml`.
+- `method`: Replace the saved settings wholesale. If `nothing`, they are loaded from `method.toml`.
+  To change *some* settings and keep the rest, pass them as keywords instead —
+  `resumeCalibration(cal; max_nr_populations=15)` — since a method object supplies every field, so
+  any field it does not name takes a constructor default rather than the value the run used.
+  Passing both a method object and individual settings is an error.
+- Any `ABCSMC` field may be given as a keyword; it patches the saved value for that one field.
+  Whenever the effective settings differ from `method.toml`, the file is rewritten to match and the
+  changed keys are reported, so a later resume does not revert to the original run's values.
 - `run_kwargs`: Forwarded to each `run(sampling; ...)` call.
 - `progress`: Console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`, `:bar`);
   same semantics as in [`runABC`](@ref).
@@ -1066,22 +1147,41 @@ result = resumeABC(Calibration(42))
 # Re-supply the problem when anonymous functions were used
 result = resumeABC(Calibration(42); problem=my_problem)
 
-# Override max generations on resume
-result = resumeABC(Calibration(42); method=ABCSMC(max_nr_populations=15))
+# Raise the generation cap, keeping every other saved setting
+result = resumeCalibration(Calibration(42); max_nr_populations=15)
+
+# Replace the settings wholesale (every unnamed field takes its default)
+result = resumeCalibration(Calibration(42), ABCSMC(population_size=64, max_nr_populations=15))
 ```
 """
-function resumeABC(calibration::Calibration;
-                   problem::Union{Nothing,CalibrationProblem}=nothing,
-                   method::Union{Nothing,ABCSMC}=nothing,
-                   run_kwargs::NamedTuple=(;),
-                   progress::Symbol=:auto,
-                   on_monad_failure::Symbol=:reject)
+function resumeCalibration(calibration::Calibration,
+                           method::Union{Nothing,ABCSMC}=nothing;
+                           problem::Union{Nothing,CalibrationProblem}=nothing,
+                           run_kwargs::NamedTuple=(;),
+                           progress::Symbol=:auto,
+                           on_monad_failure::Symbol=:reject,
+                           kwargs...)
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
     manifest = _loadProblem(calibration)
     active_problem = _resolveResumeProblem(manifest, problem, calibration)
 
-    m = isnothing(method) ? _loadMethod(calibration) : method
+    m = if isnothing(method)
+        saved = _loadMethod(calibration)
+        isempty(kwargs) ? saved : _methodWithOverrides(saved, kwargs)
+    else
+        #! A whole method object and individual settings are two ways to say the same thing, and
+        #! silently letting one win is how `method=` came to reset every field the caller did not name.
+        isempty(kwargs) || throw(ArgumentError(
+            "resumeCalibration received both a method object and method setting(s) " *
+            "$(join(keys(kwargs), ", ")). Pass one or the other, not both."))
+        method
+    end
+
+    changed = _persistEffectiveMethod(calibration, m)
+    isempty(changed) || @info "Updated method.toml to the settings this resume is running with: " *
+                              "$(join(sort(changed), ", ")). The file described the original run, " *
+                              "so a later resume would otherwise have reverted to it."
 
     #! Before anything reads or writes a generation file, bring the directory to the current layout:
     #! move any flat-layout generation into its own folder, and re-pad folder names if the cap changed.
@@ -1092,9 +1192,8 @@ function resumeABC(calibration::Calibration;
                          "$(n_moved == 1 ? "" : "s") into per-generation folders under " *
                          "generations/, padded to match max_nr_populations=$(m.max_nr_populations)."
 
-    cps         = active_problem.parameters
-    param_names = vcat([cp.lv.latent_parameter_names for cp in cps]...)
-    priors      = vcat([cp.lv.latent_parameters      for cp in cps]...)
+    cps = active_problem.parameters
+    param_names, _ = _latentNamesAndPriors(cps)
 
     start_generations = _loadGenerations(calibration, param_names, m.max_nr_populations)
 
@@ -1107,17 +1206,22 @@ function resumeABC(calibration::Calibration;
         end
     end
 
-    bank           = _buildSimulationBank(active_problem)
-    evaluate_batch = _buildEvaluateBatch(active_problem, calibration, m.max_nr_populations,
-                                         run_kwargs; verbosity=verbosity,
-                                         on_monad_failure=on_monad_failure)
-    on_generation  = gen -> _saveGeneration(calibration, gen, m.max_nr_populations, cps)
-
-    generations = _runABCSMC(m, param_names, priors, evaluate_batch, on_generation;
-                              bank=bank, start_generations=start_generations, verbosity=verbosity)
-
-    return ABCResult(calibration, generations, active_problem.parameters, m)
+    return _executeCalibration(active_problem, calibration, m, run_kwargs;
+                               verbosity=verbosity, on_monad_failure=on_monad_failure,
+                               start_generations=start_generations)
 end
+
+#! Kept, not deprecated: `runABC` exists, so `resumeABC` should too — the pair is the ABC-specific
+#! shorthand, and `runCalibration`/`resumeCalibration` are the method-agnostic forms that read like
+#! `run(::GSAMethod, ...)`. Both pairs are complete, which is the point; an asymmetric surface where
+#! only one half of one pair survives would be the confusing outcome.
+"""
+    resumeABC(calibration::Calibration; method=nothing, kwargs...) → ABCResult
+
+ABC-specific alias for [`resumeCalibration`](@ref); every argument has the same meaning.
+"""
+resumeABC(calibration::Calibration; method::Union{Nothing,ABCSMC}=nothing, kwargs...) =
+    resumeCalibration(calibration, method; kwargs...)
 
 """
     _loadMethod(calibration::Calibration) → AbstractCalibrationMethod
