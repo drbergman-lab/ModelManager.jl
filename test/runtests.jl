@@ -4132,6 +4132,44 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test r2.method.population_size    == 6
             end
 
+            @testset "_runControlKeywords survives a second runABC method" begin
+                # It is reached only while building an error message, so `only(methods(runABC))`
+                # would replace a useful diagnostic with "Collection has multiple elements" the
+                # moment anyone overloads runABC — which the shared-study-object work will.
+                expected = (:method, :run_kwargs, :description, :tags, :progress, :on_monad_failure)
+                @test ModelManager._runControlKeywords() == expected
+                @eval ModelManager runABC(::Int) = nothing        # a throwaway overload
+                try
+                    @test length(methods(runABC)) > 1
+                    @test ModelManager._runControlKeywords() == expected
+                    # The keyword error still names the run controls rather than blowing up.
+                    dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                    prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                              _test_named_ss, mseDistance)
+                    err = try runABC(prob; populaton_size=4); nothing catch e; e end
+                    @test err isa ArgumentError
+                    @test occursin("on_monad_failure", err.msg)
+                finally
+                    #! The throwaway method stays defined for the rest of the session; harmless,
+                    #! since every other test calls runABC with a CalibrationProblem.
+                end
+            end
+
+            @testset "CalibrationProblem from a monad takes its reference variation, overridably" begin
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                ref = createTrial(inputs, [DiscreteVariation(:config, xp_x, 7.0)]; n_replicates=1)
+                obs = Dict{String,Any}("x" => 1.0)
+                # Default: the monad's own variation, which is the reason to pass a monad.
+                p1 = CalibrationProblem(ref, [dv], obs, _test_named_ss, mseDistance)
+                @test p1.reference_variation_id == ref.variation_id
+                # Overridable, matching the InputFolders constructor's keyword.
+                other = VariationID(inputs)
+                p2 = CalibrationProblem(ref, [dv], obs, _test_named_ss, mseDistance;
+                                        reference_variation_id=other)
+                @test p2.reference_variation_id == other
+                @test p2.inputs == ref.inputs
+            end
+
             @testset "_methodWithOverrides patches rather than rebuilds" begin
                 saved = ABCSMC(population_size=64, max_nr_populations=10, minimum_epsilon=1e-4,
                                epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel(),

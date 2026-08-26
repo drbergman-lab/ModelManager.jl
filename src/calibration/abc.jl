@@ -439,7 +439,11 @@ end
 #! here, and the two can never drift apart. Used only to build the error message below — the guard
 #! itself is a `setdiff` against `fieldnames(ABCSMC)`, which was always dynamic.
 function _runControlKeywords()
-    declared = Base.kwarg_decl(only(methods(runABC)))
+    #! `which`, not `only(methods(...))`. The latter throws "Collection has multiple elements" the
+    #! moment `runABC` gains a second method — and it is reached only while *building an error
+    #! message*, so the useful diagnostic would be replaced by a confusing one. Naming the
+    #! problem-taking method explicitly is stable however many overloads are added later.
+    declared = Base.kwarg_decl(which(runABC, Tuple{CalibrationProblem}))
     return Tuple(k for k in declared
                  if !(k in fieldnames(ABCSMC)) && !endswith(String(k), "..."))
 end

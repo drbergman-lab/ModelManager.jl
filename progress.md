@@ -3291,12 +3291,22 @@ complete pairs — `runCalibration`/`resumeCalibration` reading like `run(::GSAM
 it is a line. Whether to retire the ABC-specific pair entirely is a separate call, and it is now a
 clean one to make because nothing depends on the asymmetry.
 
-**Two brief items turned out not to need doing.** `CalibrationParameter` and `SimulationBank` are both
-already exported, so the export-manifest gap is stale. And the `AbstractMonad` `CalibrationProblem`
-constructor's "missing" `reference_variation_id` keyword is arguably correct as-is: it takes the
-reference variation *from the monad*, which is the reason to pass a monad at all — a keyword letting you
-override it would mean passing a reference and then ignoring it. Left alone, and recorded here rather
-than silently skipped.
+**One brief item was stale, one I first got wrong.** `CalibrationParameter` and `SimulationBank` are
+both already exported, so the export-manifest gap does not exist.
+
+The `AbstractMonad` `CalibrationProblem` constructor's missing `reference_variation_id` I initially left
+alone, reasoning that it takes the reference variation *from the monad* and a keyword overriding it would
+mean passing a reference then ignoring it. That framed it as a binary it is not: the keyword's **default**
+can be `ref.variation_id`, so behaviour is unchanged and the override merely becomes expressible. Added on
+that basis — purely additive, and it removes an asymmetry with the `InputFolders` constructor that two
+briefs were both waiting on.
+
+**`_runControlKeywords` was a landmine.** It called `only(methods(runABC))`, which throws
+`ArgumentError: Collection has multiple elements` the moment `runABC` gains a second method — and it runs
+only while *building an error message*, so a user's typo would have surfaced as that instead of the
+keyword diagnostic. Verified by injecting an overload. Now `which(runABC, Tuple{CalibrationProblem})`,
+which yields the identical tuple and is stable under any number of overloads. This gates the shared-study
+work, which adds exactly such overloads.
 
 **The duplication was real.** `runCalibration` and `resumeCalibration` shared the bank, the batch
 evaluator, the generation callback, the `_runABCSMC` call and the result construction verbatim; they

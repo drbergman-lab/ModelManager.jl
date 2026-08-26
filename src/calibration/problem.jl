@@ -77,10 +77,11 @@ end
 
 function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              observed_data,
-                             summary_statistic, distance; n_replicates::Int=1)
+                             summary_statistic, distance; n_replicates::Int=1,
+                             reference_variation_id::VariationID=ref.variation_id)
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
-                              summary_statistic, distance, n_replicates, ref.variation_id)
+                              summary_statistic, distance, n_replicates, reference_variation_id)
 end
 
 #! Defined here rather than beside `ParsedVariations` in `variations.jl`: that file is included
