@@ -303,7 +303,7 @@ function _executeCalibration(problem::CalibrationProblem, calibration::Calibrati
 end
 
 """
-    runCalibration(problem::CalibrationProblem, method::ABCSMC; description="") → ABCResult
+    runCalibration(method::ABCSMC, problem::CalibrationProblem; description="") → ABCResult
 
 Run ABC-SMC calibration. See [`ABCSMC`](@ref) for method settings.
 
@@ -329,11 +329,11 @@ saved in two forms:
 # Examples
 ```julia
 method = ABCSMC(population_size=200, max_nr_populations=5)
-result = runCalibration(problem, method)
+result = runCalibration(method, problem)
 df, weights = posterior(result)
 ```
 """
-function runCalibration(problem::CalibrationProblem, method::ABCSMC;
+function runCalibration(method::ABCSMC, problem::CalibrationProblem;
                         description::String="", tags=(), run_kwargs::NamedTuple=(;),
                         progress::Symbol=:auto,
                         on_monad_failure::Symbol=:reject)
@@ -429,7 +429,7 @@ function runABC(problem::CalibrationProblem;
             "$(join(keys(kwargs), ", ")). Pass one or the other, not both."))
         method
     end
-    return runCalibration(problem, resolved; description=description, tags=tags,
+    return runCalibration(resolved, problem; description=description, tags=tags,
                           run_kwargs=run_kwargs, progress=progress,
                           on_monad_failure=on_monad_failure)
 end
@@ -1201,17 +1201,24 @@ function resumeCalibration(calibration::Calibration,
         method
     end
 
-    #! The one setting whose misalignment would otherwise be silent. `epsilon_schedule` is read as
-    #! `epsilon_schedule[t - 1]` behind a length guard, so a schedule sized for the *remaining*
-    #! generations rather than the whole run does not error — those generations quietly fall back to
-    #! the quantile rule, and the run looks like it honoured a schedule it never saw.
+    #! The one setting whose misalignment would otherwise be silent. Generation `t` reads
+    #! `epsilon_schedule[t - 1]` behind a length guard — generation 1 consumes no entry, because it has
+    #! no threshold — so an `L`-entry schedule covers generations 2 through `L + 1` and everything past
+    #! that quietly falls back to the quantile rule. A schedule sized for the *remaining* generations
+    #! instead of the whole run therefore runs out early without erroring.
     if !isnothing(m.epsilon_schedule)
-        n_done = length(_generationIndices(joinpath(calibrationFolder(calibration), "generations")))
-        length(m.epsilon_schedule) <= n_done && @warn "epsilon_schedule has " *
-            "$(length(m.epsilon_schedule)) entries but $(n_done) generation" *
-            "$(n_done == 1 ? "" : "s") already exist, and it is indexed by absolute generation " *
-            "(generation t reads entry t-1). Every new generation will fall back to " *
-            "epsilon_quantile. Supply a schedule covering the whole run to avoid this."
+        n_done    = length(_generationIndices(joinpath(calibrationFolder(calibration), "generations")))
+        last_cov  = length(m.epsilon_schedule) + 1
+        first_new = n_done + 1
+        if last_cov < m.max_nr_populations
+            covered = last_cov < first_new ? "none of the generations this resume will run" :
+                      "generations $(first_new)–$(last_cov)"
+            @warn "epsilon_schedule has $(length(m.epsilon_schedule)) entries, which covers " *
+                  "generations 2–$(last_cov): generation t reads entry t-1, and generation 1 " *
+                  "consumes none. With $(n_done) already complete it applies to $(covered); " *
+                  "generation $(last_cov + 1) onward falls back to epsilon_quantile. It is indexed " *
+                  "by absolute generation, so a schedule supplied on resume must cover the whole run."
+        end
     end
 
     changed = _persistEffectiveMethod(calibration, m)
@@ -1271,12 +1278,12 @@ resumeABC(calibration::Calibration; method::Union{Nothing,ABCSMC}=nothing, kwarg
 Run or continue a calibration through `run`, alongside `run(::AbstractTrial)` and
 `run(::GSAMethod, ...)`.
 
-The first form starts a fresh run and is `runCalibration(problem, method)`. The second continues an
+The first form starts a fresh run and is `runCalibration(method, problem)`. The second continues an
 existing one and is `resumeCalibration(calibration, method)`; as there, an `ABCSMC` field passed as a
 keyword patches the saved method rather than replacing it.
 """
 run(method::ABCSMC, problem::CalibrationProblem; kwargs...) =
-    runCalibration(problem, method; kwargs...)
+    runCalibration(method, problem; kwargs...)
 
 run(calibration::Calibration, method::Union{Nothing,ABCSMC}=nothing; kwargs...) =
     resumeCalibration(calibration, method; kwargs...)

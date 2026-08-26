@@ -107,7 +107,7 @@ method = ABCSMC(population_size=200, perturbation_kernel=LocalNNKernel(k=15))
 ```julia
 result = runABC(problem; method=method, progress=:auto)
 # or equivalently
-result = runCalibration(problem, method)
+result = runCalibration(method, problem)
 ```
 
 `progress` controls console output: `:auto` (a live progress bar on a TTY, generation logs

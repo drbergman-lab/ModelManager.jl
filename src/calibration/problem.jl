@@ -75,13 +75,17 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                               summary_statistic, distance, n_replicates, reference_variation_id)
 end
 
+#! No `reference_variation_id` keyword, deliberately. `createTrial(method, reference::AbstractMonad,
+#! avs; ...)` — the closest and most-used analogue — takes the variation from the reference and offers
+#! no override, and nothing internal constructs this form at all. Passing a reference and then
+#! overriding the thing that makes it a reference is a contradiction, not a convenience; the
+#! `InputFolders` constructor is where a variation ID is genuinely an independent argument.
 function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              observed_data,
-                             summary_statistic, distance; n_replicates::Int=1,
-                             reference_variation_id::VariationID=ref.variation_id)
+                             summary_statistic, distance; n_replicates::Int=1)
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
-                              summary_statistic, distance, n_replicates, reference_variation_id)
+                              summary_statistic, distance, n_replicates, ref.variation_id)
 end
 
 #! Defined here rather than beside `ParsedVariations` in `variations.jl`: that file is included

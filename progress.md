@@ -3303,6 +3303,28 @@ schedule sized for the remaining generations silently falls through the length g
 That last one is the only silent failure among the thirteen, so it now warns. Nothing is refused — the
 right response to "can I change this?" is a description, not a veto.
 
+**`runCalibration` now takes the method first.** Breaking, and cheap while pre-1.0. It matches
+`run(::GSAMethod, inputs, avs)` and the new `run(::ABCSMC, problem)`, so "run this method on this thing"
+reads the same way everywhere. `resumeCalibration(calibration[, method])` keeps the object first, since
+on a resume there is nothing else to lead with.
+
+**The epsilon-schedule warning I added was off by one.** Generation `t` reads `epsilon_schedule[t-1]` and
+generation 1 consumes no entry, so an `L`-entry schedule covers generations 2 through `L+1`. My first
+warning fired whenever `L <= n_done` and claimed every new generation would fall back — but at `L == n_done`
+the *first* new generation does get an entry: five generations done plus a five-entry schedule schedules
+generation 6, using the last entry, and only 7 onward reverts. The warning now reports the covered range.
+Caught by being asked to state the behaviour precisely rather than by a test, which is its own lesson about
+what "documented" was worth here.
+
+**The `reference_variation_id` keyword is reverted.** I added it reasoning that a default of
+`ref.variation_id` made it harmless. The relevant question was not whether it was harmless but whether it
+was *consistent*: `createTrial(method, reference::AbstractMonad, avs; ...)` — the closest and by far the
+most-used analogue — takes the variation from the reference and offers no override, and nothing internal
+constructs the monad form at all. So the keyword introduced an inconsistency rather than removing one.
+Worth recording separately: `run(::GSAMethod, reference::AbstractMonad, avs; ...)` *does* honour a
+`reference_variation_id`, but only because the user's value lands rightmost in the `kwargs...` splat and
+Julia lets the rightmost duplicate win — accident, not design, and undocumented.
+
 **On not deprecating `resumeABC`.** The brief proposed deprecating it in favour of a method-agnostic
 `resumeCalibration`, which would have left `runABC` standing with no partner. The surface now has two
 complete pairs — `runCalibration`/`resumeCalibration` reading like `run(::GSAMethod, ...)`, and

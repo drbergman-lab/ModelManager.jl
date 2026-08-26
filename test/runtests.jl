@@ -3058,7 +3058,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 method = ABCSMC(population_size=4, max_nr_populations=3,
                                 minimum_epsilon=0.0)
-                result = runCalibration(prob, method; description="db integration")
+                result = runCalibration(method, prob; description="db integration")
                 waitForDiagnostics()
 
                 @test result isa ABCResult
@@ -3132,13 +3132,13 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 vec_prob = CalibrationProblem(inputs, [dv], [1.0],
                                               _test_named_vec_ss, mseDistance)
-                vec_result = runCalibration(vec_prob, method)
+                vec_result = runCalibration(method, vec_prob)
                 waitForDiagnostics()
                 @test vec_result isa ABCResult
 
                 scalar_prob = CalibrationProblem(inputs, [dv], 1.0,
                                                  _test_named_scalar_ss, mseDistance)
-                scalar_result = runCalibration(scalar_prob, method)
+                scalar_result = runCalibration(method, scalar_prob)
                 waitForDiagnostics()
                 @test scalar_result isa ABCResult
             end
@@ -3149,7 +3149,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=2, max_nr_populations=1, minimum_epsilon=0.0)
 
-                tagged = runCalibration(prob, method;
+                tagged = runCalibration(method, prob;
                                         description="prose", tags=("project" => "unify",))
                 waitForDiagnostics()
                 cal = tagged.calibration
@@ -3189,7 +3189,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_nonzero_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
-                result = runCalibration(prob, method; description="views")
+                result = runCalibration(method, prob; description="views")
                 cal = result.calibration
                 waitForDiagnostics()
                 @test length(result.generations) == 2
@@ -3269,7 +3269,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
-                result = runCalibration(prob, method; description="single batch")
+                result = runCalibration(method, prob; description="single batch")
                 cal = result.calibration
                 waitForDiagnostics()
                 @test length(result.generations) == 1
@@ -3300,7 +3300,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 n_dispatched = Ref(0)
                 _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) <= 2
                 cal = try
-                    runCalibration(prob, method; description="views with failures").calibration
+                    runCalibration(method, prob; description="views with failures").calibration
                 finally
                     _fail_sim_predicate[] = nothing
                 end
@@ -3325,7 +3325,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
-                result = runCalibration(prob, method; description="taggable")
+                result = runCalibration(method, prob; description="taggable")
                 cal = result.calibration
                 waitForDiagnostics()
 
@@ -3454,7 +3454,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 observed = Dict{String,Any}("x" => 1.0)
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=2, minimum_epsilon=0.0)
-                cal = runCalibration(prob, method; description="shown").calibration
+                cal = runCalibration(method, prob; description="shown").calibration
                 waitForDiagnostics()
 
                 out = sprint(show, cal)
@@ -3466,7 +3466,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # A description was optional before this table was ever read back; an empty one
                 # is omitted rather than printed blank.
-                bare = runCalibration(prob, method).calibration
+                bare = runCalibration(method, prob).calibration
                 waitForDiagnostics()
                 @test !occursin("Description", sprint(show, bare))
 
@@ -3492,7 +3492,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
                 method = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0)
 
-                cal = runCalibration(prob, method; description="deleteme").calibration
+                cal = runCalibration(method, prob; description="deleteme").calibration
                 waitForDiagnostics()
                 tag!(cal, "project" => "doomed")
                 monad_ids = monadIDs(cal)
@@ -3510,7 +3510,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test all(id -> id in simulationIDs(), sim_ids)
 
                 # Opting in cascades to the monads and their simulations.
-                cal2 = runCalibration(prob, method; description="doomed subs").calibration
+                cal2 = runCalibration(method, prob; description="doomed subs").calibration
                 waitForDiagnostics()
                 monad_ids2 = monadIDs(cal2)
                 sim_ids2 = simulationIDs(cal2)
@@ -3551,15 +3551,14 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 for prog in (:none, :generation, :batch, :bar)
                     method = ABCSMC(population_size=4, max_nr_populations=2,
                                     minimum_epsilon=0.0)
-                    result = runCalibration(prob, method; progress=prog,
+                    result = runCalibration(method, prob; progress=prog,
                                             description="progress=$prog")
                     waitForDiagnostics()
                     @test result isa ABCResult
                     @test !isempty(result.generations)
                 end
                 # Invalid setting is rejected before any work begins.
-                @test_throws ArgumentError runCalibration(prob,
-                    ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
+                @test_throws ArgumentError runCalibration(ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0), prob;
                     progress=:verbose)
             end
 
@@ -3584,7 +3583,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 n_dispatched = Ref(0)
                 _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) <= 2
                 result = try
-                    runCalibration(prob, method; description="reject failures")
+                    runCalibration(method, prob; description="reject failures")
                 finally
                     _fail_sim_predicate[] = nothing
                 end
@@ -3628,7 +3627,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 n_dispatched = Ref(0)
                 _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
                 result = try
-                    runCalibration(prob, method; description="reject missing stat")
+                    runCalibration(method, prob; description="reject missing stat")
                 finally
                     _fail_sim_predicate[] = nothing
                 end
@@ -3651,7 +3650,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _fail_sim_predicate[] = spec -> (n_dispatched[] += 1) == 1
                 try
                     # Fails fast instead of rejecting the particle, pointing at the failure files.
-                    @test_throws "has no successful simulation" runCalibration(prob, method;
+                    @test_throws "has no successful simulation" runCalibration(method, prob;
                         description="error on failure", on_monad_failure=:error)
                 finally
                     _fail_sim_predicate[] = nothing
@@ -3659,8 +3658,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 waitForDiagnostics()
 
                 # An unrecognized policy is rejected before any work begins.
-                @test_throws ArgumentError runCalibration(prob,
-                    ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0);
+                @test_throws ArgumentError runCalibration(ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0), prob;
                     on_monad_failure=:ignore)
             end
 
@@ -3675,7 +3673,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _fail_sim_predicate[] = spec -> true
                 try
                     # Nothing survives generation 1 → error instead of an empty population.
-                    @test_throws "had a successful simulation" runCalibration(prob, method;
+                    @test_throws "had a successful simulation" runCalibration(method, prob;
                         description="all particles fail")
                 finally
                     _fail_sim_predicate[] = nothing
@@ -3692,14 +3690,14 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # propagated into the ABC-SMC internals. Not affected by :reject.
                 prob_bad_type = CalibrationProblem(inputs, [dv], observed,
                                                    _test_named_ss, _test_dict_dist)
-                @test_throws "a `Real` is required" runCalibration(prob_bad_type, method;
+                @test_throws "a `Real` is required" runCalibration(method, prob_bad_type;
                     description="non-Real distance")
 
                 # A throwing summary_statistic on a healthy monad is also fatal, and the
                 # original exception is what surfaces.
                 prob_throws = CalibrationProblem(inputs, [dv], observed,
                                                  _test_throwing_ss, mseDistance)
-                @test_throws "summary statistic boom" runCalibration(prob_throws, method;
+                @test_throws "summary statistic boom" runCalibration(method, prob_throws;
                     description="throwing summary statistic")
                 waitForDiagnostics()
             end
@@ -4074,7 +4072,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # Initial run: capped at 1 generation.
                 method1 = ABCSMC(population_size=4, max_nr_populations=1,
                                   minimum_epsilon=0.0)
-                result1 = runCalibration(prob_resume, method1; description="resume base")
+                result1 = runCalibration(method1, prob_resume; description="resume base")
                 @test length(result1.generations) == 1
 
                 # Resume: allow up to 3 total generations.
@@ -4099,7 +4097,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                            _test_nonzero_ss, mseDistance)
                 saved = ABCSMC(population_size=6, max_nr_populations=1, minimum_epsilon=0.0,
                                epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel())
-                base  = runCalibration(prob, saved; description="resume overrides")
+                base  = runCalibration(saved, prob; description="resume overrides")
                 cal   = base.calibration
 
                 # Keyword form: only the named field moves.
@@ -4155,19 +4153,19 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 end
             end
 
-            @testset "CalibrationProblem from a monad takes its reference variation, overridably" begin
+            @testset "CalibrationProblem from a monad takes its reference variation" begin
                 dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 ref = createTrial(inputs, [DiscreteVariation(:config, xp_x, 7.0)]; n_replicates=1)
                 obs = Dict{String,Any}("x" => 1.0)
                 # Default: the monad's own variation, which is the reason to pass a monad.
                 p1 = CalibrationProblem(ref, [dv], obs, _test_named_ss, mseDistance)
                 @test p1.reference_variation_id == ref.variation_id
-                # Overridable, matching the InputFolders constructor's keyword.
-                other = VariationID(inputs)
-                p2 = CalibrationProblem(ref, [dv], obs, _test_named_ss, mseDistance;
-                                        reference_variation_id=other)
-                @test p2.reference_variation_id == other
-                @test p2.inputs == ref.inputs
+                # No override: createTrial(method, reference, avs) offers none either, and passing a
+                # reference then overriding what makes it a reference is a contradiction. The
+                # InputFolders constructor is where a variation ID is an independent argument.
+                @test_throws MethodError CalibrationProblem(ref, [dv], obs, _test_named_ss,
+                                                            mseDistance;
+                                                            reference_variation_id=VariationID(inputs))
             end
 
             @testset "run dispatches on the calibration structs" begin
@@ -4202,8 +4200,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
                                           _test_nonzero_ss, mseDistance)
-                base = runCalibration(prob, ABCSMC(population_size=4, max_nr_populations=2,
-                                                   minimum_epsilon=0.0);
+                base = runCalibration(ABCSMC(population_size=4, max_nr_populations=2,
+                                                   minimum_epsilon=0.0), prob;
                                       description="schedule warn")
                 waitForDiagnostics()
                 n_done = length(base.generations)
@@ -4211,11 +4209,24 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # A schedule sized for the remaining generations, not the whole run: it is indexed by
                 # absolute generation, so every new generation would silently use epsilon_quantile.
-                @test_logs (:warn, r"epsilon_schedule has 1 entries") match_mode=:any begin
+                # An L-entry schedule covers generations 2..L+1, because generation 1 has no
+                # threshold and consumes no entry. So a 1-entry schedule covers only generation 2 —
+                # already complete here — and every new generation falls back.
+                @test_logs (:warn, r"covers generations 2–2") match_mode=:any begin
                     resumeCalibration(base.calibration; problem=prob,
-                                      max_nr_populations=n_done + 1, epsilon_schedule=[0.5])
+                                      max_nr_populations=n_done + 2, epsilon_schedule=[0.5])
                 end
                 waitForDiagnostics()
+
+                # The indexing itself, stated as a fact rather than inferred from the warning:
+                # generation t reads entry t-1, guarded by the schedule's length.
+                sched = [0.5, 0.4, 0.3, 0.2, 0.1]
+                covered = [t for t in 2:9 if t - 1 <= length(sched)]
+                @test covered == [2, 3, 4, 5, 6]          # 5 entries cover gens 2 through 6
+                @test sched[6 - 1] == 0.1                 # gen 6 takes the LAST entry
+                # Which is the case worth knowing: 5 generations done, a 5-entry schedule supplied on
+                # resume, and only generation 6 is scheduled — 7 onward revert to epsilon_quantile.
+                @test !(7 - 1 <= length(sched))
             end
 
             @testset "_methodWithOverrides patches rather than rebuilds" begin
