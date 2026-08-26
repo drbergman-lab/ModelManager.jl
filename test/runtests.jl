@@ -4096,7 +4096,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 prob  = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
                                            _test_nonzero_ss, mseDistance)
                 saved = ABCSMC(population_size=6, max_nr_populations=1, minimum_epsilon=0.0,
-                               epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel())
+                               epsilon_quantile=0.3, perturbation_kernel=ComponentwiseKernel(),
+                               max_evaluations=64)
                 base  = runCalibration(saved, prob; description="resume overrides")
                 cal   = base.calibration
 
@@ -4174,7 +4175,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                           _test_nonzero_ss, mseDistance)
 
                 # Fresh run through `run`, method first, mirroring run(::GSAMethod, inputs, avs).
-                res = run(ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0), prob)
+                res = run(ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0,
+                          max_evaluations=64), prob)
                 waitForDiagnostics()
                 @test res isa ABCResult
                 @test length(res.generations) == 1
@@ -4182,7 +4184,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # Continuing one through `run`. Calibration is deliberately not an AbstractTrial,
                 # which is what keeps this unambiguous against run(::AbstractTrial).
                 @test !(res.calibration isa ModelManager.AbstractTrial)
-                res2 = run(res.calibration; problem=prob, max_nr_populations=2)
+                res2 = run(res.calibration; problem=prob, max_nr_populations=2,
+                           max_evaluations=64)
                 waitForDiagnostics()
                 @test res2 isa ABCResult
                 @test res2.calibration.id == res.calibration.id
@@ -4191,7 +4194,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # And with an explicit method object, positionally.
                 res3 = run(res.calibration, ABCSMC(population_size=4, max_nr_populations=3,
-                                                   minimum_epsilon=0.0); problem=prob)
+                                                   minimum_epsilon=0.0, max_evaluations=64);
+                           problem=prob)
                 waitForDiagnostics()
                 @test res3 isa ABCResult
 
@@ -4231,7 +4235,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
                                           _test_nonzero_ss, mseDistance)
                 base = runCalibration(ABCSMC(population_size=4, max_nr_populations=2,
-                                                   minimum_epsilon=0.0), prob;
+                                             minimum_epsilon=0.0, max_evaluations=64), prob;
                                       description="schedule warn")
                 waitForDiagnostics()
                 n_done = length(base.generations)
