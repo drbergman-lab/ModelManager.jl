@@ -4242,9 +4242,15 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # An L-entry schedule covers generations 2..L+1, because generation 1 has no
                 # threshold and consumes no entry. So a 1-entry schedule covers only generation 2 —
                 # already complete here — and every new generation falls back.
+                #
+                # The entry is 2.0, above _test_nonzero_ss's constant distance of 1.0, and
+                # max_evaluations is set: `while length(accepted) < population_size` has no other
+                # bound, so an epsilon the model cannot reach would spin forever. Neither detail is
+                # what this test is about — the warning text is — but a test must not be able to hang.
                 @test_logs (:warn, r"covers generations 2–2") match_mode=:any begin
                     resumeCalibration(base.calibration; problem=prob,
-                                      max_nr_populations=n_done + 2, epsilon_schedule=[0.5])
+                                      max_nr_populations=n_done + 2, epsilon_schedule=[2.0],
+                                      max_evaluations=64)
                 end
                 waitForDiagnostics()
 

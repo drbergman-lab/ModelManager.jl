@@ -3371,3 +3371,26 @@ cover the difference. `_latentNamesAndPriors` splits out separately because resu
 between its docstring and the function on the first attempt. Worth noting: the guard's value showed up
 within minutes of adding it, on new code, not on a legacy sweep.
 
+### An unreachable epsilon has no bound
+
+CI on this branch hung: the Julia LTS macOS job sat in "Run all tests" for 50+ minutes where the same job
+takes ~4, while all seven others passed — including Julia 1.x on the *same* runner.
+
+The mechanism is `while length(accepted) < method.population_size` (`abc_smc.jl:634`) together with
+`max_evaluations::Union{Nothing,Int}=nothing`. **With the default, that loop has no bound at all.** If
+epsilon is below anything the model can produce, ABC-SMC proposes forever, with no diagnostic.
+
+My own new test walked straight into it: `epsilon_schedule=[0.5]` against `_test_nonzero_ss`, whose
+distance is *constantly* 1.0. Whether it hangs depends on whether any generation reads entry 1 — i.e. on
+whether the base run left one generation or two — which is not something a test should be betting on. The
+entry is now 2.0 (above the constant distance) and `max_evaluations=64` is set, so it cannot spin whatever
+the generation count turns out to be. Neither detail is what the test is about; it just must not be able
+to hang.
+
+**The library-level point is worth keeping separately from the test fix.** A user who sets an
+`epsilon_schedule` or `minimum_epsilon` below what their model can achieve gets an unbounded run and no
+message. `max_evaluations` is the existing brake and it is off by default. Options, none taken here: a
+default cap proportional to `population_size`; a warning after some multiple of `population_size`
+proposals with no acceptance; or leaving it and documenting the hazard where `epsilon_schedule` is
+described. This needs a decision rather than a quiet default change, so it is recorded, not fixed.
+
