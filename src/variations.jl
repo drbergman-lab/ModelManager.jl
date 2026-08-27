@@ -654,8 +654,11 @@ function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) whe
     return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
-#! Inverse of the index map. Errors rather than returning a sentinel, so a value that was never in the
-#! list is reported where it happens instead of surfacing later as an out-of-support assertion.
+#! Inverse of the index map. Throws for a value that was never one of the levels, so a caller passing
+#! a nonsense value is told at the point it happens rather than receiving a sentinel that silently
+#! becomes an out-of-support CDF. The `SimulationBank` inverts *speculatively*, over whatever values the
+#! database already holds, where a non-level is ordinary rather than an error -- `_bankCdfCoords` catches
+#! this and reports the monad as not reusable.
 function _discreteValueIndex(values::AbstractVector, target_value)
     idx = findfirst(==(target_value), values)
     isnothing(idx) && throw(ArgumentError(

@@ -3,12 +3,26 @@ export CalibrationParameter
 ################## Source types ##################
 
 """
+    AbstractCalibrationSource
+
+Supertype of the records tracking which variation a [`CalibrationParameter`](@ref) came from.
+
+A source exists so a particle can be reported in the user's own terms — display names, priors,
+target values — rather than as the bare CDF coordinates the sampler works in.
+
+Sources are serialised into `problem.jld2` so a run can resume. A source whose maps are derived
+from data it already carries round-trips as itself; one holding user-supplied functions may not,
+and overrides `_toManifestSource` to strip what JLD2 cannot store.
+"""
+abstract type AbstractCalibrationSource end
+
+"""
     DVSource <: AbstractCalibrationSource
 
 Tracks that a [`CalibrationParameter`](@ref) originated from a [`DistributedVariation`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct DVSource
+struct DVSource <: AbstractCalibrationSource
     dv::DistributedVariation
 end
 
@@ -19,7 +33,7 @@ Tracks that a [`CalibrationParameter`](@ref) originated from a
 [`CoVariation{DistributedVariation}`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct CVSource
+struct CVSource <: AbstractCalibrationSource
     cv::CoVariation{DistributedVariation}
 end
 
@@ -30,11 +44,37 @@ Tracks that a [`CalibrationParameter`](@ref) originated from a user-supplied
 [`LatentVariation{<:Distribution}`](@ref).
 Stored for display-format CSV reconstruction and JLD2 persistence.
 """
-struct LVSource
+struct LVSource <: AbstractCalibrationSource
     lv::LatentVariation{<:Distribution}
 end
 
-const AbstractCalibrationSource = Union{DVSource, CVSource, LVSource}
+"""
+    DiscreteSource <: AbstractCalibrationSource
+
+Tracks that a [`CalibrationParameter`](@ref) originated from a [`DiscreteVariation`](@ref).
+Stored for display-format CSV reconstruction and JLD2 persistence.
+"""
+struct DiscreteSource <: AbstractCalibrationSource
+    dv::DiscreteVariation
+end
+
+"""
+    DiscreteCoSource <: AbstractCalibrationSource
+
+Tracks that a [`CalibrationParameter`](@ref) originated from a
+[`CoVariation`](@ref) of [`DiscreteVariation`](@ref)s.
+Stored for display-format CSV reconstruction and JLD2 persistence.
+"""
+struct DiscreteCoSource <: AbstractCalibrationSource
+    cv::CoVariation{<:DiscreteVariation}
+end
+
+#! `DiscreteSource`/`DiscreteCoSource` are new types rather than a widening of `DVSource`/`CVSource`
+#! to accept any `ElementaryVariation`. The sources are JLD2-serialised inside `_ProblemManifest`,
+#! which stores the concrete type, so re-parameterising an existing one would stop older
+#! `problem.jld2` files from loading as themselves and break resume. Adding types is compatible;
+#! changing them is not. Gaining a supertype is also compatible — verified against a `problem.jld2`
+#! written before these structs subtyped anything.
 
 ################## CalibrationParameter ##################
 
@@ -103,23 +143,34 @@ _calibrationRejection(::DistributedVariation) = nothing
 _calibrationRejection(::CoVariation{DistributedVariation}) = nothing
 _calibrationRejection(::LatentVariation{<:Distribution}) = nothing
 
-_calibrationRejection(::DiscreteVariation) =
-    "DiscreteVariation cannot be used as a calibration parameter. " *
-    "Use DistributedVariation(location, xml_path, prior) instead."
+#! Discrete parameters are calibratable. They are represented as `DiscreteUniform` over their value
+#! indices, so a particle coordinate stays a CDF value in [0,1] and the quantile does the quantising —
+#! the perturbation kernels never see a target value and need no discrete counterpart. What a discrete
+#! parameter costs is resolution, not correctness: the sampler explores within-bin variation that has
+#! no effect on the simulation, which `cdf_grid_k` snapping and the `SimulationBank` already mitigate
+#! by collapsing repeated grid points.
+_calibrationRejection(::DiscreteVariation) = nothing
+_calibrationRejection(::CoVariation{<:DiscreteVariation}) = nothing
 
-_calibrationRejection(::CoVariation{<:DiscreteVariation}) =
-    "CoVariation{DiscreteVariation} cannot be used as a calibration parameter. " *
-    "Use CoVariation{DistributedVariation} instead."
-
+#! Still rejected: a `LatentVariation` whose latent parameters are a raw value vector rather than a
+#! distribution. `variationValues` treats that branch's latent values as *indices* in the CDF path,
+#! which is a different convention from the one ABC-SMC needs. Build it from a `DiscreteVariation`
+#! instead and the conversion happens for you.
 _calibrationRejection(::LatentVariation) =
-    "LatentVariation for ABC-SMC calibration must have Distribution latent parameters, " *
-    "not discrete values. Use LatentVariation{<:Distribution}."
+    "A LatentVariation for calibration must have Distribution latent parameters. Pass the " *
+    "DiscreteVariation itself — it is converted to a DiscreteUniform over its value indices — or " *
+    "construct the LatentVariation with Distribution latent parameters."
 
 _calibrationRejection(av::AbstractVariation) =
     "Unsupported variation type for calibration: $(typeof(av))."
 
-_toCalibrationParameter(av::DiscreteVariation) = throw(ArgumentError(_calibrationRejection(av)))
-_toCalibrationParameter(av::CoVariation{<:DiscreteVariation}) = throw(ArgumentError(_calibrationRejection(av)))
+function _toCalibrationParameter(dv::DiscreteVariation)
+    return CalibrationParameter(DiscreteSource(dv), LatentVariation(dv))
+end
+
+function _toCalibrationParameter(cv::CoVariation{<:DiscreteVariation})
+    return CalibrationParameter(DiscreteCoSource(cv), LatentVariation(cv))
+end
 _toCalibrationParameter(av::LatentVariation) = throw(ArgumentError(_calibrationRejection(av)))
 _toCalibrationParameter(av::AbstractVariation) = throw(ArgumentError(_calibrationRejection(av)))
 
@@ -173,6 +224,12 @@ _displayColumns(s::DVSource, ::LatentVariation) =
     [variationName(s.dv)]
 
 _displayColumns(s::CVSource, ::LatentVariation) =
+    [variationName(v) for v in s.cv.variations]
+
+_displayColumns(s::DiscreteSource, ::LatentVariation) =
+    [variationName(s.dv)]
+
+_displayColumns(s::DiscreteCoSource, ::LatentVariation) =
     [variationName(v) for v in s.cv.variations]
 
 _displayColumns(::LVSource, lv::LatentVariation) =
@@ -256,6 +313,16 @@ function _particleRowToDisplay(::DVSource, lv::LatentVariation, cdf_vals::Vector
 end
 
 function _particleRowToDisplay(::CVSource, lv::LatentVariation, cdf_vals::Vector{Float64})
+    return variationValues(lv, cdf_vals)
+end
+
+#! The value, not the index: `variationValues` maps the CDF through the latent `DiscreteUniform` and
+#! the forward map, so the display CSV carries what the model was actually run with.
+function _particleRowToDisplay(::DiscreteSource, lv::LatentVariation, cdf_vals::Vector{Float64})
+    return variationValues(lv, cdf_vals)
+end
+
+function _particleRowToDisplay(::DiscreteCoSource, lv::LatentVariation, cdf_vals::Vector{Float64})
     return variationValues(lv, cdf_vals)
 end
 

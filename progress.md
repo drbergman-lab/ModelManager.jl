@@ -3261,6 +3261,83 @@ before and after.
 
 **Deliberately kept:** the padding. Plain integer folder names (`generations/5/`) are viable now that nothing
 sorts lexicographically, but `ls` would show `1 10 2 3`. Padding costs nothing given the index is always parsed.
+## 2026-08-22 — Calibration accepts discrete parameters
+
+Item 7 Stage 1b. `#36` made discrete variations ride the `Distribution` branch as a `DiscreteUniform` over
+value indices; this removes calibration's refusal to accept them.
+
+**The kernels needed nothing.** That was the open question the brief flagged as deciding progress-vs-retreat,
+and the answer was that it had already been settled by the representation. All four perturbation kernels take
+and return `Dict{String,Float64}` of CDF coordinates — they never see a target value, so there is no discrete
+coordinate for them to perturb. `_minDiagVar` already floors a variance that collapses when a generation's
+particles all land in one bin, which is the one degenerate case discrete adds. No categorical proposal, no
+matching density, no rework.
+
+**New source types rather than widening the existing ones.** `DVSource`/`CVSource` could have been
+re-parameterised to accept any `ElementaryVariation`, which would have been less code. They are JLD2-serialised
+inside `_ProblemManifest`, though, and JLD2 stores the concrete parameterisation: widening a *field* type is
+compatible, but re-parameterising the struct makes an older `problem.jld2` load as a `ReconstructedMutable`
+that fails dispatch, breaking `resumeABC` on existing runs. Tested both ways before choosing. `DiscreteSource`
+and `DiscreteCoSource` are therefore additions to the `AbstractCalibrationSource` union.
+
+**Three things only the end-to-end test found.** The unit conversions passed while a real two-generation ABC run
+over a discrete parameter did not, which is worth recording because the brief listed the end-to-end test first
+and I wrote it last:
+
+1. `_parameterTOMLEntry` had no method for either new source — generation metadata is written per parameter.
+   These record `"values"`, the levels, rather than the internal `DiscreteUniform`: the levels tell a reader
+   which values the run could have visited, where the distribution would say only how many.
+2. `_bankColDistribution` had no method either. Returning `nothing` to match `LVSource` would have been wrong
+   in a quiet way — the bank treats `nothing` as "please report this as a bug", warns, and returns an empty
+   bank, silently disabling monad reuse. The caller only ever asks for `minimum`/`maximum` to bounds-check a
+   base config value, so a `DiscreteNonParametric` over the sorted levels answers it exactly.
+3. `_discreteValueIndex` threw on a value that is not one of the levels. The `SimulationBank` inverts
+   *speculatively*, over whatever values the database already holds, and a base config value need not be one of
+   the levels being calibrated — there, "not a level" means "this monad is not reusable", and the throw aborted
+   the whole run on an ordinary database row.
+
+   My first fix returned an out-of-support `0` instead. Review rejected it, correctly: a sentinel that is also a
+   perfectly good number flows onward into `cdf` and only fails much later, if at all. **The throw stays and
+   `_bankCdfCoords` catches it**, which is better than either — a caller passing a nonsense value is still told
+   at the point it happens, and `nothing` is already that function's established "not invertible, so not
+   reusable" signal, shared with the missing-column and CVSource-consistency paths.
+
+**Why the bank's discrete distribution is not a `DiscreteUniform`.** Review asked why `_bankColDistribution`
+returns a `DiscreteNonParametric` over the levels when the representation everywhere else is a `DiscreteUniform`
+over indices. Because this one function answers in **target space**: `DVSource` returns `s.dv.distribution`, and
+the caller compares `minimum(dist) ≤ v ≤ maximum(dist)` against a base config value parsed out of the XML. For
+levels `[0.5, 1.5, 2.5]` the latent `DiscreteUniform(1, 3)` would bound that check by `[1, 3]` — rejecting a base
+value of 0.5 and admitting 3.0, both wrong. It is the same discrete representation pushed through the forward map,
+which is what target space means here. Recorded in a `#!` at the definition so the question is answered in place.
+
+**Still rejected:** a `LatentVariation` whose latent parameters are a raw `Vector{<:Real}`. That branch treats
+its latent values as indices in the CDF path, a different convention from the one ABC-SMC needs. The error now
+names the fix — pass the `DiscreteVariation` — instead of only stating the constraint.
+
+**Known cost, not a defect:** a discrete parameter loses resolution, not correctness. The sampler explores
+within-bin variation that cannot affect the simulation. `cdf_grid_k` snapping and the bank already mitigate it
+by collapsing repeated grid points onto monads that have run.
+
+### Review round 2
+
+**`AbstractCalibrationSource` is now a real abstract type**, not a `Union`. The source docstrings had always
+advertised `DVSource <: AbstractCalibrationSource`, which was simply false while the name was a union alias —
+so this makes the documented type tree true rather than inventing one. `_toManifestSource` collapses onto the
+abstract type, with `LVSource` the single override.
+
+The reason to check before doing it was JLD2: the sources are serialised in `problem.jld2`, and re-parameterising
+a stored struct makes it come back as a `ReconstructedMutable` that fails dispatch. **Gaining a supertype is not
+that kind of change** — verified by loading a `problem.jld2` written before the structs subtyped anything and
+confirming the sources come back as real `DVSource` values, satisfy `isa AbstractCalibrationSource`, and dispatch.
+Field layout is what JLD2 commits; the supertype is not part of it.
+
+**The bank's no-DB-column check uses `insupport`, not a min/max range.** For a continuous prior the two agree.
+For a discrete one the range admits every gap between the levels: with levels `[0.5, 1.5, 2.5]`, a base config
+value of `1.0` passes a range test while no monad can ever match it. The two answers are exactly complementary
+across the levels and the gaps, which is now a test.
+
+This is the second half of the answer to "why not `DiscreteUniform` here": with `insupport` the target-space
+distribution is not merely a convenient carrier of bounds, it is the actual set membership being asked about.
 
 ## 2026-08-24 — Calibration entry points made symmetric, and `method=` stopped resetting the run
 

@@ -55,7 +55,7 @@ parameters lie strictly within `(0,1)^d` in CDF space.
 3. For each calibrated location, the variation row must pass:
    - **Non-calibrated columns** must exactly match the reference variation row value.
    - **Calibrated columns** (parameters that already have a column in the DB): the row
-     value must lie in `[minimum(dist), maximum(dist)]` of the prior.
+     value must be `insupport` of the prior.
    - **Calibrated parameters without a column yet** (never varied before): the base value
      is read from the config file via `getColumnDefaults`. Because no variation
      row can give a different value, any failure to read or parse the value, or a value
@@ -187,11 +187,14 @@ function _buildSimulationBank(problem::CalibrationProblem)
                       "happen — please report this as a bug. Returning empty bank."
                 return empty_bank
             end
-            if !(minimum(dist) ≤ v ≤ maximum(dist))
+            #! `insupport`, not a min/max range test. For a continuous prior the two agree, but for a
+            #! discrete one the range admits every gap between the levels: with levels [0.5, 1.5, 2.5]
+            #! a base value of 1.0 passes a range check while no monad can ever match it.
+            if !insupport(dist, v)
                 @info "SimulationBank: calibrated parameter \"$col\" has no DB column; " *
-                      "its base config value $v lies outside the prior support " *
-                      "[$(minimum(dist)), $(maximum(dist))]. No existing monad can have " *
-                      "a compatible value for this parameter. Returning empty bank."
+                      "its base config value $v is not in the support of the prior " *
+                      "$(dist). No existing monad can have a compatible value for this " *
+                      "parameter. Returning empty bank."
                 return empty_bank
             end
             base_missing_vals[col] = v
@@ -376,6 +379,33 @@ function _bankColDistribution(s::CVSource, lv::LatentVariation, col::String)
     return s.cv.variations[idx].distribution
 end
 
+#! Target space, not the `DiscreteUniform`-over-indices latent representation used elsewhere. Every
+#! `_bankColDistribution` method returns a *target-space* prior — `DVSource` returns `s.dv.distribution` —
+#! because the caller asks `insupport(dist, v)` of a base config value parsed straight out of the XML. For
+#! levels `[0.5, 1.5, 2.5]`, `insupport` against these levels answers correctly for every value, while the
+#! latent `DiscreteUniform(1, 3)` would accept 1.0 and 2.0 (they are valid *indices*) and reject 0.5 and
+#! 2.5 (they are not). This is the same discrete representation pushed through the forward map, which is
+#! what target space means here.
+#!
+#! A real distribution rather than `nothing`, too: the caller reads `nothing` as "this should not happen",
+#! warns asking for a bug report, and returns an empty bank, silently disabling monad reuse.
+function _discreteLevelDistribution(values)
+    support = sort(unique(Float64.(values)))
+    return DiscreteNonParametric(support, fill(1 / length(support), length(support)))
+end
+
+function _bankColDistribution(s::DiscreteSource, lv::LatentVariation, col::String)
+    columnName(lv.targets[1]) == col || return nothing
+    return _discreteLevelDistribution(s.dv.values)
+end
+
+function _bankColDistribution(s::DiscreteCoSource, lv::LatentVariation, col::String)
+    for v in s.cv.variations
+        columnName(variationTarget(v)) == col && return _discreteLevelDistribution(v.values)
+    end
+    return nothing
+end
+
 _bankColDistribution(::LVSource, ::LatentVariation, ::String) = nothing
 
 ################## CDF inversion helpers ##################
@@ -409,7 +439,16 @@ function _bankCdfCoords(lv::LatentVariation, vals::Dict{String, Float64})
         haskey(vals, col) || return nothing
         push!(target_vals, vals[col])
     end
-    lp_vals = [inv_map(target_vals) for inv_map in lv.inverse_maps]
+    #! A discrete inverse map throws when the value is not one of its levels, which is the ordinary
+    #! case here rather than an error: the bank inverts speculatively over whatever the database
+    #! already holds, and a base config value need not be one of the levels being calibrated. `nothing`
+    #! is this function's existing "not invertible, so not reusable" signal, so it is the answer here
+    #! too -- and keeping the throw means a user calling an inverse map directly still gets told.
+    lp_vals = try
+        [inv_map(target_vals) for inv_map in lv.inverse_maps]
+    catch
+        return nothing
+    end
     any(isnan, lp_vals) && return nothing   # e.g. CVSource consistency check failed
     cdfs = [cdf(d, lp) for (d, lp) in zip(lv.latent_parameters, lp_vals)]
     return cdfs
