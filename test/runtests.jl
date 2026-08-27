@@ -3943,6 +3943,82 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       joinpath(gdir, "0011", "monads.csv")
             end
 
+            @testset "StudySpec feeds both sensitivity and calibration" begin
+                dv1 = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                dv2 = DistributedVariation(:config, xp_y, Uniform(1.0, 4.0))
+                spec = StudySpec(inputs, [dv1, dv2]; n_replicates=2, use_previous=false)
+
+                @test spec.inputs == inputs
+                @test length(spec.variations) == 2
+                @test spec.n_replicates == 2
+                @test spec.use_previous == false
+                @test spec.reference_variation_id == VariationID(inputs)
+                # The user's originals are kept, not normalised: the reverse conversion would lose a
+                # DistributedVariation's display name, which the generation CSVs are keyed by.
+                @test all(v -> v isa DistributedVariation, spec.variations)
+
+                # Vararg form, and the eltype the invariant ParsedVariations constructor needs.
+                spec_va = StudySpec(inputs, dv1, dv2)
+                @test spec_va.variations == spec.variations
+                @test spec.variations isa Vector{AbstractVariation}
+                @test ModelManager.ParsedVariations(spec) isa ModelManager.ParsedVariations
+
+                # Same spec drives a calibration...
+                prob = CalibrationProblem(spec, Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance)
+                @test prob.inputs == inputs
+                @test prob.n_replicates == 2
+                @test prob.reference_variation_id == spec.reference_variation_id
+                @test length(prob.parameters) == 2
+                # ...with overrides where they make sense.
+                prob2 = CalibrationProblem(spec, Dict{String,Any}("x" => 1.0),
+                                           _test_named_ss, mseDistance; n_replicates=5)
+                @test prob2.n_replicates == 5
+
+                # ...and a sensitivity sweep, forwarding all three spec fields.
+                gsa = run(MOAT(), spec; functions=Function[])
+                waitForDiagnostics()
+                @test gsa isa ModelManager.GSASampling
+
+                # A caller keyword beats the spec's, since kwargs... comes last.
+                spec1 = StudySpec(inputs, [dv1, dv2]; n_replicates=1)
+                gsa2 = run(MOAT(), spec1; functions=Function[], n_replicates=1)
+                waitForDiagnostics()
+                @test gsa2 isa ModelManager.GSASampling
+            end
+
+            @testset "StudySpec from a monad takes its reference variation" begin
+                dv  = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                ref = createTrial(inputs, [DiscreteVariation(:config, xp_x, 9.0)]; n_replicates=1)
+                spec = StudySpec(ref, [dv])
+                @test spec.inputs == ref.inputs
+                @test spec.reference_variation_id == ref.variation_id
+                # No override, matching createTrial and CalibrationProblem's monad forms: passing a
+                # reference and then replacing what makes it a reference is a contradiction.
+                @test_throws MethodError StudySpec(ref, [dv];
+                                                   reference_variation_id=VariationID(inputs))
+                @test StudySpec(ref, dv).variations == spec.variations
+            end
+
+            @testset "StudySpec show reports usability per parameter" begin
+                dv  = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                dsc = DiscreteVariation(:config, xp_y, [1.0, 2.0])
+                out = sprint(show, MIME"text/plain"(), StudySpec(inputs, [dv, dsc]))
+                @test occursin("StudySpec:", out)
+                @test occursin("(sensitivity only)", out)      # use_previous is calibration-irrelevant
+                # Each parameter's verdict is derived from _calibrationRejection rather than hardcoded,
+                # so this does not have to be revisited as more variation kinds become calibratable.
+                for v in (dv, dsc)
+                    expected = isnothing(ModelManager._calibrationRejection(v)) ? "yes" : "no"
+                    line = only(filter(l -> occursin(ModelManager.variationName(v), l),
+                                       split(out, "\n")))
+                    @test occursin("calibration: " * expected, line)
+                    @test occursin("sensitivity: yes", line)   # every variation kind sweeps
+                end
+                # Fields on their own lines, not run together with the input folders.
+                @test occursin(r"\n  Replicates:", out)
+            end
+
             @testset "generation index is the index, not a listing position" begin
                 # The bug this pins down: posterior, ConvergenceSummary and the recipes each used a
                 # generation's POSITION in a sorted filename listing as its index. That is only

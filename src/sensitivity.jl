@@ -96,6 +96,20 @@ function run(method::GSAMethod, reference::AbstractMonad, avs::Vector{<:Abstract
     return run(method, reference.inputs, avs; reference_variation_id=reference.variation_id, functions, kwargs...)
 end
 
+#! `kwargs...` comes last so a caller's explicit `n_replicates=` beats the spec's, rather than the spec
+#! silently winning. Julia gives the rightmost duplicate keyword precedence — the same mechanism that
+#! used to let a caller override a *reference monad's* variation, which is now refused. Harmless here,
+#! because a spec's fields are defaults the user set, not an identity carried by an object.
+function run(method::GSAMethod, spec::StudySpec;
+             functions::AbstractVector{<:Function}=Function[], kwargs...)
+    return run(method, spec.inputs, spec.variations;
+               functions=functions,
+               reference_variation_id=spec.reference_variation_id,
+               n_replicates=spec.n_replicates,
+               use_previous=spec.use_previous,
+               kwargs...)
+end
+
 function run(method::GSAMethod, inputs_or_ref::Union{InputFolders,AbstractMonad}, av1::AbstractVariation, avs::Vararg{AbstractVariation}; kwargs...)
     return run(method, inputs_or_ref, [av1; avs...]; kwargs...)
 end

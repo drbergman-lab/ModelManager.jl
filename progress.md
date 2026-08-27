@@ -3471,3 +3471,37 @@ default cap proportional to `population_size`; a warning after some multiple of 
 proposals with no acceptance; or leaving it and documenting the hazard where `epsilon_schedule` is
 described. This needs a decision rather than a quiet default change, so it is recorded, not fixed.
 
+## 2026-08-26 — StudySpec (item 7, Stage 2)
+
+The shared half of a sensitivity study and a calibration: inputs, parameters, baseline, replicates.
+
+**No new named entry points**, per the user's steer after `runSensitivity` was ruled out — that name had
+existed before and was removed, so re-adding it would undo a deliberate decision. Consumption is
+`run(::GSAMethod, spec)` and `CalibrationProblem(spec, ...)`, which works because `run` already dispatches
+on the calibration structs from #40. The brief's `runABC(inputs, priors, data, ...)` convenience layer is
+dropped entirely rather than deferred.
+
+**What it deliberately does not hold.** `observed_data`, `summary_statistic`, `distance` stay on
+`CalibrationProblem`; `functions` stays on the sensitivity entry point. The brief was explicit about not
+adding an `observed_data` field "for later", and it is right: a sensitivity study has none, and an optional
+field that half the consumers ignore is how these abstractions rot. `use_previous` is the one asymmetry —
+calibration reuses through the `SimulationBank`, not the runner's matching — so it is marked "(sensitivity
+only)" in the docstring and in `show` rather than quietly ignored.
+
+**Three details the scoping got right and were worth keeping.** The field is a concrete
+`Vector{AbstractVariation}` because `ParsedVariations`' inner constructor is invariant; the constructor
+normalises through `convertToAbstractVariationVector`, which lives in `user_api.jl` and so is defined
+*after* `study.jl` — fine, because bodies are lazy and only signatures constrain include order; and
+docstrings use a plain code span for `ParsedVariations`, which is not a public binding.
+
+**`kwargs...` is forwarded last** so a caller's `n_replicates=` beats the spec's. That is the same
+rightmost-duplicate-wins mechanism that made a reference monad's variation silently overridable in GSA,
+which #40 turned into an error. The difference is real rather than convenient: a spec's fields are defaults
+the user set, while a monad's variation is an identity the object carries.
+
+**Two bugs found by writing the tests.** `printInputFolders` leaves its last line unterminated, so
+`Replicates:` shared a line with the input folders until an explicit `println` was added. And my first
+`show` test hardcoded "every parameter is calibratable", which is only true once #38 lands — it now derives
+each expectation from `_calibrationRejection`, so it does not need revisiting as more variation kinds
+become calibratable.
+

@@ -88,6 +88,24 @@ function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                               summary_statistic, distance, n_replicates, ref.variation_id)
 end
 
+#! `use_previous` is deliberately dropped: calibration reuses through the `SimulationBank`, not the
+#! runner's matching, so there is nothing here for it to mean. Named in the `StudySpec` docstring and
+#! marked "(sensitivity only)" by its `show`, so the omission is visible rather than silent.
+"""
+    CalibrationProblem(spec::StudySpec, observed_data, summary_statistic, distance; kwargs...)
+
+Build a problem from a [`StudySpec`](@ref), taking its inputs, parameters, reference variation and
+replicate count. `n_replicates` and `reference_variation_id` may be overridden.
+"""
+function CalibrationProblem(spec::StudySpec, observed_data, summary_statistic, distance;
+                            n_replicates::Integer=spec.n_replicates,
+                            reference_variation_id::VariationID=spec.reference_variation_id)
+    return CalibrationProblem(spec.inputs, spec.variations, observed_data,
+                              summary_statistic, distance;
+                              n_replicates=Int(n_replicates),
+                              reference_variation_id=reference_variation_id)
+end
+
 #! Defined here rather than beside `ParsedVariations` in `variations.jl`: that file is included
 #! before `calibration/problem.jl`, so a method signature naming `CalibrationProblem` there would be
 #! an `UndefVarError` at definition time.
