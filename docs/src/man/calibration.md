@@ -153,6 +153,37 @@ under a [`Calibration`](@ref) record in the database, so an interrupted run can 
 result = resumeABC(Calibration(calibration_id))   # no need to re-supply the problem
 ```
 
+## What a run leaves on disk
+
+A calibration writes three files describing the run, then one folder per generation:
+
+```
+outputs/calibrations/1/
+├── problem.jld2          # the CalibrationProblem, so a resume needs no re-supplied problem
+├── method.toml           # the method's settings
+├── parameters.toml       # display name → database column → prior, per parameter
+└── generations/
+    ├── 01/
+    │   ├── particles.csv          # accepted particles, in target space
+    │   ├── cdfs.csv               # the same particles in CDF space
+    │   ├── metadata.toml          # both epsilons, ESS, acceptance rate, evaluation count
+    │   ├── monads.csv             # every monad evaluated, as compressed ID ranges
+    │   ├── proposals.csv          # distance and outcome for every proposal
+    │   ├── failed_simulations.csv # only when a simulation failed
+    │   └── failed_monads.csv      # only when a monad lost every simulation
+    ├── 02/
+    └── …
+```
+
+The folder name is the generation number, zero-padded to fit `max_nr_populations`. If a resume raises
+that cap the existing folders are re-padded to match, so the directory stays in order; lowering it
+narrows them again, but never below the width the generations already on disk require.
+
+Calibrations written by an earlier version stored the same artifacts as flat files
+(`generation_01.csv`, `generation_01_monads.csv`, and a `generation_cdfs/` subdirectory). Those are
+read as they are — nothing needs converting before you can plot or inspect a run — and are moved into
+the folder layout the first time the run is resumed.
+
 ## Finding your runs again
 
 Every calibration in the project is listed by [`calibrationsTable`](@ref) — when it ran, which
@@ -294,11 +325,11 @@ absorbed.
 Every generation's failures are recorded in the calibration folder, next to the monad record:
 
 ```
-generations/generation_{NNN}_failed_simulations.csv   # simulation IDs that failed
-generations/generation_{NNN}_failed_monads.csv        # monads with ≥1 failed simulation
+generations/{t}/failed_simulations.csv   # simulation IDs that failed
+generations/{t}/failed_monads.csv        # monads with ≥1 failed simulation
 ```
 
-Both use the same compressed-ID format as `generation_{NNN}_monads.csv` (read them back with
+Both use the same compressed-ID format as `monads.csv` (read them back with
 `ModelManager.constituentIDs(path)`). You get **one warning per generation** pointing at these
 files, not one per failure — a population of hundreds proposed against a broken parameter region
 would otherwise bury the log. The files are only written when something failed.

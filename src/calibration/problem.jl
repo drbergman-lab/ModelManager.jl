@@ -122,17 +122,17 @@ Represents a calibration run tracked in the database.
 
 Created automatically by [`runABC`](@ref). The associated output folder at
 `data/outputs/calibrations/{id}/` contains:
-- `generations/generation_{NNN}_monads.csv`: monad IDs evaluated per generation (written
+- `generations/{t}/monads.csv`: monad IDs evaluated per generation (written
   before each batch for crash safety).
-- `generations/generation_{NNN}_failed_simulations.csv` and
-  `generations/generation_{NNN}_failed_monads.csv`: IDs of simulations that failed in that
+- `generations/{t}/failed_simulations.csv` and
+  `generations/{t}/failed_monads.csv`: IDs of simulations that failed in that
   generation and of the monads they belong to. Written only when something failed.
-- `generations/generation_{NNN}.csv`: human-readable per-generation results — target
+- `generations/{t}/particles.csv`: human-readable per-generation results — target
   parameter values (and latent parameter samples for user-supplied `LatentVariation`s),
   weights, distances, and monad IDs.
-- `generations/generation_{NNN}.toml`: generation-level metadata (epsilon,
+- `generations/{t}/metadata.toml`: generation-level metadata (epsilon,
   acceptance_rate, ess, n_evaluations).
-- `generations/generation_cdfs/generation_{NNN}.csv`: raw CDF coordinates for each accepted particle;
+- `generations/{t}/cdfs.csv`: raw CDF coordinates for each accepted particle;
   used by [`resumeABC`](@ref) to reconstruct the internal particle state exactly.
 - `method.toml`: serialized ABC-SMC settings (used by [`resumeABC`](@ref)).
 - `problem.jld2`: full serialized [`CalibrationProblem`](@ref); enables
@@ -295,7 +295,7 @@ end
 
 Extract posterior samples directly from disk for a completed calibration run.
 
-Reads the human-readable `generations/generation_{NNN}.csv` file for the requested
+Reads the human-readable `generations/{t}/particles.csv` file for the requested
 generation. Returns only the parameter columns (strips `weight`, `distance`, `monad_id`).
 
 Useful when you have only the calibration ID (e.g. after a session restart) and don't
@@ -318,17 +318,22 @@ function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:fina
         "No generations directory found for Calibration($(calibration.id)). " *
         "Has the calibration been run?")
 
-    # All generation_NNN.csv files (exclude _monads files)
-    all_names = readdir(gen_dir)
-    csv_names = sort(filter(f -> occursin(r"^generation_\d+\.csv$", f), all_names))
-    isempty(csv_names) && error(
+    #! Addressed by generation index, not by position in a sorted file list. The old form sorted names
+    #! lexicographically and then used the list position as `t`, which is only correct while every name
+    #! has the same width and no generation is missing.
+    indices = _generationIndices(gen_dir)
+    isempty(indices) && error(
         "No completed generations found for Calibration($(calibration.id)).")
 
-    t = generation === :final ? length(csv_names) : Int(generation)
-    1 <= t <= length(csv_names) || throw(ArgumentError(
-        "Generation $t is out of range [1, $(length(csv_names))]."))
+    t = generation === :final ? last(indices) : Int(generation)
+    t in indices || throw(ArgumentError(
+        "Generation $t not found for Calibration($(calibration.id)). Available: $(indices)."))
 
-    df = CSV.read(joinpath(gen_dir, csv_names[t]), DataFrame)
+    csv_path = _generationArtifact(gen_dir, t, :particles)
+    isnothing(csv_path) && error(
+        "Generation $t of Calibration($(calibration.id)) has no particle file.")
+
+    df = CSV.read(csv_path, DataFrame)
     weights    = df[!, :weight]
     display_df = select(df, Not([:weight, :distance, :monad_id]))
     return display_df, weights
@@ -394,20 +399,25 @@ end
 function ConvergenceSummary(cal::Calibration)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
-    toml_files = sort(filter(f -> occursin(r"^generation_\d+\.toml$", f), readdir(gen_dir)))
-    isempty(toml_files) && error("No generation metadata found for Calibration($(cal.id)).")
+    indices = _generationIndices(gen_dir)
+    isempty(indices) && error("No generation metadata found for Calibration($(cal.id)).")
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
     thresholds = Union{Nothing,Float64}[]
     n_accepteds = Int[]; esss = Float64[]; ess_fractions = Float64[]
     n_evaluationss = Int[]
 
-    for (t, fname) in enumerate(toml_files)
-        d = TOML.parsefile(joinpath(gen_dir, fname))
-        csv_path = joinpath(gen_dir, replace(fname, ".toml" => ".csv"))
-        n_acc = isfile(csv_path) ?
-                nrow(CSV.read(csv_path, DataFrame; select=[:weight])) :
-                round(Int, d["acceptance_rate"] * d["n_evaluations"])
+    #! `t` is the generation's own index, not its position in a listing, and the particle file is
+    #! resolved on its own rather than by swapping the metadata file's extension — under the folder
+    #! layout `metadata.toml` and `particles.csv` share no stem, so that trick no longer applies.
+    for t in indices
+        toml_path = _generationArtifact(gen_dir, t, :metadata)
+        isnothing(toml_path) && continue
+        d = TOML.parsefile(toml_path)
+        csv_path = _generationArtifact(gen_dir, t, :particles)
+        n_acc = isnothing(csv_path) ?
+                round(Int, d["acceptance_rate"] * d["n_evaluations"]) :
+                nrow(CSV.read(csv_path, DataFrame; select=[:weight]))
         push!(ts, t)
         #! Pre-rename runs wrote this as "epsilon"; read either spelling so they still load.
         push!(epsilons, get(d, "max_epsilon_accepted", get(d, "epsilon", NaN)))
