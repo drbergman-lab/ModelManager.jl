@@ -210,7 +210,7 @@ method = ABCSMC(
     min_acceptance_rate = 0.01,
 )
 
-result = runCalibration(problem, method)
+result = runCalibration(method, problem)
 ```
 """
 struct ABCSMC <: AbstractCalibrationMethod
@@ -285,6 +285,6 @@ function ABCSMC(; population_size::Int=100,
 end
 
 # Generic dispatch stub. The user-facing docstring lives on the method-specific
-# implementation (e.g. `runCalibration(::CalibrationProblem, ::ABCSMC)` in abc.jl)
+# implementation (e.g. `runCalibration(::ABCSMC, ::CalibrationProblem)` in abc.jl)
 # so the rendered API reference shows a single, detailed entry.
 function runCalibration end

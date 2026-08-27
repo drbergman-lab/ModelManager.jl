@@ -3262,3 +3262,135 @@ before and after.
 **Deliberately kept:** the padding. Plain integer folder names (`generations/5/`) are viable now that nothing
 sorts lexicographically, but `ls` would show `1 10 2 3`. Padding costs nothing given the index is always parsed.
 
+## 2026-08-24 — Calibration entry points made symmetric, and `method=` stopped resetting the run
+
+Item 5's remainder, plus the `method=` bug that came out of the #37 path audit.
+
+**`method=` was a whole-object swap, and that is not what anyone means by it.** `resumeABC(cal;
+method=ABCSMC(max_nr_populations=15))` reads as "raise the cap"; what it did was hand the resume a fresh
+`ABCSMC` whose other twelve fields were constructor defaults. Measured on a saved method of
+`population_size=64, epsilon_quantile=0.3, minimum_epsilon=1e-4, ComponentwiseKernel`: the override
+silently produced `100, 0.5, 0.01, GaussianKernel`.
+
+The fix keeps both forms and makes the distinction explicit. A keyword *patches* — `_methodWithOverrides`
+copies the saved method and replaces only the named fields — while a method object still replaces
+wholesale, which is a legitimate thing to want. Passing both is an `ArgumentError`, since they are two
+ways to say the same thing and letting one win silently is how this started. `_methodFromKeywords` could
+not be reused: it builds a fresh `ABCSMC`, which is precisely the behaviour being fixed.
+
+**The effective method is now written back to `method.toml`.** Otherwise the file describes a run it no
+longer matches, and the *next* resume reverts to it — the override would silently un-apply. Same
+reasoning as upgrading a generation TOML on read, and the changed keys are reported so it is never
+silent. Comparison is on the serialised dict rather than the struct, so `_saveMethod` was split into
+`_methodDict` plus a writer.
+
+**Everything flows through `run` now.** `run(method::ABCSMC, problem)` and
+`run(calibration[, method])` sit beside `run(::AbstractTrial)` and `run(::GSAMethod, ...)`. Two prior
+decisions made this free rather than fiddly: `run(::GSAMethod, ...)` already returns an analysis object
+(`GSASampling`), so returning an `ABCResult` is precedent rather than novelty; and `Calibration` was
+deliberately kept *out* of the containment hierarchy in #32, which is exactly what makes
+`run(::Calibration)` unambiguous against `run(::AbstractTrial)`. Method-first matches GSA.
+
+**What a changed setting actually does on resume**, since "patches the saved method" says nothing about
+whether the patch is meaningful. A resume only appends generations, so every change takes effect from the
+next generation — a generation is the unit of change and nothing can take effect part-way through one.
+Most fields are therefore uninteresting: the cap, the four stopping criteria, `epsilon_quantile`,
+`accept_overflow`, `max_evaluations`, `store_rejected`. Three deserve naming: `population_size` leaves the
+run with generations of different sizes (legal, since weights normalise per generation, but worth knowing);
+`cdf_grid_k` is resolved once at loop entry, so snapping applies only to new generations and bank reuse
+differs either side of the resume; and `epsilon_schedule` is indexed by **absolute** generation, so a
+schedule sized for the remaining generations silently falls through the length guard to the quantile rule.
+That last one is the only silent failure among the thirteen, so it now warns. Nothing is refused — the
+right response to "can I change this?" is a description, not a veto.
+
+**`runCalibration` now takes the method first.** Breaking, and cheap while pre-1.0. It matches
+`run(::GSAMethod, inputs, avs)` and the new `run(::ABCSMC, problem)`, so "run this method on this thing"
+reads the same way everywhere. `resumeCalibration(calibration[, method])` keeps the object first, since
+on a resume there is nothing else to lead with.
+
+**The epsilon-schedule warning I added was off by one.** Generation `t` reads `epsilon_schedule[t-1]` and
+generation 1 consumes no entry, so an `L`-entry schedule covers generations 2 through `L+1`. My first
+warning fired whenever `L <= n_done` and claimed every new generation would fall back — but at `L == n_done`
+the *first* new generation does get an entry: five generations done plus a five-entry schedule schedules
+generation 6, using the last entry, and only 7 onward reverts. The warning now reports the covered range.
+Caught by being asked to state the behaviour precisely rather than by a test, which is its own lesson about
+what "documented" was worth here.
+
+**The `reference_variation_id` keyword is reverted.** I added it reasoning that a default of
+`ref.variation_id` made it harmless. The relevant question was not whether it was harmless but whether it
+was *consistent*: `createTrial(method, reference::AbstractMonad, avs; ...)` — the closest and by far the
+most-used analogue — takes the variation from the reference and offers no override, and nothing internal
+constructs the monad form at all. So the keyword introduced an inconsistency rather than removing one.
+Worth recording separately: `run(::GSAMethod, reference::AbstractMonad, avs; ...)` *does* honour a
+`reference_variation_id`, but only because the user's value lands rightmost in the `kwargs...` splat and
+Julia lets the rightmost duplicate win — accident, not design, and undocumented.
+
+**The accidental GSA override is now an error.** `run(::GSAMethod, reference::AbstractMonad, avs; ...)`
+passed `reference_variation_id=reference.variation_id` *before* `kwargs...`, and Julia lets the rightmost
+duplicate win, so a caller's value silently beat the reference. Undeclared and undocumented, which is the
+argument for removing rather than documenting it: `createTrial` has always refused the same thing (it has
+no splat to carry it), so the accident was the only place the package was inconsistent with itself. It now
+throws, naming the `InputFolders` form as where a variation ID is an independent argument.
+
+Checked while there: the `run(::AddVariationMethod, args...)` path forwards unrecognised keywords to
+`run(trial; kwargs...)` and thence to the simulator, so `reference_variation_id` there does not override
+anything — it just reaches the simulator as an unknown keyword. Broader issue, different from this one, and
+left alone.
+
+**On not deprecating `resumeABC`.** The brief proposed deprecating it in favour of a method-agnostic
+`resumeCalibration`, which would have left `runABC` standing with no partner. The surface now has two
+complete pairs — `runCalibration`/`resumeCalibration` reading like `run(::GSAMethod, ...)`, and
+`runABC`/`resumeABC` as the ABC shorthand — and `resumeABC` is a one-line alias, so the cost of keeping
+it is a line. Whether to retire the ABC-specific pair entirely is a separate call, and it is now a
+clean one to make because nothing depends on the asymmetry.
+
+**One brief item was stale, one I first got wrong.** `CalibrationParameter` and `SimulationBank` are
+both already exported, so the export-manifest gap does not exist.
+
+The `AbstractMonad` `CalibrationProblem` constructor's missing `reference_variation_id` I initially left
+alone, reasoning that it takes the reference variation *from the monad* and a keyword overriding it would
+mean passing a reference then ignoring it. That framed it as a binary it is not: the keyword's **default**
+can be `ref.variation_id`, so behaviour is unchanged and the override merely becomes expressible. Added on
+that basis — purely additive, and it removes an asymmetry with the `InputFolders` constructor that two
+briefs were both waiting on.
+
+**`_runControlKeywords` was a landmine.** It called `only(methods(runABC))`, which throws
+`ArgumentError: Collection has multiple elements` the moment `runABC` gains a second method — and it runs
+only while *building an error message*, so a user's typo would have surfaced as that instead of the
+keyword diagnostic. Verified by injecting an overload. Now `which(runABC, Tuple{CalibrationProblem})`,
+which yields the identical tuple and is stable under any number of overloads. This gates the shared-study
+work, which adds exactly such overloads.
+
+**The duplication was real.** `runCalibration` and `resumeCalibration` shared the bank, the batch
+evaluator, the generation callback, the `_runABCSMC` call and the result construction verbatim; they
+differ only in what comes before. That tail is now `_executeCalibration`, taking `start_generations` to
+cover the difference. `_latentNamesAndPriors` splits out separately because resume needs the names
+*before* it can load generations.
+
+**The docstring guard from #37 caught me immediately** — the `#!` explaining `_executeCalibration` landed
+between its docstring and the function on the first attempt. Worth noting: the guard's value showed up
+within minutes of adding it, on new code, not on a legacy sweep.
+
+### An unreachable epsilon has no bound
+
+CI on this branch hung: the Julia LTS macOS job sat in "Run all tests" for 50+ minutes where the same job
+takes ~4, while all seven others passed — including Julia 1.x on the *same* runner.
+
+The mechanism is `while length(accepted) < method.population_size` (`abc_smc.jl:634`) together with
+`max_evaluations::Union{Nothing,Int}=nothing`. **With the default, that loop has no bound at all.** If
+epsilon is below anything the model can produce, ABC-SMC proposes forever, with no diagnostic.
+
+My own new test walked straight into it: `epsilon_schedule=[0.5]` against `_test_nonzero_ss`, whose
+distance is *constantly* 1.0. Whether it hangs depends on whether any generation reads entry 1 — i.e. on
+whether the base run left one generation or two — which is not something a test should be betting on. The
+entry is now 2.0 (above the constant distance) and `max_evaluations=64` is set, so it cannot spin whatever
+the generation count turns out to be. Neither detail is what the test is about; it just must not be able
+to hang.
+
+**The library-level point is worth keeping separately from the test fix.** A user who sets an
+`epsilon_schedule` or `minimum_epsilon` below what their model can achieve gets an unbounded run and no
+message. `max_evaluations` is the existing brake and it is off by default. Options, none taken here: a
+default cap proportional to `population_size`; a warning after some multiple of `population_size`
+proposals with no acceptance; or leaving it and documenting the hazard where `epsilon_schedule` is
+described. This needs a decision rather than a quiet default change, so it is recorded, not fixed.
+
