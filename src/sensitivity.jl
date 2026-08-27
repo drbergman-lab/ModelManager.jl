@@ -82,7 +82,17 @@ function run(method::GSAMethod, inputs::InputFolders, avs::AbstractVector{<:Abst
     return gsa_sampling
 end
 
+#! Rejected rather than silently honoured. `reference_variation_id` is passed here *before* `kwargs...`,
+#! and Julia lets the rightmost duplicate win, so a caller supplying one used to override the reference's
+#! own variation — accidentally, and undocumented. The reference is the reference:
+#! `createTrial(method, reference::AbstractMonad, avs; ...)` offers no override either, and the
+#! `InputFolders` form is where a variation ID is genuinely an independent argument.
 function run(method::GSAMethod, reference::AbstractMonad, avs::Vector{<:AbstractVariation}; functions::AbstractVector{<:Function}=Function[], kwargs...)
+    haskey(kwargs, :reference_variation_id) && throw(ArgumentError(
+        "run(::GSAMethod, reference::AbstractMonad, ...) takes its reference variation from " *
+        "`reference`, so `reference_variation_id` cannot also be given — it would override the " *
+        "thing that makes `reference` a reference. Pass `InputFolders` instead to supply a " *
+        "variation ID independently."))
     return run(method, reference.inputs, avs; reference_variation_id=reference.variation_id, functions, kwargs...)
 end
 

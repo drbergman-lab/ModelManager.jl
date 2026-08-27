@@ -61,7 +61,7 @@ export GaussianKernel, ComponentwiseKernel, LocalNNKernel, LocalNNCovKernel
 export CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior
 export ConvergenceSummary
 export mseDistance
-export runABC, resumeABC
+export runABC, resumeABC, resumeCalibration
 
 include("utilities.jl")
 include("abstract_simulator.jl")
