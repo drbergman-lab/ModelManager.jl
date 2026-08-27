@@ -60,8 +60,8 @@ function _lazyLoadRejectedFromDisk(cal::Calibration, t_next::Int, max_nr_populat
                                     mapping::Dict{String,String})
     #! Located by pattern, not rebuilt from `max_nr_populations`: a resume may have changed the
     #! padding, and the miss here is silent — it degrades to an accepted-only plot with no error.
-    monads_path = _findGenerationFile(joinpath(calibrationFolder(cal), "generations"),
-                                      t_next, "_monads.csv")
+    monads_path = _generationArtifact(joinpath(calibrationFolder(cal), "generations"),
+                                      t_next, :monads)
     isnothing(monads_path) && return nothing
 
     all_ids      = constituentIDs(monads_path)
@@ -108,8 +108,8 @@ function _lazyLoadRejected(result::ABCResult, t_next::Int)
     #! By pattern, not from `result.method.max_nr_populations`. That is the *in-memory* cap, which a
     #! `method=` override on resume can have raised above the one the existing files were named under
     #! — and `method.toml` is never rewritten, so the two genuinely disagree.
-    monads_path = _findGenerationFile(joinpath(calibrationFolder(result.calibration), "generations"),
-                                      t_next, "_monads.csv")
+    monads_path = _generationArtifact(joinpath(calibrationFolder(result.calibration), "generations"),
+                                      t_next, :monads)
     isnothing(monads_path) && return nothing
 
     all_ids      = constituentIDs(monads_path)
@@ -275,14 +275,16 @@ end
     if space === :target
         df, w = posterior(cal; generation=generation)
     else
-        cdf_dir = joinpath(calibrationFolder(cal), "generations", "generation_cdfs")
-        isdir(cdf_dir) || error("No generation_cdfs directory for Calibration($(cal.id)).")
-        files = sort(filter(f -> occursin(r"^generation_\d+\.csv$", f), readdir(cdf_dir)))
-        isempty(files) && error("No CDF generation files for Calibration($(cal.id)).")
-        t = generation === :final ? length(files) : Int(generation)
-        1 <= t <= length(files) || throw(ArgumentError(
-            "Generation $t is out of range [1, $(length(files))]."))
-        df_cdf  = CSV.read(joinpath(cdf_dir, files[t]), DataFrame)
+        gen_dir = joinpath(calibrationFolder(cal), "generations")
+        indices = _generationIndices(gen_dir)
+        isempty(indices) && error("No CDF generation files for Calibration($(cal.id)).")
+        t = generation === :final ? last(indices) : Int(generation)
+        t in indices || throw(ArgumentError(
+            "Generation $t not found for Calibration($(cal.id)). Available: $(indices)."))
+        cdf_path = _generationArtifact(gen_dir, t, :cdfs)
+        isnothing(cdf_path) && error(
+            "Generation $t of Calibration($(cal.id)) has no CDF file.")
+        df_cdf  = CSV.read(cdf_path, DataFrame)
         weights_col = hasproperty(df_cdf, :weight) ? df_cdf[!, :weight] :
                       fill(1.0 / nrow(df_cdf), nrow(df_cdf))
         df = select(df_cdf, Not(intersect([:weight, :distance, :monad_id], Symbol.(names(df_cdf)))))
@@ -592,11 +594,9 @@ only_or_nothing(v) = length(v) == 1 ? first(v) : nothing
 #! One generation's TOML metadata, or an empty Dict when it is missing.
 function _calibrationGenerationMeta(cal::Calibration, t::Int)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
-    isdir(gen_dir) || return Dict{String,Any}()
-    name = only_or_nothing(filter(f -> occursin(Regex("^generation_0*$(t)\\.toml\$"), f),
-                                  readdir(gen_dir)))
-    isnothing(name) && return Dict{String,Any}()
-    return TOML.parsefile(joinpath(gen_dir, name))
+    path    = _generationArtifact(gen_dir, t, :metadata)
+    isnothing(path) && return Dict{String,Any}()
+    return TOML.parsefile(path)
 end
 
 """
@@ -855,12 +855,17 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
                    logscale             = false)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
-    csv_names = sort(filter(f -> occursin(r"^generation_\d+\.csv$", f), readdir(gen_dir)))
-    isempty(csv_names) && error("No completed generations for Calibration($(cal.id)).")
+    #! Generations are addressed by index throughout, so both layouts and any padding width behave
+    #! alike, and `t` never means "position in a sorted listing".
+    indices = _generationIndices(gen_dir)
+    isempty(indices) && error("No completed generations for Calibration($(cal.id)).")
 
-    # Helper: read a display-format generation CSV; return (param_df, weights, raw_df).
-    function _readGenCSV(fname)
-        raw = CSV.read(joinpath(gen_dir, fname), DataFrame)
+    # Helper: read generation t's display-format particles; return (param_df, weights, raw_df).
+    function _readGenCSV(t::Int)
+        path = _generationArtifact(gen_dir, t, :particles)
+        isnothing(path) && error(
+            "Generation $t of Calibration($(cal.id)) has no particle file.")
+        raw = CSV.read(path, DataFrame)
         w   = hasproperty(raw, :weight) ? Float64.(raw[!, :weight]) :
               fill(1.0 / nrow(raw), nrow(raw))
         df  = select(raw, Not(intersect([:weight, :distance, :monad_id],
@@ -871,8 +876,8 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
     if style === :ridgeline
         dfs = Vector{DataFrame}()
         wts = Vector{Vector{Float64}}()
-        for fname in csv_names
-            df, w, _ = _readGenCSV(fname)
+        for t in indices
+            df, w, _ = _readGenCSV(t)
             push!(dfs, df)
             push!(wts, w)
         end
@@ -880,14 +885,14 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
         _RidgelineData(dfs, wts, nothing, nothing, pnames)
 
     elseif style === :transition
-        T = length(csv_names)
-        t = isnothing(generation) ? T - 1 : Int(generation)
+        T = last(indices)
+        t = isnothing(generation) ? max(T - 1, 1) : Int(generation)
         t_next = t + 1
-        (1 <= t && t_next <= T) || throw(ArgumentError(
-            "generation must be in [1, $(T-1)], got $t"))
+        (t in indices && t_next in indices) || throw(ArgumentError(
+            "generation must be one with a successor; got $t, available $(indices)"))
 
-        kde_df, kde_w, _        = _readGenCSV(csv_names[t])
-        acc_df, acc_w, acc_raw  = _readGenCSV(csv_names[t_next])
+        kde_df, kde_w, _        = _readGenCSV(t)
+        acc_df, acc_w, acc_raw  = _readGenCSV(t_next)
 
         pnames = names(kde_df)
 
@@ -922,14 +927,13 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
                         pop_size, note,
                         show_particles, aggregate_duplicates)
     elseif style === :distances
-        t = isnothing(generation) ? length(csv_names) : Int(generation)
-        prop_path = _findGenerationFile(gen_dir, t, "_proposals.csv")
+        t = isnothing(generation) ? last(indices) : Int(generation)
+        t in indices || error("No generation $(t) for Calibration($(cal.id)).")
+        prop_path = _generationArtifact(gen_dir, t, :proposals)
         prop_df = isnothing(prop_path) ? nothing :
             CSV.read(prop_path, DataFrame;
                      types=Dict(:monad_id => Int, :distance => Float64, :accepted => Bool))
-        gen_name = only_or_nothing(filter(f -> occursin(Regex("^generation_0*$(t)\\.csv\$"), f), csv_names))
-        isnothing(gen_name) && error("No generation $(t) for Calibration($(cal.id)).")
-        _, _, raw = _readGenCSV(gen_name)
+        _, _, raw = _readGenCSV(t)
         acc_dists = hasproperty(raw, :distance) ? Float64.(raw[!, :distance]) : Float64[]
         meta = _calibrationGenerationMeta(cal, t)
         acc, rej, note = _distanceSeries(prop_df, acc_dists)

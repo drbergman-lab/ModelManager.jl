@@ -3209,6 +3209,58 @@ so a failed rename is logged and skipped rather than aborting the resume.
 budget, so `t_start:cap` is empty whenever a resume asks for no more generations than already exist — and an
 empty range runs nothing, silently, returning the same generations a finished run would. `_runABCSMC` warns.
 
+## 2026-08-24 — One folder per generation
+
+`generations/` held every artifact of every generation as a flat file with the index in its name, plus a
+`generation_cdfs/` subdirectory. A ten-generation run was 41 entries in one directory; it is now ten folders.
+
+**The design move that made this tractable was addressing artifacts by *role*.** `_GENERATION_ARTIFACTS` maps
+`:particles`, `:cdfs`, `:metadata`, `:monads`, `:proposals`, `:failed_simulations`, `:failed_monads` to
+basenames, and `_generationArtifact(gen_dir, t, role)` resolves one: folder layout first, historical flat layout
+second. Every reader goes through it, so supporting both layouts costs one function rather than a branch at each
+of the ~12 read sites. Only `_flatGenerationArtifact` still knows the old names.
+
+That also settled the awkward part. There is **no migration channel for on-disk calibration artifacts** —
+`upgradeMilestones` covers database rows, and ModelManager has no upgrade path of its own — so a layout change
+could either strand every existing calibration or require converting before reading. Neither is acceptable for
+files a user may just want to plot. Reading both layouts means an old run works untouched; `_migrateGenerationLayout!`
+then tidies it on the next resume, where we are already writing in that directory anyway.
+
+**What the change exposed.** Four sites used a listing's *position* as the generation index, which is only
+correct while every name is the same width and no generation is missing: `posterior`, `ConvergenceSummary`, and the
+`:ridgeline` and `:transition` branches of the `Calibration` recipe. All four now take the index from
+`_generationIndices`.
+
+Measured on the parent branch with generations 1, 2, 10 on disk (the mixed widths a resume produces):
+
+| call | before | correct |
+|---|---|---|
+| `ConvergenceSummary(cal).df.t` | `[1, 2, 3]` | `[1, 2, 10]` |
+| `…max_epsilon_accepted` | `[0.9, 0.01, 0.5]` | `[0.9, 0.5, 0.01]` |
+| `posterior(cal; generation=10)` | throws "out of range [1, 3]" | generation 10 |
+| `posterior(cal)` | generation **2** | generation 10 |
+
+The epsilon column is misordered because `generation_010.toml` sorts *between* `generation_01.toml` and
+`generation_02.toml`, so a convergence plot showed ε going 0.9 → 0.01 → 0.5 — non-monotonic, which reads as a
+diverging run. And `posterior(cal)` silently returned the wrong generation's posterior rather than failing.
+
+These four were the least-tested paths in the file, which is why the bugs survived: codecov put the rewritten
+regions at 0% covered. The new "generation index is the index, not a listing position" testset pins all of it,
+using generations 1, 2, 10 at mixed widths so both assumptions break at once. `ConvergenceSummary` additionally derived the particles path by swapping the metadata
+file's extension — `metadata.toml` and `particles.csv` share no stem, so that had to become a real lookup.
+
+**Collapsed rather than ported.** The four per-generation path builders were each a hand-rolled
+"prefer-existing-else-compute" block; they are now one line apiece over `_generationArtifactToWrite`, which holds
+that rule once. `_saveGeneration` lost its `cdf_dir` argument entirely — the CDF coordinates are a sibling file
+now, so the three-arity chain collapsed to one.
+
+**Verified against a real run**, not just fixtures: the ten-generation calibration from the distance-histogram
+work migrated 50 files into 10 folders, and `_loadGenerations`, `posterior` (final and by generation),
+`ConvergenceSummary`, `calibrationMonadIDs` (total and per generation), and `show` all returned identical results
+before and after.
+
+**Deliberately kept:** the padding. Plain integer folder names (`generations/5/`) are viable now that nothing
+sorts lexicographically, but `ls` would show `1 10 2 3`. Padding costs nothing given the index is always parsed.
 ## 2026-08-22 — Calibration accepts discrete parameters
 
 Item 7 Stage 1b. `#36` made discrete variations ride the `Distribution` branch as a `DiscreteUniform` over

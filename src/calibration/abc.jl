@@ -101,7 +101,7 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
 2. Creates or retrieves a `Monad` for each proposal: known-mid proposals use
    `Monad(mid; ...)` (one SELECT); nothing-mid proposals use `_createMonadForParams`
    (INSERT OR IGNORE + SELECT).
-3. Records all monad IDs evaluated so far in this generation to `generation_{NNN}_monads.csv`
+3. Records all monad IDs evaluated so far in this generation to `generations/{t}/monads.csv`
    using `compressIDs` **before** launching simulations (crash safety). The file is
    overwritten on each batch call so it always contains a single fully-compressed entry
    spanning all batches in the generation.
@@ -272,8 +272,8 @@ Run ABC-SMC calibration. See [`ABCSMC`](@ref) for method settings.
 The full `CalibrationProblem` is serialized to `problem.jld2` enabling
 `resumeABC(Calibration(id))` with no further arguments. Per-generation results are
 saved in two forms:
-- `generations/generation_{t}.csv`: human-readable target parameter values.
-- `generations/generation_cdfs/generation_{t}.csv`: raw CDF coordinates for exact resume.
+- `generations/{t}/particles.csv`: human-readable target parameter values.
+- `generations/{t}/cdfs.csv`: raw CDF coordinates for exact resume.
 
 # Arguments
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
@@ -285,8 +285,8 @@ saved in two forms:
   simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
   which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
   simulation and monad IDs are recorded per generation in
-  `generations/generation_{NNN}_failed_simulations.csv` and
-  `generations/generation_{NNN}_failed_monads.csv`.
+  `generations/{t}/failed_simulations.csv` and
+  `generations/{t}/failed_monads.csv`.
 
 # Examples
 ```julia
@@ -366,8 +366,8 @@ constructor, so every field it accepts is accepted here, with the same defaults.
 - `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful simulation.
   `:reject` records its distance as `missing` (so the particle is never accepted) and continues;
   `:error` stops the run. Failed simulation and monad IDs are recorded per generation either way, in
-  `generations/generation_{NNN}_failed_simulations.csv` and
-  `generations/generation_{NNN}_failed_monads.csv`.
+  `generations/{t}/failed_simulations.csv` and
+  `generations/{t}/failed_monads.csv`.
 
 # Returns
 An [`ABCResult`](@ref) holding the calibration, its generations, the parameters and the method.
@@ -706,7 +706,7 @@ end
     _writeParametersTOML(calibration::Calibration, cps::Vector{CalibrationParameter})
 
 Write `parameters.toml` to the calibration output folder. This file provides a
-human-readable mapping from the display column names used in `generations/generation_NNN.csv`
+human-readable mapping from the display column names used in `generations/{t}/particles.csv`
 to the underlying database column names (XML paths), along with the prior distributions.
 
 Complements `problem.jld2` (the machine-readable full serialization) for quick inspection
@@ -728,7 +728,7 @@ function _writeParametersTOML(calibration::Calibration, cps::Vector{CalibrationP
     end
     open(path, "w") do io
         println(io, "# Display name → database column mapping for calibration $(calibration.id).")
-        println(io, "# Display names are used in generations/generation_NNN.csv.")
+        println(io, "# Display names are used in generations/{t}/particles.csv.")
         println(io, "# Database columns are the full XML paths stored in the variations tables.")
         println(io)
         TOML.print(io, Dict{String,Any}("parameters" => entries))
@@ -791,6 +791,9 @@ end
 
 ################## Resume — validation helpers ##################
 
+#! Ordered by index, never by name — `_generationIndices` parses it, so mixed padding widths and both
+#! layouts order alike. Sorting the names instead would put `generation_006.csv` before
+#! `generation_05.csv` and answer generation 5 for a run that reached 10.
 """
     _findLastGenerationCSVs(calibration) → Union{Nothing, Tuple{String,String}}
 
@@ -799,17 +802,12 @@ if no generations have been written yet.
 """
 function _findLastGenerationCSVs(calibration::Calibration)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
-    cdf_dir = joinpath(gen_dir, "generation_cdfs")
-    (isdir(gen_dir) && isdir(cdf_dir)) || return nothing
-    #! Ordered by the parsed index, not by name. A resume that widened the padding leaves mixed
-    #! widths, and lexicographically `generation_006.csv` sorts *before* `generation_05.csv`, so
-    #! taking the last name would answer generation 5 for a run that reached 10.
-    indexed = _indexedGenerationFiles(cdf_dir, r"^generation_(\d+)\.csv$")
-    isempty(indexed) && return nothing
-    last_name = basename(last(indexed)[2])
-    cdf_path     = joinpath(cdf_dir, last_name)
-    display_path = joinpath(gen_dir, last_name)
-    isfile(display_path) || return nothing
+    indices = _generationIndices(gen_dir)
+    isempty(indices) && return nothing
+    t = last(indices)
+    cdf_path     = _generationArtifact(gen_dir, t, :cdfs)
+    display_path = _generationArtifact(gen_dir, t, :particles)
+    (isnothing(cdf_path) || isnothing(display_path)) && return nothing
     return cdf_path, display_path
 end
 
@@ -1111,13 +1109,14 @@ function resumeABC(calibration::Calibration;
 
     m = isnothing(method) ? _loadMethod(calibration) : method
 
-    #! Before anything reads or writes a generation file, bring the existing names to one width. A
-    #! resume may have changed `max_nr_populations`, and while every reader is padding-agnostic, a
-    #! directory holding both `generation_05.csv` and `generation_006.csv` is needlessly hard to read.
-    n_repadded = _normalizeGenerationPadding!(calibration, m.max_nr_populations)
-    n_repadded > 0 && @info "Re-padded $(n_repadded) generation file" *
-                            "$(n_repadded == 1 ? "" : "s") to match max_nr_populations=" *
-                            "$(m.max_nr_populations)."
+    #! Before anything reads or writes a generation file, bring the directory to the current layout:
+    #! move any flat-layout generation into its own folder, and re-pad folder names if the cap changed.
+    #! Readers handle both layouts at any width, so this is tidiness rather than a precondition — which
+    #! is why it runs on resume (where we are already writing here) and not on a read-only plot.
+    n_moved = _migrateGenerationLayout!(calibration, m.max_nr_populations)
+    n_moved > 0 && @info "Reorganised $(n_moved) generation file" *
+                         "$(n_moved == 1 ? "" : "s") into per-generation folders under " *
+                         "generations/, padded to match max_nr_populations=$(m.max_nr_populations)."
 
     cps         = active_problem.parameters
     param_names = vcat([cp.lv.latent_parameter_names for cp in cps]...)
@@ -1190,62 +1189,46 @@ Zero-padded generation index string, e.g. `"03"` for t=3, max=10 or `"003"` for 
 _generationTag(t::Int, max_nr_populations::Int) =
     lpad(string(t), ndigits(max_nr_populations), '0')
 
+#! All four are `_generationArtifactToWrite` with the role filled in, which is where the two rules that
+#! used to be repeated per builder now live: an existing artifact wins over a computed path (so an
+#! appender cannot split one generation's record across two files after a resume changes the padding),
+#! and the folder is created on demand.
+#! One docstring each: a docstring attaches to the single expression that follows it, so one block
+#! listing all four signatures would document only the first of them.
 """
     _generationProposalsPath(dir, t, max_nr_populations) → String
 
-Path to a generation's proposal-distance CSV (`monad_id`, `distance`, `accepted`).
+Path to generation `t`'s proposal-distance record, for writing.
 """
 _generationProposalsPath(dir::String, t::Int, max_nr_populations::Int) =
-    joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_proposals.csv")
+    _generationArtifactToWrite(dir, t, :proposals, max_nr_populations)
 
-#! Appending must land in the file that is already there. A generation interrupted mid-run leaves a
-#! monads file but no particles file, so it is not counted as loaded and a resume re-runs it — and if
-#! the resume also changed `max_nr_populations`, computing the name afresh would open a *second* file
-#! under the new padding and split one generation's monad record across two.
 """
     _generationMonadsPath(calibration, t, max_nr_populations) → String
 
-Path to the monad-ID record for generation `t`, e.g. `generations/generation_05_monads.csv`. An
-existing file for that generation wins over the computed name, whatever padding it carries.
+Path to generation `t`'s evaluated-monad record, for writing.
 """
-function _generationMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
-    dir      = joinpath(calibrationFolder(calibration), "generations")
-    existing = _findGenerationFile(dir, t, "_monads.csv")
-    isnothing(existing) || return existing
-    return joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_monads.csv")
-end
+_generationMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int) =
+    _generationArtifactToWrite(joinpath(calibrationFolder(calibration), "generations"),
+                               t, :monads, max_nr_populations)
 
-#! Prefers an existing file for the same reason `_generationMonadsPath` does: a generation
-#! retried after a resume changed the padding would otherwise split its failure record across
-#! two differently-named files, and nothing scans for these.
 """
     _failedSimulationsPath(calibration, t, max_nr_populations) → String
 
-Path to the failed-simulation record for generation `t`:
-`generations/generation_{NNN}_failed_simulations.csv`.
+Path to generation `t`'s failed-simulation record, for writing.
 """
-function _failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
-    dir      = joinpath(calibrationFolder(calibration), "generations")
-    existing = _findGenerationFile(dir, t, "_failed_simulations.csv")
-    isnothing(existing) || return existing
-    return joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_failed_simulations.csv")
-end
+_failedSimulationsPath(calibration::Calibration, t::Int, max_nr_populations::Int) =
+    _generationArtifactToWrite(joinpath(calibrationFolder(calibration), "generations"),
+                               t, :failed_simulations, max_nr_populations)
 
-#! Prefers an existing file for the same reason `_generationMonadsPath` does: a generation
-#! retried after a resume changed the padding would otherwise split its failure record across
-#! two differently-named files, and nothing scans for these.
 """
     _failedMonadsPath(calibration, t, max_nr_populations) → String
 
-Path to the record of monads with at least one failed simulation in generation `t`:
-`generations/generation_{NNN}_failed_monads.csv`.
+Path to generation `t`'s failed-monad record, for writing.
 """
-function _failedMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int)
-    dir      = joinpath(calibrationFolder(calibration), "generations")
-    existing = _findGenerationFile(dir, t, "_failed_monads.csv")
-    isnothing(existing) || return existing
-    return joinpath(dir, "generation_$(_generationTag(t, max_nr_populations))_failed_monads.csv")
-end
+_failedMonadsPath(calibration::Calibration, t::Int, max_nr_populations::Int) =
+    _generationArtifactToWrite(joinpath(calibrationFolder(calibration), "generations"),
+                               t, :failed_monads, max_nr_populations)
 
 """
     _appendCompressedIDs(path, new_ids) → String
@@ -1337,9 +1320,9 @@ end
     _saveGeneration(calibration, gen, max_nr_populations[, cps])
 
 Save a generation result. Writes:
-- `generations/generation_{NNN}.csv`: human-readable display format.
-- `generations/generation_cdfs/generation_{NNN}.csv`: raw CDF coordinates for resume.
-- `generations/generation_{NNN}.toml`: generation-level metadata.
+- `generations/{t}/particles.csv`: human-readable display format.
+- `generations/{t}/cdfs.csv`: raw CDF coordinates for resume.
+- `generations/{t}/metadata.toml`: generation-level metadata.
 
 When called with the 2-directory form `_saveGeneration(dir, cdf_dir, gen, ...)`, the
 caller controls both directories (used in tests).
@@ -1351,29 +1334,22 @@ function _saveGeneration(calibration::Calibration, gen::GenerationResult,
     _saveGeneration(dir, gen, max_nr_populations, cps)
 end
 
-# Single-dir form: cdf_dir is a "generation_cdfs" subdirectory of dir.
-# Used by tests that only supply one temp directory.
+#! One directory per generation, so the artifacts are addressed by role and need no generation number
+#! in their own names. The `cdf_dir` argument the flat layout needed is gone: the CDF coordinates are
+#! simply `cdfs.csv` beside the rest.
 function _saveGeneration(dir::String, gen::GenerationResult, max_nr_populations::Int,
                          cps::Vector{CalibrationParameter}=CalibrationParameter[])
-    _saveGeneration(dir, joinpath(dir, "generation_cdfs"), gen, max_nr_populations, cps)
-end
+    gdir = _generationFolderToWrite(dir, gen.t, max_nr_populations)
 
-function _saveGeneration(dir::String, cdf_dir::String, gen::GenerationResult,
-                         max_nr_populations::Int,
-                         cps::Vector{CalibrationParameter}=CalibrationParameter[])
-    mkpath(dir)
-    mkpath(cdf_dir)
-    tag = _generationTag(gen.t, max_nr_populations)
-
-    # Raw CDF CSV for resumeABC.
+    # Raw CDF coordinates for resumeABC.
     cdf_df = copy(gen.particles)
     cdf_df[!, :weight]   = gen.weights
     cdf_df[!, :distance] = gen.distances
     cdf_df[!, :monad_id] = gen.monad_ids
-    CSV.write(joinpath(cdf_dir, "generation_$tag.csv"), cdf_df)
+    CSV.write(joinpath(gdir, _GENERATION_ARTIFACTS.cdfs), cdf_df)
 
     # Human-readable display CSV.
-    CSV.write(joinpath(dir, "generation_$tag.csv"), _buildDisplayDF(gen, cps))
+    CSV.write(joinpath(gdir, _GENERATION_ARTIFACTS.particles), _buildDisplayDF(gen, cps))
 
     #! Every evaluated proposal and whether it passed ε. Deliberately a separate file rather than
     #! extra rows in the display CSV: `posterior(::Calibration)` reads that one and strips exactly
@@ -1381,7 +1357,7 @@ function _saveGeneration(dir::String, cdf_dir::String, gen::GenerationResult,
     #! with meaningless weights. Written unconditionally — this is three numbers per proposal on
     #! disk, unlike `store_rejected`, which holds a full CDF-coordinate frame in memory.
     isnothing(gen.proposal_distances) ||
-        CSV.write(_generationProposalsPath(dir, gen.t, max_nr_populations), gen.proposal_distances)
+        CSV.write(joinpath(gdir, _GENERATION_ARTIFACTS.proposals), gen.proposal_distances)
 
     # Generation-level TOML.
     meta = Dict{String,Any}(
@@ -1397,7 +1373,7 @@ function _saveGeneration(dir::String, cdf_dir::String, gen::GenerationResult,
     #! Omitted rather than written as a placeholder: generation 1 has no threshold, because it
     #! accepts every proposal it evaluates, and TOML has no null.
     isnothing(gen.epsilon_threshold) || (meta["epsilon_threshold"] = gen.epsilon_threshold)
-    open(joinpath(dir, "generation_$tag.toml"), "w") do io
+    open(joinpath(gdir, _GENERATION_ARTIFACTS.metadata), "w") do io
         TOML.print(io, meta; sorted=true)
     end
 end
@@ -1405,7 +1381,7 @@ end
 """
     _loadGenerations(calibration, param_names, max_nr_populations) → Vector{GenerationResult}
 
-Load saved generation results from `generation_cdfs/` (raw CDF coordinates), reconstructing
+Load saved generation results from each generation's `cdfs.csv` (raw CDF coordinates), reconstructing
 the internal particle state needed for `resumeABC`.
 """
 function _loadGenerations(calibration::Calibration, param_names::Vector{String},
@@ -1416,21 +1392,18 @@ end
 
 function _loadGenerations(dir::String, param_names::Vector{String},
                           max_nr_populations::Int)
-    cdf_dir = joinpath(dir, "generation_cdfs")
-    !isdir(cdf_dir) && return GenerationResult[]
-
-    # Discover files by scanning the directory so the tag zero-padding from the
-    # original run (which may differ from the current max_nr_populations) is not assumed.
-    csv_files = filter(f -> occursin(r"^generation_\d+\.csv$", f), readdir(cdf_dir))
-    isempty(csv_files) && return GenerationResult[]
-    sort!(csv_files, by = f -> parse(Int, match(r"\d+", f).match))
+    #! Discovered, never reconstructed: `_generationIndices` reports what is on disk across both the
+    #! folder layout and the historical flat one, at any padding width, and `_generationArtifact`
+    #! resolves each file the same way. A generation whose CDF file is missing is skipped rather than
+    #! erroring — that is an interrupted write, and the generations before it are still usable.
+    indices = _generationIndices(dir)
+    isempty(indices) && return GenerationResult[]
 
     generations = GenerationResult[]
     n_upgraded = 0
-    for csv_file in csv_files
-        tag      = match(r"generation_(\d+)\.csv", csv_file).captures[1]
-        t        = parse(Int, tag)
-        csv_path = joinpath(cdf_dir, csv_file)
+    for t in indices
+        csv_path = _generationArtifact(dir, t, :cdfs)
+        isnothing(csv_path) && continue
 
         df        = CSV.read(csv_path, DataFrame)
         weights   = df[!, :weight]
@@ -1438,7 +1411,8 @@ function _loadGenerations(dir::String, param_names::Vector{String},
         monad_ids = df[!, :monad_id]
         particles = select(df, param_names)
 
-        toml_path = joinpath(dir, "generation_$tag.toml")
+        toml_path = _generationArtifact(dir, t, :metadata)
+        isnothing(toml_path) && continue
         meta = TOML.parsefile(toml_path)
         #! Older runs recorded a single `epsilon`. Read it, and upgrade the file in place so the next
         #! read takes the current path — resuming already writes into this folder, so there is nothing
@@ -1456,11 +1430,10 @@ function _loadGenerations(dir::String, param_names::Vector{String},
 
         #! Absent for a run that predates the file, in which case the recipe degrades to the
         #! accepted distances it can still read from the generation CSV.
-        proposals_path = joinpath(dir, "generation_$(tag)_proposals.csv")
-        proposal_distances = isfile(proposals_path) ?
+        proposals_path = _generationArtifact(dir, t, :proposals)
+        proposal_distances = isnothing(proposals_path) ? nothing :
             CSV.read(proposals_path, DataFrame;
-                     types=Dict(:monad_id => Int, :distance => Float64, :accepted => Bool)) :
-            nothing
+                     types=Dict(:monad_id => Int, :distance => Float64, :accepted => Bool))
 
         push!(generations, GenerationResult(t, particles, weights, distances,
                                             max_epsilon_accepted,
@@ -1483,7 +1456,7 @@ end
 """
     _upgradeGenerationMetadata!(path, meta) → Bool
 
-Rewrite one `generation_{NNN}.toml` in place to the current key names, mutating `meta` to match.
+Rewrite one `{t}/metadata.toml` in place to the current key names, mutating `meta` to match.
 Returns whether anything changed.
 """
 function _upgradeGenerationMetadata!(path::String, meta::AbstractDict)
