@@ -219,7 +219,7 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().last_trash_sweep = ""
 
     try
-        mm_globals().db = SQLite.DB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))
+        mm_globals().db = _openDB(joinpath(mm_globals().data_dir, centralDBFileName(simulator)))
     catch e
         println("Could not open database: $e")
         mm_globals().data_dir = ""

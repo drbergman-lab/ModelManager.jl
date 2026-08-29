@@ -4332,3 +4332,11 @@ end
 else
     @info "Skipping \"docstrings only @ref public bindings\": needs Julia 1.11+ for Base.ispublic."
 end
+
+@testset "_openDB sets a busy timeout" begin
+    path = joinpath(mktempdir(), "busy.db")
+    db = ModelManager._openDB(path)
+    row = first(ModelManager.DBInterface.execute(db, "PRAGMA busy_timeout;"))
+    @test row[1] == 5000
+    close(db)
+end
