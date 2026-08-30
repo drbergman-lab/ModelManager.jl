@@ -1,3 +1,17 @@
+"""
+    _openDB(path) -> SQLite.DB
+
+Open a SQLite database with a busy timeout, so a second ModelManager session
+(e.g. analysis reading while a campaign writes) waits up to five seconds for
+locks instead of failing immediately with `SQLiteException("database is
+locked")`. Every ModelManager database open goes through this.
+"""
+function _openDB(path::AbstractString)
+    db = SQLite.DB(path)
+    DBInterface.execute(db, "PRAGMA busy_timeout = 5000;")
+    return db
+end
+
 using DataFrames
 
 ################## Database Initialization Functions ##################
@@ -9,7 +23,7 @@ Initialize the central database, creating the schema if it does not already exis
 """
 function initializeDatabase()
     close(centralDB())
-    mm_globals().db = SQLite.DB(centralDB().file)
+    mm_globals().db = _openDB(centralDB().file)
     SQLite.transaction(centralDB(), "EXCLUSIVE")
     try
         createSchema()
@@ -1201,7 +1215,7 @@ function _openPostProcessingDB()
     assertInitialized()
     path = postProcessingDBPath()
     mkpath(dirname(path))
-    db = SQLite.DB(path)
+    db = _openDB(path)
     DBInterface.execute(db, "CREATE TABLE IF NOT EXISTS $(_POST_PROCESSING_TABLE) (simulation_id INTEGER PRIMARY KEY);")
     return db
 end
@@ -1307,7 +1321,7 @@ function _deletePostProcessingRows(simulation_ids::AbstractVector{<:Integer})
     isempty(simulation_ids) && return nothing
     path = postProcessingDBPath()
     isfile(path) || return nothing
-    db = SQLite.DB(path)
+    db = _openDB(path)
     try
         tableExists(_POST_PROCESSING_TABLE; db=db) || return nothing
         DBInterface.execute(db, "DELETE FROM $(_POST_PROCESSING_TABLE) WHERE simulation_id IN ($(join(simulation_ids, ",")));")
@@ -1328,7 +1342,7 @@ function _readPostProcessingTable(query::String)
     assertInitialized()
     path = postProcessingDBPath()
     isfile(path) || return DataFrame(SimID=Int[])
-    db = SQLite.DB(path)
+    db = _openDB(path)
     df = try
         queryToDataFrame(query; db=db)
     finally
