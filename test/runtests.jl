@@ -148,6 +148,16 @@ _qoi_monad(m::Monad)      = length(ModelManager.constituentIDs(m))
 # A plain GSA function: takes a simulation ID, as `functions=` always has.
 _qoi_by_id(sim_id)        = getParameterValue(Simulation(Int(sim_id)), :config, XMLPath(["data", "x"]))
 
+# Reads a previously-stored post-processing value instead of recomputing from output. This is the
+# write-once-read-later path: the sink survives post-simulation cleanup, the output folder may not.
+function _qoi_from_sink(s::Simulation)
+    row = postProcessingTable([s.id])
+    (nrow(row) == 1 && "stored_x" in names(row) && !ismissing(row.stored_x[1])) ||
+        error("no stored value for simulation $(s.id)")
+    return Float64(row.stored_x[1])
+end
+
+
 
 # Named functions used as keys in the GSA sensitivity-recipe tests, so legend labels
 # are stable strings ("_gsa_fA", "_gsa_fB") rather than gensym closure names.
@@ -4032,6 +4042,34 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test occursin("both", err.msg)
                 @test occursin("Vector", err.msg)
                 @test occursin("scalar", err.msg)
+            end
+
+            @testset "a QoI can read a value the sink stored earlier" begin
+                # The workflow: post-processing writes a value per simulation while the output folder
+                # still exists; a later GSA or calibration reads it back from the sink. Essential when
+                # post-simulation cleanup has since deleted what the QoI was computed from.
+                vals = [1301.0, 1307.0]
+                dv = DiscreteVariation(:config, xp_x, vals)
+                t  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+
+                # Pass 1: store it, under the QoI's own name.
+                run(t; post_processor=QoI("stored_x", _qoi_sim))
+                waitForDiagnostics()
+                stored = postProcessingTable(simulationIDs(t))
+                @test "stored_x" in names(stored)
+                @test Set(skipmissing(stored.stored_x)) == Set(vals)
+
+                # Pass 2: a different QoI reads the stored value rather than the model output, and
+                # feeds calibration and GSA exactly as a freshly-computed one would.
+                readback = QoI("stored_x", _qoi_from_sink)
+                mid = first(ModelManager.monadIDs(t))
+                sids = ModelManager.constituentIDs(Monad, mid)
+                @test ModelManager._reduceOverMonad(readback, mid) ≈
+                      mean([_qoi_sim(Simulation(i)) for i in sids])
+
+                # And through a real consumer, to show nothing about the seam needs changing.
+                ss = ModelManager._asSummaryStatistic(readback)
+                @test ss(mid)["stored_x"] ≈ mean([_qoi_sim(Simulation(i)) for i in sids])
             end
 
             @testset "sensitivity on a discrepancy-to-data QoI" begin

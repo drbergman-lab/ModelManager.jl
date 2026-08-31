@@ -59,6 +59,24 @@ differences, and sums them into the one number sensitivity analysis needs. Repor
 the mean is a second `QoI` over the same `compute`, with `reduce` comparing `std` to the observed
 spread instead.
 
+# Reading a value the sink stored earlier
+Post-processing runs while a simulation's output folder still exists; post-simulation cleanup may then
+delete what the quantity was computed from. A `QoI` whose `compute` reads the sink instead of the output
+folder therefore still works afterwards, and needs nothing new — the sink is keyed by simulation ID and
+by the QoI's own `name`:
+
+```julia
+tumor = QoI("tumor", s -> finalPopulationCount(s)["tumor"])
+run(trial; post_processor=tumor)                      # stores it while the output exists
+
+stored = QoI("tumor", s -> postProcessingTable([s.id]).tumor[1])
+run(MOAT(), spec; functions=[stored])                 # reads it back, output folder or not
+```
+
+Automating the fallback — a `QoI` looking up its own `name` before calling `compute` — is not done here.
+It is a small change, and the reason to hold it back is not effort: a value found by name says nothing
+about which model version produced it, so an automatic lookup could silently reuse a stale number.
+
 # Examples
 ```julia
 tumor = QoI("tumor", s -> finalPopulationCount(s)["tumor"])
