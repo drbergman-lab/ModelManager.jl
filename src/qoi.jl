@@ -1,4 +1,4 @@
-export QoI
+export QoI, verifyStoredValues
 
 """
     QoI(name, compute; reduce=mean)
@@ -73,9 +73,22 @@ stored = QoI("tumor", s -> postProcessingTable([s.id]).tumor[1])
 run(MOAT(), spec; functions=[stored])                 # reads it back, output folder or not
 ```
 
-Automating the fallback — a `QoI` looking up its own `name` before calling `compute` — is not done here.
-It is a small change, and the reason to hold it back is not effort: a value found by name says nothing
-about which model version produced it, so an automatic lookup could silently reuse a stale number.
+`stored` automates the lookup, and **defaults to `:never`**:
+
+```julia
+QoI("tumor", computeFromOutput; stored=:prefer)    # stored value if present, else compute
+QoI("tumor", computeFromOutput; stored=:require)   # stored value or an error
+```
+
+It defaults off because **nothing records which `compute` produced a stored value, and no fingerprint
+can**: redefining a function's body in place leaves both `hash` and `nameof` unchanged, so a changed
+`compute` is undetectable, while two textually identical anonymous functions hash differently, so an
+unchanged one is equally unrecognisable. The sink stores no provenance either.
+
+What is robust is recomputation. [`verifyStoredValues`](@ref) recomputes where a simulation's output
+survives and reports agreements, mismatches, and how many could not be checked because the output is
+gone — which is precisely the case `stored` exists for. Run it before trusting stored values for
+anything that matters.
 
 # Examples
 ```julia
@@ -100,17 +113,103 @@ struct QoI
     name::String
     compute::Function
     reduce::Function
+    stored::Symbol
 end
 
-QoI(name::AbstractString, compute::Function; reduce::Function=mean) =
-    QoI(String(name), compute, reduce)
+const _QOI_STORED_MODES = (:never, :prefer, :require)
+
+function QoI(name::AbstractString, compute::Function;
+             reduce::Function=mean, stored::Symbol=:never)
+    stored in _QOI_STORED_MODES || throw(ArgumentError(
+        "QoI `stored` must be one of $(_QOI_STORED_MODES); got :$(stored)."))
+    return QoI(String(name), compute, reduce, stored)
+end
 
 qoiName(q::QoI) = q.name
 
 #! Every consumer reaches a simulation by ID, so this is the one place that turns an ID into the object
 #! a user's `compute` expects. Keeping it in one function is what lets `compute` be written against
 #! `Simulation` rather than against whatever each consumer happens to pass.
-_computeOn(q::QoI, sim_id::Integer) = q.compute(Simulation(Int(sim_id)))
+function _computeOn(q::QoI, sim_id::Integer)
+    sid = Int(sim_id)
+    if q.stored !== :never
+        v = _storedValue(q.name, sid)
+        isnothing(v) || return v
+        q.stored === :require && throw(ArgumentError(
+            "QoI \"$(q.name)\" is `stored=:require` but simulation $(sid) has no stored value for " *
+            "it. Run the trial with `post_processor` writing \"$(q.name)\" first, or use " *
+            "`stored=:prefer` to fall back to computing it."))
+    end
+    return q.compute(Simulation(sid))
+end
+
+"""
+    _storedValue(name, sim_id) → Float64 or nothing
+
+The post-processing sink's value for `name` on `sim_id`, or `nothing` if it was never stored.
+"""
+function _storedValue(name::AbstractString, sim_id::Int)
+    tbl = postProcessingTable([sim_id])
+    nrow(tbl) == 1 || return nothing
+    name in names(tbl) || return nothing
+    v = tbl[1, name]
+    return ismissing(v) ? nothing : Float64(v)
+end
+
+#! There is no way to check that a stored value came from *this* `compute`, and that is the whole
+#! reason `stored` defaults to `:never`. Verified rather than assumed: after redefining a function's
+#! body in place, both `hash` and `nameof` are unchanged, so a changed `compute` is undetectable; and
+#! two textually identical anonymous functions hash *differently*, so an unchanged one is equally
+#! unrecognisable. A fingerprint fails in both directions. The sink stores no provenance either — the
+#! table is `simulation_id` plus one column per name.
+#!
+#! What *is* robust is recomputation: where a simulation's output survives, the stored value can be
+#! checked against a fresh one, which is ground truth rather than a proxy for it. Where the output is
+#! gone the answer is honestly "unverifiable", not a guess.
+"""
+    verifyStoredValues(q::QoI, T; rtol=1e-8, limit=nothing) → NamedTuple
+
+Check a `QoI`'s stored values against freshly computed ones, for the simulations of `T`.
+
+Returns `(; n_checked, n_agreed, n_mismatched, n_unverifiable, n_missing, mismatches)`. A simulation is
+*unverifiable* when its output folder is gone, which is exactly the situation `stored` exists for — the
+value may be perfectly good, but nothing here can confirm it.
+
+Use this before trusting `stored=:prefer` or `stored=:require` on results you care about. Nothing about
+a stored value records which `compute` produced it, so recomputation is the only real check.
+
+# Example
+```julia
+report = verifyStoredValues(tumor, my_sampling)
+report.n_mismatched == 0 || error("stored values disagree with a fresh computation")
+```
+"""
+function verifyStoredValues(q::QoI, T::AbstractTrial; rtol::Real=1e-8,
+                            limit::Union{Nothing,Integer}=nothing)
+    sids = simulationIDs(T)
+    isnothing(limit) || (sids = sids[1:min(length(sids), Int(limit))])
+    n_agreed = 0; n_mismatched = 0; n_unverifiable = 0; n_missing = 0
+    mismatches = NamedTuple{(:simulation_id, :stored, :recomputed),Tuple{Int,Float64,Float64}}[]
+    for sid in sids
+        v = _storedValue(q.name, Int(sid))
+        if isnothing(v)
+            n_missing += 1
+            continue
+        end
+        if !isdir(pathToOutputFolder(Int(sid)))
+            n_unverifiable += 1
+            continue
+        end
+        fresh = Float64(q.compute(Simulation(Int(sid))))
+        if isapprox(v, fresh; rtol=rtol)
+            n_agreed += 1
+        else
+            n_mismatched += 1
+            push!(mismatches, (simulation_id = Int(sid), stored = v, recomputed = fresh))
+        end
+    end
+    return (; n_checked = length(sids), n_agreed, n_mismatched, n_unverifiable, n_missing, mismatches)
+end
 
 """
     _reduceOverMonad(q, monad_id) → value

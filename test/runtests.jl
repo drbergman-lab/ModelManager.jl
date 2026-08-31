@@ -4072,6 +4072,60 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test ss(mid)["stored_x"] ≈ mean([_qoi_sim(Simulation(i)) for i in sids])
             end
 
+            @testset "stored=:prefer/:require and verifyStoredValues" begin
+                vals = [1409.0, 1423.0]
+                dv = DiscreteVariation(:config, xp_x, vals)
+                t  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+
+                # Default is off, and that is the contract: nothing records which compute produced a
+                # stored value, so opting in has to be deliberate.
+                @test QoI("stored_x", _qoi_sim).stored === :never
+                @test_throws ArgumentError QoI("stored_x", _qoi_sim; stored=:sometimes)
+
+                # :require before anything is stored names the fix rather than failing obscurely.
+                sid_probe = 1
+                @test_throws ArgumentError ModelManager._computeOn(
+                    QoI("never_stored_anywhere", _qoi_sim; stored=:require), sid_probe)
+
+                # Store, then read back through `stored`.
+                run(t; post_processor=QoI("stored_x", _qoi_sim))
+                waitForDiagnostics()
+                sids = simulationIDs(t)
+                for sid in sids
+                    @test ModelManager._storedValue("stored_x", sid) !== nothing
+                end
+
+                # :prefer returns the stored number without calling compute. A compute that throws
+                # proves the stored path was taken rather than merely agreeing with it.
+                exploding = QoI("stored_x", s -> error("compute must not run"); stored=:prefer)
+                @test ModelManager._computeOn(exploding, first(sids)) ≈
+                      ModelManager._storedValue("stored_x", first(sids))
+                # ...and falls back to compute when nothing is stored under that name.
+                fallback = QoI("no_such_column", _qoi_sim; stored=:prefer)
+                @test ModelManager._computeOn(fallback, first(sids)) ≈
+                      _qoi_sim(Simulation(first(sids)))
+
+                # verifyStoredValues recomputes where the output survives.
+                rep = verifyStoredValues(QoI("stored_x", _qoi_sim), t)
+                @test rep.n_checked == length(sids)
+                @test rep.n_agreed + rep.n_unverifiable == length(sids)
+                @test rep.n_mismatched == 0
+                @test isempty(rep.mismatches)
+
+                # A disagreeing compute is caught and reported, not averaged over.
+                bad = verifyStoredValues(QoI("stored_x", s -> _qoi_sim(s) + 1000.0), t)
+                if bad.n_unverifiable < length(sids)      # only if some output survives to check
+                    @test bad.n_mismatched > 0
+                    @test !isempty(bad.mismatches)
+                    @test bad.mismatches[1].stored != bad.mismatches[1].recomputed
+                end
+
+                # And a name that was never stored is reported as missing, not as agreement.
+                none = verifyStoredValues(QoI("no_such_column", _qoi_sim), t)
+                @test none.n_missing == length(sids)
+                @test none.n_agreed == 0
+            end
+
             @testset "sensitivity on a discrepancy-to-data QoI" begin
                 # The workflow: a simulation yields several values; average each across replicates,
                 # THEN compare to data. Squaring is nonlinear, so mean-then-square is not

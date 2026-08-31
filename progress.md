@@ -3576,3 +3576,29 @@ function object, in a `Dict{Function,...}` — so a `QoI` could not be a key unt
 became `Dict{Union{Function,QoI},...}`. Untyped per-element `calculateGSA!` methods then became
 ambiguous against the vector method, so they take the union explicitly.
 
+### Stored QoI values, and why they default off
+
+The workflow: post-processing writes a value while a simulation's output still exists; a later GSA or
+calibration reads it back, because cleanup has since removed what it was computed from.
+
+**The default was decided by a measurement, not a preference.** The question was whether the
+invalidation machinery could be made robust enough to default *into* reuse. It cannot, and the reason is
+specific: a stored value carries nothing about which `compute` produced it, and no fingerprint can supply
+that. Redefining a function's body in place leaves both `hash` and `nameof` unchanged — so a changed
+`compute` is undetectable — and two textually identical anonymous functions hash *differently*, so an
+unchanged one is equally unrecognisable. Both directions fail. The sink stores no provenance either; its
+table is `simulation_id` plus one column per QoI name. So `stored=:never`.
+
+This is the same hazard already recorded for JLD2 in CLAUDE.md — a function is saved by name, and a
+redefinition is picked up silently. Worth noting it is not a sink limitation but a property of Julia
+functions.
+
+**What is robust is recomputation, so that is what `verifyStoredValues` does.** Where a simulation's
+output survives it recomputes and compares; where the output is gone it reports `n_unverifiable` rather
+than guessing — and that is precisely the case `stored` exists for, so the honest answer matters more
+than a reassuring one. Mismatches come back with the simulation ID and both values.
+
+**One test detail worth keeping.** `stored=:prefer` is checked with a `compute` that *throws*, so the
+test proves the stored path was taken rather than merely that it agreed with a fresh computation. Two
+values agreeing would not have distinguished the two paths.
+
