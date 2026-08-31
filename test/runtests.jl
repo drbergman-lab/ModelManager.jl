@@ -4006,6 +4006,38 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
             end
 
+            @testset "sensitivity on a discrepancy-to-data QoI" begin
+                # The workflow: a simulation yields several values; average each across replicates,
+                # THEN compare to data. Squaring is nonlinear, so mean-then-square is not
+                # square-then-mean, and a per-simulation compute cannot do it — it has no access to
+                # the mean. `reduce` is the monad-level step that can: it receives every replicate's
+                # value, so `compute` returns the raw per-simulation values and `reduce` averages and
+                # then squares.
+                obs = Dict("x" => 2.0, "y" => 3.0)
+                function _both(s::Simulation)
+                    return Dict("x" => getParameterValue(s, :config, XMLPath(["data", "x"])),
+                                "y" => getParameterValue(s, :config, XMLPath(["data", "y"])))
+                end
+                # One scalar per monad: mean per key, squared difference, then summed.
+                mse_reduce = per_sim -> sum((mean(getindex.(per_sim, k)) - obs[k])^2 for k in keys(obs))
+                q = QoI("mse", _both; reduce=mse_reduce)
+
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=3)
+                gsa = run(MOAT(), spec; functions=[q])
+                waitForDiagnostics()
+                @test gsa isa ModelManager.GSASampling
+                @test haskey(gsa.results, q)
+
+                # And the arithmetic the workflow depends on: averaging first is not the same as
+                # squaring first, so which side of `reduce` the nonlinearity sits on matters.
+                per_sim = [Dict("x" => 1.0, "y" => 2.0), Dict("x" => 3.0, "y" => 4.0)]
+                mean_then_sq = sum((mean(getindex.(per_sim, k)) - obs[k])^2 for k in keys(obs))
+                sq_then_mean = sum(mean((getindex.(per_sim, k) .- obs[k]).^2) for k in keys(obs))
+                @test mse_reduce(per_sim) ≈ mean_then_sq
+                @test !(mean_then_sq ≈ sq_then_mean)
+            end
+
             @testset "GSA honours a QoI's reducer, and plain functions still work" begin
                 spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
                                  n_replicates=2)

@@ -28,6 +28,25 @@ Because `reduce` sees every replicate's value, a measurement that needs the repl
 rather than as summarised numbers is expressed by having `compute` return the raw material — a time
 series, say — and letting `reduce` do the pooled work.
 
+# `reduce` is the monad-level step, not merely an average
+This matters whenever the quantity involves a nonlinearity applied *after* the replicates are
+combined. Sensitivity analysis on a discrepancy-to-data score is the common case: you want each
+measured value averaged across replicates and *then* compared to data, because averaging squared
+errors is not the same number as squaring the averaged error. A per-simulation `compute` cannot do it —
+it has no access to the mean — but `reduce` can, because it receives every replicate:
+
+```julia
+observed = Dict("tumor" => 2.0, "immune" => 3.0)
+
+QoI("mse", endpointCounts;
+    reduce = per_sim -> sum((mean(getindex.(per_sim, k)) - observed[k])^2 for k in keys(observed)))
+```
+
+`compute` returns each simulation's raw values, and `reduce` averages per quantity, takes the squared
+differences, and sums them into the one number sensitivity analysis needs. Reporting spread alongside
+the mean is a second `QoI` over the same `compute`, with `reduce` comparing `std` to the observed
+spread instead.
+
 # Examples
 ```julia
 tumor = QoI("tumor", s -> finalPopulationCount(s)["tumor"])
