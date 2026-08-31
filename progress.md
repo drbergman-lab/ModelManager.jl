@@ -3505,3 +3505,39 @@ the user set, while a monad's variation is an identity the object carries.
 each expectation from `_calibrationRejection`, so it does not need revisiting as more variation kinds
 become calibratable.
 
+## 2026-08-30 — The QoI seam (item 7, Stage 3)
+
+The first bullet of CLAUDE.md's to-do list, and its premise was partly wrong: `populationCountQoI` does
+not exist in this repository and never did — the builders are PCMM-side. So the work was to build the
+seam here, not to rewire existing builders.
+
+**Three consumers, three shapes, one measurement.** Sensitivity analysis calls `f(simulation_id)` — a
+bare `Int` — and averages replicates itself with a hard-coded `mean`. Calibration calls
+`summary_statistic(monad_id)`, also a bare `Int`, one level up. The sink calls
+`post_processor(::SimulationProcess)`. `QoI(name, level, compute; reduce)` is the measurement;
+`sensitivityFunction`, `summaryStatistic` and `postProcessor` return exactly the callable each consumer
+already accepted, so **no consumer changed** and the whole stage is additive.
+
+**The level is a type parameter, not a `Symbol`.** The user had already ruled out inferring it, and the
+reason is that `Simulation` and `Monad` are both `AbstractMonad`s: a `compute` written for
+`AbstractMonad` is callable at either level, so dispatch cannot recover the intent and reading a monad
+as a simulation is the one failure that must be impossible. Given the level must be declared, a type
+beats a symbol three ways: `Simulaton` is an `UndefVarError` where `:simulaton` is a silent mismatch;
+`hasmethod(compute, Tuple{L})` becomes verification of a declaration rather than a guess; and the
+adapters dispatch on `QoI{Simulation}` versus `QoI{Monad}`, so `postProcessor` excludes the monad level
+in its *signature* rather than rejecting it at runtime.
+
+**Two refusals, both deliberate.** A simulation-level QoI with a non-`mean` `reduce` is refused by
+`sensitivityFunction`, because GSA's hard-coded averaging would discard the reducer without trace —
+better to say so than to accept and ignore. And a monad-level QoI has no per-simulation form for GSA to
+call at all. Both errors name the alternative.
+
+**A test bug worth recording.** The end-to-end sink test first used parameter values another testset had
+already run, so `use_previous` reused those simulations — and the post-processor only fires for
+simulations that actually execute, so the sink held one row where three were expected. It read exactly
+like the adapter dropping rows. Values unique to the testset plus `use_previous=false` fixed it, and the
+comment now says why, because the same trap will catch the next sink test.
+
+**The docstring guard earned its keep a third time**, catching all three `#!` blocks in the new file
+before the suite went green.
+
