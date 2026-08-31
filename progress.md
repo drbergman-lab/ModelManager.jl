@@ -3541,3 +3541,38 @@ comment now says why, because the same trap will catch the next sink test.
 **The docstring guard earned its keep a third time**, catching all three `#!` blocks in the new file
 before the suite went green.
 
+### Review on #43: the level went away
+
+Four review comments, and the load-bearing one asked whether a `Monad` level was needed at all —
+"fundamentally, we're going to compute a QoI for each sim and then reduce across a Monad... a QoI for a
+Monad is less flexible and effectively just embeds the `reduce` inside its `compute`."
+
+That is right, and checking it properly is what convinced me. My instinct had been that spread across
+replicates needed monad-level access, but that is a per-simulation value with a `std` reducer. The
+general case follows: since `reduce` receives *everything* `compute` returned, a measurement needing the
+replicates jointly is expressed by having `compute` return the raw material — a time series — and letting
+`reduce` pool it. So monad-level `compute` is the same pair with the reduction folded in, and it bought a
+granularity question, a type parameter, a `hasmethod` check and a long docstring section defending the
+design, all for no expressive gain.
+
+**Removing it deleted the justification along with the feature**, which is the second review point: a
+docstring explaining why a type beats a `Symbol` was defending a choice nobody would now make, and the
+reviewer was right that explaining a rejected alternative is actively confusing. There is no level, so
+there is nothing to explain.
+
+**Sensitivity analysis now honours the reducer**, per the first comment. `evaluateFunctionOnSampling`
+hard-coded `mean`; it takes the QoI's reducer instead. That removed the refusal I had built — a
+simulation-level QoI with a non-`mean` reducer used to be rejected because GSA would silently discard it.
+Better to fix the internals than to document the limitation, which is what the reviewer said.
+
+**One compatibility trap caught in my own draft.** My first pass wrapped a plain `Function` into a `QoI`
+so consumers handled one type. But existing GSA functions are called with a simulation *ID*, while a
+QoI's `compute` receives a `Simulation` — the wrapper would have silently changed what every
+`functions=[f]` call is handed. `_qoiEvaluator` now reduces either input to the same pair (an
+ID-callable and a reducer) without changing what a plain function receives.
+
+**Widening the results Dicts was the non-obvious consequence.** `GSASampling` keys its results by the
+function object, in a `Dict{Function,...}` — so a `QoI` could not be a key until those three fields
+became `Dict{Union{Function,QoI},...}`. Untyped per-element `calculateGSA!` methods then became
+ambiguous against the vector method, so they take the union explicitly.
+

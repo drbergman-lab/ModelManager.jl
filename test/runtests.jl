@@ -145,8 +145,8 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 # values differ; _qoi_monad sees the whole monad at once.
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
 _qoi_monad(m::Monad)      = length(ModelManager.constituentIDs(m))
-_qoi_anylevel(x::ModelManager.AbstractMonad) = 1.0
-_qoi_wronglevel(x::Int)   = 1.0
+# A plain GSA function: takes a simulation ID, as `functions=` always has.
+_qoi_by_id(sim_id)        = getParameterValue(Simulation(Int(sim_id)), :config, XMLPath(["data", "x"]))
 
 
 # Named functions used as keys in the GSA sensitivity-recipe tests, so legend labels
@@ -3952,98 +3952,73 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       joinpath(gdir, "0011", "monads.csv")
             end
 
-            @testset "QoI declares its level rather than inferring it" begin
-                q = QoI("x", Simulation, _qoi_sim)
-                @test q isa QoI{Simulation}
+            @testset "QoI is compute-per-simulation plus a reducer" begin
+                q = QoI("x", _qoi_sim)
                 @test q.name == "x"
                 @test q.reduce === mean
+                @test QoI("x", _qoi_sim; reduce=maximum).reduce === maximum
 
-                # A compute with no method at the declared level is refused at construction.
-                @test_throws ArgumentError QoI("bad", Simulation, _qoi_wronglevel)
-                # So is a level that is not one of the two granularities.
-                @test_throws ArgumentError QoI("bad", ModelManager.AbstractMonad, _qoi_anylevel)
-
-                # The point of declaring: a compute written for AbstractMonad is callable at BOTH
-                # levels, so dispatch could never recover which was meant. Declaring settles it, and
-                # the two are different types rather than the same object with a different flag.
-                @test QoI("a", Simulation, _qoi_anylevel) isa QoI{Simulation}
-                @test QoI("a", Monad, _qoi_anylevel)      isa QoI{Monad}
-                @test QoI{Simulation} !== QoI{Monad}
+                # A QoI and a plain Function collapse to the same pair, but a plain Function keeps
+                # its existing contract: it is called with an ID, not a Simulation. Wrapping it
+                # would silently change what every existing `functions=[f]` receives.
+                fq, rq = ModelManager._qoiEvaluator(q)
+                ff, rf = ModelManager._qoiEvaluator(_qoi_by_id)
+                @test rq === mean && rf === mean
+                @test_throws ArgumentError ModelManager._qoiEvaluator(42)
             end
 
-            @testset "QoI adapts to all three consumers" begin
-                dv  = DiscreteVariation(:config, xp_x, [13.0, 17.0])
-                m   = createTrial(inputs, [dv]; n_replicates=2)
+            @testset "QoI passes straight to all three consumers" begin
+                vals = [1051.0, 1061.0]
+                dv = DiscreteVariation(:config, xp_x, vals)
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
                 run(m)
                 waitForDiagnostics()
-                mons = ModelManager.monadIDs(m)
-                @test !isempty(mons)
-                mid = first(mons)
+                mid = first(ModelManager.monadIDs(m))
+                sids = ModelManager.constituentIDs(Monad, mid)
+                sim_vals = [_qoi_sim(Simulation(i)) for i in sids]
 
-                qs = QoI("x", Simulation, _qoi_sim)
-                qm = QoI("n", Monad, _qoi_monad)
+                # Reducer honoured, and it is the QoI's own -- not a hard-coded mean.
+                @test ModelManager._reduceOverMonad(QoI("x", _qoi_sim), mid) ≈ mean(sim_vals)
+                @test ModelManager._reduceOverMonad(QoI("x", _qoi_sim; reduce=maximum), mid) ≈
+                      maximum(sim_vals)
 
-                # 1. Sensitivity: a function of a simulation ID.
-                f = sensitivityFunction(qs)
-                sid = first(ModelManager.constituentIDs(Monad, mid))
-                @test f(sid) ≈ _qoi_sim(Simulation(sid))
+                # Calibration: the QoI itself is the summary statistic.
+                prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(0.5, 3.0))],
+                                          Dict{String,Any}("x" => 1.0),
+                                          QoI("x", _qoi_sim), mseDistance)
+                @test prob.summary_statistic isa Function
+                @test prob.summary_statistic(mid)["x"] ≈ mean(sim_vals)
 
-                # 2. Calibration: a function of a monad ID returning a Dict keyed by QoI name.
-                ss = summaryStatistic(qs)
-                d = ss(mid)
-                @test d isa Dict{String,Any}
-                @test haskey(d, "x")
-                # Simulation-level: replicates collapse through `reduce`.
-                sim_vals = [_qoi_sim(Simulation(i)) for i in ModelManager.constituentIDs(Monad, mid)]
-                @test d["x"] ≈ mean(sim_vals)
-                # Monad-level: compute sees the monad itself, no reduction.
-                @test summaryStatistic(qm)(mid)["n"] == _qoi_monad(Monad(mid))
-                # Several at once, keyed by name.
-                both = summaryStatistic([qs, qm])(mid)
-                @test Set(keys(both)) == Set(["x", "n"])
-                @test_throws ArgumentError summaryStatistic([qs, QoI("x", Monad, _qoi_monad)])
-
-                # `reduce` is honoured, and is the reason a Simulation-level QoI can serve
-                # calibration at all — calibration needs one number per parameter set.
-                q_max = QoI("x", Simulation, _qoi_sim; reduce=maximum)
-                @test summaryStatistic(q_max)(mid)["x"] ≈ maximum(sim_vals)
-
-                # 3. The sink: Simulation-level only, since the hook fires once per simulation.
-                pp = postProcessor(qs)
-                @test pp isa Function
-                # Monad-level cannot even be passed — the signature excludes it.
-                @test_throws MethodError postProcessor(qm)
-            end
-
-            @testset "QoI drives the post-processing sink end to end" begin
-                # The seam is only real if the adapter's output is what the consumer actually wants,
-                # so this goes through `run(...; post_processor=...)` rather than calling the closure.
-                # Values unique to this testset, and use_previous=false: the post_processor only
-                # fires for simulations that actually execute, so a reused simulation records
-                # nothing. Reusing values another testset had already run made this look like the
-                # adapter had dropped rows.
-                vals = [1237.0, 1241.0]
-                dv = DiscreteVariation(:config, xp_x, vals)
-                m  = createTrial(inputs, [dv]; n_replicates=1, use_previous=false)
-                run(m; post_processor=postProcessor(QoI("xval", Simulation, _qoi_sim)))
+                # The sink: the QoI itself is the post_processor.
+                m2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1069.0])];
+                                 n_replicates=1, use_previous=false)
+                run(m2; post_processor=QoI("xval", _qoi_sim))
                 waitForDiagnostics()
-
-                sids = simulationIDs(m)
-                @test length(sids) == length(vals)
-                tbl = postProcessingTable(sids)
+                tbl = postProcessingTable(simulationIDs(m2))
                 @test "xval" in names(tbl)
-                @test Set(skipmissing(tbl.xval)) == Set(vals)
+                @test Set(skipmissing(tbl.xval)) == Set([1069.0])
+
+                # Duplicate names are refused rather than silently collapsing a column.
+                @test_throws ArgumentError ModelManager._asPostProcessor(
+                    [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
+                @test_throws ArgumentError ModelManager._asSummaryStatistic(
+                    [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
             end
 
-            @testset "QoI refuses the combinations that would be silently wrong" begin
-                # Sensitivity averages replicates itself with a hard-coded mean, so a custom reduce
-                # would be discarded without trace. Refused rather than ignored.
-                q_med = QoI("x", Simulation, _qoi_sim; reduce=maximum)
-                @test_throws ArgumentError sensitivityFunction(q_med)
-                # And a Monad-level QoI has no per-simulation form for GSA to call.
-                @test_throws ArgumentError sensitivityFunction(QoI("n", Monad, _qoi_monad))
-                # mean is fine, because that is exactly what GSA does.
-                @test sensitivityFunction(QoI("x", Simulation, _qoi_sim)) isa Function
+            @testset "GSA honours a QoI's reducer, and plain functions still work" begin
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=2)
+                # A plain Function gets a simulation ID and mean over replicates, exactly as before.
+                gsa1 = run(MOAT(), spec; functions=[_qoi_by_id])
+                waitForDiagnostics()
+                @test gsa1 isa ModelManager.GSASampling
+
+                # A QoI with a non-mean reducer is now accepted rather than refused: this is what
+                # changed in GSA's internals.
+                gsa2 = run(MOAT(), spec; functions=[QoI("x", _qoi_sim; reduce=maximum)])
+                waitForDiagnostics()
+                @test gsa2 isa ModelManager.GSASampling
             end
 
             @testset "StudySpec feeds both sensitivity and calibration" begin

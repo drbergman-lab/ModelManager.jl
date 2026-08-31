@@ -75,7 +75,7 @@ Run a global sensitivity analysis and return a [`GSASampling`](@ref) result.
 `kwargs` are forwarded to [`run`](@ref)`(::Sampling; ...)` and from there to the
 simulator hooks — pass any simulator-specific options here.
 """
-function run(method::GSAMethod, inputs::InputFolders, avs::AbstractVector{<:AbstractVariation}; functions::AbstractVector{<:Function}=Function[], kwargs...)
+function run(method::GSAMethod, inputs::InputFolders, avs::AbstractVector{<:AbstractVariation}; functions::AbstractVector=Any[], kwargs...)
     pv = ParsedVariations(avs)
     gsa_sampling = runSensitivitySampling(method, inputs, pv; kwargs...)
     sensitivityResults!(gsa_sampling, functions)
@@ -87,7 +87,7 @@ end
 #! own variation — accidentally, and undocumented. The reference is the reference:
 #! `createTrial(method, reference::AbstractMonad, avs; ...)` offers no override either, and the
 #! `InputFolders` form is where a variation ID is genuinely an independent argument.
-function run(method::GSAMethod, reference::AbstractMonad, avs::Vector{<:AbstractVariation}; functions::AbstractVector{<:Function}=Function[], kwargs...)
+function run(method::GSAMethod, reference::AbstractMonad, avs::Vector{<:AbstractVariation}; functions::AbstractVector=Any[], kwargs...)
     haskey(kwargs, :reference_variation_id) && throw(ArgumentError(
         "run(::GSAMethod, reference::AbstractMonad, ...) takes its reference variation from " *
         "`reference`, so `reference_variation_id` cannot also be given — it would override the " *
@@ -101,7 +101,7 @@ end
 #! used to let a caller override a *reference monad's* variation, which is now refused. Harmless here,
 #! because a spec's fields are defaults the user set, not an identity carried by an object.
 function run(method::GSAMethod, spec::StudySpec;
-             functions::AbstractVector{<:Function}=Function[], kwargs...)
+             functions::AbstractVector=Any[], kwargs...)
     return run(method, spec.inputs, spec.variations;
                functions=functions,
                reference_variation_id=spec.reference_variation_id,
@@ -119,7 +119,7 @@ end
 
 Calculate sensitivity indices for `functions` and record the sampling scheme.
 """
-function sensitivityResults!(gsa_sampling::GSASampling, functions::AbstractVector{<:Function})
+function sensitivityResults!(gsa_sampling::GSASampling, functions::AbstractVector)
     calculateGSA!(gsa_sampling, functions)
     recordSensitivityScheme(gsa_sampling)
 end
@@ -129,7 +129,7 @@ end
 
 Calculate sensitivity indices for each function in `functions`.
 """
-function calculateGSA!(gsa_sampling::GSASampling, functions::AbstractVector{<:Function})
+function calculateGSA!(gsa_sampling::GSASampling, functions::AbstractVector)
     for f in functions
         calculateGSA!(gsa_sampling, f)
     end
@@ -168,10 +168,10 @@ Result of a [`MOAT`](@ref) sensitivity analysis.
 struct MOATSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{Function,GlobalSensitivity.MorrisResult}
+    results::Dict{Union{Function,QoI},GlobalSensitivity.MorrisResult}
 end
 
-MOATSampling(sampling::Sampling, monad_ids_df::DataFrame) = MOATSampling(sampling, monad_ids_df, Dict{Function,GlobalSensitivity.MorrisResult}())
+MOATSampling(sampling::Sampling, monad_ids_df::DataFrame) = MOATSampling(sampling, monad_ids_df, Dict{Union{Function,QoI},GlobalSensitivity.MorrisResult}())
 
 function Base.show(io::IO, moat_sampling::MOATSampling)
     println(io, "MOAT sampling")
@@ -253,7 +253,7 @@ function perturbVariation(pv::ParsedVariations, inputs::InputFolders, reference_
     return perturbed_variation_ids
 end
 
-function calculateGSA!(moat_sampling::MOATSampling, f::Function)
+function calculateGSA!(moat_sampling::MOATSampling, f::Union{Function,QoI})
     if f in keys(moat_sampling.results)
         return
     end
@@ -310,12 +310,12 @@ Result of a [`Sobolʼ`](@ref) sensitivity analysis.
 struct SobolSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{Function,GlobalSensitivity.SobolResult}
+    results::Dict{Union{Function,QoI},GlobalSensitivity.SobolResult}
     sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}
 end
 
 SobolSampling(sampling::Sampling, monad_ids_df::DataFrame; sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}=(first_order=:Jansen1999, total_order=:Jansen1999)) =
-    SobolSampling(sampling, monad_ids_df, Dict{Function,GlobalSensitivity.SobolResult}(), sobol_index_methods)
+    SobolSampling(sampling, monad_ids_df, Dict{Union{Function,QoI},GlobalSensitivity.SobolResult}(), sobol_index_methods)
 
 function Base.show(io::IO, sobol_sampling::SobolSampling)
     println(io, "Sobol sampling")
@@ -361,7 +361,7 @@ function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::Parse
     return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods)
 end
 
-function calculateGSA!(sobol_sampling::SobolSampling, f::Function)
+function calculateGSA!(sobol_sampling::SobolSampling, f::Union{Function,QoI})
     if f in keys(sobol_sampling.results)
         return
     end
@@ -431,13 +431,13 @@ Result of an [`RBD`](@ref) sensitivity analysis.
 struct RBDSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{Function,Vector{<:Real}}
+    results::Dict{Union{Function,QoI},Vector{<:Real}}
     num_harmonics::Int
     num_cycles::Union{Int,Rational}
 end
 
 RBDSampling(sampling::Sampling, monad_ids_df::DataFrame, num_cycles; num_harmonics::Int=6) =
-    RBDSampling(sampling, monad_ids_df, Dict{Function,Vector{<:Real}}(), num_harmonics, num_cycles)
+    RBDSampling(sampling, monad_ids_df, Dict{Union{Function,QoI},Vector{<:Real}}(), num_harmonics, num_cycles)
 
 function Base.show(io::IO, rbd_sampling::RBDSampling)
     println(io, "RBD sampling")
@@ -472,7 +472,7 @@ function runSensitivitySampling(method::RBD, inputs::InputFolders, pv::ParsedVar
     return RBDSampling(sampling, monad_ids_df, method.rbd_variation.num_cycles; num_harmonics=method.num_harmonics)
 end
 
-function calculateGSA!(rbd_sampling::RBDSampling, f::Function)
+function calculateGSA!(rbd_sampling::RBDSampling, f::Union{Function,QoI})
     if f in keys(rbd_sampling.results)
         return
     end
@@ -506,15 +506,21 @@ end
 
 Evaluate `f` (a function of `simulation_id`) on each monad in the sampling, averaging replicates.
 """
-function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Function)
+function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function,QoI})
+    #! The reducer comes from the QoI rather than being hard-coded. A plain `Function` still gets
+    #! `mean` over its replicates, which is what this always did, so existing `functions=[f]` calls
+    #! are unchanged. `Float64` stays because the sensitivity indices downstream require it: a
+    #! reducer returning something else fails here, at the QoI, rather than deep inside
+    #! GlobalSensitivity.
+    compute, reduce_replicates = _qoiEvaluator(f)
     monad_id_df = getMonadIDDataFrame(gsa_sampling)
     value_dict = Dict{Int,Float64}()
     vals = zeros(Float64, size(monad_id_df))
     for (ind, monad_id) in enumerate(monad_id_df |> Matrix)
         if !haskey(value_dict, monad_id)
             simulation_ids = constituentIDs(Monad, monad_id)
-            sim_values = [f(simulation_id) for simulation_id in simulation_ids]
-            value_dict[monad_id] = mean(sim_values)
+            sim_values = [compute(simulation_id) for simulation_id in simulation_ids]
+            value_dict[monad_id] = reduce_replicates(sim_values)
         end
         vals[ind] = value_dict[monad_id]
     end

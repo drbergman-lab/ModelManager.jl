@@ -255,7 +255,10 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
 """
 function run(T::AbstractTrial; quiet::Bool=false,
              on_progress::Union{Nothing,Function}=nothing,
-             post_processor::Union{Nothing,Function}=nothing, tags=(), kwargs...)
+             post_processor=nothing, tags=(), kwargs...)
+    #! A `QoI` (or a vector of them) is accepted here as well as a bare function; `_asPostProcessor`
+    #! is the identity on a function, so nothing already written changes.
+    post_processor = isnothing(post_processor) ? nothing : _asPostProcessor(post_processor)
     #! Applied before anything is dispatched, so tags survive an interrupted run and the
     #! trial is queryable by tag while its simulations are still in flight.
     refreshProvenance!()

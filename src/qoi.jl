@@ -1,152 +1,142 @@
-export QoI, sensitivityFunction, summaryStatistic, postProcessor
+export QoI
 
 """
-    QoI(name, level, compute; reduce=mean)
+    QoI(name, compute; reduce=mean)
 
-A named quantity of interest: what to measure, and at which level of the trial hierarchy.
+A named quantity of interest: measure something per simulation, then combine the replicates.
 
-Three parts of ModelManager ask a user for "a number out of a simulation", and each asks in its own
-shape — sensitivity analysis wants a function of a simulation ID, calibration wants a function of a
-monad ID, and the post-processing sink wants a function of a `SimulationProcess`. A `QoI` is that
-measurement written once; [`sensitivityFunction`](@ref), [`summaryStatistic`](@ref) and
-[`postProcessor`](@ref) adapt it to each.
+Three parts of ModelManager need a number out of a group of simulations — sensitivity analysis,
+calibration, and the post-processing sink — and each used to ask in its own shape. A `QoI` is that
+measurement written once and passed to any of them.
 
 # Arguments
-- `name`: the column name in the post-processing sink, and the key in the `Dict` that
-  [`summaryStatistic`](@ref) produces.
-- `level`: `Simulation` or `Monad` — the *type* `compute` accepts, given positionally.
-- `compute`: `(::level) -> Real | Bool | String`.
+- `name`: identifies the quantity. It is the sink's column name and the key under which
+  [`CalibrationProblem`](@ref) reports the value to its `distance`.
+- `compute`: called with one [`Simulation`](@ref). It may return anything `reduce` understands.
 
 # Keywords
-- `reduce`: how replicate values combine into one per parameter set, `mean` by default. Meaningful
-  only at `Simulation` level; a monad-level `compute` sees every replicate itself and reduces however
-  it likes.
+- `reduce`: combines one parameter set's replicate values into a single value, `mean` by default.
+  It receives the vector of everything `compute` returned for that set.
 
-# Why the level is a type, not a `Symbol`
-`Simulation` and `Monad` are both `AbstractMonad`s, so a `compute` written as `f(x::AbstractMonad)` is
-callable at either level and dispatch cannot recover which was meant. Reading a monad as a simulation
-is the one failure this seam must make impossible, so the level is **declared** rather than inferred.
-Naming it as a type rather than a symbol makes the declaration typo-proof — `Simulaton` is an
-`UndefVarError` where `:simulaton` would be a silent mismatch — and lets the adapters dispatch on
-`QoI{Simulation}` versus `QoI{Monad}`, so an illegal pairing cannot be constructed rather than merely
-being rejected.
+# What each consumer needs back
+`reduce`'s return type is constrained by where the QoI is used, not by `QoI` itself: sensitivity
+analysis needs a `Real`, the post-processing sink stores a `Bool`, `Integer`, `Real` or
+`AbstractString`, and calibration only needs something its `distance` accepts. Returning something a
+given consumer cannot use is that consumer's error to raise.
+
+Because `reduce` sees every replicate's value, a measurement that needs the replicates *jointly*
+rather than as summarised numbers is expressed by having `compute` return the raw material — a time
+series, say — and letting `reduce` do the pooled work.
 
 # Examples
 ```julia
-# A per-simulation measurement, averaged over replicates
-tumor = QoI("tumor", Simulation, s -> finalPopulationCount(s)["tumor"])
+tumor = QoI("tumor", s -> finalPopulationCount(s)["tumor"])
 
-# The same measurement, taking the median across replicates instead
-QoI("tumor", Simulation, s -> finalPopulationCount(s)["tumor"]; reduce=median)
+# A different way of combining replicates
+QoI("tumor_median", s -> finalPopulationCount(s)["tumor"]; reduce=median)
 
-# A measurement that needs every replicate at once
-QoI("spread", Monad, m -> std(replicateEndpoints(m)))
+# Spread across replicates, rather than their centre
+QoI("spread", s -> finalPopulationCount(s)["tumor"]; reduce=std)
+
+# Pooling the replicates instead of reducing per-simulation numbers
+QoI("slope", timeSeries; reduce=series -> fitSlope(reduce(vcat, series)))
 
 # One QoI, three consumers
-run(MOAT(), spec; functions=[sensitivityFunction(tumor)])
-CalibrationProblem(spec, observed, summaryStatistic(tumor), mseDistance)
-run(trial; post_processor=postProcessor(tumor))
+run(MOAT(), spec; functions=[tumor])
+CalibrationProblem(spec, observed, tumor, mseDistance)
+run(trial; post_processor=tumor)
 ```
 """
-struct QoI{L<:AbstractMonad}
+struct QoI
     name::String
     compute::Function
     reduce::Function
 end
 
-#! The only constructor, so `L` can never be omitted. `hasmethod` here *verifies a declaration* rather
-#! than guessing one: a `compute` defined only on `AbstractMonad` satisfies it for whichever level was
-#! named, which is correct — it is genuinely callable there, and the user has said which they meant.
-function QoI(name::AbstractString, ::Type{L}, compute::Function;
-             reduce::Function=mean) where {L<:AbstractMonad}
-    L === Simulation || L === Monad || throw(ArgumentError(
-        "A QoI's level must be `Simulation` or `Monad`; got $(L). Those are the two granularities " *
-        "the trial hierarchy offers a measurement."))
-    hasmethod(compute, Tuple{L}) || throw(ArgumentError(
-        "QoI \"$(name)\" declares level $(L), but its `compute` has no method accepting one. " *
-        "Either give `compute` a `($(L),)` method or declare the level it actually takes."))
-    return QoI{L}(String(name), compute, reduce)
-end
+QoI(name::AbstractString, compute::Function; reduce::Function=mean) =
+    QoI(String(name), compute, reduce)
 
 qoiName(q::QoI) = q.name
 
-#! Sensitivity analysis evaluates per simulation and averages replicates itself with a hard-coded
-#! `mean` (`evaluateFunctionOnSampling`), so `q.reduce` is not consulted here and a non-`mean` reducer
-#! would be quietly ignored — hence the explicit refusal below rather than a surprise.
-"""
-    sensitivityFunction(q::QoI) → Function
+#! Every consumer reaches a simulation by ID, so this is the one place that turns an ID into the object
+#! a user's `compute` expects. Keeping it in one function is what lets `compute` be written against
+#! `Simulation` rather than against whatever each consumer happens to pass.
+_computeOn(q::QoI, sim_id::Integer) = q.compute(Simulation(Int(sim_id)))
 
-Adapt `q` for the `functions` keyword of `run(::GSAMethod, ...)`, which calls it with a simulation ID.
 """
-function sensitivityFunction(q::QoI{Simulation})
-    q.reduce === mean || throw(ArgumentError(
-        "QoI \"$(q.name)\" carries a custom `reduce`, but sensitivity analysis averages replicates " *
-        "itself with `mean` and would ignore it. Use `reduce=mean` for a sensitivity study, or " *
-        "reduce inside a `Monad`-level `compute`."))
-    return sim_id::Integer -> q.compute(Simulation(Int(sim_id)))
+    _reduceOverMonad(q, monad_id) → value
+
+Apply `q` to every simulation of `monad_id` and combine the results with `q.reduce`.
+"""
+function _reduceOverMonad(q, monad_id::Integer)
+    f, red = _qoiEvaluator(q)
+    sim_ids = constituentIDs(Monad, Int(monad_id))
+    isempty(sim_ids) && throw(ArgumentError(
+        "Monad $(monad_id) has no simulations, so QoI \"$(qoiName(q))\" cannot be evaluated on it."))
+    return red([f(sid) for sid in sim_ids])
 end
 
-function sensitivityFunction(q::QoI{Monad})
-    throw(ArgumentError(
-        "QoI \"$(q.name)\" is `Monad`-level, but sensitivity analysis evaluates one simulation at a " *
-        "time and averages the replicates itself. Express it as a `Simulation`-level QoI, or compute " *
-        "it per simulation and let the library average."))
-end
-
-#! A `Simulation`-level QoI is where `reduce` finally matters: calibration compares one number per
-#! parameter set, so the replicates have to collapse, and unlike sensitivity analysis nothing upstream
-#! has already done it.
+#! A bare `Function` keeps its existing contract exactly: it is called with a simulation *ID* and its
+#! replicates are averaged. Only a `QoI`'s `compute` receives a `Simulation`. Wrapping a plain function
+#! into a `QoI` would silently change what it is handed, breaking every `functions=[f]` already written.
+#!
+#! Both collapse to the same pair — a per-simulation-ID callable and a reducer — so a consumer written
+#! against that pair supports both without branching.
 """
-    summaryStatistic(q::QoI) → Function
-    summaryStatistic(qs) → Function
+    _qoiEvaluator(q) → (sim_id -> value, reduce)
 
-Adapt one or more `QoI`s for [`CalibrationProblem`](@ref)'s `summary_statistic`, which calls it with a
-monad ID and whose result is handed to the problem's `distance`.
-
-Returns a `Dict{String,Any}` keyed by QoI name, which is the shape [`mseDistance`](@ref) expects.
+Reduce a `QoI` or a plain `Function` to the pair every consumer needs: something callable with a
+simulation ID, and the reducer for its replicates.
 """
-summaryStatistic(q::QoI) = summaryStatistic([q])
+_qoiEvaluator(q::QoI)      = (sid -> _computeOn(q, sid), q.reduce)
+_qoiEvaluator(f::Function) = (sid -> f(sid), mean)
+_qoiEvaluator(x) = throw(ArgumentError(
+    "Expected a QoI or a Function; got $(typeof(x))."))
 
-function summaryStatistic(qs::AbstractVector{<:QoI})
-    isempty(qs) && throw(ArgumentError("summaryStatistic needs at least one QoI."))
+qoiName(f::Function) = string(nameof(f))
+
+#! The three consumers differ in what they are handed and what they must return, so each gets its own
+#! adapter — but all of them go through `_qoiEvaluator`, so a `QoI` and a plain `Function` behave the
+#! same way everywhere. The adapters are internal: a user passes the `QoI` itself.
+"""
+    _asSummaryStatistic(x) → Function
+
+Adapt a `QoI`, a vector of them, or an existing summary-statistic function for
+[`CalibrationProblem`](@ref), which calls it with a monad ID.
+"""
+_asSummaryStatistic(f::Function) = f
+
+_asSummaryStatistic(q::QoI) = _asSummaryStatistic([q])
+
+function _asSummaryStatistic(qs::AbstractVector{QoI})
+    isempty(qs) && throw(ArgumentError("A summary statistic needs at least one QoI."))
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one summary statistic; got $(names)."))
-    return function (monad_id::Integer)
-        d = Dict{String,Any}()
-        for q in qs
-            d[q.name] = _qoiOnMonad(q, Int(monad_id))
-        end
-        return d
-    end
+    return (monad_id::Integer) -> Dict{String,Any}(
+        q.name => _reduceOverMonad(q, monad_id) for q in qs)
 end
 
-_qoiOnMonad(q::QoI{Monad}, monad_id::Int) = q.compute(Monad(monad_id))
-
-function _qoiOnMonad(q::QoI{Simulation}, monad_id::Int)
-    sim_ids = constituentIDs(Monad, monad_id)
-    isempty(sim_ids) && throw(ArgumentError(
-        "Monad $(monad_id) has no simulations, so QoI \"$(q.name)\" cannot be evaluated on it."))
-    return q.reduce([q.compute(Simulation(sid)) for sid in sim_ids])
-end
-
-#! `Monad`-level is unrepresentable here rather than rejected at runtime: the hook fires once per
-#! simulation, so there is no monad for a monad-level `compute` to receive. The signature says so.
+#! No reducer here, and none possible: the hook fires once per simulation, so there is exactly one
+#! value and nothing to combine. A QoI's `reduce` is simply unused by the sink.
 """
-    postProcessor(qs::QoI...) → Function
+    _asPostProcessor(x) → Function
 
-Adapt `Simulation`-level `QoI`s for `run`'s `post_processor`, which calls it once per simulation and
-records the returned `name => value` pairs in the post-processing sink.
+Adapt a `QoI`, a vector of them, or an existing post-processor for `run`'s `post_processor`, which
+calls it once per simulation with a `SimulationProcess`.
 """
-postProcessor(qs::QoI{Simulation}...) = postProcessor(collect(qs))
+_asPostProcessor(f::Function) = f
 
-function postProcessor(qs::AbstractVector{QoI{Simulation}})
-    isempty(qs) && throw(ArgumentError("postProcessor needs at least one QoI."))
+_asPostProcessor(q::QoI) = _asPostProcessor([q])
+
+function _asPostProcessor(qs::AbstractVector{QoI})
+    isempty(qs) && throw(ArgumentError("A post-processor needs at least one QoI."))
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one post-processor; got $(names)."))
     return function (sp::SimulationProcess)
-        sim = Simulation(simulationID(sp))
-        return Dict{String,Any}(q.name => q.compute(sim) for q in qs)
+        sid = simulationID(sp)
+        return Dict{String,Any}(q.name => _computeOn(q, sid) for q in qs)
     end
 end
+
