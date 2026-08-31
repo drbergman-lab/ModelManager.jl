@@ -4006,6 +4006,34 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
             end
 
+            @testset "a non-scalar QoI is fine except at the sink" begin
+                # compute may return a vector or Dict, because `reduce` collapses it. The sink is the
+                # exception: it fires once per simulation, so `reduce` is never called and compute's
+                # own value is stored. That asymmetry is easy to trip over, so it is pinned here.
+                obs = Dict("x" => 2.0, "y" => 3.0)
+                vecq = QoI("both", s -> [getParameterValue(s, :config, XMLPath(["data", "x"])),
+                                         getParameterValue(s, :config, XMLPath(["data", "y"]))];
+                           reduce = per_sim -> sum(abs2, mean(per_sim) .- [obs["x"], obs["y"]]))
+
+                # Calibration and GSA are happy: reduce returns a scalar.
+                dv = DiscreteVariation(:config, xp_x, [1091.0])
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+                @test ModelManager._reduceOverMonad(vecq, mid) isa Real
+
+                # The sink refuses it, and the message names the QoI and the type rather than
+                # failing somewhere in the DB layer.
+                err = try
+                    ModelManager._postProcessingColumnSpec("both", [1.0, 2.0]); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("both", err.msg)
+                @test occursin("Vector", err.msg)
+                @test occursin("scalar", err.msg)
+            end
+
             @testset "sensitivity on a discrepancy-to-data QoI" begin
                 # The workflow: a simulation yields several values; average each across replicates,
                 # THEN compare to data. Squaring is nonlinear, so mean-then-square is not

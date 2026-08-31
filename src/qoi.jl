@@ -12,17 +12,29 @@ measurement written once and passed to any of them.
 # Arguments
 - `name`: identifies the quantity. It is the sink's column name and the key under which
   [`CalibrationProblem`](@ref) reports the value to its `distance`.
-- `compute`: called with one [`Simulation`](@ref). It may return anything `reduce` understands.
+- `compute`: called with one [`Simulation`](@ref). It may return anything `reduce` understands — a
+  scalar, a vector, a `Dict` — **except** when the QoI is used as a `post_processor`, where `reduce`
+  is never called and `compute`'s own return value is what gets stored.
 
 # Keywords
 - `reduce`: combines one parameter set's replicate values into a single value, `mean` by default.
   It receives the vector of everything `compute` returned for that set.
 
 # What each consumer needs back
-`reduce`'s return type is constrained by where the QoI is used, not by `QoI` itself: sensitivity
-analysis needs a `Real`, the post-processing sink stores a `Bool`, `Integer`, `Real` or
-`AbstractString`, and calibration only needs something its `distance` accepts. Returning something a
-given consumer cannot use is that consumer's error to raise.
+Neither `compute` nor `reduce` is constrained by `QoI` itself; the requirement comes from where the QoI
+is used, and it does not fall on the same function in each case:
+
+| consumer | what must be a usable value | what it must be |
+|---|---|---|
+| `run(::GSAMethod, ...; functions=)` | `reduce`'s return | a `Real` (the sensitivity indices need `Float64`) |
+| [`CalibrationProblem`](@ref)'s `summary_statistic` | `reduce`'s return | anything the problem's `distance` accepts |
+| `run(...; post_processor=)` | **`compute`'s return** | a scalar `Bool`, `Integer`, `Real` or `AbstractString` |
+
+The sink is the exception, and the reason is that it fires once per simulation: there is exactly one
+value and nothing to combine, so `reduce` is never called and the freedom to return a vector does not
+apply. Write richer per-simulation output to the simulation's own folder instead. Returning something a
+consumer cannot use is that consumer's error to raise, and the sink's names the QoI and the offending
+type.
 
 Because `reduce` sees every replicate's value, a measurement that needs the replicates *jointly*
 rather than as summarised numbers is expressed by having `compute` return the raw material — a time
