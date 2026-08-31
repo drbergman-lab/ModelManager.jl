@@ -210,6 +210,20 @@ pendingSimulationSpecs(sampling::Sampling) =
 pendingSimulationSpecs(trial::Trial) =
     reduce(vcat, pendingSimulationSpecs.(trial.samplings); init=SimulationSpec[])
 
+#! `run_kwargs` and a loose splat are one channel, not two. Calibration has to bundle -- `runABC`
+#! and `resumeCalibration` spend their splat on `ABCSMC` field forwarding, so there is none left for
+#! simulator options -- while `run` has always taken loose keywords. Accepting both everywhere means a
+#! bundle built once is portable to any entry point, and a loose keyword still works where it always did.
+#!
+#! Loose wins on a collision: it is the more deliberate spelling at the call site, while the bundle is
+#! the form that gets passed around and forgotten.
+"""
+    _mergeRunKwargs(run_kwargs::NamedTuple, kwargs) → NamedTuple
+
+Combine a `run_kwargs` bundle with loose keyword arguments; a loose key overrides the bundle's.
+"""
+_mergeRunKwargs(run_kwargs::NamedTuple, kwargs) = merge(run_kwargs, values(kwargs))
+
 """
     run(T::AbstractTrial; quiet=false, kwargs...) -> MMOutput
 
@@ -252,12 +266,19 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   both [`postSimulationProcessing`](@ref) and [`postSimulationCleanup`](@ref) (e.g.
   `prune_options`). Any simulator-specific flags flow through this channel.
   [`runSimulation`](@ref) takes no kwargs.
+- `run_kwargs::NamedTuple=(;)`: simulator options as a bundle, equivalent to passing them
+  loosely. Calibration must bundle — `runABC` and `resumeCalibration` spend their keyword
+  splat on `ABCSMC` fields — so accepting the bundle here means one assembled once is
+  portable to any entry point. Where a key appears both ways, the loose keyword wins.
 """
 function run(T::AbstractTrial; quiet::Bool=false,
              on_progress::Union{Nothing,Function}=nothing,
-             post_processor=nothing, tags=(), kwargs...)
+             post_processor=nothing, tags=(),
+             run_kwargs::NamedTuple=(;), kwargs...)
+    kwargs = _mergeRunKwargs(run_kwargs, kwargs)
     #! A `QoI` (or a vector of them) is accepted here as well as a bare function; `_asPostProcessor`
-    #! is the identity on a function, so nothing already written changes.
+    #! is the identity on a function, so nothing already written changes. Note the annotation stays
+    #! off `post_processor`: a `QoI` is not a `Function`, so restoring it would reject one.
     post_processor = isnothing(post_processor) ? nothing : _asPostProcessor(post_processor)
     #! Applied before anything is dispatched, so tags survive an interrupted run and the
     #! trial is queryable by tag while its simulations are still in flight.

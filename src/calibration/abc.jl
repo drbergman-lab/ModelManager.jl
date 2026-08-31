@@ -168,7 +168,10 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         #! survive a monad deletion. Its monads match through inheritance.
         tagReserved!(sampling, ["mm:calibration" => string(calibration.id), "mm:generation" => string(t)])
         on_progress = _batchProgressCallback(verbosity, "  gen $t batch $batch_index ")
-        run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
+        #! The calibration's own controls come *after* the splat so they win. `run_kwargs` is for
+        #! simulator options; splatting it last let `run_kwargs=(quiet=false,)` or `(on_progress=f,)`
+        #! silently replace the progress machinery the `progress=` keyword had just configured.
+        run(sampling; run_kwargs..., quiet=true, on_progress=on_progress)
 
         failed_simulations, failed_monads, without_success = _batchOutcome(sim_ids_before)
         _recordBatchFailures(calibration, t, max_nr_populations, verbosity, warned_generations,
