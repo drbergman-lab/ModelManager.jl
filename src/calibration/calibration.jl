@@ -6,6 +6,7 @@ include("distance.jl")
 include("bank.jl")
 include("abc_smc.jl")
 include("abc.jl")
+include("training_set.jl")
 
 ################## Folder Helpers ##################
 

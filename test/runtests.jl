@@ -4227,6 +4227,81 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test length(res.generations) == 1
             end
 
+            @testset "_flattenSummary produces deterministic named numbers" begin
+                fs = ModelManager._flattenSummary
+                @test fs(3.0) == ["value" => 3.0]
+                @test fs(true) == ["value" => 1.0]
+                @test fs([1.0, 2.0]) == ["value.1" => 1.0, "value.2" => 2.0]
+                @test fs((a=1.0, b=2.0)) == ["value.a" => 1.0, "value.b" => 2.0]
+                # Dict keys are sorted, so two exports of the same problem cannot disagree on column
+                # order -- a consumer reading by position would otherwise silently mismatch.
+                @test fs(Dict("b" => 2.0, "a" => 1.0)) == ["value.a" => 1.0, "value.b" => 2.0]
+                @test fs(Dict("b" => 2.0, "a" => 1.0)) == fs(Dict("a" => 1.0, "b" => 2.0))
+                # Nesting, and a clear refusal for anything that is not numbers.
+                @test fs(Dict("x" => [1.0, 2.0])) == ["value.x.1" => 1.0, "value.x.2" => 2.0]
+                @test_throws ArgumentError fs("not a number")
+                @test_throws ArgumentError fs(Dict("x" => "nope"))
+            end
+
+            @testset "exportTrainingSet writes a consumer-agnostic table" begin
+                dv1 = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                dv2 = DistributedVariation(:config, xp_y, Uniform(1.0, 4.0))
+                prob = CalibrationProblem(inputs, [dv1, dv2], Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance; n_replicates=2)
+                ts = exportTrainingSet(prob; n=4, description="training set", progress=:none)
+                waitForDiagnostics()
+
+                @test ts isa TrainingSet
+                @test ts.n_rows == 4
+                @test ts.n_failed == 0
+                @test isdir(ts.path)
+
+                # The table: one row per parameter set, with all four column groups.
+                tbl = CSV.read(joinpath(ts.path, "training_set.csv"), DataFrame)
+                @test nrow(tbl) == 4
+                for c in ["monad_id", "n_success"]
+                    @test c in names(tbl)
+                end
+                @test all(tbl.n_success .== 2)
+                for c in vcat(ts.column_groups.latent, ts.column_groups.parameters,
+                              ts.column_groups.summaries)
+                    @test c in names(tbl)
+                end
+                @test length(ts.column_groups.latent) == 2
+                @test length(ts.column_groups.parameters) == 2
+
+                # Latent coordinates are CDFs, strictly inside the unit interval.
+                for c in ts.column_groups.latent
+                    @test all(0 .< tbl[!, c] .< 1)
+                end
+                # Interpretable values sit inside their priors, not in CDF space. The groups must be
+                # distinguishable: for a DistributedVariation the latent and target names are both
+                # variationName(dv), so without prefixes the merge silently dropped the CDF columns.
+                @test all(startswith.(ts.column_groups.latent, "cdf."))
+                @test all(startswith.(ts.column_groups.parameters, "target."))
+                @test isempty(intersect(ts.column_groups.latent, ts.column_groups.parameters))
+                @test all(0.5 .<= tbl[!, ts.column_groups.parameters[1]] .<= 3.0)
+                @test all(1.0 .<= tbl[!, ts.column_groups.parameters[2]] .<= 4.0)
+                # And the two spaces really differ, so one is not a copy of the other.
+                @test tbl[!, ts.column_groups.latent[1]] != tbl[!, ts.column_groups.parameters[1]]
+
+                # The manifest tells a consumer which columns are which, with no Julia needed.
+                man = TOML.parsefile(joinpath(ts.path, "manifest.toml"))
+                @test man["n_requested"] == 4
+                @test man["n_rows"] == 4
+                @test man["n_replicates"] == 2
+                @test man["design"] == "LHSVariation"
+                @test Set(man["columns"]["latent"]) == Set(ts.column_groups.latent)
+                @test Set(man["columns"]["summaries"]) == Set(ts.column_groups.summaries)
+
+                # It is a Calibration like any other, so the usual read paths work on it.
+                @test ts.calibration isa Calibration
+                @test occursin("training-set", sprint(show, ts.calibration))
+                @test ModelManager.hasTag(ts.calibration, "mm:method")
+
+                @test_throws ArgumentError exportTrainingSet(prob; n=0)
+            end
+
             @testset "StudySpec feeds both sensitivity and calibration" begin
                 dv1 = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 dv2 = DistributedVariation(:config, xp_y, Uniform(1.0, 4.0))

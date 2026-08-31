@@ -3635,3 +3635,36 @@ the bundle is checked to actually reach the simulator hook rather than only to p
 `run`'s *own* docstring and its definition, detaching documentation I had not written. Worth noting because
 the previous three were all comments I had placed above my own functions.
 
+## 2026-08-31 — Training-set export (item 8, first increment)
+
+`exportTrainingSet(problem; n)` simulates a space-filling design over the problem's priors and writes
+the parameters and their summary statistics as a table. Offline training on one fixed pre-simulated
+design is the documented recommendation for expensive simulators, so this is the happy path rather than
+a compromise.
+
+**Three of the four column groups existed only in process.** The CDF design matrix is dropped by
+`createTrial`, and `summary_statistic`'s output is consumed by `distance` on the very next line and never
+stored. So this is a persistence change more than a formatting one.
+
+**CSV plus TOML, no new dependency.** It is the shape the calibration folder already uses, and Python
+BayesFlow, `NeuralEstimators.jl` and `InvertibleNetworks.jl` can all read it. `.npz` or HDF5 would each
+cost a dependency for no gain at this size.
+
+**`LHSVariation` only, against the plan's `Union{LHSVariation,SobolVariation}`.** Only those two carry a
+`cdfs` field, but Sobol's is `(latent, sample, design_matrix)` with `variation_ids` shaped
+`(n, n_matrices)`: its samples are structured into the A/B/AB matrices the index estimator needs, not a
+flat design. Flattening them mixes those roles, which is a modelling decision rather than a formatting
+one, so it is deferred rather than guessed at.
+
+**A real bug the test caught.** For a `DistributedVariation`, `latent_parameter_names` and
+`_displayColumns` are *both* `[variationName(dv)]` — identical. Merging the two groups into one row by
+name therefore dropped every CDF column silently, leaving the target value under the latent column's
+name. The failing assertion was `0 < cdf < 1`, on a column that actually held a value in `[0.5, 3.0]`.
+Columns are now prefixed `cdf.`, `target.` and `summary.`, which fixes it and tells a consumer which
+space a column is in without consulting the manifest; a duplicate-name guard covers any future collision.
+
+**Not done, and deliberately so:** the time-boxed spike. Its deliverable is a written verdict on whether
+a pure-Julia neural-posterior-estimation package can replace the Python bridge, produced in a scratch
+environment with no dependency added here. That is an experiment, not code, and it needs this export to
+exist first — which it now does.
+
