@@ -72,7 +72,8 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                              reference_variation_id::VariationID=VariationID(inputs))
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(inputs, cps, observed_data,
-                              summary_statistic, distance, n_replicates, reference_variation_id)
+                              _asSummaryStatistic(summary_statistic), distance,
+                              n_replicates, reference_variation_id)
 end
 
 #! No `reference_variation_id` keyword, deliberately. `createTrial(method, reference::AbstractMonad,
@@ -85,7 +86,8 @@ function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              summary_statistic, distance; n_replicates::Int=1)
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
-                              summary_statistic, distance, n_replicates, ref.variation_id)
+                              _asSummaryStatistic(summary_statistic), distance,
+                              n_replicates, ref.variation_id)
 end
 
 #! `use_previous` is deliberately dropped: calibration reuses through the `SimulationBank`, not the

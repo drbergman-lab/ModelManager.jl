@@ -3505,3 +3505,100 @@ the user set, while a monad's variation is an identity the object carries.
 each expectation from `_calibrationRejection`, so it does not need revisiting as more variation kinds
 become calibratable.
 
+## 2026-08-30 — The QoI seam (item 7, Stage 3)
+
+The first bullet of CLAUDE.md's to-do list, and its premise was partly wrong: `populationCountQoI` does
+not exist in this repository and never did — the builders are PCMM-side. So the work was to build the
+seam here, not to rewire existing builders.
+
+**Three consumers, three shapes, one measurement.** Sensitivity analysis calls `f(simulation_id)` — a
+bare `Int` — and averages replicates itself with a hard-coded `mean`. Calibration calls
+`summary_statistic(monad_id)`, also a bare `Int`, one level up. The sink calls
+`post_processor(::SimulationProcess)`. `QoI(name, level, compute; reduce)` is the measurement;
+`sensitivityFunction`, `summaryStatistic` and `postProcessor` return exactly the callable each consumer
+already accepted, so **no consumer changed** and the whole stage is additive.
+
+**The level is a type parameter, not a `Symbol`.** The user had already ruled out inferring it, and the
+reason is that `Simulation` and `Monad` are both `AbstractMonad`s: a `compute` written for
+`AbstractMonad` is callable at either level, so dispatch cannot recover the intent and reading a monad
+as a simulation is the one failure that must be impossible. Given the level must be declared, a type
+beats a symbol three ways: `Simulaton` is an `UndefVarError` where `:simulaton` is a silent mismatch;
+`hasmethod(compute, Tuple{L})` becomes verification of a declaration rather than a guess; and the
+adapters dispatch on `QoI{Simulation}` versus `QoI{Monad}`, so `postProcessor` excludes the monad level
+in its *signature* rather than rejecting it at runtime.
+
+**Two refusals, both deliberate.** A simulation-level QoI with a non-`mean` `reduce` is refused by
+`sensitivityFunction`, because GSA's hard-coded averaging would discard the reducer without trace —
+better to say so than to accept and ignore. And a monad-level QoI has no per-simulation form for GSA to
+call at all. Both errors name the alternative.
+
+**A test bug worth recording.** The end-to-end sink test first used parameter values another testset had
+already run, so `use_previous` reused those simulations — and the post-processor only fires for
+simulations that actually execute, so the sink held one row where three were expected. It read exactly
+like the adapter dropping rows. Values unique to the testset plus `use_previous=false` fixed it, and the
+comment now says why, because the same trap will catch the next sink test.
+
+**The docstring guard earned its keep a third time**, catching all three `#!` blocks in the new file
+before the suite went green.
+
+### Review on #43: the level went away
+
+Four review comments, and the load-bearing one asked whether a `Monad` level was needed at all —
+"fundamentally, we're going to compute a QoI for each sim and then reduce across a Monad... a QoI for a
+Monad is less flexible and effectively just embeds the `reduce` inside its `compute`."
+
+That is right, and checking it properly is what convinced me. My instinct had been that spread across
+replicates needed monad-level access, but that is a per-simulation value with a `std` reducer. The
+general case follows: since `reduce` receives *everything* `compute` returned, a measurement needing the
+replicates jointly is expressed by having `compute` return the raw material — a time series — and letting
+`reduce` pool it. So monad-level `compute` is the same pair with the reduction folded in, and it bought a
+granularity question, a type parameter, a `hasmethod` check and a long docstring section defending the
+design, all for no expressive gain.
+
+**Removing it deleted the justification along with the feature**, which is the second review point: a
+docstring explaining why a type beats a `Symbol` was defending a choice nobody would now make, and the
+reviewer was right that explaining a rejected alternative is actively confusing. There is no level, so
+there is nothing to explain.
+
+**Sensitivity analysis now honours the reducer**, per the first comment. `evaluateFunctionOnSampling`
+hard-coded `mean`; it takes the QoI's reducer instead. That removed the refusal I had built — a
+simulation-level QoI with a non-`mean` reducer used to be rejected because GSA would silently discard it.
+Better to fix the internals than to document the limitation, which is what the reviewer said.
+
+**One compatibility trap caught in my own draft.** My first pass wrapped a plain `Function` into a `QoI`
+so consumers handled one type. But existing GSA functions are called with a simulation *ID*, while a
+QoI's `compute` receives a `Simulation` — the wrapper would have silently changed what every
+`functions=[f]` call is handed. `_qoiEvaluator` now reduces either input to the same pair (an
+ID-callable and a reducer) without changing what a plain function receives.
+
+**Widening the results Dicts was the non-obvious consequence.** `GSASampling` keys its results by the
+function object, in a `Dict{Function,...}` — so a `QoI` could not be a key until those three fields
+became `Dict{Union{Function,QoI},...}`. Untyped per-element `calculateGSA!` methods then became
+ambiguous against the vector method, so they take the union explicitly.
+
+### Stored QoI values, and why they default off
+
+The workflow: post-processing writes a value while a simulation's output still exists; a later GSA or
+calibration reads it back, because cleanup has since removed what it was computed from.
+
+**The default was decided by a measurement, not a preference.** The question was whether the
+invalidation machinery could be made robust enough to default *into* reuse. It cannot, and the reason is
+specific: a stored value carries nothing about which `compute` produced it, and no fingerprint can supply
+that. Redefining a function's body in place leaves both `hash` and `nameof` unchanged — so a changed
+`compute` is undetectable — and two textually identical anonymous functions hash *differently*, so an
+unchanged one is equally unrecognisable. Both directions fail. The sink stores no provenance either; its
+table is `simulation_id` plus one column per QoI name. So `stored=:never`.
+
+This is the same hazard already recorded for JLD2 in CLAUDE.md — a function is saved by name, and a
+redefinition is picked up silently. Worth noting it is not a sink limitation but a property of Julia
+functions.
+
+**What is robust is recomputation, so that is what `verifyStoredValues` does.** Where a simulation's
+output survives it recomputes and compares; where the output is gone it reports `n_unverifiable` rather
+than guessing — and that is precisely the case `stored` exists for, so the honest answer matters more
+than a reassuring one. Mismatches come back with the simulation ID and both values.
+
+**One test detail worth keeping.** `stored=:prefer` is checked with a `compute` that *throws*, so the
+test proves the stored path was taken rather than merely that it agreed with a fresh computation. Two
+values agreeing would not have distinguished the two paths.
+

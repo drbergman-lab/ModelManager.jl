@@ -140,6 +140,25 @@ _test_named_dist(s, o)     = 0.0
 # Used by resumeABC test to prevent premature convergence.
 _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
+# ---- QoI test computes ----------------------------------------------------
+# Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
+# values differ; _qoi_monad sees the whole monad at once.
+_qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
+_qoi_monad(m::Monad)      = length(ModelManager.constituentIDs(m))
+# A plain GSA function: takes a simulation ID, as `functions=` always has.
+_qoi_by_id(sim_id)        = getParameterValue(Simulation(Int(sim_id)), :config, XMLPath(["data", "x"]))
+
+# Reads a previously-stored post-processing value instead of recomputing from output. This is the
+# write-once-read-later path: the sink survives post-simulation cleanup, the output folder may not.
+function _qoi_from_sink(s::Simulation)
+    row = postProcessingTable([s.id])
+    (nrow(row) == 1 && "stored_x" in names(row) && !ismissing(row.stored_x[1])) ||
+        error("no stored value for simulation $(s.id)")
+    return Float64(row.stored_x[1])
+end
+
+
+
 # Named functions used as keys in the GSA sensitivity-recipe tests, so legend labels
 # are stable strings ("_gsa_fA", "_gsa_fB") rather than gensym closure names.
 _gsa_fA(mid) = 0.0
@@ -3941,6 +3960,217 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # A generation with no folder yet gets one at the computed width.
                 @test ModelManager._generationArtifactToWrite(gdir, 11, :monads, 1000) ==
                       joinpath(gdir, "0011", "monads.csv")
+            end
+
+            @testset "QoI is compute-per-simulation plus a reducer" begin
+                q = QoI("x", _qoi_sim)
+                @test q.name == "x"
+                @test q.reduce === mean
+                @test QoI("x", _qoi_sim; reduce=maximum).reduce === maximum
+
+                # A QoI and a plain Function collapse to the same pair, but a plain Function keeps
+                # its existing contract: it is called with an ID, not a Simulation. Wrapping it
+                # would silently change what every existing `functions=[f]` receives.
+                fq, rq = ModelManager._qoiEvaluator(q)
+                ff, rf = ModelManager._qoiEvaluator(_qoi_by_id)
+                @test rq === mean && rf === mean
+                @test_throws ArgumentError ModelManager._qoiEvaluator(42)
+            end
+
+            @testset "QoI passes straight to all three consumers" begin
+                vals = [1051.0, 1061.0]
+                dv = DiscreteVariation(:config, xp_x, vals)
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+                sids = ModelManager.constituentIDs(Monad, mid)
+                sim_vals = [_qoi_sim(Simulation(i)) for i in sids]
+
+                # Reducer honoured, and it is the QoI's own -- not a hard-coded mean.
+                @test ModelManager._reduceOverMonad(QoI("x", _qoi_sim), mid) ≈ mean(sim_vals)
+                @test ModelManager._reduceOverMonad(QoI("x", _qoi_sim; reduce=maximum), mid) ≈
+                      maximum(sim_vals)
+
+                # Calibration: the QoI itself is the summary statistic.
+                prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(0.5, 3.0))],
+                                          Dict{String,Any}("x" => 1.0),
+                                          QoI("x", _qoi_sim), mseDistance)
+                @test prob.summary_statistic isa Function
+                @test prob.summary_statistic(mid)["x"] ≈ mean(sim_vals)
+
+                # The sink: the QoI itself is the post_processor.
+                m2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1069.0])];
+                                 n_replicates=1, use_previous=false)
+                run(m2; post_processor=QoI("xval", _qoi_sim))
+                waitForDiagnostics()
+                tbl = postProcessingTable(simulationIDs(m2))
+                @test "xval" in names(tbl)
+                @test Set(skipmissing(tbl.xval)) == Set([1069.0])
+
+                # Duplicate names are refused rather than silently collapsing a column.
+                @test_throws ArgumentError ModelManager._asPostProcessor(
+                    [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
+                @test_throws ArgumentError ModelManager._asSummaryStatistic(
+                    [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
+            end
+
+            @testset "a non-scalar QoI is fine except at the sink" begin
+                # compute may return a vector or Dict, because `reduce` collapses it. The sink is the
+                # exception: it fires once per simulation, so `reduce` is never called and compute's
+                # own value is stored. That asymmetry is easy to trip over, so it is pinned here.
+                obs = Dict("x" => 2.0, "y" => 3.0)
+                vecq = QoI("both", s -> [getParameterValue(s, :config, XMLPath(["data", "x"])),
+                                         getParameterValue(s, :config, XMLPath(["data", "y"]))];
+                           reduce = per_sim -> sum(abs2, mean(per_sim) .- [obs["x"], obs["y"]]))
+
+                # Calibration and GSA are happy: reduce returns a scalar.
+                dv = DiscreteVariation(:config, xp_x, [1091.0])
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+                @test ModelManager._reduceOverMonad(vecq, mid) isa Real
+
+                # The sink refuses it, and the message names the QoI and the type rather than
+                # failing somewhere in the DB layer.
+                err = try
+                    ModelManager._postProcessingColumnSpec("both", [1.0, 2.0]); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("both", err.msg)
+                @test occursin("Vector", err.msg)
+                @test occursin("scalar", err.msg)
+            end
+
+            @testset "a QoI can read a value the sink stored earlier" begin
+                # The workflow: post-processing writes a value per simulation while the output folder
+                # still exists; a later GSA or calibration reads it back from the sink. Essential when
+                # post-simulation cleanup has since deleted what the QoI was computed from.
+                vals = [1301.0, 1307.0]
+                dv = DiscreteVariation(:config, xp_x, vals)
+                t  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+
+                # Pass 1: store it, under the QoI's own name.
+                run(t; post_processor=QoI("stored_x", _qoi_sim))
+                waitForDiagnostics()
+                stored = postProcessingTable(simulationIDs(t))
+                @test "stored_x" in names(stored)
+                @test Set(skipmissing(stored.stored_x)) == Set(vals)
+
+                # Pass 2: a different QoI reads the stored value rather than the model output, and
+                # feeds calibration and GSA exactly as a freshly-computed one would.
+                readback = QoI("stored_x", _qoi_from_sink)
+                mid = first(ModelManager.monadIDs(t))
+                sids = ModelManager.constituentIDs(Monad, mid)
+                @test ModelManager._reduceOverMonad(readback, mid) ≈
+                      mean([_qoi_sim(Simulation(i)) for i in sids])
+
+                # And through a real consumer, to show nothing about the seam needs changing.
+                ss = ModelManager._asSummaryStatistic(readback)
+                @test ss(mid)["stored_x"] ≈ mean([_qoi_sim(Simulation(i)) for i in sids])
+            end
+
+            @testset "stored=:prefer/:require and verifyStoredValues" begin
+                vals = [1409.0, 1423.0]
+                dv = DiscreteVariation(:config, xp_x, vals)
+                t  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+
+                # Default is off, and that is the contract: nothing records which compute produced a
+                # stored value, so opting in has to be deliberate.
+                @test QoI("stored_x", _qoi_sim).stored === :never
+                @test_throws ArgumentError QoI("stored_x", _qoi_sim; stored=:sometimes)
+
+                # :require before anything is stored names the fix rather than failing obscurely.
+                sid_probe = 1
+                @test_throws ArgumentError ModelManager._computeOn(
+                    QoI("never_stored_anywhere", _qoi_sim; stored=:require), sid_probe)
+
+                # Store, then read back through `stored`.
+                run(t; post_processor=QoI("stored_x", _qoi_sim))
+                waitForDiagnostics()
+                sids = simulationIDs(t)
+                for sid in sids
+                    @test ModelManager._storedValue("stored_x", sid) !== nothing
+                end
+
+                # :prefer returns the stored number without calling compute. A compute that throws
+                # proves the stored path was taken rather than merely agreeing with it.
+                exploding = QoI("stored_x", s -> error("compute must not run"); stored=:prefer)
+                @test ModelManager._computeOn(exploding, first(sids)) ≈
+                      ModelManager._storedValue("stored_x", first(sids))
+                # ...and falls back to compute when nothing is stored under that name.
+                fallback = QoI("no_such_column", _qoi_sim; stored=:prefer)
+                @test ModelManager._computeOn(fallback, first(sids)) ≈
+                      _qoi_sim(Simulation(first(sids)))
+
+                # verifyStoredValues recomputes where the output survives.
+                rep = verifyStoredValues(QoI("stored_x", _qoi_sim), t)
+                @test rep.n_checked == length(sids)
+                @test rep.n_agreed + rep.n_unverifiable == length(sids)
+                @test rep.n_mismatched == 0
+                @test isempty(rep.mismatches)
+
+                # A disagreeing compute is caught and reported, not averaged over.
+                bad = verifyStoredValues(QoI("stored_x", s -> _qoi_sim(s) + 1000.0), t)
+                if bad.n_unverifiable < length(sids)      # only if some output survives to check
+                    @test bad.n_mismatched > 0
+                    @test !isempty(bad.mismatches)
+                    @test bad.mismatches[1].stored != bad.mismatches[1].recomputed
+                end
+
+                # And a name that was never stored is reported as missing, not as agreement.
+                none = verifyStoredValues(QoI("no_such_column", _qoi_sim), t)
+                @test none.n_missing == length(sids)
+                @test none.n_agreed == 0
+            end
+
+            @testset "sensitivity on a discrepancy-to-data QoI" begin
+                # The workflow: a simulation yields several values; average each across replicates,
+                # THEN compare to data. Squaring is nonlinear, so mean-then-square is not
+                # square-then-mean, and a per-simulation compute cannot do it — it has no access to
+                # the mean. `reduce` is the monad-level step that can: it receives every replicate's
+                # value, so `compute` returns the raw per-simulation values and `reduce` averages and
+                # then squares.
+                obs = Dict("x" => 2.0, "y" => 3.0)
+                function _both(s::Simulation)
+                    return Dict("x" => getParameterValue(s, :config, XMLPath(["data", "x"])),
+                                "y" => getParameterValue(s, :config, XMLPath(["data", "y"])))
+                end
+                # One scalar per monad: mean per key, squared difference, then summed.
+                mse_reduce = per_sim -> sum((mean(getindex.(per_sim, k)) - obs[k])^2 for k in keys(obs))
+                q = QoI("mse", _both; reduce=mse_reduce)
+
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=3)
+                gsa = run(MOAT(), spec; functions=[q])
+                waitForDiagnostics()
+                @test gsa isa ModelManager.GSASampling
+                @test haskey(gsa.results, q)
+
+                # And the arithmetic the workflow depends on: averaging first is not the same as
+                # squaring first, so which side of `reduce` the nonlinearity sits on matters.
+                per_sim = [Dict("x" => 1.0, "y" => 2.0), Dict("x" => 3.0, "y" => 4.0)]
+                mean_then_sq = sum((mean(getindex.(per_sim, k)) - obs[k])^2 for k in keys(obs))
+                sq_then_mean = sum(mean((getindex.(per_sim, k) .- obs[k]).^2) for k in keys(obs))
+                @test mse_reduce(per_sim) ≈ mean_then_sq
+                @test !(mean_then_sq ≈ sq_then_mean)
+            end
+
+            @testset "GSA honours a QoI's reducer, and plain functions still work" begin
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=2)
+                # A plain Function gets a simulation ID and mean over replicates, exactly as before.
+                gsa1 = run(MOAT(), spec; functions=[_qoi_by_id])
+                waitForDiagnostics()
+                @test gsa1 isa ModelManager.GSASampling
+
+                # A QoI with a non-mean reducer is now accepted rather than refused: this is what
+                # changed in GSA's internals.
+                gsa2 = run(MOAT(), spec; functions=[QoI("x", _qoi_sim; reduce=maximum)])
+                waitForDiagnostics()
+                @test gsa2 isa ModelManager.GSASampling
             end
 
             @testset "StudySpec feeds both sensitivity and calibration" begin
