@@ -188,9 +188,10 @@ Create a trial from `inputs_or_ref` and `avs`, then run it. `kwargs` are forward
 [`run`](@ref)`(::AbstractTrial; ...)`, which passes them through to
 `prepareTrialHierarchy` and the simulator hooks.
 """
-function run(method::AddVariationMethod, args...; n_replicates=1, use_previous=true, tags=(), kwargs...)
+function run(method::AddVariationMethod, args...; n_replicates=1, use_previous=true, tags=(),
+             run_kwargs::NamedTuple=(;), kwargs...)
     trial = createTrial(method, args...; n_replicates=n_replicates, use_previous=use_previous, tags=tags)
-    return run(trial; kwargs...)
+    return run(trial; _mergeRunKwargs(run_kwargs, kwargs)...)
 end
 
 run(inputs::InputFolders, args...; kwargs...) = run(GridVariation(), inputs, args...; kwargs...)
@@ -211,4 +212,5 @@ sims = [createTrial(inputs, dv1), createTrial(inputs, dv2)]
 run(sims)
 ```
 """
-run(Ts::AbstractVector; tags=(), kwargs...) = run(createTrial(Ts; tags=tags); kwargs...)
+run(Ts::AbstractVector; tags=(), run_kwargs::NamedTuple=(;), kwargs...) =
+    run(createTrial(Ts; tags=tags); _mergeRunKwargs(run_kwargs, kwargs)...)

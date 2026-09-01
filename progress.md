@@ -3601,4 +3601,37 @@ than a reassuring one. Mismatches come back with the simulation ID and both valu
 **One test detail worth keeping.** `stored=:prefer` is checked with a `compute` that *throws*, so the
 test proves the stored path was taken rather than merely that it agreed with a fresh computation. Two
 values agreeing would not have distinguished the two paths.
+## 2026-08-30 — One simulator-option channel (item 7, Stage 4)
+
+Two spellings existed and the split was structural rather than stylistic. `run(::AbstractTrial)`,
+`run(::AddVariationMethod, ...)`, `run(::AbstractVector)` and `run(::GSAMethod, ...)` take a loose
+`kwargs...` splat. `runCalibration`/`runABC`/`resumeCalibration`/`resumeABC` take a
+`run_kwargs::NamedTuple` bundle — not by preference but by necessity: they spend their splat on `ABCSMC`
+field forwarding, so there was none left for simulator options.
+
+**Both are now accepted on the splat-based entry points**, merged by `_mergeRunKwargs` with the loose
+keyword winning a collision. The point is portability: a bundle assembled once reaches any entry point.
+
+**Where the scoping recommended the reverse, I did not follow it.** It proposed giving `runCalibration` a
+loose splat, since it takes the method positionally and one was available. That would have converted its
+present `MethodError` on a mistyped keyword into a silent forward to the simulator hooks — which accept
+anything and whose post-simulation defaults are permissive no-ops. The whole convention is meant to be
+additive; adding a splat there subtracts error checking, so the bundle travels to the splat side instead.
+
+**A real bug found on the way.** `run_kwargs` was splatted *last* in the per-batch call:
+
+    run(sampling; quiet=true, on_progress=on_progress, run_kwargs...)
+
+Julia gives the rightmost duplicate precedence, so `run_kwargs=(quiet=false,)` or `(on_progress=f,)`
+silently replaced the progress machinery the `progress=` keyword had just configured — the third instance
+this week of rightmost-wins causing a silent override, after the reference monad's variation and resume's
+`method=`. The calibration's own controls now come after the splat.
+
+**Tests assert arrival, not just merging.** The stub simulator records what `setupSampling` received, so
+the bundle is checked to actually reach the simulator hook rather than only to produce the right
+`NamedTuple`.
+
+**The docstring guard caught a fourth case**, and this one was a different shape: my helper landed between
+`run`'s *own* docstring and its definition, detaching documentation I had not written. Worth noting because
+the previous three were all comments I had placed above my own functions.
 

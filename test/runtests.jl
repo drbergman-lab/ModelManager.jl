@@ -97,7 +97,13 @@ module _NestedSimModule
 end
 
 # ---- Trial execution --------------------------------------------------------
-ModelManager.setupSampling(::TestSimulator, args...; kwargs...) = true
+# Records the keywords setupSampling last received, so tests can assert that a simulator option
+# actually arrived rather than only that the merge helper computed the right NamedTuple.
+const _last_setup_kwargs = Ref{Any}(nothing)
+function ModelManager.setupSampling(::TestSimulator, args...; kwargs...)
+    _last_setup_kwargs[] = kwargs
+    return true
+end
 ModelManager.setupMonad(::TestSimulator,    args...; kwargs...) = true
 
 # When set, `runSimulation` reports failure for any spec the predicate accepts — used by the
@@ -4171,6 +4177,54 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 gsa2 = run(MOAT(), spec; functions=[QoI("x", _qoi_sim; reduce=maximum)])
                 waitForDiagnostics()
                 @test gsa2 isa ModelManager.GSASampling
+            end
+
+            @testset "run_kwargs is one channel with the loose splat" begin
+                m = ModelManager._mergeRunKwargs
+                @test m((prune=1, keep=2), pairs(NamedTuple())) == (prune=1, keep=2)
+                @test m(NamedTuple(), pairs((a=1,)))            == (a=1,)
+                @test m(NamedTuple(), pairs(NamedTuple()))      == NamedTuple()
+                # A loose keyword wins: it is the more deliberate spelling at the call site.
+                @test m((prune=1, keep=2), pairs((keep=99,)))   == (prune=1, keep=99)
+
+                # The bundle reaches the simulator hooks exactly as a loose keyword does. The stub
+                # simulator records what setupSampling saw, so this checks arrival, not just merging.
+                dv = DiscreteVariation(:config, xp_x, [131.0, 137.0])
+                t1 = createTrial(inputs, [dv]; n_replicates=1, use_previous=false)
+                run(t1; run_kwargs=(marker_kw="bundle",))
+                waitForDiagnostics()
+                @test _last_setup_kwargs[] !== nothing
+                @test get(_last_setup_kwargs[], :marker_kw, nothing) == "bundle"
+
+                t2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [139.0])];
+                                 n_replicates=1, use_previous=false)
+                run(t2; marker_kw="loose")
+                waitForDiagnostics()
+                @test get(_last_setup_kwargs[], :marker_kw, nothing) == "loose"
+
+                # Both spellings at once: loose wins, bundle's other keys survive.
+                t3 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [149.0])];
+                                 n_replicates=1, use_previous=false)
+                run(t3; run_kwargs=(marker_kw="bundle", other_kw=7), marker_kw="loose")
+                waitForDiagnostics()
+                @test get(_last_setup_kwargs[], :marker_kw, nothing) == "loose"
+                @test get(_last_setup_kwargs[], :other_kw, nothing) == 7
+            end
+
+            @testset "run_kwargs cannot hijack calibration's own run controls" begin
+                # run_kwargs used to be splatted LAST, so a simulator bundle could replace the
+                # progress machinery the `progress=` keyword had just configured. The calibration's
+                # own controls now come after it.
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_nonzero_ss, mseDistance)
+                res = runCalibration(ABCSMC(population_size=4, max_nr_populations=1,
+                                            minimum_epsilon=0.0, max_evaluations=32), prob;
+                                     description="run_kwargs precedence", progress=:none,
+                                     run_kwargs=(quiet=false, on_progress=nothing))
+                waitForDiagnostics()
+                @test res isa ABCResult
+                @test length(res.generations) == 1
             end
 
             @testset "StudySpec feeds both sensitivity and calibration" begin
