@@ -150,9 +150,11 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
 # ---- QoI test computes ----------------------------------------------------
 # Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
-# values differ; _qoi_monad sees the whole monad at once.
+# values differ. (There is deliberately no monad-level QoI helper here: a QoI's `compute` is only
+# ever handed a `Simulation` -- see `_computeOn` -- so a `compute(::Monad)` would MethodError. A
+# helper asserting otherwise sat here unused, and read as documentation of a contract that does
+# not exist.)
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
-_qoi_monad(m::Monad)      = length(ModelManager.constituentIDs(m))
 # A plain GSA function: takes a simulation ID, as `functions=` always has.
 _qoi_by_id(sim_id)        = getParameterValue(Simulation(Int(sim_id)), :config, XMLPath(["data", "x"]))
 
@@ -4127,6 +4129,27 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # And through a real consumer, to show nothing about the seam needs changing.
                 @test ModelManager._evaluateSummary(readback, mid)["stored_x"] ≈
                       mean([_qoi_sim(Simulation(i)) for i in sids])
+
+                # A Dict-returning `compute` left on the default `reduce=mean` is a sharp edge: it
+                # dies inside Statistics with `MethodError: no method matching /(::Dict, ::Int64)`,
+                # naming neither the QoI nor the reduction step -- and calibration's catch then
+                # blames the user's summary/distance function. The reframed error must name the
+                # QoI, the returned type, `reduce`, and the one-QoI-per-quantity fix.
+                dictq = QoI("dictq", s -> Dict{String,Any}("a" => 1.0, "b" => 2.0))
+                err = try
+                    ModelManager._reduceOverMonad(dictq, mid); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                msg = err.msg
+                @test occursin("dictq", msg)
+                @test occursin("reduce", msg)
+                @test occursin("Dict", msg)
+                @test occursin("vector of QoIs", msg)
+                @test occursin("MethodError", msg)          # underlying cause still reported
+                # A reduce that does understand the Dict is untouched by the guard.
+                okq = QoI("okq", s -> Dict{String,Any}("a" => 1.0);
+                          reduce = vs -> sum(v["a"] for v in vs))
+                @test ModelManager._reduceOverMonad(okq, mid) ≈ Float64(length(sids))
             end
 
             @testset "stored=:prefer/:require and verifyStoredValues" begin

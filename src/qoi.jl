@@ -130,8 +130,14 @@ qoiName(q::QoI) = q.name
 #! Every consumer reaches a simulation by ID, so this is the one place that turns an ID into the object
 #! a user's `compute` expects. Keeping it in one function is what lets `compute` be written against
 #! `Simulation` rather than against whatever each consumer happens to pass.
-function _computeOn(q::QoI, sim_id::Integer)
-    sid = Int(sim_id)
+_computeOn(q::QoI, sim::Simulation) = _computeOn(q, sim.id, sim)
+
+_computeOn(q::QoI, sim_id::Integer) = _computeOn(q, Int(sim_id), nothing)
+
+#! `sim` is the already-constructed `Simulation` when a caller has one (the post-processing sink
+#! does), and `nothing` when only an ID is in hand. Splitting it this way keeps the stored-value
+#! lookup, which needs only the ID, ahead of any database round trip to build the object.
+function _computeOn(q::QoI, sid::Int, sim::Union{Nothing,Simulation})
     if q.stored !== :never
         v = _storedValue(q.name, sid)
         isnothing(v) || return v
@@ -140,7 +146,7 @@ function _computeOn(q::QoI, sim_id::Integer)
             "it. Run the trial with `post_processor` writing \"$(q.name)\" first, or use " *
             "`stored=:prefer` to fall back to computing it."))
     end
-    return q.compute(Simulation(sid))
+    return q.compute(isnothing(sim) ? Simulation(sid) : sim)
 end
 
 """
@@ -221,7 +227,26 @@ function _reduceOverMonad(q, monad_id::Integer)
     sim_ids = constituentIDs(Monad, Int(monad_id))
     isempty(sim_ids) && throw(ArgumentError(
         "Monad $(monad_id) has no simulations, so QoI \"$(qoiName(q))\" cannot be evaluated on it."))
-    return red([f(sid) for sid in sim_ids])
+    vals = [f(sid) for sid in sim_ids]
+    #! Without this, the default `reduce=mean` meeting a `Dict`-returning `compute` throws
+    #! `MethodError: no method matching /(::Dict{String,Any}, ::Int64)` from inside Statistics —
+    #! no mention of the QoI, of replicates, or of the reduction step, and calibration's own catch
+    #! then reports the fault as being in the user's summary or distance function.
+    return try
+        red(vals)
+    catch e
+        e isa MethodError || rethrow()
+        throw(ArgumentError("""
+        QoI "$(qoiName(q))": combining the $(length(vals)) replicate value(s) of monad \
+        $(monad_id) with `reduce` failed. `compute` returned $(eltype(vals)), which \
+        $(red === mean ? "the default `reduce=mean` cannot average" : "`reduce` does not accept").
+        $(red === mean && !(eltype(vals) <: Union{Real,AbstractArray{<:Real}}) ?
+          "To report several named quantities, pass one QoI per quantity (a vector of QoIs) \
+        rather than one QoI whose `compute` returns a Dict; or give this QoI a `reduce` that \
+        understands $(eltype(vals))." :
+          "Give this QoI a `reduce` that accepts a Vector{$(eltype(vals))}.")
+        The underlying error was: $(sprint(showerror, e))"""))
+    end
 end
 
 #! A bare `Function` keeps its existing contract exactly: it is called with a simulation *ID* and its
@@ -316,9 +341,10 @@ function _asPostProcessor(qs::AbstractVector{QoI})
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one post-processor; got $(names)."))
+    #! `sp` already carries the `Simulation`, so pass it through rather than re-querying it by ID:
+    #! `_computeOn(q, sid)` would build a fresh one per QoI per simulation.
     return function (sp::SimulationProcess)
-        sid = simulationID(sp)
-        return Dict{String,Any}(q.name => _computeOn(q, sid) for q in qs)
+        return Dict{String,Any}(q.name => _computeOn(q, sp.simulation) for q in qs)
     end
 end
 

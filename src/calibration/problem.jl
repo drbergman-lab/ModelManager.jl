@@ -18,12 +18,12 @@ and how to compare simulated to observed output.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
 - `summary_statistic`: a `Function` called as `(monad_id::Int) → T` for any `T` accepted by
-  `distance`, or a [`QoI`](@ref) / vector of them, which is stored as given and reduced over
-  each monad into a `Dict` keyed by QoI name. QoIs are preserved rather than converted, so a
-  QoI-backed problem can also be evaluated per simulation (see `exportTrainingSet`)
-  as its first argument. Called once per proposed particle. The user controls how to
-  aggregate over `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single
-  replicate).
+  `distance` as its first argument, or a [`QoI`](@ref) / vector of them. Called once per proposed
+  particle. Given a plain `Function` you control how to aggregate over
+  `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single replicate). A `QoI` is stored
+  as given and reduced over each monad into a `Dict` keyed by QoI name; QoIs are preserved rather
+  than converted, so a QoI-backed problem can also be evaluated per simulation — see
+  [`exportTrainingSet`](@ref).
 - `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
   of `summary_statistic`; `observed` is `observed_data`.
   Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
