@@ -3689,3 +3689,47 @@ defined.
 Verified by reproducing the exact mistake: dropping `training_set.md` from `make.jl` makes the guard fail
 and name both symbols and their source file. Restoring it goes green.
 
+### The BayesFlow API, settled
+
+Asked to stop hedging on this before merge, and rightly — the format depends on it. From BayesFlow's
+own v2 docs:
+
+- It takes a **dict of named, batch-first arrays**. v2 names parameters and data by convention rather
+  than positionally.
+- The conventional keys are **`inference_variables`** (the parameters to infer),
+  **`summary_variables`** (data passed through a summary network) and **`inference_conditions`** (data
+  passed straight to the inference network).
+- Offline training is **`workflow.fit_offline(data=..., epochs=..., batch_size=...)`**.
+- Set- or series-valued observations take shape `(n_simulations, n_observations, n_dim)`, with the
+  observation count **fixed across simulations**.
+
+Nothing here requires a space-filling design, and the CSV-plus-manifest format survives unchanged: each
+column becomes one named array. The manifest now records the group→role mapping directly, so a consumer
+does not infer it from prefixes.
+
+Two consequences worth having on the record. `cdf.*` is the better inference target of the two parameter
+groups — bounded in `(0,1)` and comparably scaled, where `target.*` may span orders of magnitude — with
+draws pushed back through the prior quantile to read them in model units. And the fixed-observation-count
+requirement means the set-valued shape is unavailable when replicate counts differ, which is exactly what
+a partial failure produces; `n_success` is the column that tells a consumer whether reshaping is safe.
+
+**`MonteCarloVariation` is now the default design for the export.** NPE's objective is an expectation
+under the prior and its calibration diagnostics assume independent joint draws; LHS has exactly matched
+marginals but dependent samples, which invalidates those rank statistics even for a perfect
+approximator. Trading away the tool that tells you whether to trust the network is a bad trade, so LHS is
+available but not the default here. `rand` can return exactly `0.0`, whose prior quantile is `-Inf` for an
+unbounded prior, so out-of-range entries are redrawn.
+
+**Both granularities are supported, and the default is the conservative one.** `:monad` combines
+replicates; `:simulation` writes one row per surviving replicate. The rule is to match the observed
+data: a network learns `q(θ|x)` for the x-distribution it saw, so training on replicate means and then
+conditioning on one noisy observation gives tight posteriors in the wrong place. `:simulation` is the
+statistically better choice for single-realization data, but `:monad` is the default because it works
+with any summary statistic.
+
+**An architectural consequence found by the failing test, not by reasoning.** `:simulation` first tried
+to read the QoI off `problem.summary_statistic` — but `CalibrationProblem` converts a QoI into a plain
+monad-level function at construction, so the QoI is gone by then. It is now an explicit `qoi=` keyword,
+required at that granularity. Reaching back through a boundary that had already erased what I wanted was
+the mistake; the error message now explains why the problem cannot supply it.
+

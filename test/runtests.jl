@@ -4254,6 +4254,70 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test ts.n_failed == 0              # each monad still had a survivor
             end
 
+            @testset "training-set granularity: monad rows vs simulation rows" begin
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                # A QoI, so :simulation is available: a plain summary function takes a monad ID.
+                q = QoI("x", _qoi_sim)
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          q, mseDistance; n_replicates=3)
+
+                mon = exportTrainingSet(prob; n=3, granularity=:monad,
+                                        description="gran monad", progress=:none)
+                waitForDiagnostics()
+                sim = exportTrainingSet(prob; n=3, granularity=:simulation, qoi=q,
+                                        description="gran sim", progress=:none)
+                waitForDiagnostics()
+
+                tm = CSV.read(joinpath(mon.path, "training_set.csv"), DataFrame)
+                tsim = CSV.read(joinpath(sim.path, "training_set.csv"), DataFrame)
+
+                # One row per parameter set, versus one per surviving replicate.
+                @test nrow(tm) == 3
+                @test nrow(tsim) == 3 * 3
+                @test all(tm.simulation_id .== 0)          # no single simulation to name
+                @test all(tsim.simulation_id .> 0)
+                # θ repeats across a parameter set's replicates, which is correct: they are
+                # independent draws from p(x|θ).
+                @test length(unique(tsim.monad_id)) == 3
+                @test length(unique(tsim[!, mon.column_groups.latent[1]])) == 3
+
+                # The manifest says which, so a consumer cannot misread the granularity.
+                @test TOML.parsefile(joinpath(mon.path, "manifest.toml"))["granularity"] == "monad"
+                @test TOML.parsefile(joinpath(sim.path, "manifest.toml"))["granularity"] == "simulation"
+                # ...and records the BayesFlow adapter roles rather than leaving them to be inferred.
+                bf = TOML.parsefile(joinpath(mon.path, "manifest.toml"))["bayesflow"]
+                @test Set(bf["inference_variables"]) == Set(mon.column_groups.latent)
+                @test Set(bf["summary_variables"]) == Set(mon.column_groups.summaries)
+
+                # :simulation with a plain summary function is refused, naming the fix.
+                plain = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                           _test_named_ss, mseDistance)
+                # :simulation without qoi= is refused up front, naming the fix -- the problem's
+                # summary_statistic is monad-level by contract even when a QoI was passed to it.
+                @test_throws ArgumentError exportTrainingSet(prob; n=2, granularity=:simulation,
+                                                             progress=:none)
+                @test_throws ArgumentError exportTrainingSet(plain; n=2, granularity=:simulation,
+                                                             progress=:none)
+                @test_throws ArgumentError exportTrainingSet(prob; n=2, granularity=:nonsense)
+            end
+
+            @testset "MonteCarloVariation draws independently inside the unit interval" begin
+                # The default design for a training set: i.i.d. prior draws, because NPE's objective
+                # is an expectation under the prior and its calibration diagnostics assume
+                # independence. LHS has matched marginals but dependent samples.
+                mc = MonteCarloVariation(16)
+                @test mc.n == 16
+                @test MonteCarloVariation(; n=5).n == 5
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                pv = ModelManager.ParsedVariations([dv])
+                res = ModelManager.addVariations(mc, inputs, pv, VariationID(inputs))
+                @test res isa ModelManager.AddMonteCarloVariationsResult
+                @test size(res.cdfs, 2) == 16
+                # Strictly inside (0,1): an endpoint maps to a prior quantile of ±Inf.
+                @test all(0 .< res.cdfs .< 1)
+                @test length(res.variation_ids) == 16
+            end
+
             @testset "_flattenSummary produces deterministic named numbers" begin
                 fs = ModelManager._flattenSummary
                 @test fs(3.0) == ["value" => 3.0]
@@ -4321,7 +4385,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test man["n_requested"] == 4
                 @test man["n_rows"] == 4
                 @test man["n_replicates"] == 2
-                @test man["design"] == "LHSVariation"
+                # The default design is i.i.d. prior draws, not LHS.
+                @test man["design"] == "MonteCarloVariation"
                 @test Set(man["columns"]["latent"]) == Set(ts.column_groups.latent)
                 @test Set(man["columns"]["summaries"]) == Set(ts.column_groups.summaries)
 
