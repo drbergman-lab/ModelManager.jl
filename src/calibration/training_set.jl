@@ -111,14 +111,12 @@ need simulation on demand.
   `:monad` with `n_replicates == m`. Training on 10-replicate means and then conditioning on one noisy
   observation gives tight posteriors in the wrong place — overconfidence, the worst failure available.
 
-  `:monad` is the default only because it works with any summary statistic. `:simulation` needs
-  `qoi=` — a [`QoI`](@ref), or several — because a `CalibrationProblem`'s `summary_statistic` is a
-  monad-level function by contract, and a QoI handed to that constructor is converted into one, so the
-  QoI is not recoverable from the problem. It is the statistically better choice whenever your
-  observations are single realizations.
-- `qoi`: the QoI(s) to evaluate per simulation, required by `granularity=:simulation` and unused
-  otherwise. At that granularity there is one value per row and nothing to combine, so a QoI's
-  `reduce` is bypassed — the same asymmetry the post-processing sink has.
+  `:monad` is the default only because it works with any summary statistic. `:simulation` requires a
+  problem whose `summary_statistic` is a [`QoI`](@ref) (or a vector of them): a plain summary function
+  takes a monad ID by contract and has no per-simulation form to call. It is the statistically better
+  choice whenever your observations are single realizations. At `:simulation` there is one value per
+  row and nothing to combine, so a QoI's `reduce` is bypassed — the same asymmetry the
+  post-processing sink has.
 
   Note `:simulation` rows have one row per *surviving* replicate, so a partially-failed monad
   contributes fewer. That matters if a consumer wants BayesFlow's set-valued shape
@@ -156,7 +154,6 @@ function exportTrainingSet(problem::CalibrationProblem;
                            n::Integer,
                            design::Union{LHSVariation,MonteCarloVariation}=MonteCarloVariation(Int(n)),
                            granularity::Symbol=:monad,
-                           qoi::Union{Nothing,QoI,AbstractVector{QoI}}=nothing,
                            description::String="",
                            tags=(),
                            run_kwargs::NamedTuple=(;),
@@ -165,14 +162,15 @@ function exportTrainingSet(problem::CalibrationProblem;
     n > 0 || throw(ArgumentError("n must be positive; got $(n)."))
     granularity in (:simulation, :monad) || throw(ArgumentError(
         "granularity must be :simulation or :monad; got :$(granularity)."))
-    #! `CalibrationProblem` converts a `QoI` to a plain monad-level function at construction, so the
-    #! QoI itself is not recoverable from `problem.summary_statistic`. Per-simulation rows therefore
-    #! need it passed explicitly rather than reached for through that boundary.
-    granularity === :monad || !isnothing(qoi) || throw(ArgumentError(
-        "granularity=:simulation needs `qoi=` — the QoI to evaluate on each simulation. A " *
-        "`CalibrationProblem`'s `summary_statistic` is a monad-level function by contract (a QoI " *
-        "passed to the constructor is converted to one), so it cannot be applied to a single " *
-        "simulation. Pass the same QoI here, or use granularity=:monad."))
+    #! A plain `summary_statistic` is called with a monad ID by contract, so it genuinely cannot be
+    #! applied to one simulation -- there is no per-simulation decomposition inside it to reach for.
+    #! A QoI-backed problem has one, which is why the problem now preserves the QoI it was given.
+    summary_qois = _summaryQoIs(problem.summary_statistic)
+    granularity === :monad || !isempty(summary_qois) || throw(ArgumentError(
+        "granularity=:simulation needs a `QoI`-backed problem. This problem's `summary_statistic` " *
+        "is a plain function, which takes a monad ID by contract and so cannot be applied to a " *
+        "single simulation. Build the `CalibrationProblem` with a `QoI` (or a vector of them) " *
+        "instead, or use granularity=:monad."))
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
     refreshProvenance!()
@@ -247,10 +245,10 @@ function exportTrainingSet(problem::CalibrationProblem;
         #! tight and wrong — overconfident, which is the worst failure mode available.
         per_sim_ids = granularity === :simulation ? _successfulSimIDs(all_statuses, sim_ids_before[mid],
                                                                      completed_id) : Int[]
-        qois = isnothing(qoi) ? QoI[] : (qoi isa QoI ? QoI[qoi] : collect(qoi))
         summaries = try
-            granularity === :monad ? [problem.summary_statistic(mid)] :
-                                     [Dict{String,Any}(q.name => _computeOn(q, sid) for q in qois)
+            granularity === :monad ? [_evaluateSummary(problem.summary_statistic, mid)] :
+                                     [Dict{String,Any}(q.name => _computeOn(q, sid)
+                                                       for q in summary_qois)
                                       for sid in per_sim_ids]
         catch e
             throw(ErrorException(

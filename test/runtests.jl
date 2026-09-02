@@ -138,6 +138,8 @@ ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
 # Must live here (not inside @testset blocks) so they get stable module-qualified names
 # rather than compiler-generated closures like #249#250.
+_test_qoi_compute(s) = 7.0
+_test_qoi_reduce(v) = sum(v) / length(v)
 _test_named_ss(mid)        = Dict{String,Any}("x" => 1.0)
 _test_named_vec_ss(mid)    = [1.0]
 _test_named_scalar_ss(mid) = 1.0
@@ -1922,6 +1924,52 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             loaded2 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path2)
             @test !ModelManager._isCompleteManifest(loaded2)
             @test isnothing(loaded2.summary_statistic)
+
+            # A QoI-valued summary_statistic is stored as the QoI itself, not collapsed to a
+            # closure, so the manifest field now holds a struct where it used to hold a Function.
+            # The field is untyped, so this is a JLD2-compatible widening -- pinned here because the
+            # failure mode would be a resume that cannot reconstruct the problem.
+            qoi_named = QoI("x", _test_qoi_compute; reduce=_test_qoi_reduce)
+            prob_qoi  = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                           qoi_named, _test_named_dist, 1, var_id)
+            @test prob_qoi.summary_statistic === qoi_named
+            manifest_qoi = ModelManager._ProblemManifest(prob_qoi)
+            @test ModelManager._isCompleteManifest(manifest_qoi)
+            path3 = joinpath(dir, "problem_qoi.jld2")
+            jldsave(path3; manifest=manifest_qoi)
+            loaded3 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path3)
+            @test ModelManager._isCompleteManifest(loaded3)
+            back = loaded3.summary_statistic
+            @test back isa QoI
+            @test back.name == "x"
+            @test nameof(back.compute) === nameof(_test_qoi_compute)
+            @test nameof(back.reduce)  === nameof(_test_qoi_reduce)
+            @test back.compute(nothing) == 7.0   # callable after load, not just present
+
+            # A vector of QoIs round-trips as a vector.
+            prob_qv = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                         QoI[qoi_named, QoI("y", _test_qoi_compute;
+                                                            reduce=_test_qoi_reduce)],
+                                         _test_named_dist, 1, var_id)
+            manifest_qv = ModelManager._ProblemManifest(prob_qv)
+            @test ModelManager._isCompleteManifest(manifest_qv)
+            path4 = joinpath(dir, "problem_qv.jld2")
+            jldsave(path4; manifest=manifest_qv)
+            loaded4 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path4)
+            @test loaded4.summary_statistic isa Vector{QoI}
+            @test [q.name for q in loaded4.summary_statistic] == ["x", "y"]
+
+            # Either function being anonymous makes the QoI unrestorable. `reduce` is the one worth
+            # pinning: a named compute with an anonymous reduce would otherwise come back as a QoI
+            # that silently averages instead of doing the monad-level step it was written for.
+            qoi_anon_reduce = QoI("x", _test_qoi_compute; reduce=v -> sum(v))
+            @test ModelManager._isAnonymousFunction(qoi_anon_reduce)
+            @test !ModelManager._isAnonymousFunction(qoi_named)
+            @test ModelManager._isAnonymousFunction(QoI[qoi_named, qoi_anon_reduce])
+            prob_qanon = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                            qoi_anon_reduce, _test_named_dist, 1, var_id)
+            @test !ModelManager._isCompleteManifest(
+                ModelManager._ProblemManifest(prob_qanon))
         end
     end
 
@@ -4003,8 +4051,11 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                                                         Uniform(0.5, 3.0))],
                                           Dict{String,Any}("x" => 1.0),
                                           QoI("x", _qoi_sim), mseDistance)
-                @test prob.summary_statistic isa Function
-                @test prob.summary_statistic(mid)["x"] ≈ mean(sim_vals)
+                # The QoI is preserved, not converted: the problem still holds the object the user
+                # passed, which is what lets a per-simulation consumer use its `compute`.
+                @test prob.summary_statistic isa QoI
+                @test ModelManager._evaluateSummary(prob.summary_statistic, mid)["x"] ≈
+                      mean(sim_vals)
 
                 # The sink: the QoI itself is the post_processor.
                 m2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1069.0])];
@@ -4018,7 +4069,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # Duplicate names are refused rather than silently collapsing a column.
                 @test_throws ArgumentError ModelManager._asPostProcessor(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
-                @test_throws ArgumentError ModelManager._asSummaryStatistic(
+                @test_throws ArgumentError ModelManager._validateSummaryStatistic(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
             end
 
@@ -4074,8 +4125,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       mean([_qoi_sim(Simulation(i)) for i in sids])
 
                 # And through a real consumer, to show nothing about the seam needs changing.
-                ss = ModelManager._asSummaryStatistic(readback)
-                @test ss(mid)["stored_x"] ≈ mean([_qoi_sim(Simulation(i)) for i in sids])
+                @test ModelManager._evaluateSummary(readback, mid)["stored_x"] ≈
+                      mean([_qoi_sim(Simulation(i)) for i in sids])
             end
 
             @testset "stored=:prefer/:require and verifyStoredValues" begin
@@ -4264,7 +4315,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 mon = exportTrainingSet(prob; n=3, granularity=:monad,
                                         description="gran monad", progress=:none)
                 waitForDiagnostics()
-                sim = exportTrainingSet(prob; n=3, granularity=:simulation, qoi=q,
+                sim = exportTrainingSet(prob; n=3, granularity=:simulation,
                                         description="gran sim", progress=:none)
                 waitForDiagnostics()
 
@@ -4292,10 +4343,10 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # :simulation with a plain summary function is refused, naming the fix.
                 plain = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
                                            _test_named_ss, mseDistance)
-                # :simulation without qoi= is refused up front, naming the fix -- the problem's
-                # summary_statistic is monad-level by contract even when a QoI was passed to it.
-                @test_throws ArgumentError exportTrainingSet(prob; n=2, granularity=:simulation,
-                                                             progress=:none)
+                # A plain-function problem cannot do :simulation, and is refused up front. A
+                # QoI-backed one can, because the problem now preserves the QoI it was given.
+                @test ModelManager._summaryQoIs(prob.summary_statistic) == [q]
+                @test isempty(ModelManager._summaryQoIs(plain.summary_statistic))
                 @test_throws ArgumentError exportTrainingSet(plain; n=2, granularity=:simulation,
                                                              progress=:none)
                 @test_throws ArgumentError exportTrainingSet(prob; n=2, granularity=:nonsense)

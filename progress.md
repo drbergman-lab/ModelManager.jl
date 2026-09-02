@@ -3727,9 +3727,29 @@ conditioning on one noisy observation gives tight posteriors in the wrong place.
 statistically better choice for single-realization data, but `:monad` is the default because it works
 with any summary statistic.
 
-**An architectural consequence found by the failing test, not by reasoning.** `:simulation` first tried
-to read the QoI off `problem.summary_statistic` — but `CalibrationProblem` converts a QoI into a plain
-monad-level function at construction, so the QoI is gone by then. It is now an explicit `qoi=` keyword,
-required at that granularity. Reaching back through a boundary that had already erased what I wanted was
-the mistake; the error message now explains why the problem cannot supply it.
+**`CalibrationProblem` no longer collapses a QoI into a function.** The `:simulation` path first tried
+to read the QoI off `problem.summary_statistic` and could not: the constructor called
+`_asSummaryStatistic`, which turned a `QoI` into a monad-level closure and discarded the per-simulation
+`compute`. My first fix was an explicit `qoi=` keyword, i.e. asking the user to pass the same object
+twice. That was papering over the actual defect.
+
+The question that killed it was whether the conversion should run the other way — wrap a plain function
+into a `QoI`. It cannot: a `QoI`'s `compute` is called with one `Simulation`, while a
+`summary_statistic` function is called with a *monad ID* by contract, and there is no per-simulation
+decomposition hiding inside a monad-level function to recover. (The same asymmetry is already noted in
+`qoi.jl` for GSA's `functions=`, where a bare function is simulation-level — so "plain Function" means
+different things in the two places, which is worth knowing before touching either.)
+
+So the fix is not to convert in either direction but **not to collapse at all**: the field is now
+`Union{Function,QoI,Vector{QoI}}`, holding whatever it was handed, with `_evaluateSummary` dispatching
+at the call site and `_summaryQoIs` exposing the QoIs to per-simulation consumers. Validation stays
+eager, so a duplicate QoI name is still caught at construction. This is the pattern GSA's `functions=`
+already used — calibration was the inconsistent one. The `qoi=` keyword is gone.
+
+Two things checked rather than assumed. The manifest's `summary_statistic` field is untyped, so storing
+a `QoI` there is a JLD2-compatible widening — verified by round-tripping one and calling
+`compute` after load, now a test rather than a scratch probe. And `_isAnonymousFunction` needed QoI
+methods: a QoI is restorable only if *both* its functions are named. `reduce` is the one that matters,
+since a named `compute` with an anonymous `reduce` would otherwise come back as a QoI that silently
+averages instead of doing the monad-level step it was written for.
 

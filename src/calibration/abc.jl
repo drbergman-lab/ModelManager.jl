@@ -214,7 +214,7 @@ function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_
         "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
         "they would have produced is missing."
     distance = try
-        simulated = problem.summary_statistic(monad_id)
+        simulated = _evaluateSummary(problem.summary_statistic, monad_id)
         problem.distance(simulated, problem.observed_data)
     catch
         @error """
@@ -604,7 +604,8 @@ directly (DVSource/CVSource closures would get session-specific compiler names t
 across Julia sessions).
 
 Named `summary_statistic` and `distance` functions are stored directly (JLD2 saves the
-function name); anonymous ones become `nothing`. Named LVSource map functions are stored
+function name); anonymous ones become `nothing`. A `QoI`-valued `summary_statistic` is stored as the
+`QoI` itself, and counts as anonymous if either its `compute` or its `reduce` is. Named LVSource map functions are stored
 directly inside their `LVSource`; anonymous ones become `_StrippedLVSource`.
 DVSource and CVSource are always stored as-is (their closures are never serialized — maps
 are always reconstructed from source data at load time via `_manifestToProblem`).
@@ -624,7 +625,7 @@ struct _ProblemManifest
     observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID
-    summary_statistic          # named Function or nothing (anonymous/not restorable)
+    summary_statistic          # named Function/QoI(s), or nothing (not restorable)
     distance                   # named Function or nothing (anonymous/not restorable)
 end
 

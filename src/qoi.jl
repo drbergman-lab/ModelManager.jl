@@ -246,24 +246,58 @@ qoiName(f::Function) = string(nameof(f))
 #! The three consumers differ in what they are handed and what they must return, so each gets its own
 #! adapter — but all of them go through `_qoiEvaluator`, so a `QoI` and a plain `Function` behave the
 #! same way everywhere. The adapters are internal: a user passes the `QoI` itself.
+#! A `CalibrationProblem` stores whatever it was handed rather than collapsing it to a function. The
+#! earlier version converted a `QoI` into a monad-level closure at construction, which threw away the
+#! per-simulation `compute` — so nothing downstream could evaluate the quantity on a single simulation
+#! even though the user had supplied exactly the object that knows how. Reversing the direction is not
+#! possible: a plain `summary_statistic` is called with a *monad ID* by contract and has no
+#! per-simulation decomposition inside it, so it cannot be wrapped into a `QoI`, whose `compute`
+#! receives one `Simulation`. Preserving and dispatching is what GSA's `functions=` already does.
 """
-    _asSummaryStatistic(x) → Function
+    _validateSummaryStatistic(x) → Function | QoI | Vector{QoI}
 
-Adapt a `QoI`, a vector of them, or an existing summary-statistic function for
-[`CalibrationProblem`](@ref), which calls it with a monad ID.
+Check that `x` can serve as a [`CalibrationProblem`](@ref)'s `summary_statistic` and return it in
+canonical form, unchanged in kind. Validation is eager — at construction, not at first evaluation —
+so a duplicate QoI name is reported before any simulation runs.
 """
-_asSummaryStatistic(f::Function) = f
+_validateSummaryStatistic(f::Function) = f
 
-_asSummaryStatistic(q::QoI) = _asSummaryStatistic([q])
+_validateSummaryStatistic(q::QoI) = q
 
-function _asSummaryStatistic(qs::AbstractVector{QoI})
+function _validateSummaryStatistic(qs::AbstractVector{QoI})
     isempty(qs) && throw(ArgumentError("A summary statistic needs at least one QoI."))
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one summary statistic; got $(names)."))
-    return (monad_id::Integer) -> Dict{String,Any}(
-        q.name => _reduceOverMonad(q, monad_id) for q in qs)
+    return collect(qs)
 end
+
+_validateSummaryStatistic(x) = throw(ArgumentError(
+    "A summary statistic must be a Function, a QoI, or a vector of QoIs; got $(typeof(x))."))
+
+"""
+    _evaluateSummary(ss, monad_id) → value
+
+Evaluate a [`CalibrationProblem`](@ref)'s `summary_statistic` on one monad. A plain `Function` is
+called with the monad ID; a `QoI` is reduced over the monad's simulations and reported under its name.
+"""
+_evaluateSummary(f::Function, monad_id::Integer) = f(monad_id)
+
+_evaluateSummary(q::QoI, monad_id::Integer) =
+    Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id))
+
+_evaluateSummary(qs::AbstractVector{QoI}, monad_id::Integer) =
+    Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id) for q in qs)
+
+"""
+    _summaryQoIs(ss) → Vector{QoI}
+
+The QoIs behind a `summary_statistic`, or empty for a plain function. Empty means the quantity can
+only be evaluated per monad.
+"""
+_summaryQoIs(::Function) = QoI[]
+_summaryQoIs(q::QoI) = QoI[q]
+_summaryQoIs(qs::AbstractVector{QoI}) = collect(qs)
 
 #! No reducer here, and none possible: the hook fires once per simulation, so there is exactly one
 #! value and nothing to combine. A QoI's `reduce` is simply unused by the sink.

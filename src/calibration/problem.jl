@@ -17,7 +17,10 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic::Function`: `(monad_id::Int) → T` for any `T` accepted by `distance`
+- `summary_statistic`: a `Function` called as `(monad_id::Int) → T` for any `T` accepted by
+  `distance`, or a [`QoI`](@ref) / vector of them, which is stored as given and reduced over
+  each monad into a `Dict` keyed by QoI name. QoIs are preserved rather than converted, so a
+  QoI-backed problem can also be evaluated per simulation (see `exportTrainingSet`)
   as its first argument. Called once per proposed particle. The user controls how to
   aggregate over `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single
   replicate).
@@ -59,7 +62,7 @@ struct CalibrationProblem
     inputs::InputFolders
     parameters::Vector{CalibrationParameter}
     observed_data::Any
-    summary_statistic::Function
+    summary_statistic::Union{Function,QoI,Vector{QoI}}
     distance::Function
     n_replicates::Int
     reference_variation_id::VariationID
@@ -72,7 +75,7 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                              reference_variation_id::VariationID=VariationID(inputs))
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(inputs, cps, observed_data,
-                              _asSummaryStatistic(summary_statistic), distance,
+                              _validateSummaryStatistic(summary_statistic), distance,
                               n_replicates, reference_variation_id)
 end
 
@@ -86,7 +89,7 @@ function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              summary_statistic, distance; n_replicates::Int=1)
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
-                              _asSummaryStatistic(summary_statistic), distance,
+                              _validateSummaryStatistic(summary_statistic), distance,
                               n_replicates, ref.variation_id)
 end
 
