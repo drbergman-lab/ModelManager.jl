@@ -57,7 +57,7 @@ makedocs(;
                 "runner.md", "abstract_simulator.md", "recorder.md", "hpc.md",
             ]),
             "Analysis & calibration" => map(s -> "lib/$(s)", [
-                "study.md", "qoi.md", "sensitivity.md", "calibration.md",
+                "study.md", "qoi.md", "sensitivity.md", "calibration.md", "training_set.md",
             ]),
             "Management & maintenance" => map(s -> "lib/$(s)", [
                 "database.md", "tags.md", "deletion.md", "up.md", "package_version.md",

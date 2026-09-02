@@ -6344,6 +6344,55 @@ end
 # longer renders the private API either, so ModelManager's own build would catch this too —
 # but only in CI's `docs` job, and only for names that exist. This runs with the ordinary
 # test suite and needs no docs build. See CLAUDE.md, "Docstring cross-references".
+# `docs/make.jl` runs with `checkdocs=:exports`, so every exported name must appear on a rendered
+# `docs/src/lib/*.md` page or `makedocs` terminates. That check lives only in CI's `docs` job, which
+# is the slowest possible place to learn you forgot a page — and forgetting one is easy, because a new
+# source file needs both the page and an entry in `make.jl`'s hand-maintained group list. This runs
+# with the ordinary suite and needs no docs build, exactly as the two docstring guards below do.
+@testset "every exported name's source file has a docs page" begin
+    src_dir  = joinpath(pkgdir(ModelManager), "src")
+    lib_dir  = joinpath(pkgdir(ModelManager), "docs", "src", "lib")
+    make_jl  = read(joinpath(pkgdir(ModelManager), "docs", "make.jl"), String)
+
+    #! The union of every `Pages = [...]` entry across the lib pages: the set of source files whose
+    #! public docstrings are actually rendered somewhere.
+    covered = Set{String}()
+    rendered_pages = String[]
+    for file in readdir(lib_dir)
+        endswith(file, ".md") || continue
+        text = read(joinpath(lib_dir, file), String)
+        #! A page only counts if `make.jl` lists it; an orphan page renders nothing.
+        occursin("\"$(file)\"", make_jl) || continue
+        push!(rendered_pages, file)
+        for m in eachmatch(r"Pages\s*=\s*\[([^\]]*)\]", text)
+            for jm in eachmatch(r"\"([^\"]+\.jl)\"", m.captures[1])
+                push!(covered, basename(jm.captures[1]))
+            end
+        end
+    end
+    @test !isempty(rendered_pages)
+
+    #! Where each exported name's docstring was written, which is the file `Pages` must name.
+    uncovered = Tuple{Symbol,String}[]
+    for name in names(ModelManager)
+        name === :ModelManager && continue
+        binding = Docs.Binding(ModelManager, name)
+        md = get(Docs.meta(ModelManager), binding, nothing)
+        isnothing(md) && continue
+        for (_, docstr) in md.docs
+            file = basename(String(docstr.data[:path]))
+            isempty(file) && continue
+            file in covered || push!(uncovered, (name, file))
+        end
+    end
+
+    isempty(uncovered) ||
+        @info "Exported names whose source file is on no rendered docs page " *
+              "(checkdocs=:exports will fail the docs build):\n" *
+              join(["  $(n) — src/.../$(f)" for (n, f) in sort(unique(uncovered))], "\n")
+    @test isempty(uncovered)
+end
+
 # Anything between a docstring and the definition it documents makes Julia drop the docstring
 # silently: it is simply absent from `Docs.meta`, with no warning at any point. A comment does it —
 # which the `#!` convention walks straight into, since a rationale comment naturally wants to sit

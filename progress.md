@@ -3668,3 +3668,24 @@ a pure-Julia neural-posterior-estimation package can replace the Python bridge, 
 environment with no dependency added here. That is an experiment, not code, and it needs this export to
 exist first — which it now does.
 
+### The docs build caught what the test suite should have
+
+CI's `docs` job failed on `#45`: `2 docstrings not included in the manual` — `TrainingSet` and
+`exportTrainingSet`. `docs/make.jl` runs with `checkdocs=:exports`, so an exported name that appears on
+no rendered page terminates `makedocs`. I had added `docs/src/lib/study.md` and `qoi.md` for the two
+previous new files and simply forgot the third.
+
+CLAUDE.md already says the docs build should not be the guard, because it runs only in CI's slowest job
+— and that was written about `@ref` targets, where a test now covers it. The same reasoning applies here
+and there was no test, so there is one now: it collects every `Pages = [...]` entry from the lib pages
+that `make.jl` actually lists, then checks each exported name's docstring source file against that set.
+
+**Two details it has to get right**, both learned from the failure rather than guessed. A page that
+exists but is missing from `make.jl`'s hand-maintained group list renders nothing, so the guard requires
+the filename to appear in `make.jl` — an orphan page must not count as coverage. And the file it compares
+is the one where the *docstring* was written, taken from `Docs.meta`, not where the binding happens to be
+defined.
+
+Verified by reproducing the exact mistake: dropping `training_set.md` from `make.jl` makes the guard fail
+and name both symbols and their source file. Restoring it goes green.
+
