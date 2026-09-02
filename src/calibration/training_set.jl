@@ -104,7 +104,9 @@ need simulation on demand.
 
 # Output
 `training_set/` beside `generations/`:
-- `training_set.csv` — one row per parameter set: `monad_id`, `n_success`, then three prefixed groups —
+- `training_set.csv` — one row per parameter set: `monad_id`, `n_success` (replicates that actually
+  succeeded, which is the precision of that row's summary and need not be the same for every row), then
+  three prefixed groups —
   `cdf.*` (latent coordinates in `(0, 1)`), `target.*` (the same parameters as model values), and
   `summary.*` (the flattened summary statistics). The prefixes exist because a parameter's latent and
   target names are otherwise identical, and they let a consumer tell the two spaces apart unaided.
@@ -166,6 +168,17 @@ function exportTrainingSet(problem::CalibrationProblem;
 
     _, _, without_success = _batchOutcome(sim_ids_before)
 
+    #! How many replicates actually succeeded, per monad — not how many were created. A summary
+    #! averaged over 2 survivors is noisier than one averaged over 10, and a consumer training on
+    #! these rows has to know that: the input noise level is what the network calibrates against, so
+    #! unequal replicate counts across rows silently mean unequal precision. `_batchOutcome` reports
+    #! which monads failed entirely but no per-monad counts, so they are computed here.
+    completed_id = statusCodeID("Completed")
+    all_statuses = _simulationStatusIDs(reduce(vcat, values(sim_ids_before); init=Int[]))
+    n_success_by_monad = Dict{Int,Int}(
+        mid => count(sid -> get(all_statuses, sid, -1) == completed_id, sids)
+        for (mid, sids) in sim_ids_before)
+
     #! Prefixed, because the two groups otherwise collide: for a `DistributedVariation` both
     #! `latent_parameter_names` and `_displayColumns` are `[variationName(dv)]`, so an unprefixed merge
     #! silently dropped every CDF column in favour of the target value under the same key. The prefixes
@@ -202,7 +215,7 @@ function exportTrainingSet(problem::CalibrationProblem;
         disp = vcat([_particleRowToDisplay(cp, collect(cdf_col[_latentRange(cps, i)]))
                      for (i, cp) in enumerate(cps)]...)
         row = merge(
-            (monad_id = mid, n_success = length(sim_ids_before[mid])),
+            (monad_id = mid, n_success = n_success_by_monad[mid]),
             NamedTuple{Tuple(Symbol.(latent_names))}(Tuple(Float64.(cdf_col))),
             NamedTuple{Tuple(Symbol.(param_names))}(Tuple(Float64.(disp))),
             NamedTuple{Tuple(Symbol.(summary_names))}(Tuple(last.(flat))),

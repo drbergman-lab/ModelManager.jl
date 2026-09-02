@@ -4227,6 +4227,33 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test length(res.generations) == 1
             end
 
+            @testset "training-set n_success counts successes, not simulations" begin
+                # A monad with one failed replicate must report 1, not 2: the column is the precision
+                # of that row's summary, and reporting the created count would overstate it.
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance; n_replicates=2)
+                #! Fail exactly one simulation per monad, leaving each with a single survivor.
+                seen = Set{Int}()
+                _fail_sim_predicate[] = spec -> begin
+                    mid = spec.monad_id
+                    mid in seen && return false
+                    push!(seen, mid)
+                    return true
+                end
+                ts = try
+                    exportTrainingSet(prob; n=3, description="partial failure", progress=:none)
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                tbl = CSV.read(joinpath(ts.path, "training_set.csv"), DataFrame)
+                @test nrow(tbl) == ts.n_rows
+                @test all(tbl.n_success .== 1)      # one of the two replicates failed
+                @test ts.n_failed == 0              # each monad still had a survivor
+            end
+
             @testset "_flattenSummary produces deterministic named numbers" begin
                 fs = ModelManager._flattenSummary
                 @test fs(3.0) == ["value" => 3.0]
@@ -4262,6 +4289,10 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 for c in ["monad_id", "n_success"]
                     @test c in names(tbl)
                 end
+                # n_success is the number of replicates that SUCCEEDED, which sets that row's
+                # precision -- not the number created. With no failures here the two coincide, so the
+                # assertion below is weak on its own; the partial-failure case is what distinguishes
+                # them and is covered by the fail-predicate test that follows.
                 @test all(tbl.n_success .== 2)
                 for c in vcat(ts.column_groups.latent, ts.column_groups.parameters,
                               ts.column_groups.summaries)
