@@ -72,11 +72,16 @@ _flattenSummary(x, base::AbstractString="value") = throw(ArgumentError(
     "A summary statistic must flatten to numbers for a training set; got $(typeof(x)) at \"$(base)\". " *
     "Supported: Real, Bool, AbstractDict, AbstractVector and NamedTuple of those."))
 
-#! Deliberately `LHSVariation` only, not the `Union{LHSVariation,SobolVariation}` the plan proposed.
-#! Only those two carry a `cdfs` field at all, but Sobol's is `(latent, sample, design_matrix)` with
-#! `variation_ids` shaped `(n, n_matrices)`: its samples are structured into the A/B/AB matrices the
-#! Sobol index estimator needs, not a flat design. Flattening them into one training table mixes those
-#! roles, which is a modelling decision rather than a formatting one, so it is left for whoever wants it.
+#! Why only these two designs, and not `SobolVariation` or `RBDVariation`: a training set's inputs are
+#! the CDF coordinates, so a design can only be used here if it hands them back. `AddLHSVariationsResult`
+#! and `AddMonteCarloVariationsResult` are the only ones carrying a flat `cdfs::Matrix{Float64}`.
+#! `AddRBDVariationsResult` has no `cdfs` field at all (only `variation_ids` and `variation_matrix`), so
+#! there is simply nothing to read. `AddSobolVariationsResult` does have one, but shaped
+#! `Array{Float64,3}` -- (latent, sample, design_matrix) -- because its samples are structured into the
+#! A/B/AB matrices the Sobol index estimator needs. The A and B matrices are honest prior draws and
+#! could be flattened into training rows; the AB matrices are column-swapped hybrids of them, so they
+#! are neither independent nor prior-distributed. Choosing which to keep is a modelling decision rather
+#! than a formatting one, so Sobol is left out until someone wants it and says which.
 """
     exportTrainingSet(problem::CalibrationProblem; n, kwargs...) → TrainingSet
 
