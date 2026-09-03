@@ -3635,3 +3635,74 @@ the bundle is checked to actually reach the simulator hook rather than only to p
 `run`'s *own* docstring and its definition, detaching documentation I had not written. Worth noting because
 the previous three were all comments I had placed above my own functions.
 
+## One contract for user measurement functions
+
+A bare `Function` meant four different things, established from the code rather than the docstrings:
+a simulation ID in GSA's `functions=`, a **monad** ID in `CalibrationProblem`'s `summary_statistic`,
+a `SimulationProcess` at the post-processing sink, and — for a `QoI`'s `compute` — a `Simulation`.
+Two of those were an `Int` meaning different entities, with both ID spaces dense positive integers,
+so handing a calibration summary to `functions=` computed on the wrong thing and returned a
+plausible number with no error anywhere. That is the bug class this closes.
+
+**Dispatch-sniffing was considered and measured, not dismissed.** The idea was to inspect the user's
+method table and adapt: `::Simulation` as-is, `::Int` via `sim.id`, `::SimulationProcess` via a
+reconstructed process. It cannot work. An untyped argument is `::Any`, so for `f(sim_id) = …` and for
+every lambda, `hasmethod` returns **true for all three** candidate types and the declared type is
+`Any` — no signal at all. Untyped is the dominant form: GSA's documented idiom is
+`simulation_id -> Real`, and the downstream package's docstrings use `monad_id -> …`. Sniffing would
+have silently picked the `Simulation` branch for nearly every function already written, turning a loud
+break into a silent one. Restricting it to explicitly-annotated signatures does not rescue it — every
+lambda would then error, which is the same migration work with more machinery and a rule
+("we adapt if you annotate") that is harder to explain than "always a `Simulation`".
+
+So: one contract. A measurement function is called once per **simulation** with a `Simulation`, and
+its replicates are combined by `reduce`. A bare `Function` is the shorthand for `reduce = mean`; a
+`QoI` is how you say anything else. `_qoiEvaluator` stays the single normalisation point — both arms
+now return the same pair, so no consumer branches.
+
+**Deliberately not "wrap every bare Function into a QoI".** That was the tempting framing, and it is
+slightly wrong: a `QoI` *contains* two functions, so wrapping eliminates nothing — what it eliminates
+is *ambiguously-contracted* functions, which the contract change does by itself. Wrapping would also
+force a name where GSA needs none (results are keyed by the object, and `nameof` on a lambda is
+`"#2"`, so two anonymous functions in one `functions=` vector would collide under the duplicate-name
+check that already guards QoI vectors). A name is required only where a name is actually used.
+
+**Calibration refuses a bare `Function` outright**, and this is the part that needed evidence. Its
+*granularity* changed, so an old-style function cannot be adapted — its aggregation is fused into its
+body. Reinterpreting it per-simulation-then-mean is a different number for any post-aggregation
+nonlinearity: squaring the mean of [10, 20] gives 225, the mean of the squares gives 250, an 11%
+shift.
+
+My first plan was to make that loud by wrapping the value under `nameof(f)` so the shape reaching
+`distance` changed. **Measured, that does not work.** `mseDistance(::Dict, ::Dict)` is deliberately
+permissive: on disjoint keys it warns twice with `maxlog=1` and computes anyway, treating absent keys
+as zero. Wrapping errors for scalar and vector `observed_data` but returns a number for a `Dict` —
+the most common shape, and the one every downstream summary statistic uses. So loudness cannot be
+routed through `distance`. It is a construction-time refusal instead: it fires before any simulation
+runs and cannot be warned past. ModelManager has no version row of its own yet, so there is no
+migration channel to gate on — that remains the first open to-do.
+
+**A single `QoI` reports its value directly; a vector reports a `Dict` keyed by name.** This is what
+preserves the scalar and vector `observed_data` shapes `mseDistance` documents and has a regression
+test for. Wrapping every case would have made `Dict` the only comparable shape and silently retired
+two thirds of that function's methods.
+
+**QoI preservation had to come along.** Collapsing a QoI into a closure at construction made
+`_isAnonymousFunction` true for every QoI-backed problem, so the manifest stored `nothing` and resume
+demanded `problem=`. Harmless while QoIs were one option among several; fatal once a QoI is the *only*
+accepted summary statistic, since every calibration would have become unrestorable. The problem now
+stores what it was handed and dispatches at the call site.
+
+**The sink hands over a `Simulation` too**, and `SimulationProcess` leaves the user-facing contract.
+It carried nothing recoverable that a `Simulation` does not: `monad_id` is `only(monadIDs(sim))`,
+`success` is always `true` there because `run` only fires the hook on success, and `process` — the
+live OS process — cannot be honestly reconstructed after the fact and is meaningless post-hoc.
+`simulationID(::Simulation)` was added so the accessor the docs tell people to use still applies.
+The `AbstractSimulator` hooks (`postSimulationProcessing`, `postSimulationCleanup`) still take a
+`SimulationProcess` and are untouched.
+
+The test suite was the guard throughout: the first run after the source change reported 36 failures,
+and every one was a call site written to an old contract. That is the property the design was chosen
+for — `Int(::Simulation)` and `getParameterValue(::Int, …)` are both `MethodError`s, so a missed site
+surfaces as a failure rather than a wrong number.
+

@@ -194,8 +194,8 @@ target location's file type.
 
 **Behavioral specification:**
 - Per-simulation ordering is: `postSimulationProcessing` (simulator-specific, non-destructive) → `post_processor` (user) → `postSimulationCleanup` (simulator-specific, destructive, e.g. pruning). The user callback therefore always sees the intact (but processed) output folder; destructive cleanup is deferred until after it. `postSimulationProcessing` and `post_processor` are only meaningful pre-cleanup; `postSimulationCleanup` runs regardless of success so failed simulations are still cleaned up.
-- `run(T; post_processor::Union{Nothing,Function}=nothing, …)` invokes `post_processor(simulation_process)` once per **successfully completed** simulation, in the ordering above. Failed/skipped simulations do not trigger it.
-- The callback receives the `SimulationProcess`; from it the user reaches `simulation.id`, `monad_id`, and the output folder via `pathToOutputFolder(id)`. Inside the callback the user may do anything (compute quantities, write files, delete outputs).
+- `run(T; post_processor=nothing, …)` invokes `post_processor(simulation)` once per **successfully completed** simulation, in the ordering above. Failed/skipped simulations do not trigger it.
+- The callback receives the `Simulation` — the same argument a `QoI`'s `compute` gets, so one measurement function serves the sink, sensitivity analysis and calibration alike. From it the user reaches `simulationID(sim)`, the output folder via `pathToOutputFolder(sim)`, and the owning monad via `only(monadIDs(sim))`. Inside the callback the user may do anything (compute quantities, write files, delete outputs).
 - Return-value contract:
   - `nothing` → nothing is stored.
   - `NamedTuple` / `AbstractDict` of `name => scalar` (`Real`, `Bool`, or `String`) → one row keyed by `simulation_id` is upserted into the sink DB `data/outputs/postprocessing.db`, table `post_processing`. Columns are added on demand; a re-run overwrites the existing row for that `simulation_id`.

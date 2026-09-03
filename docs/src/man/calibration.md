@@ -34,7 +34,7 @@ problem = CalibrationProblem(
     ref,                                              # base inputs + fixed parameters
     [DistributedVariation(:config, xml_path, Uniform(1e-7, 1e-4))],  # parameters to infer
     observed,                                         # observed data
-    monad_id -> summarize(monad_id),                 # summary statistic
+    QoI("tumor", sim -> measure(sim)),                # summary statistic
     mseDistance,                                      # distance function
 )
 ```
@@ -46,8 +46,13 @@ The parameters can be any mix of [`DistributedVariation`](@ref),
 
 Two functions you supply:
 
-- **`summary_statistic`** — `monad_id -> T`. Called once per proposed particle; you decide how
-  to aggregate over the monad's replicate simulations (average, pick one, etc.).
+- **`summary_statistic`** — a [`QoI`](@ref), or a vector of them. Each QoI's `compute` is called
+  once per *simulation* with a [`Simulation`](@ref), and its replicates are combined by that QoI's
+  `reduce` (`mean` by default — pass `reduce=` for anything else, and note it receives every
+  replicate's value, so a step that must happen *after* averaging goes there). A single QoI reports
+  its value directly; a vector reports a `Dict` keyed by QoI name. A bare function is refused: it
+  used to be called once per *monad* and aggregate however it liked, and the two cannot be told
+  apart automatically.
 - **`distance`** — `(simulated, observed) -> Float64`. The built-in [`mseDistance`](@ref)
   handles `Dict`, `Vector`, and scalar inputs; supply your own for anything else.
 

@@ -39,6 +39,11 @@ Return the ID of the simulation this process ran. Accessor for use inside a `pos
 """
 simulationID(simulation_process::SimulationProcess) = simulation_process.simulation.id
 
+#! The sink hands a `post_processor` a `Simulation`, so the accessor it is told to use has to accept
+#! one. Kept alongside the `SimulationProcess` method rather than replacing it: the runner still uses
+#! that form internally.
+simulationID(simulation::Simulation) = simulation.id
+
 """
     monadID(simulation_process::SimulationProcess)
 

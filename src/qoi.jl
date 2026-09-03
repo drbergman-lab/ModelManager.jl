@@ -224,20 +224,26 @@ function _reduceOverMonad(q, monad_id::Integer)
     return red([f(sid) for sid in sim_ids])
 end
 
-#! A bare `Function` keeps its existing contract exactly: it is called with a simulation *ID* and its
-#! replicates are averaged. Only a `QoI`'s `compute` receives a `Simulation`. Wrapping a plain function
-#! into a `QoI` would silently change what it is handed, breaking every `functions=[f]` already written.
+#! One contract, everywhere: a user measurement function is called with a `Simulation` and its
+#! replicates are combined by `reduce`. A bare `Function` is the shorthand for the common case --
+#! `reduce = mean` -- and a `QoI` is how you say anything else. `_qoiEvaluator` is the single place
+#! the two normalise to the same pair, so no consumer branches on which one it was given.
 #!
-#! Both collapse to the same pair — a per-simulation-ID callable and a reducer — so a consumer written
-#! against that pair supports both without branching.
+#! Before this, a bare `Function` meant three different things: a simulation *ID* here, a *monad* ID
+#! in `CalibrationProblem`, and a `SimulationProcess` at the sink. Two of those were an `Int`, and both
+#! ID spaces are dense positive integers, so handing a calibration summary to `functions=` computed on
+#! the wrong entity and returned a plausible number with no error anywhere.
 """
     _qoiEvaluator(q) → (sim_id -> value, reduce)
 
 Reduce a `QoI` or a plain `Function` to the pair every consumer needs: something callable with a
-simulation ID, and the reducer for its replicates.
+simulation ID, and the reducer for its replicates. Both call the user's function with a
+[`Simulation`](@ref); only a `QoI` can override the reducer.
 """
 _qoiEvaluator(q::QoI)      = (sid -> _computeOn(q, sid), q.reduce)
-_qoiEvaluator(f::Function) = (sid -> f(sid), mean)
+#! No `stored` lookup on this path, and none possible: that lookup is keyed by a QoI's name, and a
+#! bare function has none. Naming it is exactly what promoting it to a `QoI` does.
+_qoiEvaluator(f::Function) = (sid -> f(Simulation(sid)), mean)
 _qoiEvaluator(x) = throw(ArgumentError(
     "Expected a QoI or a Function; got $(typeof(x))."))
 
@@ -246,34 +252,93 @@ qoiName(f::Function) = string(nameof(f))
 #! The three consumers differ in what they are handed and what they must return, so each gets its own
 #! adapter — but all of them go through `_qoiEvaluator`, so a `QoI` and a plain `Function` behave the
 #! same way everywhere. The adapters are internal: a user passes the `QoI` itself.
+#! Calibration is the one consumer whose GRANULARITY changed, so a function written for the old
+#! contract cannot be adapted -- it aggregated the replicates itself, and that aggregation is fused
+#! into its body. Accepting it silently would re-run it per simulation and average the results, which
+#! for any post-aggregation nonlinearity is simply a different number: measured, squaring the mean of
+#! [10, 20] gives 225 while the mean of the squares gives 250, an 11% shift with nothing raised.
+#!
+#! Nor can `distance` be relied on to catch it. `mseDistance(::Dict, ::Dict)` is deliberately
+#! permissive about key mismatches -- it warns once (`maxlog=1`) and computes anyway, treating absent
+#! keys as zero -- so the wrong number flows straight through to a converged, wrong posterior.
+#!
+#! So it is refused at construction, before any simulation runs. That is the only guaranteed-loud
+#! option available: ModelManager has no version row of its own yet, so there is no migration channel
+#! to gate on (see the first entry in CLAUDE.md's to-do list).
 """
-    _asSummaryStatistic(x) → Function
+    _validateSummaryStatistic(x) → QoI | Vector{QoI}
 
-Adapt a `QoI`, a vector of them, or an existing summary-statistic function for
-[`CalibrationProblem`](@ref), which calls it with a monad ID.
+Check that `x` can serve as a [`CalibrationProblem`](@ref)'s `summary_statistic` and return it
+unchanged in kind. Validation is eager -- at construction, not at first evaluation -- so a duplicate
+QoI name is reported before any simulation runs. A bare `Function` is refused; see the note above.
 """
-_asSummaryStatistic(f::Function) = f
+_validateSummaryStatistic(q::QoI) = q
 
-_asSummaryStatistic(q::QoI) = _asSummaryStatistic([q])
-
-function _asSummaryStatistic(qs::AbstractVector{QoI})
+function _validateSummaryStatistic(qs::AbstractVector{QoI})
     isempty(qs) && throw(ArgumentError("A summary statistic needs at least one QoI."))
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one summary statistic; got $(names)."))
-    return (monad_id::Integer) -> Dict{String,Any}(
-        q.name => _reduceOverMonad(q, monad_id) for q in qs)
+    return collect(qs)
 end
+
+_validateSummaryStatistic(f::Function) = throw(ArgumentError("""
+    `summary_statistic` must be a `QoI` or a vector of them, not a bare function.
+
+    A measurement function is now called once per *simulation* with a `Simulation`, and its replicates
+    are combined by the QoI's `reduce`. Previously a bare function here was called once per *monad*
+    with a monad ID and did its own aggregation, so the two cannot be told apart automatically -- and
+    silently reinterpreting yours would change your results without raising anything.
+
+    Migrating `$(qoiName(f))`:
+      * already per-simulation?  QoI("$(qoiName(f))", $(qoiName(f)))
+      * averaged its replicates? QoI("$(qoiName(f))", sim -> <the per-simulation part>)
+      * did something else after averaging (a ratio, a square, a log)? Put the per-simulation
+        measurement in `compute` and that step in `reduce`, which receives every replicate's value:
+        QoI("$(qoiName(f))", sim -> <per-simulation>; reduce = vals -> <what you did to the mean>)
+    """))
+
+_validateSummaryStatistic(x) = throw(ArgumentError(
+    "A summary statistic must be a QoI or a vector of QoIs; got $(typeof(x))."))
+
+#! One QoI yields its value directly; several yield a `Dict` keyed by name. Keeping the single-QoI
+#! case unwrapped is what preserves the scalar and vector `observed_data` shapes `mseDistance`
+#! documents -- wrapping every case would make a `Dict` the only comparable shape and silently retire
+#! two thirds of that function's methods.
+"""
+    _evaluateSummary(ss, monad_id) → value
+
+Evaluate a [`CalibrationProblem`](@ref)'s `summary_statistic` on one monad: a single `QoI` reduces to
+its own value, a vector of them to a `Dict` keyed by QoI name.
+"""
+_evaluateSummary(q::QoI, monad_id::Integer) = _reduceOverMonad(q, monad_id)
+
+_evaluateSummary(qs::AbstractVector{QoI}, monad_id::Integer) =
+    Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id) for q in qs)
+
+"""
+    _summaryQoIs(ss) → Vector{QoI}
+
+The QoIs behind a `summary_statistic`, for consumers that need to evaluate them per simulation.
+"""
+_summaryQoIs(q::QoI) = QoI[q]
+_summaryQoIs(qs::AbstractVector{QoI}) = collect(qs)
 
 #! No reducer here, and none possible: the hook fires once per simulation, so there is exactly one
 #! value and nothing to combine. A QoI's `reduce` is simply unused by the sink.
+#!
+#! The sink used to hand a bare function the `SimulationProcess` itself. It now gets the `Simulation`,
+#! like every other consumer. Nothing is lost: `monad_id` is recoverable with `monadIDs(sim)`, and
+#! `success` is always `true` here because `run` only fires the hook when the simulation succeeded.
+#! The one field that cannot be reconstructed, `process`, is the live OS process, which is meaningless
+#! after the run anyway.
 """
     _asPostProcessor(x) → Function
 
-Adapt a `QoI`, a vector of them, or an existing post-processor for `run`'s `post_processor`, which
-calls it once per simulation with a `SimulationProcess`.
+Adapt a `QoI`, a vector of them, or an existing post-processor for `run`'s `post_processor`. The
+adapted function is called once per simulation with a [`Simulation`](@ref).
 """
-_asPostProcessor(f::Function) = f
+_asPostProcessor(f::Function) = sp -> f(sp.simulation)
 
 _asPostProcessor(q::QoI) = _asPostProcessor([q])
 

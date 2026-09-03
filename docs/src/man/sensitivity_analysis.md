@@ -17,16 +17,10 @@ run(method, inputs, variations; functions = [f1, f2, ...])
 - `inputs` — the base [`InputFolders`](@ref) (or a reference monad).
 - `variations` — the parameters to analyze, as [`DistributedVariation`](@ref)s (or
   [`CoVariation`](@ref)s), so each can be sampled across its range.
-- `functions` — output functions of the form `simulation_id -> Real`. Each defines one scalar
-  output whose sensitivity to the inputs is computed. Each function is called once per
-  *simulation*, and the values are averaged over a monad's replicates for you.
-
-!!! note "Replicate aggregation differs between the two workflows"
-    Sensitivity analysis aggregates replicates itself, taking the `mean` over a monad's
-    simulations, so its output functions are per-simulation. Calibration leaves aggregation to
-    you: a [`CalibrationProblem`](@ref)'s `summary_statistic` is called once per *monad* and
-    decides for itself how to combine `simulationIDs(Monad, monad_id)`. A function written for
-    one is therefore not directly reusable as the other without accounting for that difference.
+- `functions` — output functions of the form `simulation -> Real`, or [`QoI`](@ref)s. Each defines
+  one scalar output whose sensitivity to the inputs is computed. Each is called once per
+  *simulation* with a [`Simulation`](@ref), and the values are combined over a monad's replicates
+  by `mean` — pass a `QoI` to choose a different reduction.
 
 `run` builds the appropriate sampling design, runs the simulations, evaluates your output
 functions, and returns a [`GSASampling`](@ref) result holding the sensitivity indices.

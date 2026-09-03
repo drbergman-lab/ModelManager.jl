@@ -17,10 +17,12 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic::Function`: `(monad_id::Int) → T` for any `T` accepted by `distance`
-  as its first argument. Called once per proposed particle. The user controls how to
-  aggregate over `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single
-  replicate).
+- `summary_statistic`: a [`QoI`](@ref), or a vector of them. Each QoI's `compute` is called once per
+  *simulation* with a [`Simulation`](@ref), and its replicates are combined by that QoI's `reduce`
+  (`mean` unless you say otherwise). A single QoI reports its value directly; a vector reports a
+  `Dict` keyed by QoI name. A bare `Function` is refused, because the old contract called it once per
+  *monad* and let it aggregate however it liked — the two cannot be distinguished automatically, and
+  reinterpreting one silently would change results without raising. The error says how to migrate.
 - `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
   of `summary_statistic`; `observed` is `observed_data`.
   Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
@@ -59,7 +61,7 @@ struct CalibrationProblem
     inputs::InputFolders
     parameters::Vector{CalibrationParameter}
     observed_data::Any
-    summary_statistic::Function
+    summary_statistic::Union{QoI,Vector{QoI}}
     distance::Function
     n_replicates::Int
     reference_variation_id::VariationID
@@ -72,7 +74,7 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                              reference_variation_id::VariationID=VariationID(inputs))
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(inputs, cps, observed_data,
-                              _asSummaryStatistic(summary_statistic), distance,
+                              _validateSummaryStatistic(summary_statistic), distance,
                               n_replicates, reference_variation_id)
 end
 
@@ -86,7 +88,7 @@ function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              summary_statistic, distance; n_replicates::Int=1)
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
-                              _asSummaryStatistic(summary_statistic), distance,
+                              _validateSummaryStatistic(summary_statistic), distance,
                               n_replicates, ref.variation_id)
 end
 

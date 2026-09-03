@@ -214,7 +214,7 @@ function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_
         "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
         "they would have produced is missing."
     distance = try
-        simulated = problem.summary_statistic(monad_id)
+        simulated = _evaluateSummary(problem.summary_statistic, monad_id)
         problem.distance(simulated, problem.observed_data)
     catch
         @error """
@@ -624,7 +624,7 @@ struct _ProblemManifest
     observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID
-    summary_statistic          # named Function or nothing (anonymous/not restorable)
+    summary_statistic          # QoI(s) with named functions, or nothing (not restorable)
     distance                   # named Function or nothing (anonymous/not restorable)
 end
 
