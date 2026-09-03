@@ -252,25 +252,42 @@ qoiName(f::Function) = string(nameof(f))
 #! The three consumers differ in what they are handed and what they must return, so each gets its own
 #! adapter — but all of them go through `_qoiEvaluator`, so a `QoI` and a plain `Function` behave the
 #! same way everywhere. The adapters are internal: a user passes the `QoI` itself.
-#! Calibration is the one consumer whose GRANULARITY changed, so a function written for the old
-#! contract cannot be adapted -- it aggregated the replicates itself, and that aggregation is fused
-#! into its body. Accepting it silently would re-run it per simulation and average the results, which
-#! for any post-aggregation nonlinearity is simply a different number: measured, squaring the mean of
-#! [10, 20] gives 225 while the mean of the squares gives 250, an 11% shift with nothing raised.
+#! Calibration is the one consumer whose GRANULARITY changed: a bare function used to be called once
+#! per *monad* and aggregate the replicates itself. Reinterpreting such a function per-simulation and
+#! averaging is a different number for any post-aggregation nonlinearity -- squaring the mean of
+#! [10, 20] gives 225, the mean of the squares gives 250 -- and nothing raises.
 #!
 #! Nor can `distance` be relied on to catch it. `mseDistance(::Dict, ::Dict)` is deliberately
-#! permissive about key mismatches -- it warns once (`maxlog=1`) and computes anyway, treating absent
-#! keys as zero -- so the wrong number flows straight through to a converged, wrong posterior.
+#! permissive about key mismatches: it warns once (`maxlog=1`) and computes anyway, treating absent
+#! keys as zero. So the wrong number flows through to a converged, wrong posterior.
 #!
-#! So it is refused at construction, before any simulation runs. That is the only guaranteed-loud
-#! option available: ModelManager has no version row of its own yet, so there is no migration channel
-#! to gate on (see the first entry in CLAUDE.md's to-do list).
+#! The distinguishing signal is the DECLARED argument type. A function written for the new contract
+#! says so -- `f(s::Simulation)`, or an annotated lambda `(s::Simulation) -> ...` -- while every
+#! old-contract function is either untyped (`f(mid)`, declared `Any`) or annotated `::Int`. That is
+#! checkable, so it is checked, at construction, before any simulation runs.
+#!
+#! This is not the dispatch-*sniffing* that was rejected. Sniffing tried to adapt all three old
+#! contracts by guessing which one a function wanted; for an untyped argument `hasmethod` answers
+#! `true` for every candidate, so it would have silently picked one. Here an ambiguous signature is
+#! refused rather than guessed at, which is the whole difference.
 """
-    _validateSummaryStatistic(x) → QoI | Vector{QoI}
+    _declaresSimulation(f) → Bool
+
+Whether `f` has a method whose first argument is declared to accept a [`Simulation`](@ref) --
+`Simulation` itself or a supertype of it, but not `Any`. An untyped argument carries no intent, so it
+does not count.
+"""
+_declaresSimulation(f::Function) = any(methods(f)) do m
+    T = m.sig.parameters[2]
+    T !== Any && Simulation <: T
+end
+
+"""
+    _validateSummaryStatistic(x) → Function | QoI | Vector{QoI}
 
 Check that `x` can serve as a [`CalibrationProblem`](@ref)'s `summary_statistic` and return it
-unchanged in kind. Validation is eager -- at construction, not at first evaluation -- so a duplicate
-QoI name is reported before any simulation runs. A bare `Function` is refused; see the note above.
+unchanged in kind. Validation is eager -- at construction, not at first evaluation -- so both a
+duplicate QoI name and an unmigrated summary function are reported before any simulation runs.
 """
 _validateSummaryStatistic(q::QoI) = q
 
@@ -282,21 +299,27 @@ function _validateSummaryStatistic(qs::AbstractVector{QoI})
     return collect(qs)
 end
 
-_validateSummaryStatistic(f::Function) = throw(ArgumentError("""
-    `summary_statistic` must be a `QoI` or a vector of them, not a bare function.
+function _validateSummaryStatistic(f::Function)
+    _declaresSimulation(f) && return f
+    throw(ArgumentError("""
+    `summary_statistic` must say that it takes a `Simulation`.
 
-    A measurement function is now called once per *simulation* with a `Simulation`, and its replicates
-    are combined by the QoI's `reduce`. Previously a bare function here was called once per *monad*
-    with a monad ID and did its own aggregation, so the two cannot be told apart automatically -- and
-    silently reinterpreting yours would change your results without raising anything.
+    A measurement function is now called once per *simulation* and its replicates are combined by
+    `reduce` (`mean` by default). A bare function here used to be called once per *monad*, with a
+    monad ID, and did its own aggregation -- so an unannotated argument is ambiguous between the two,
+    and silently reinterpreting yours would change your results without raising anything.
 
-    Migrating `$(qoiName(f))`:
-      * already per-simulation?  QoI("$(qoiName(f))", $(qoiName(f)))
-      * averaged its replicates? QoI("$(qoiName(f))", sim -> <the per-simulation part>)
-      * did something else after averaging (a ratio, a square, a log)? Put the per-simulation
-        measurement in `compute` and that step in `reduce`, which receives every replicate's value:
-        QoI("$(qoiName(f))", sim -> <per-simulation>; reduce = vals -> <what you did to the mean>)
+    For `$(qoiName(f))`, either:
+      * annotate it, if it already measures ONE simulation:
+            $(qoiName(f))(s::Simulation) = ...        # or (s::Simulation) -> ...
+      * or pass a `QoI`, which also lets you choose the reduction:
+            QoI("$(qoiName(f))", s -> <per-simulation measurement>)
+            QoI("$(qoiName(f))", s -> <per-simulation>; reduce = vals -> <what you did to the mean>)
+
+    If it aggregated replicates itself, the per-simulation part goes in `compute` and whatever you
+    did after averaging goes in `reduce`, which receives every replicate's value.
     """))
+end
 
 _validateSummaryStatistic(x) = throw(ArgumentError(
     "A summary statistic must be a QoI or a vector of QoIs; got $(typeof(x))."))
@@ -313,14 +336,23 @@ its own value, a vector of them to a `Dict` keyed by QoI name.
 """
 _evaluateSummary(q::QoI, monad_id::Integer) = _reduceOverMonad(q, monad_id)
 
+#! A bare function is one quantity, so like a single QoI it reports its value directly -- and needs no
+#! name, because nothing keys it.
+_evaluateSummary(f::Function, monad_id::Integer) = _reduceOverMonad(f, monad_id)
+
 _evaluateSummary(qs::AbstractVector{QoI}, monad_id::Integer) =
     Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id) for q in qs)
 
+#! Empty for a bare function: a per-simulation consumer can still call it, but there is no QoI to
+#! hand back. The `#!` note goes ABOVE the docstring -- anything between a docstring and its
+#! definition, comment or blank line, silently detaches it from `Docs.meta`.
 """
     _summaryQoIs(ss) → Vector{QoI}
 
 The QoIs behind a `summary_statistic`, for consumers that need to evaluate them per simulation.
+Empty for a bare function.
 """
+_summaryQoIs(::Function) = QoI[]
 _summaryQoIs(q::QoI) = QoI[q]
 _summaryQoIs(qs::AbstractVector{QoI}) = collect(qs)
 

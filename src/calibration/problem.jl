@@ -17,12 +17,16 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic`: a [`QoI`](@ref), or a vector of them. Each QoI's `compute` is called once per
-  *simulation* with a [`Simulation`](@ref), and its replicates are combined by that QoI's `reduce`
-  (`mean` unless you say otherwise). A single QoI reports its value directly; a vector reports a
-  `Dict` keyed by QoI name. A bare `Function` is refused, because the old contract called it once per
-  *monad* and let it aggregate however it liked — the two cannot be distinguished automatically, and
-  reinterpreting one silently would change results without raising. The error says how to migrate.
+- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function that **declares it
+  takes a [`Simulation`](@ref)** — `f(s::Simulation)`, or `(s::Simulation) -> …`. In every case the
+  measurement is made once per *simulation* and the replicates are combined by `reduce` (`mean` for a
+  plain function; a `QoI` is how you choose otherwise, and its `reduce` receives every replicate's
+  value, so a step that must happen *after* averaging goes there). A single QoI or a plain function
+  reports its value directly; a vector of QoIs reports a `Dict` keyed by QoI name.
+
+  The annotation is required because the previous contract called a bare function once per *monad*
+  and let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
+  reinterpreting one silently would change results without raising; the error explains the migration.
 - `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
   of `summary_statistic`; `observed` is `observed_data`.
   Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
@@ -61,7 +65,7 @@ struct CalibrationProblem
     inputs::InputFolders
     parameters::Vector{CalibrationParameter}
     observed_data::Any
-    summary_statistic::Union{QoI,Vector{QoI}}
+    summary_statistic::Union{Function,QoI,Vector{QoI}}
     distance::Function
     n_replicates::Int
     reference_variation_id::VariationID

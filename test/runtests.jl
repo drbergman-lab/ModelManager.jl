@@ -4023,24 +4023,36 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test seen[end] === Simulation
             end
 
-            @testset "a bare function is refused as a summary statistic" begin
+            @testset "a summary statistic must declare it takes a Simulation" begin
                 # Calibration is the one consumer whose GRANULARITY changed, so an old-style function
-                # cannot be adapted: it aggregated the replicates itself, fused into its body.
-                # Accepting it silently would re-run it per simulation and average -- a different
-                # number for any post-aggregation nonlinearity, with nothing raised. Measured:
+                # cannot be adapted: its aggregation is fused into its body. Reinterpreting it
+                # per-simulation-then-mean is a different number for any post-aggregation
+                # nonlinearity, with nothing raised. Measured:
                 @test mean([10.0, 20.0])^2 != mean([10.0, 20.0] .^ 2)   # 225.0 vs 250.0
 
+                # The declared argument type is the signal, and it is checkable -- unlike the
+                # dispatch-sniffing that was rejected, where an untyped argument makes `hasmethod`
+                # answer true for every candidate type.
+                @test ModelManager._declaresSimulation(_sim_one)               # f(s::Simulation)
+                @test ModelManager._declaresSimulation((s::Simulation) -> 1.0) # annotated lambda
+                @test !ModelManager._declaresSimulation(_test_named_dist)      # untyped
+                @test !ModelManager._declaresSimulation(s -> 1.0)              # plain lambda
+
+                # An annotated function is accepted, and stored as itself.
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], 1.0, _sim_one, mseDistance)
+                @test prob.summary_statistic === _sim_one
+                @test isempty(ModelManager._summaryQoIs(prob.summary_statistic))
+
+                # An unannotated one is refused at construction, before any simulation runs, with a
+                # message that says what to do rather than only that it refused.
                 err = try
                     ModelManager._validateSummaryStatistic(_test_named_dist); nothing
                 catch e; e end
                 @test err isa ArgumentError
-                # The message has to say what to do, not just that it refused.
+                @test occursin("Simulation", err.msg)
                 @test occursin("QoI", err.msg)
-                @test occursin("per *simulation*", err.msg) || occursin("per-simulation", err.msg)
                 @test occursin("_test_named_dist", err.msg)
-
-                # ...and it fires at construction, before any simulation runs.
-                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 @test_throws ArgumentError CalibrationProblem(inputs, [dv],
                                                               Dict{String,Any}("x" => 1.0),
                                                               _test_named_dist, mseDistance)

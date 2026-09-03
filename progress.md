@@ -3667,7 +3667,8 @@ force a name where GSA needs none (results are keyed by the object, and `nameof`
 `"#2"`, so two anonymous functions in one `functions=` vector would collide under the duplicate-name
 check that already guards QoI vectors). A name is required only where a name is actually used.
 
-**Calibration refuses a bare `Function` outright**, and this is the part that needed evidence. Its
+**Calibration accepts a bare `Function` only if it declares it takes a `Simulation`**, and this is
+the part that needed evidence. Its
 *granularity* changed, so an old-style function cannot be adapted — its aggregation is fused into its
 body. Reinterpreting it per-simulation-then-mean is a different number for any post-aggregation
 nonlinearity: squaring the mean of [10, 20] gives 225, the mean of the squares gives 250, an 11%
@@ -3705,4 +3706,44 @@ The test suite was the guard throughout: the first run after the source change r
 and every one was a call site written to an old contract. That is the property the design was chosen
 for — `Int(::Simulation)` and `getParameterValue(::Int, …)` are both `MethodError`s, so a missed site
 surfaces as a failure rather than a wrong number.
+
+### Refinement: the annotation is the signal, not a blanket refusal
+
+The first cut refused every bare `Function` as a `summary_statistic`. That was heavier than needed.
+The distinguishing signal is the **declared argument type**: a function written for the new contract
+says so — `f(s::Simulation)`, or an annotated lambda `(s::Simulation) -> ...` — while every
+old-contract function is untyped (`f(mid)`, declared `Any`) or annotated `::Int`. `_declaresSimulation`
+checks the method table for a first parameter `T` with `T !== Any && Simulation <: T`, which admits
+`Simulation` and object-typed supertypes and rejects `Any`, `Int` and `SimulationProcess`. Measured on
+all six shapes, including the multi-method case.
+
+This is **not** the dispatch-sniffing rejected earlier. Sniffing tried to *adapt* all three old
+contracts by inferring which one a function wanted, and for an untyped argument `hasmethod` answers
+`true` for every candidate, so it would have silently picked one. Here an ambiguous signature is
+*refused*, not guessed at. Annotating a lambda works, so this costs no expressiveness — it costs one
+type annotation, in the one consumer where getting it wrong is silent.
+
+The requirement is deliberately **not** extended to `functions=` or `post_processor`. Neither changed
+granularity — only the argument type — so an unmigrated function there fails at the call, and
+requiring an annotation forever would be ceremony once migration is done. Calibration is different
+because the old and new readings both produce a number.
+
+### Why a single quantity is not wrapped in a `Dict`
+
+`_evaluateSummary` returns the reduced value directly for a single `QoI` or a plain function, and a
+`Dict` keyed by name only for a vector of QoIs. The rule is about **arity, not about `Dict`s**: one
+quantity is one value, several are a named collection.
+
+An earlier justification for this was wrong and worth correcting: I claimed wrapping would mean a
+scalar `observed_data` "could never match", which states a triviality — the shapes have always had to
+match, and a `Dict`-returning summary was equally incomparable to a scalar before. The real reasons
+are narrower. Wrapping would make `Dict` the *only* shape calibration can produce, so
+`mseDistance`'s `(Real, Real)` and `(Vector, Vector)` methods become unreachable from calibration and
+a vector-valued observation needs a wrapper key it did not need before. And wrapping forces a name
+onto something nothing keys: a plain annotated function has no useful name (`nameof` on a lambda is
+`"#3"`), so the single-QoI and plain-function paths would stop behaving identically — which is the
+whole premise of "a bare function is the shorthand for a QoI".
+
+Uniformity is the honest counter-argument, and it is not unreasonable; this is a judgement call
+rather than a forced consequence.
 
