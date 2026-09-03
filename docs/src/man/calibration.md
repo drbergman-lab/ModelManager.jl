@@ -25,7 +25,9 @@ using Distributions
 ref = createTrial(inputs, DiscreteVariation(:config, XMLPath(["overall","max_time"]), 120.0);
                   n_replicates=0)
 
-observed = Dict("default" => 100.0)
+# One quantity, so `observed` is the bare value that quantity should match. Use a vector of QoIs
+# with a `Dict` of observations when you are comparing several named quantities at once.
+observed = 100.0
 
 # The parameter to infer (a rate, say), addressed by its XMLPath.
 xml_path = XMLPath(["cell_definitions", "cell_definition:name:tumor", "phenotype", "death", "rate"])
@@ -34,7 +36,7 @@ problem = CalibrationProblem(
     ref,                                              # base inputs + fixed parameters
     [DistributedVariation(:config, xml_path, Uniform(1e-7, 1e-4))],  # parameters to infer
     observed,                                         # observed data
-    QoI("tumor", sim -> measure(sim)),                # summary statistic
+    QoI("tumor", measureTumor),                       # summary statistic, per simulation
     mseDistance,                                      # distance function
 )
 ```

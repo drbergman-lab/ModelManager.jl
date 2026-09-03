@@ -3747,3 +3747,46 @@ whole premise of "a bare function is the shorthand for a QoI".
 Uniformity is the honest counter-argument, and it is not unreasonable; this is a judgement call
 rather than a forced consequence.
 
+### Reshaped on review: wrap everything into a QoI, and pass Simulations at the call sites
+
+Two of my objections to "always wrap" turned out to be wrong, and I checked rather than argued:
+
+- **Anonymous names do not collide.** I had claimed two lambdas in one `functions=` vector would both
+  be named `"#2"`. Measured: they get `#2` and `#5` — distinct per function. The collision hazard was
+  imaginary.
+- **They do need regularising, exactly as predicted.** `"#2"` is not a valid bare identifier, and the
+  name becomes a sink column and a `Dict` key. `_qoiNameFromFunction` keeps a named function's own
+  name and rewrites an anonymous one (`#3#4` → `anon_3_4`).
+
+So `_qoiEvaluator` is gone. `_asQoI` wraps at the boundary, nothing downstream sees a bare `Function`,
+and `_summaryQoIs` went with it (it was unused here — it belonged to the training-set work).
+`_computeOn` gained a `Simulation` method; the ID method survives only because the stored-value lookup
+needs just an ID, so a `stored=:prefer` hit still answers without building the object.
+
+**The sink no longer re-wraps.** `_asPostProcessor(f::Function) = sp -> f(sp.simulation)` was the
+Möbius strip called out in review: it took a `Simulation`-accepting function and made it accept a
+`SimulationProcess` again, purely because the runner passed one. The runner now reads
+`simulation_process.simulation` itself and the adapter only ever deals in `Simulation`s.
+
+**Splicing was the one real obstacle to "always wrap", and it is now a feature.** The sink has always
+accepted a `NamedTuple`/`Dict` return and spread it into columns, so wrapping a bare post-processor
+into a QoI would have nested it and broken multi-column returns. A QoI's `compute` returning a
+`NamedTuple` or `Dict` now contributes its entries as columns directly instead of nesting under the
+QoI's name. That preserves every existing post-processor **and** removes the blocker the PCMM handoff
+recorded against `populationCountQoI`, whose column set is discovered from the simulation's own output
+at run time.
+
+Two details that only showed up by running it. Splicing must **not** stringify the keys: the sink
+already rejects distinct keys that collide once stringified (`1` and `"1"`), and converting early both
+collapsed them silently and moved the error out of the sink into the per-simulation stage, which wraps
+exceptions in `_SimulationStageError` and so changed its type. Keys are therefore passed through as-is,
+and only a collision the `Dict` itself would swallow — two QoIs contributing the very same key — is
+caught in the adapter, since that case is new.
+
+**The annotation is now a warning, not a refusal.** Review pointed out that requiring a declared
+`::Simulation` rejects `sim -> measure(sim)`, the natural new-contract lambda. The declared type is
+still the only signal distinguishing an old monad-level summary, so it is still checked — but it warns
+and proceeds rather than refusing. That is a deliberate trade: the silent-renumbering risk is real
+(225 vs 250 on the worked example) and a warning is weaker than a refusal, but refusing the common
+lambda was the worse cost. Easy to flip if that judgement changes.
+

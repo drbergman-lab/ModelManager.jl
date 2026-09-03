@@ -32,16 +32,18 @@ struct SimulationProcess
 end
 
 """
+    simulationID(simulation::Simulation)
     simulationID(simulation_process::SimulationProcess)
 
-Return the ID of the simulation this process ran. Accessor for use inside a `post_processor`
-(see [`run`](@ref)) so users need not reach into `simulation_process.simulation.id`.
+Return a simulation's ID.
+
+A `post_processor` (see [`run`](@ref)) is called with a [`Simulation`](@ref), so that is the form to
+use in one — `simulationID(sim)` rather than reaching for `sim.id`. The `SimulationProcess` method
+serves the runner and the `AbstractSimulator` hooks
+([`postSimulationProcessing`](@ref), [`postSimulationCleanup`](@ref)), which still receive that type.
 """
 simulationID(simulation_process::SimulationProcess) = simulation_process.simulation.id
 
-#! The sink hands a `post_processor` a `Simulation`, so the accessor it is told to use has to accept
-#! one. Kept alongside the `SimulationProcess` method rather than replacing it: the runner still uses
-#! that form internally.
 simulationID(simulation::Simulation) = simulation.id
 
 """
@@ -490,7 +492,10 @@ function processSimulationTask(simulation_task; post_processor::Union{Nothing,Fu
               () -> postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...))
     qoi = nothing
     if !isnothing(post_processor) && simulation_process.success
-        qoi = _runStage(:post_processor, sid, () -> post_processor(simulation_process))
+        #! The user's callback takes a `Simulation`; the adapter no longer re-wraps it back into
+        #! something that accepts a `SimulationProcess`, so the field is read here instead.
+        qoi = _runStage(:post_processor, sid,
+                        () -> post_processor(simulation_process.simulation))
     end
     _runStage(:postSimulationCleanup, sid,
               () -> postSimulationCleanup(mm_globals().simulator, simulation_process; kwargs...))

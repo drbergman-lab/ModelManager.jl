@@ -42,12 +42,13 @@ and how to compare simulated to observed output.
 # Short run for testing — set max_time via a reference
 ref = createTrial(inputs, DiscreteVariation(["overall","max_time"], 12.0); n_replicates=0)
 
+# A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
 observed = Dict("default" => 100.0)
 problem = CalibrationProblem(
     ref,
     [DistributedVariation(:config, xml_path, Uniform(1e-7, 1e-4))],
     observed,
-    monad_id -> endpointPopulationCounts(monad_id),
+    [QoI("default", countDefaultCells)],
     mseDistance
 )
 
@@ -65,7 +66,7 @@ struct CalibrationProblem
     inputs::InputFolders
     parameters::Vector{CalibrationParameter}
     observed_data::Any
-    summary_statistic::Union{Function,QoI,Vector{QoI}}
+    summary_statistic::Union{QoI,Vector{QoI}}
     distance::Function
     n_replicates::Int
     reference_variation_id::VariationID

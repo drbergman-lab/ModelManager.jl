@@ -3985,13 +3985,15 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test q.reduce === mean
                 @test QoI("x", _qoi_sim; reduce=maximum).reduce === maximum
 
-                # A QoI and a plain Function collapse to the same pair, but a plain Function keeps
-                # its existing contract: it is called with an ID, not a Simulation. Wrapping it
-                # would silently change what every existing `functions=[f]` receives.
-                fq, rq = ModelManager._qoiEvaluator(q)
-                ff, rf = ModelManager._qoiEvaluator(_qoi_by_id)
-                @test rq === mean && rf === mean
-                @test_throws ArgumentError ModelManager._qoiEvaluator(42)
+                # A bare Function is wrapped into a QoI at the boundary, so nothing downstream sees
+                # one: it gains a name and reduce=mean, and its `compute` is the function itself.
+                @test ModelManager._asQoI(q) === q
+                wrapped = ModelManager._asQoI(_qoi_by_id)
+                @test wrapped isa QoI
+                @test wrapped.compute === _qoi_by_id
+                @test wrapped.name == "_qoi_by_id"
+                @test wrapped.reduce === mean
+                @test_throws ArgumentError ModelManager._asQoI(42)
             end
 
             @testset "one contract: every consumer hands over a Simulation" begin
@@ -4006,56 +4008,52 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 seen = Any[]
                 rec(x) = (push!(seen, typeof(x)); 1.0)
 
-                compute, red = ModelManager._qoiEvaluator(rec)
-                compute(sid)
+                q = ModelManager._asQoI(rec)           # wrapped at the boundary, never stays a Function
+                @test q isa QoI
+                @test q.compute === rec
+                @test q.reduce === mean                 # the default reduction a bare function gets
+                ModelManager._computeOn(q, sid)
                 @test seen[end] === Simulation          # GSA: a Simulation, not a bare Int
-                @test red === mean                      # and the default reduction is still mean
 
                 empty!(seen)
-                sp = ModelManager.SimulationProcess(Simulation(sid), 1, nothing, true)
-                ModelManager._asPostProcessor(rec)(sp)
+                ModelManager._asPostProcessor(rec)(Simulation(sid))
                 @test seen[end] === Simulation          # sink: a Simulation, not a SimulationProcess
 
                 # A QoI's compute already received a Simulation, so the two now agree exactly.
                 empty!(seen)
-                cq, _ = ModelManager._qoiEvaluator(QoI("rec", rec))
-                cq(sid)
+                ModelManager._computeOn(QoI("rec", rec), sid)
                 @test seen[end] === Simulation
+
+                # And a bare function's name is regularised so it can be a column / Dict key.
+                @test ModelManager._qoiNameFromFunction(_sim_one) == "_sim_one"
+                @test occursin(r"^anon_[0-9_]+$", ModelManager._qoiNameFromFunction(s -> 1.0))
             end
 
-            @testset "a summary statistic must declare it takes a Simulation" begin
-                # Calibration is the one consumer whose GRANULARITY changed, so an old-style function
-                # cannot be adapted: its aggregation is fused into its body. Reinterpreting it
-                # per-simulation-then-mean is a different number for any post-aggregation
-                # nonlinearity, with nothing raised. Measured:
-                @test mean([10.0, 20.0])^2 != mean([10.0, 20.0] .^ 2)   # 225.0 vs 250.0
-
-                # The declared argument type is the signal, and it is checkable -- unlike the
-                # dispatch-sniffing that was rejected, where an untyped argument makes `hasmethod`
-                # answer true for every candidate type.
-                @test ModelManager._declaresSimulation(_sim_one)               # f(s::Simulation)
-                @test ModelManager._declaresSimulation((s::Simulation) -> 1.0) # annotated lambda
-                @test !ModelManager._declaresSimulation(_test_named_dist)      # untyped
-                @test !ModelManager._declaresSimulation(s -> 1.0)              # plain lambda
-
-                # An annotated function is accepted, and stored as itself.
+            @testset "a bare summary statistic is wrapped into a QoI" begin
+                # Nothing stays a bare Function internally: the boundary wraps it, supplying the two
+                # things it lacks -- a name and reduce=mean.
                 dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 prob = CalibrationProblem(inputs, [dv], 1.0, _sim_one, mseDistance)
-                @test prob.summary_statistic === _sim_one
-                @test isempty(ModelManager._summaryQoIs(prob.summary_statistic))
+                @test prob.summary_statistic isa QoI
+                @test prob.summary_statistic.compute === _sim_one
+                @test prob.summary_statistic.name == "_sim_one"
+                @test prob.summary_statistic.reduce === mean
 
-                # An unannotated one is refused at construction, before any simulation runs, with a
-                # message that says what to do rather than only that it refused.
-                err = try
-                    ModelManager._validateSummaryStatistic(_test_named_dist); nothing
-                catch e; e end
-                @test err isa ArgumentError
-                @test occursin("Simulation", err.msg)
-                @test occursin("QoI", err.msg)
-                @test occursin("_test_named_dist", err.msg)
-                @test_throws ArgumentError CalibrationProblem(inputs, [dv],
-                                                              Dict{String,Any}("x" => 1.0),
-                                                              _test_named_dist, mseDistance)
+                # An unannotated function is accepted but flagged: the declared argument type is the
+                # only signal that a function was written for the new per-simulation contract, and an
+                # old monad-level summary would otherwise return a different number silently.
+                @test ModelManager._declaresSimulation(_sim_one)                # f(s::Simulation)
+                @test ModelManager._declaresSimulation((s::Simulation) -> 1.0)  # annotated lambda
+                @test !ModelManager._declaresSimulation(_test_named_dist)       # untyped
+                @test !ModelManager._declaresSimulation(s -> 1.0)               # plain lambda
+                @test_logs (:warn, r"does not declare it takes a `Simulation`") match_mode=:any begin
+                    ModelManager._validateSummaryStatistic(_test_named_dist)
+                end
+                # ...and an annotated one is silent (@test_logs with no patterns asserts no records).
+                @test_logs ModelManager._validateSummaryStatistic(_sim_one)
+
+                # The number that would silently change, for the record:
+                @test mean([10.0, 20.0])^2 != mean([10.0, 20.0] .^ 2)   # 225.0 vs 250.0
             end
 
             @testset "a QoI-backed problem stays restorable" begin

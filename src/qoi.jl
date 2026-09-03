@@ -127,20 +127,32 @@ end
 
 qoiName(q::QoI) = q.name
 
-#! Every consumer reaches a simulation by ID, so this is the one place that turns an ID into the object
-#! a user's `compute` expects. Keeping it in one function is what lets `compute` be written against
-#! `Simulation` rather than against whatever each consumer happens to pass.
+#! `compute` is always handed a `Simulation`. The ID method exists only because the stored-value
+#! lookup needs just an ID, so a `stored=:prefer`/`:require` hit answers without a database round trip
+#! to build the object; on a miss it constructs one and delegates.
 function _computeOn(q::QoI, sim_id::Integer)
     sid = Int(sim_id)
-    if q.stored !== :never
-        v = _storedValue(q.name, sid)
-        isnothing(v) || return v
-        q.stored === :require && throw(ArgumentError(
-            "QoI \"$(q.name)\" is `stored=:require` but simulation $(sid) has no stored value for " *
-            "it. Run the trial with `post_processor` writing \"$(q.name)\" first, or use " *
-            "`stored=:prefer` to fall back to computing it."))
-    end
+    v = _storedLookup(q, sid)
+    isnothing(v) || return v
     return q.compute(Simulation(sid))
+end
+
+function _computeOn(q::QoI, sim::Simulation)
+    v = _storedLookup(q, sim.id)
+    isnothing(v) || return v
+    return q.compute(sim)
+end
+
+#! `nothing` means "no stored value, compute it".
+function _storedLookup(q::QoI, sid::Int)
+    q.stored === :never && return nothing
+    v = _storedValue(q.name, sid)
+    isnothing(v) || return v
+    q.stored === :require && throw(ArgumentError(
+        "QoI \"$(q.name)\" is `stored=:require` but simulation $(sid) has no stored value for " *
+        "it. Run the trial with `post_processor` writing \"$(q.name)\" first, or use " *
+        "`stored=:prefer` to fall back to computing it."))
+    return nothing
 end
 
 """
@@ -216,42 +228,52 @@ end
 
 Apply `q` to every simulation of `monad_id` and combine the results with `q.reduce`.
 """
-function _reduceOverMonad(q, monad_id::Integer)
-    f, red = _qoiEvaluator(q)
+function _reduceOverMonad(x, monad_id::Integer)
+    q = _asQoI(x)
     sim_ids = constituentIDs(Monad, Int(monad_id))
     isempty(sim_ids) && throw(ArgumentError(
-        "Monad $(monad_id) has no simulations, so QoI \"$(qoiName(q))\" cannot be evaluated on it."))
-    return red([f(sid) for sid in sim_ids])
+        "Monad $(monad_id) has no simulations, so QoI \"$(q.name)\" cannot be evaluated on it."))
+    return q.reduce([_computeOn(q, sid) for sid in sim_ids])
 end
 
-#! One contract, everywhere: a user measurement function is called with a `Simulation` and its
-#! replicates are combined by `reduce`. A bare `Function` is the shorthand for the common case --
-#! `reduce = mean` -- and a `QoI` is how you say anything else. `_qoiEvaluator` is the single place
-#! the two normalise to the same pair, so no consumer branches on which one it was given.
+#! One contract, and one internal representation. A user may hand any consumer a bare `Function`; it
+#! is wrapped into a `QoI` here, at the boundary, so nothing downstream branches on which it was
+#! given. The wrapper supplies the two things a bare function lacks: a name, and `reduce = mean`.
 #!
-#! Before this, a bare `Function` meant three different things: a simulation *ID* here, a *monad* ID
-#! in `CalibrationProblem`, and a `SimulationProcess` at the sink. Two of those were an `Int`, and both
-#! ID spaces are dense positive integers, so handing a calibration summary to `functions=` computed on
-#! the wrong entity and returned a plausible number with no error anywhere.
+#! Before this, a bare `Function` meant three different things -- a simulation *ID* in `functions=`, a
+#! *monad* ID in `CalibrationProblem`, and a `SimulationProcess` at the sink. Two were an `Int`, and
+#! both ID spaces are dense positive integers, so handing a calibration summary to `functions=`
+#! measured the wrong entity and returned a plausible number with no error anywhere.
 """
-    _qoiEvaluator(q) → (sim_id -> value, reduce)
+    _asQoI(x) → QoI
 
-Reduce a `QoI` or a plain `Function` to the pair every consumer needs: something callable with a
-simulation ID, and the reducer for its replicates. Both call the user's function with a
-[`Simulation`](@ref); only a `QoI` can override the reducer.
+Wrap `x` as a [`QoI`](@ref) if it is not one already. A bare `Function` becomes
+`QoI(name, f; reduce=mean)`, with `name` derived from the function; a `QoI` passes through untouched.
 """
-_qoiEvaluator(q::QoI)      = (sid -> _computeOn(q, sid), q.reduce)
-#! No `stored` lookup on this path, and none possible: that lookup is keyed by a QoI's name, and a
-#! bare function has none. Naming it is exactly what promoting it to a `QoI` does.
-_qoiEvaluator(f::Function) = (sid -> f(Simulation(sid)), mean)
-_qoiEvaluator(x) = throw(ArgumentError(
-    "Expected a QoI or a Function; got $(typeof(x))."))
+_asQoI(q::QoI) = q
+_asQoI(f::Function) = QoI(_qoiNameFromFunction(f), f)
+_asQoI(x) = throw(ArgumentError("Expected a QoI or a Function; got $(typeof(x))."))
+
+#! Anonymous functions are named `"#3"` / `"#3#4"` -- distinct per function (measured, so fine as
+#! identities) but not valid identifiers, and this name becomes a sink column name and a `Dict` key.
+#! So regularise rather than reject: `#3#4` becomes `anon_3_4`.
+"""
+    _qoiNameFromFunction(f) → String
+
+A name for a bare function, usable as a database column and a `Dict` key. Named functions keep their
+own name; anonymous ones get a regularised `anon_…` form.
+"""
+function _qoiNameFromFunction(f::Function)
+    raw = string(nameof(f))
+    occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", raw) && return raw
+    return "anon" * replace(raw, r"[^A-Za-z0-9_]+" => "_")
+end
 
 qoiName(f::Function) = string(nameof(f))
 
 #! The three consumers differ in what they are handed and what they must return, so each gets its own
-#! adapter — but all of them go through `_qoiEvaluator`, so a `QoI` and a plain `Function` behave the
-#! same way everywhere. The adapters are internal: a user passes the `QoI` itself.
+#! adapter — but all of them go through `_asQoI` first, so nothing downstream ever sees a bare
+#! `Function`. The adapters are internal: a user passes the `QoI` or the function itself.
 #! Calibration is the one consumer whose GRANULARITY changed: a bare function used to be called once
 #! per *monad* and aggregate the replicates itself. Reinterpreting such a function per-simulation and
 #! averaging is a different number for any post-aggregation nonlinearity -- squaring the mean of
@@ -300,25 +322,23 @@ function _validateSummaryStatistic(qs::AbstractVector{QoI})
 end
 
 function _validateSummaryStatistic(f::Function)
-    _declaresSimulation(f) && return f
-    throw(ArgumentError("""
-    `summary_statistic` must say that it takes a `Simulation`.
+    #! Warned, not refused. The declared argument type is the only available signal that a function was
+    #! written for the new contract -- an old monad-level summary is untyped or `::Int` -- but refusing
+    #! every unannotated function also rejects `sim -> measure(sim)`, the natural new-contract lambda.
+    #! So it is accepted and flagged. The risk is real: an old summary that aggregated its own
+    #! replicates now returns a different number rather than an error, and `mseDistance` will not catch
+    #! it (on a key mismatch it warns once and computes anyway, treating absent keys as zero).
+    _declaresSimulation(f) || @warn """
+        `summary_statistic` was given a function that does not declare it takes a `Simulation`.
 
-    A measurement function is now called once per *simulation* and its replicates are combined by
-    `reduce` (`mean` by default). A bare function here used to be called once per *monad*, with a
-    monad ID, and did its own aggregation -- so an unannotated argument is ambiguous between the two,
-    and silently reinterpreting yours would change your results without raising anything.
-
-    For `$(qoiName(f))`, either:
-      * annotate it, if it already measures ONE simulation:
-            $(qoiName(f))(s::Simulation) = ...        # or (s::Simulation) -> ...
-      * or pass a `QoI`, which also lets you choose the reduction:
-            QoI("$(qoiName(f))", s -> <per-simulation measurement>)
-            QoI("$(qoiName(f))", s -> <per-simulation>; reduce = vals -> <what you did to the mean>)
-
-    If it aggregated replicates itself, the per-simulation part goes in `compute` and whatever you
-    did after averaging goes in `reduce`, which receives every replicate's value.
-    """))
+        Measurement functions are now called once per *simulation*, and their replicates are combined
+        by `reduce` (`mean` here). If `$(_qoiNameFromFunction(f))` was written for the previous
+        contract -- called once per *monad*, doing its own aggregation -- it will now return a
+        different value with no error. Annotate it `(s::Simulation)` to silence this, or pass a `QoI`
+        to choose the reduction:
+            QoI("$(_qoiNameFromFunction(f))", s -> <per-simulation>; reduce = vals -> <after averaging>)
+        """ maxlog=1
+    return _asQoI(f)
 end
 
 _validateSummaryStatistic(x) = throw(ArgumentError(
@@ -336,52 +356,59 @@ its own value, a vector of them to a `Dict` keyed by QoI name.
 """
 _evaluateSummary(q::QoI, monad_id::Integer) = _reduceOverMonad(q, monad_id)
 
-#! A bare function is one quantity, so like a single QoI it reports its value directly -- and needs no
-#! name, because nothing keys it.
-_evaluateSummary(f::Function, monad_id::Integer) = _reduceOverMonad(f, monad_id)
 
 _evaluateSummary(qs::AbstractVector{QoI}, monad_id::Integer) =
     Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id) for q in qs)
 
-#! Empty for a bare function: a per-simulation consumer can still call it, but there is no QoI to
-#! hand back. The `#!` note goes ABOVE the docstring -- anything between a docstring and its
-#! definition, comment or blank line, silently detaches it from `Docs.meta`.
-"""
-    _summaryQoIs(ss) → Vector{QoI}
-
-The QoIs behind a `summary_statistic`, for consumers that need to evaluate them per simulation.
-Empty for a bare function.
-"""
-_summaryQoIs(::Function) = QoI[]
-_summaryQoIs(q::QoI) = QoI[q]
-_summaryQoIs(qs::AbstractVector{QoI}) = collect(qs)
 
 #! No reducer here, and none possible: the hook fires once per simulation, so there is exactly one
 #! value and nothing to combine. A QoI's `reduce` is simply unused by the sink.
 #!
-#! The sink used to hand a bare function the `SimulationProcess` itself. It now gets the `Simulation`,
-#! like every other consumer. Nothing is lost: `monad_id` is recoverable with `monadIDs(sim)`, and
-#! `success` is always `true` here because `run` only fires the hook when the simulation succeeded.
-#! The one field that cannot be reconstructed, `process`, is the live OS process, which is meaningless
-#! after the run anyway.
+#! A `compute` returning a `NamedTuple` or a `Dict` contributes its own entries as columns rather than
+#! nesting under the QoI's name. That is what lets a wrapped bare function keep producing several
+#! columns -- the sink has always accepted a multi-field return and spread it -- and what lets a QoI
+#! discover its column set from the simulation's own output at run time.
 """
     _asPostProcessor(x) → Function
 
-Adapt a `QoI`, a vector of them, or an existing post-processor for `run`'s `post_processor`. The
-adapted function is called once per simulation with a [`Simulation`](@ref).
+Adapt a `QoI`, a vector of them, or a bare function for `run`'s `post_processor`. The adapted function
+is called once per simulation with a [`Simulation`](@ref).
 """
-_asPostProcessor(f::Function) = sp -> f(sp.simulation)
-
-_asPostProcessor(q::QoI) = _asPostProcessor([q])
+_asPostProcessor(x) = _asPostProcessor([_asQoI(x)])
 
 function _asPostProcessor(qs::AbstractVector{QoI})
     isempty(qs) && throw(ArgumentError("A post-processor needs at least one QoI."))
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one post-processor; got $(names)."))
-    return function (sp::SimulationProcess)
-        sid = simulationID(sp)
-        return Dict{String,Any}(q.name => _computeOn(q, sid) for q in qs)
+    return function (sim::Simulation)
+        #! Keys are NOT stringified here. The sink already rejects distinct keys that collide once
+        #! stringified (`1` and `"1"`), and doing that conversion early would collapse them silently
+        #! before its check ever ran -- and would move the error out of the sink and into the
+        #! per-simulation stage, which wraps it.
+        entries = Pair{Any,Any}[]
+        for q in qs
+            v = _computeOn(q, sim)
+            #! `nothing`/`missing` records nothing for this simulation -- how a post-processor skips
+            #! one whose output it could not read.
+            (isnothing(v) || ismissing(v)) && continue
+            if v isa NamedTuple || v isa AbstractDict
+                for (k, vv) in pairs(v)
+                    push!(entries, k => vv)
+                end
+            else
+                push!(entries, q.name => v)
+            end
+        end
+        isempty(entries) && return nothing
+        out = Dict{Any,Any}(entries)
+        #! Only a collision the `Dict` itself would swallow is caught here: two QoIs contributing the
+        #! very same key. Anything that merely collides after stringification is left to the sink.
+        length(out) == length(entries) || throw(ArgumentError(
+            "post_processor produced the same quantity name from more than one QoI. Names must be " *
+            "unique across the whole post-processor, including keys spliced from a `compute` that " *
+            "returns a NamedTuple or Dict."))
+        return out
     end
 end
 
