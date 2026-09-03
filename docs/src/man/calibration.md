@@ -19,15 +19,19 @@ A [`CalibrationProblem`](@ref) bundles the model, the parameters to infer, the d
 to compare:
 
 ```julia
-using Distributions
+using Distributions, CSV, DataFrames
 
 # Fix non-calibrated parameters via a reference monad (n_replicates=0 just records the IDs).
 ref = createTrial(inputs, DiscreteVariation(:config, XMLPath(["overall","max_time"]), 120.0);
                   n_replicates=0)
 
-# Your own per-simulation measurement. It is handed one `Simulation`; how you read a simulation's
-# output is simulator-specific, so this stands in for whatever your simulator package provides.
-measureTumor(sim::Simulation) = length(readdir(pathToOutputFolder(sim)))
+# Your own per-simulation measurement: reach into this simulation's output and return a number.
+# Parsing raw output is the backend's job, so in practice you would call the loader your simulator
+# package provides (keyed by `simulationID`); this reads a summary file the simulator wrote.
+function measureTumor(sim::Simulation)
+    counts = joinpath(pathToOutputFolder(sim), "final_cell_counts.csv") |> CSV.File |> DataFrame
+    return Float64(only(counts[counts.cell_type .== "tumor", :count]))
+end
 
 # One quantity, so `observed` is the bare value that quantity should match. Use a vector of QoIs
 # with a `Dict` of observations when you are comparing several named quantities at once.

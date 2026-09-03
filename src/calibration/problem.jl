@@ -42,9 +42,13 @@ and how to compare simulated to observed output.
 # Short run for testing — set max_time via a reference
 ref = createTrial(inputs, DiscreteVariation(["overall","max_time"], 12.0); n_replicates=0)
 
-# Your own per-simulation measurement. It is handed one `Simulation`; how you read a simulation's
-# output is simulator-specific, so this stands in for whatever your simulator package provides.
-countDefaultCells(sim::Simulation) = length(readdir(pathToOutputFolder(sim)))
+# Your own per-simulation measurement: reach into this simulation's output and return a number.
+# Parsing raw output is the backend's job, so in practice you would call the loader your simulator
+# package provides (keyed by `simulationID`); this reads a summary file the simulator wrote.
+function countDefaultCells(sim::Simulation)
+    counts = joinpath(pathToOutputFolder(sim), "final_cell_counts.csv") |> CSV.File |> DataFrame
+    return Float64(only(counts[counts.cell_type .== "default", :count]))
+end
 
 # A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
 observed = Dict("default" => 100.0)
