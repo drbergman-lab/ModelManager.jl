@@ -25,6 +25,10 @@ using Distributions
 ref = createTrial(inputs, DiscreteVariation(:config, XMLPath(["overall","max_time"]), 120.0);
                   n_replicates=0)
 
+# Your own per-simulation measurement. It is handed one `Simulation`; how you read a simulation's
+# output is simulator-specific, so this stands in for whatever your simulator package provides.
+measureTumor(sim::Simulation) = length(readdir(pathToOutputFolder(sim)))
+
 # One quantity, so `observed` is the bare value that quantity should match. Use a vector of QoIs
 # with a `Dict` of observations when you are comparing several named quantities at once.
 observed = 100.0

@@ -42,6 +42,10 @@ and how to compare simulated to observed output.
 # Short run for testing — set max_time via a reference
 ref = createTrial(inputs, DiscreteVariation(["overall","max_time"], 12.0); n_replicates=0)
 
+# Your own per-simulation measurement. It is handed one `Simulation`; how you read a simulation's
+# output is simulator-specific, so this stands in for whatever your simulator package provides.
+countDefaultCells(sim::Simulation) = length(readdir(pathToOutputFolder(sim)))
+
 # A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
 observed = Dict("default" => 100.0)
 problem = CalibrationProblem(
