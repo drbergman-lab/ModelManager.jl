@@ -3753,3 +3753,44 @@ methods: a QoI is restorable only if *both* its functions are named. `reduce` is
 since a named `compute` with an anonymous `reduce` would otherwise come back as a QoI that silently
 averages instead of doing the monad-level step it was written for.
 
+### What an adversarial audit of this PR turned up
+
+Ran a breakage audit over the whole diff plus the downstream package, then had every
+breaking/behaviour-change claim independently refuted rather than trusting the finder. 15 claims, 2
+refuted, and four of the survivors were real defects in code I had just written.
+
+**The reduce-error guard was reaching too far.** I had wrapped `red(vals)` in a `try/catch` that
+converted *any* `MethodError` into a friendly ArgumentError about the reducer's argument type. The
+filter is `e isa MethodError`, which cannot distinguish "`red` has no method for `vals`" from "`red`
+accepted `vals` and something one frame deeper raised" — and the motivating case proves the point,
+since `mean(::Vector{Dict})` raises on `/`, *below* `mean`. So a user whose own `reduce` had an
+internal type bug would be told, falsely, that `reduce` does not accept its input. The fix is to
+decide before calling: `_meanApplicable` asks whether the element type supports the `+` and `/` that
+`mean` needs, and only the default reducer is ever second-guessed. Anything `red` itself raises now
+propagates untouched, with its own backtrace. A non-concrete eltype is deliberately left alone — a
+heterogeneous `Vector{Any}` of numbers averages fine, and a false positive would reject working code.
+
+**`on_monad_failure` was accepted, validated, and then never read**, so `:error` behaved exactly like
+`:reject`: a caller asking to be told about a broken model got a warning and a short table. Now
+honoured before the row loop.
+
+**`n` and `design.n` could silently disagree.** `n` only ever built the *default* design;
+`addVariations` reads the count off the design itself, so `exportTrainingSet(prob; n=2000,
+design=LHSVariation(50))` simulated 50 sets while `manifest.toml` recorded 2000. Rather than pick a
+winner, the mismatch is now refused.
+
+**`simulation_id` was written but undocumented and outside the collision guard** — it was missing
+from `all_names`, so a summary key called `simulation_id` would have silently shadowed it. Also, a
+monad yielding no rows was skipped without being counted, so the closing warning under-reported.
+
+One behaviour change is intended and stays: a QoI-backed problem now writes a *restorable*
+`problem.jld2` where it previously wrote `nothing` plus a warning, because the QoI is no longer
+collapsed into an anonymous closure at construction. A calibration saved by an older version still
+holds `nothing` and will keep asking for `problem=` on resume; one saved by this version will not.
+
+**Downstream is fine, and I checked rather than assumed.** PCMM's full source compiles against this
+branch, and a `CalibrationProblem` built from its real `endpointPopulationCounts` works unchanged.
+The one failure — `ModelManager.packageName` no longer existing — reproduces *identically* against
+`origin/main`, so it is version drift PCMM already owed (it also still pins `ModelManager = "0.8"`
+against a `0.9.0` main), not anything this PR introduced.
+

@@ -4145,7 +4145,17 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test occursin("reduce", msg)
                 @test occursin("Dict", msg)
                 @test occursin("vector of QoIs", msg)
-                @test occursin("MethodError", msg)          # underlying cause still reported
+
+                # ...but the guard must NOT reach around `reduce` itself. Catching MethodError around
+                # the call cannot tell "reduce rejects this argument" from "reduce accepted it and
+                # something one frame deeper raised", so a bug inside the user's own reduce used to be
+                # reported as reduce rejecting its input. A reduce that accepts the vector fine and
+                # then errors internally must surface as its own MethodError, untouched.
+                buggy = QoI("buggy", _qoi_sim; reduce = vs -> sum(vs) + "not a number")
+                @test_throws MethodError ModelManager._reduceOverMonad(buggy, mid)
+                # A non-mean reduce is never second-guessed, whatever compute returned.
+                dictok = QoI("dictok", s -> Dict{String,Any}("a" => 1.0); reduce = length)
+                @test ModelManager._reduceOverMonad(dictok, mid) == length(sids)
                 # A reduce that does understand the Dict is untouched by the guard.
                 okq = QoI("okq", s -> Dict{String,Any}("a" => 1.0);
                           reduce = vs -> sum(v["a"] for v in vs))

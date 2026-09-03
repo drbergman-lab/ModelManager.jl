@@ -132,9 +132,11 @@ need simulation on demand.
 
 # Output
 `training_set/` beside `generations/`:
-- `training_set.csv` — one row per parameter set: `monad_id`, `n_success` (replicates that actually
-  succeeded, which is the precision of that row's summary and need not be the same for every row), then
-  three prefixed groups —
+- `training_set.csv` — one row per parameter set: `monad_id`, `simulation_id`, `n_success` (replicates
+  that actually succeeded, which is the precision of that row's summary and need not be the same for
+  every row), then three prefixed groups —
+  `simulation_id` names the simulation a row came from at `granularity=:simulation`, and is `0` at
+  `:monad`, where a row summarises every replicate and so has no single simulation to name.
   `cdf.*` (latent coordinates in `(0, 1)`), `target.*` (the same parameters as model values), and
   `summary.*` (the flattened summary statistics). The prefixes exist because a parameter's latent and
   target names are otherwise identical, and they let a consumer tell the two spaces apart unaided.
@@ -165,6 +167,13 @@ function exportTrainingSet(problem::CalibrationProblem;
                            progress::Symbol=:auto,
                            on_monad_failure::Symbol=:reject)
     n > 0 || throw(ArgumentError("n must be positive; got $(n)."))
+    #! `n` only ever built the DEFAULT design; `addVariations` reads the count off the design itself.
+    #! So an explicit `design` silently won, and `manifest.toml` recorded the ignored `n`. Rather than
+    #! pick a winner, refuse the ambiguity.
+    design.n == n || throw(ArgumentError(
+        "exportTrainingSet: n=$(n) but `design` will draw $(design.n) samples. `n` is the shorthand " *
+        "for the default design, and the design's own n is what actually runs, so these must agree. " *
+        "Pass `design=$(nameof(typeof(design)))($(n))`, or set n=$(design.n)."))
     granularity in (:simulation, :monad) || throw(ArgumentError(
         "granularity must be :simulation or :monad; got :$(granularity)."))
     #! A plain `summary_statistic` is called with a monad ID by contract, so it genuinely cannot be
@@ -235,6 +244,16 @@ function exportTrainingSet(problem::CalibrationProblem;
     latent_names = ["cdf." * nm for nm in vcat([cp.lv.latent_parameter_names for cp in cps]...)]
     param_names  = ["target." * nm for nm in vcat([_displayColumns(cp) for cp in cps]...)]
 
+    #! Honoured, not merely validated: :error previously behaved exactly like :reject, so a caller
+    #! asking to be told about a broken model got a silent warning and a short table instead.
+    if on_monad_failure === :error && !isempty(without_success)
+        ids = sort(collect(without_success))
+        throw(ErrorException(
+            "Training set: $(length(ids)) of $(length(monads)) parameter sets produced no " *
+            "successful simulation, and on_monad_failure=:error. Monad IDs: $(ids). Use " *
+            "on_monad_failure=:reject (the default) to drop them and export the rest."))
+    end
+
     rows = NamedTuple[]
     summary_names = String[]
     n_failed = 0
@@ -262,7 +281,9 @@ function exportTrainingSet(problem::CalibrationProblem;
                 "bug in the summary function, not a sampling outcome.\n$(sprint(showerror, e))"))
         end
         flats = [_flattenSummary(sm, "summary") for sm in summaries]
-        isempty(flats) && continue
+        #! Counted, not just skipped: this monad contributes no row, so it belongs in the same tally
+        #! as one with no successful simulation, or the closing warning under-reports.
+        isempty(flats) && (n_failed += 1; continue)
         flat = first(flats)
         if isempty(summary_names)
             summary_names = first.(flat)
@@ -290,7 +311,7 @@ function exportTrainingSet(problem::CalibrationProblem;
         end
     end
 
-    all_names = vcat(["monad_id", "n_success"], latent_names, param_names, summary_names)
+    all_names = vcat(["monad_id", "simulation_id", "n_success"], latent_names, param_names, summary_names)
     length(unique(all_names)) == length(all_names) || throw(ArgumentError(
         "Training set: duplicate column names $(all_names[nonunique(DataFrame(n=all_names), [:n])]) — " *
         "a parameter or summary name collides with another column, which would silently drop one of " *

@@ -228,26 +228,27 @@ function _reduceOverMonad(q, monad_id::Integer)
     isempty(sim_ids) && throw(ArgumentError(
         "Monad $(monad_id) has no simulations, so QoI \"$(qoiName(q))\" cannot be evaluated on it."))
     vals = [f(sid) for sid in sim_ids]
-    #! Without this, the default `reduce=mean` meeting a `Dict`-returning `compute` throws
-    #! `MethodError: no method matching /(::Dict{String,Any}, ::Int64)` from inside Statistics —
-    #! no mention of the QoI, of replicates, or of the reduction step, and calibration's own catch
-    #! then reports the fault as being in the user's summary or distance function.
-    return try
-        red(vals)
-    catch e
-        e isa MethodError || rethrow()
+    #! Checked BEFORE calling `red`, not by catching around it. A try/catch filtering on MethodError
+    #! cannot tell "`red` has no method for `vals`" from "`red` accepted `vals` and something one
+    #! frame deeper raised" — the motivating case proves it, since `mean(::Vector{Dict})` raises on
+    #! `/`, below `mean`. Catching around the call therefore reported a bug inside a user's own
+    #! `reduce` as `reduce` rejecting its argument. Anything `red` raises now propagates untouched.
+    if red === mean && !_meanApplicable(eltype(vals))
         throw(ArgumentError("""
-        QoI "$(qoiName(q))": combining the $(length(vals)) replicate value(s) of monad \
-        $(monad_id) with `reduce` failed. `compute` returned $(eltype(vals)), which \
-        $(red === mean ? "the default `reduce=mean` cannot average" : "`reduce` does not accept").
-        $(red === mean && !(eltype(vals) <: Union{Real,AbstractArray{<:Real}}) ?
-          "To report several named quantities, pass one QoI per quantity (a vector of QoIs) \
+        QoI "$(qoiName(q))": `compute` returned $(eltype(vals)), which the default `reduce=mean` \
+        cannot average, so the $(length(vals)) replicate value(s) of monad $(monad_id) cannot be \
+        combined. To report several named quantities, pass one QoI per quantity (a vector of QoIs) \
         rather than one QoI whose `compute` returns a Dict; or give this QoI a `reduce` that \
-        understands $(eltype(vals))." :
-          "Give this QoI a `reduce` that accepts a Vector{$(eltype(vals))}.")
-        The underlying error was: $(sprint(showerror, e))"""))
+        accepts a Vector{$(eltype(vals))}."""))
     end
+    return red(vals)
 end
+
+#! `mean` is `sum(vals) / length(vals)`, so it needs `+` on the element type and `/` by an `Int`.
+#! A non-concrete eltype is deliberately left alone — a heterogeneous `Vector{Any}` of numbers averages
+#! fine, and a false positive here would reject code that works today.
+_meanApplicable(::Type{T}) where {T} =
+    !isconcretetype(T) || (hasmethod(+, Tuple{T,T}) && hasmethod(/, Tuple{T,Int}))
 
 #! A bare `Function` keeps its existing contract exactly: it is called with a simulation *ID* and its
 #! replicates are averaged. Only a `QoI`'s `compute` receives a `Simulation`. Wrapping a plain function
