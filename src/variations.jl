@@ -916,6 +916,32 @@ end
 LHSVariation(n; add_noise::Bool=false, rng::AbstractRNG=Random.GLOBAL_RNG, orthogonalize::Bool=true) = LHSVariation(n, add_noise, rng, orthogonalize)
 LHSVariation(; n::Int=4, kwargs...) = LHSVariation(n; kwargs...)
 
+#! Plain i.i.d. draws, which sounds like a worse LHS and is, for anything that wants coverage per
+#! sample. It exists because amortized neural posterior estimation wants the opposite: its training
+#! objective is an expectation *under the prior*, and its calibration diagnostics (simulation-based
+#! calibration and friends) assume independent joint draws. A stratified design has matched marginals
+#! but dependent samples, which makes those rank statistics invalid even for a perfect approximator —
+#! so it trades away the tool you use to decide whether to trust the network.
+"""
+    MonteCarloVariation <: AddVariationMethod
+
+Independent draws from the priors — the unstratified counterpart to [`LHSVariation`](@ref).
+
+Prefer `LHSVariation` when you want coverage of the parameter space per simulation, as sensitivity
+analysis does. Prefer this when a method's theory assumes i.i.d. prior draws, as amortized neural
+posterior estimation does; see [`exportTrainingSet`](@ref).
+
+# Fields
+- `n::Int`: Number of samples.
+- `rng::AbstractRNG=Random.GLOBAL_RNG`
+"""
+struct MonteCarloVariation <: AddVariationMethod
+    n::Int
+    rng::AbstractRNG
+end
+MonteCarloVariation(n; rng::AbstractRNG=Random.GLOBAL_RNG) = MonteCarloVariation(n, rng)
+MonteCarloVariation(; n::Int=4, kwargs...) = MonteCarloVariation(n; kwargs...)
+
 """
     SobolVariation <: AddVariationMethod
 
@@ -1023,6 +1049,39 @@ struct AddLHSVariationsResult <: AddVariationsResult
     cdfs::Matrix{Float64}
     variation_ids::Vector{VariationID}
 end
+
+"""
+    AddMonteCarloVariationsResult <: AddVariationsResult
+
+Result of `addVariations` with [`MonteCarloVariation`](@ref).
+
+# Fields
+- `cdfs::Matrix{Float64}`: The sampled CDF coordinates in `(0, 1)`, one row per latent dimension and
+  one column per sample.
+- `variation_ids::Vector{VariationID}`: One [`VariationID`](@ref) per sample, in the same order as the
+  columns of `cdfs`.
+"""
+struct AddMonteCarloVariationsResult <: AddVariationsResult
+    cdfs::Matrix{Float64}
+    variation_ids::Vector{VariationID}
+end
+
+#! `rand` can return exactly 0.0, whose prior quantile is the distribution's lower endpoint — `-Inf`
+#! for an unbounded prior. Redrawing the offending entries keeps every coordinate strictly inside the
+#! open interval, which is what `variationValues` and the training-set export both assume.
+function addVariations(mc_variation::MonteCarloVariation, inputs::InputFolders,
+                       pv::ParsedVariations, reference_variation_id::VariationID)
+    d = nLatentDims(pv)
+    cdfs = rand(mc_variation.rng, Float64, d, mc_variation.n)
+    while any(c -> !(0 < c < 1), cdfs)
+        for i in eachindex(cdfs)
+            (0 < cdfs[i] < 1) || (cdfs[i] = rand(mc_variation.rng, Float64))
+        end
+    end
+    variation_ids = addCDFVariations(inputs, pv, reference_variation_id, cdfs)
+    return AddMonteCarloVariationsResult(cdfs, variation_ids)
+end
+
 
 """
     AddSobolVariationsResult <: AddVariationsResult

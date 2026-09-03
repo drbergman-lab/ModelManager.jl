@@ -138,6 +138,8 @@ ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
 # Must live here (not inside @testset blocks) so they get stable module-qualified names
 # rather than compiler-generated closures like #249#250.
+_test_qoi_compute(s) = 7.0
+_test_qoi_reduce(v) = sum(v) / length(v)
 _test_named_ss(mid)        = Dict{String,Any}("x" => 1.0)
 _test_named_vec_ss(mid)    = [1.0]
 _test_named_scalar_ss(mid) = 1.0
@@ -148,9 +150,11 @@ _test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
 
 # ---- QoI test computes ----------------------------------------------------
 # Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
-# values differ; _qoi_monad sees the whole monad at once.
+# values differ. (There is deliberately no monad-level QoI helper here: a QoI's `compute` is only
+# ever handed a `Simulation` -- see `_computeOn` -- so a `compute(::Monad)` would MethodError. A
+# helper asserting otherwise sat here unused, and read as documentation of a contract that does
+# not exist.)
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
-_qoi_monad(m::Monad)      = length(ModelManager.constituentIDs(m))
 # A plain GSA function: takes a simulation ID, as `functions=` always has.
 _qoi_by_id(sim_id)        = getParameterValue(Simulation(Int(sim_id)), :config, XMLPath(["data", "x"]))
 
@@ -1922,6 +1926,52 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             loaded2 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path2)
             @test !ModelManager._isCompleteManifest(loaded2)
             @test isnothing(loaded2.summary_statistic)
+
+            # A QoI-valued summary_statistic is stored as the QoI itself, not collapsed to a
+            # closure, so the manifest field now holds a struct where it used to hold a Function.
+            # The field is untyped, so this is a JLD2-compatible widening -- pinned here because the
+            # failure mode would be a resume that cannot reconstruct the problem.
+            qoi_named = QoI("x", _test_qoi_compute; reduce=_test_qoi_reduce)
+            prob_qoi  = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                           qoi_named, _test_named_dist, 1, var_id)
+            @test prob_qoi.summary_statistic === qoi_named
+            manifest_qoi = ModelManager._ProblemManifest(prob_qoi)
+            @test ModelManager._isCompleteManifest(manifest_qoi)
+            path3 = joinpath(dir, "problem_qoi.jld2")
+            jldsave(path3; manifest=manifest_qoi)
+            loaded3 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path3)
+            @test ModelManager._isCompleteManifest(loaded3)
+            back = loaded3.summary_statistic
+            @test back isa QoI
+            @test back.name == "x"
+            @test nameof(back.compute) === nameof(_test_qoi_compute)
+            @test nameof(back.reduce)  === nameof(_test_qoi_reduce)
+            @test back.compute(nothing) == 7.0   # callable after load, not just present
+
+            # A vector of QoIs round-trips as a vector.
+            prob_qv = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                         QoI[qoi_named, QoI("y", _test_qoi_compute;
+                                                            reduce=_test_qoi_reduce)],
+                                         _test_named_dist, 1, var_id)
+            manifest_qv = ModelManager._ProblemManifest(prob_qv)
+            @test ModelManager._isCompleteManifest(manifest_qv)
+            path4 = joinpath(dir, "problem_qv.jld2")
+            jldsave(path4; manifest=manifest_qv)
+            loaded4 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path4)
+            @test loaded4.summary_statistic isa Vector{QoI}
+            @test [q.name for q in loaded4.summary_statistic] == ["x", "y"]
+
+            # Either function being anonymous makes the QoI unrestorable. `reduce` is the one worth
+            # pinning: a named compute with an anonymous reduce would otherwise come back as a QoI
+            # that silently averages instead of doing the monad-level step it was written for.
+            qoi_anon_reduce = QoI("x", _test_qoi_compute; reduce=v -> sum(v))
+            @test ModelManager._isAnonymousFunction(qoi_anon_reduce)
+            @test !ModelManager._isAnonymousFunction(qoi_named)
+            @test ModelManager._isAnonymousFunction(QoI[qoi_named, qoi_anon_reduce])
+            prob_qanon = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                            qoi_anon_reduce, _test_named_dist, 1, var_id)
+            @test !ModelManager._isCompleteManifest(
+                ModelManager._ProblemManifest(prob_qanon))
         end
     end
 
@@ -4003,8 +4053,11 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                                                         Uniform(0.5, 3.0))],
                                           Dict{String,Any}("x" => 1.0),
                                           QoI("x", _qoi_sim), mseDistance)
-                @test prob.summary_statistic isa Function
-                @test prob.summary_statistic(mid)["x"] ≈ mean(sim_vals)
+                # The QoI is preserved, not converted: the problem still holds the object the user
+                # passed, which is what lets a per-simulation consumer use its `compute`.
+                @test prob.summary_statistic isa QoI
+                @test ModelManager._evaluateSummary(prob.summary_statistic, mid)["x"] ≈
+                      mean(sim_vals)
 
                 # The sink: the QoI itself is the post_processor.
                 m2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1069.0])];
@@ -4018,7 +4071,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # Duplicate names are refused rather than silently collapsing a column.
                 @test_throws ArgumentError ModelManager._asPostProcessor(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
-                @test_throws ArgumentError ModelManager._asSummaryStatistic(
+                @test_throws ArgumentError ModelManager._validateSummaryStatistic(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
             end
 
@@ -4074,8 +4127,39 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       mean([_qoi_sim(Simulation(i)) for i in sids])
 
                 # And through a real consumer, to show nothing about the seam needs changing.
-                ss = ModelManager._asSummaryStatistic(readback)
-                @test ss(mid)["stored_x"] ≈ mean([_qoi_sim(Simulation(i)) for i in sids])
+                @test ModelManager._evaluateSummary(readback, mid)["stored_x"] ≈
+                      mean([_qoi_sim(Simulation(i)) for i in sids])
+
+                # A Dict-returning `compute` left on the default `reduce=mean` is a sharp edge: it
+                # dies inside Statistics with `MethodError: no method matching /(::Dict, ::Int64)`,
+                # naming neither the QoI nor the reduction step -- and calibration's catch then
+                # blames the user's summary/distance function. The reframed error must name the
+                # QoI, the returned type, `reduce`, and the one-QoI-per-quantity fix.
+                dictq = QoI("dictq", s -> Dict{String,Any}("a" => 1.0, "b" => 2.0))
+                err = try
+                    ModelManager._reduceOverMonad(dictq, mid); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                msg = err.msg
+                @test occursin("dictq", msg)
+                @test occursin("reduce", msg)
+                @test occursin("Dict", msg)
+                @test occursin("vector of QoIs", msg)
+
+                # ...but the guard must NOT reach around `reduce` itself. Catching MethodError around
+                # the call cannot tell "reduce rejects this argument" from "reduce accepted it and
+                # something one frame deeper raised", so a bug inside the user's own reduce used to be
+                # reported as reduce rejecting its input. A reduce that accepts the vector fine and
+                # then errors internally must surface as its own MethodError, untouched.
+                buggy = QoI("buggy", _qoi_sim; reduce = vs -> sum(vs) + "not a number")
+                @test_throws MethodError ModelManager._reduceOverMonad(buggy, mid)
+                # A non-mean reduce is never second-guessed, whatever compute returned.
+                dictok = QoI("dictok", s -> Dict{String,Any}("a" => 1.0); reduce = length)
+                @test ModelManager._reduceOverMonad(dictok, mid) == length(sids)
+                # A reduce that does understand the Dict is untouched by the guard.
+                okq = QoI("okq", s -> Dict{String,Any}("a" => 1.0);
+                          reduce = vs -> sum(v["a"] for v in vs))
+                @test ModelManager._reduceOverMonad(okq, mid) ≈ Float64(length(sids))
             end
 
             @testset "stored=:prefer/:require and verifyStoredValues" begin
@@ -4225,6 +4309,222 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 waitForDiagnostics()
                 @test res isa ABCResult
                 @test length(res.generations) == 1
+            end
+
+            @testset "training-set accepts a Sobol design and pairs rows to the right monad" begin
+                # Sobol stores cdfs as (latent, n_matrices, sample) while its variation_ids are
+                # (sample, n_matrices) -- transposed axes. Flattening without swapping them pairs
+                # every row with the WRONG parameter set, and nothing downstream would notice,
+                # because target.* is derived from the same cdf column rather than read back from
+                # the database. So this checks the row against the monad's ACTUAL parameter value.
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance)
+                design = SobolVariation(8; skip_start=true)
+                ts = exportTrainingSet(prob; n=8, design=design,
+                                       description="sobol design", progress=:none)
+                waitForDiagnostics()
+
+                tbl = CSV.read(joinpath(ts.path, "training_set.csv"), DataFrame)
+                @test nrow(tbl) == 8
+                man = TOML.parsefile(joinpath(ts.path, "manifest.toml"))
+                @test man["design"] == "SobolVariation"
+
+                target_col = only(filter(startswith("target."), names(tbl)))
+                for row in eachrow(tbl)
+                    actual = getParameterValue(Monad(row.monad_id), :config, xp_x)
+                    @test row[target_col] ≈ actual
+                end
+                @test length(unique(tbl.monad_id)) == 8   # no monad claimed twice
+
+                # n_matrices > 1 is refused: the blocks are slices of ONE sequence, so in low
+                # dimension they repeat each other's points and you get fewer distinct parameter
+                # sets than rows asked for. Measured: SobolVariation(4; n_matrices=2) over a single
+                # parameter yields 4 distinct sets, not 8.
+                @test length(unique(vec(ModelManager.generateSobolCDFs(
+                    SobolVariation(4; n_matrices=2, skip_start=true), 1)))) == 4
+                @test_throws ArgumentError exportTrainingSet(
+                    prob; n=8, design=SobolVariation(4; n_matrices=2, skip_start=true),
+                    progress=:none)
+
+                # The all-zeros corner maps to a prior endpoint, and the error must say how to fix it.
+                err = try
+                    exportTrainingSet(prob; n=4, design=SobolVariation(4; skip_start=false),
+                                      progress=:none); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("skip_start", err.msg)
+            end
+
+            @testset "training-set n_success counts successes, not simulations" begin
+                # A monad with one failed replicate must report 1, not 2: the column is the precision
+                # of that row's summary, and reporting the created count would overstate it.
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance; n_replicates=2)
+                #! Fail exactly one simulation per monad, leaving each with a single survivor.
+                seen = Set{Int}()
+                _fail_sim_predicate[] = spec -> begin
+                    mid = spec.monad_id
+                    mid in seen && return false
+                    push!(seen, mid)
+                    return true
+                end
+                ts = try
+                    exportTrainingSet(prob; n=3, description="partial failure", progress=:none)
+                finally
+                    _fail_sim_predicate[] = nothing
+                end
+                waitForDiagnostics()
+
+                tbl = CSV.read(joinpath(ts.path, "training_set.csv"), DataFrame)
+                @test nrow(tbl) == ts.n_rows
+                @test all(tbl.n_success .== 1)      # one of the two replicates failed
+                @test ts.n_failed == 0              # each monad still had a survivor
+            end
+
+            @testset "training-set granularity: monad rows vs simulation rows" begin
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                # A QoI, so :simulation is available: a plain summary function takes a monad ID.
+                q = QoI("x", _qoi_sim)
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          q, mseDistance; n_replicates=3)
+
+                mon = exportTrainingSet(prob; n=3, granularity=:monad,
+                                        description="gran monad", progress=:none)
+                waitForDiagnostics()
+                sim = exportTrainingSet(prob; n=3, granularity=:simulation,
+                                        description="gran sim", progress=:none)
+                waitForDiagnostics()
+
+                tm = CSV.read(joinpath(mon.path, "training_set.csv"), DataFrame)
+                tsim = CSV.read(joinpath(sim.path, "training_set.csv"), DataFrame)
+
+                # One row per parameter set, versus one per surviving replicate.
+                @test nrow(tm) == 3
+                @test nrow(tsim) == 3 * 3
+                @test all(tm.simulation_id .== 0)          # no single simulation to name
+                @test all(tsim.simulation_id .> 0)
+                # θ repeats across a parameter set's replicates, which is correct: they are
+                # independent draws from p(x|θ).
+                @test length(unique(tsim.monad_id)) == 3
+                @test length(unique(tsim[!, mon.column_groups.latent[1]])) == 3
+
+                # The manifest says which, so a consumer cannot misread the granularity.
+                @test TOML.parsefile(joinpath(mon.path, "manifest.toml"))["granularity"] == "monad"
+                @test TOML.parsefile(joinpath(sim.path, "manifest.toml"))["granularity"] == "simulation"
+                # ...and records the BayesFlow adapter roles rather than leaving them to be inferred.
+                bf = TOML.parsefile(joinpath(mon.path, "manifest.toml"))["bayesflow"]
+                @test Set(bf["inference_variables"]) == Set(mon.column_groups.latent)
+                @test Set(bf["summary_variables"]) == Set(mon.column_groups.summaries)
+
+                # :simulation with a plain summary function is refused, naming the fix.
+                plain = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                           _test_named_ss, mseDistance)
+                # A plain-function problem cannot do :simulation, and is refused up front. A
+                # QoI-backed one can, because the problem now preserves the QoI it was given.
+                @test ModelManager._summaryQoIs(prob.summary_statistic) == [q]
+                @test isempty(ModelManager._summaryQoIs(plain.summary_statistic))
+                @test_throws ArgumentError exportTrainingSet(plain; n=2, granularity=:simulation,
+                                                             progress=:none)
+                @test_throws ArgumentError exportTrainingSet(prob; n=2, granularity=:nonsense)
+            end
+
+            @testset "MonteCarloVariation draws independently inside the unit interval" begin
+                # The default design for a training set: i.i.d. prior draws, because NPE's objective
+                # is an expectation under the prior and its calibration diagnostics assume
+                # independence. LHS has matched marginals but dependent samples.
+                mc = MonteCarloVariation(16)
+                @test mc.n == 16
+                @test MonteCarloVariation(; n=5).n == 5
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                pv = ModelManager.ParsedVariations([dv])
+                res = ModelManager.addVariations(mc, inputs, pv, VariationID(inputs))
+                @test res isa ModelManager.AddMonteCarloVariationsResult
+                @test size(res.cdfs, 2) == 16
+                # Strictly inside (0,1): an endpoint maps to a prior quantile of ±Inf.
+                @test all(0 .< res.cdfs .< 1)
+                @test length(res.variation_ids) == 16
+            end
+
+            @testset "_flattenSummary produces deterministic named numbers" begin
+                fs = ModelManager._flattenSummary
+                @test fs(3.0) == ["value" => 3.0]
+                @test fs(true) == ["value" => 1.0]
+                @test fs([1.0, 2.0]) == ["value.1" => 1.0, "value.2" => 2.0]
+                @test fs((a=1.0, b=2.0)) == ["value.a" => 1.0, "value.b" => 2.0]
+                # Dict keys are sorted, so two exports of the same problem cannot disagree on column
+                # order -- a consumer reading by position would otherwise silently mismatch.
+                @test fs(Dict("b" => 2.0, "a" => 1.0)) == ["value.a" => 1.0, "value.b" => 2.0]
+                @test fs(Dict("b" => 2.0, "a" => 1.0)) == fs(Dict("a" => 1.0, "b" => 2.0))
+                # Nesting, and a clear refusal for anything that is not numbers.
+                @test fs(Dict("x" => [1.0, 2.0])) == ["value.x.1" => 1.0, "value.x.2" => 2.0]
+                @test_throws ArgumentError fs("not a number")
+                @test_throws ArgumentError fs(Dict("x" => "nope"))
+            end
+
+            @testset "exportTrainingSet writes a consumer-agnostic table" begin
+                dv1 = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                dv2 = DistributedVariation(:config, xp_y, Uniform(1.0, 4.0))
+                prob = CalibrationProblem(inputs, [dv1, dv2], Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance; n_replicates=2)
+                ts = exportTrainingSet(prob; n=4, description="training set", progress=:none)
+                waitForDiagnostics()
+
+                @test ts isa TrainingSet
+                @test ts.n_rows == 4
+                @test ts.n_failed == 0
+                @test isdir(ts.path)
+
+                # The table: one row per parameter set, with all four column groups.
+                tbl = CSV.read(joinpath(ts.path, "training_set.csv"), DataFrame)
+                @test nrow(tbl) == 4
+                for c in ["monad_id", "n_success"]
+                    @test c in names(tbl)
+                end
+                # n_success is the number of replicates that SUCCEEDED, which sets that row's
+                # precision -- not the number created. With no failures here the two coincide, so the
+                # assertion below is weak on its own; the partial-failure case is what distinguishes
+                # them and is covered by the fail-predicate test that follows.
+                @test all(tbl.n_success .== 2)
+                for c in vcat(ts.column_groups.latent, ts.column_groups.parameters,
+                              ts.column_groups.summaries)
+                    @test c in names(tbl)
+                end
+                @test length(ts.column_groups.latent) == 2
+                @test length(ts.column_groups.parameters) == 2
+
+                # Latent coordinates are CDFs, strictly inside the unit interval.
+                for c in ts.column_groups.latent
+                    @test all(0 .< tbl[!, c] .< 1)
+                end
+                # Interpretable values sit inside their priors, not in CDF space. The groups must be
+                # distinguishable: for a DistributedVariation the latent and target names are both
+                # variationName(dv), so without prefixes the merge silently dropped the CDF columns.
+                @test all(startswith.(ts.column_groups.latent, "cdf."))
+                @test all(startswith.(ts.column_groups.parameters, "target."))
+                @test isempty(intersect(ts.column_groups.latent, ts.column_groups.parameters))
+                @test all(0.5 .<= tbl[!, ts.column_groups.parameters[1]] .<= 3.0)
+                @test all(1.0 .<= tbl[!, ts.column_groups.parameters[2]] .<= 4.0)
+                # And the two spaces really differ, so one is not a copy of the other.
+                @test tbl[!, ts.column_groups.latent[1]] != tbl[!, ts.column_groups.parameters[1]]
+
+                # The manifest tells a consumer which columns are which, with no Julia needed.
+                man = TOML.parsefile(joinpath(ts.path, "manifest.toml"))
+                @test man["n_requested"] == 4
+                @test man["n_rows"] == 4
+                @test man["n_replicates"] == 2
+                # The default design is i.i.d. prior draws, not LHS.
+                @test man["design"] == "MonteCarloVariation"
+                @test Set(man["columns"]["latent"]) == Set(ts.column_groups.latent)
+                @test Set(man["columns"]["summaries"]) == Set(ts.column_groups.summaries)
+
+                # It is a Calibration like any other, so the usual read paths work on it.
+                @test ts.calibration isa Calibration
+                @test occursin("training-set", sprint(show, ts.calibration))
+                @test ModelManager.hasTag(ts.calibration, "mm:method")
+
+                @test_throws ArgumentError exportTrainingSet(prob; n=0)
             end
 
             @testset "StudySpec feeds both sensitivity and calibration" begin
@@ -6269,6 +6569,55 @@ end
 # longer renders the private API either, so ModelManager's own build would catch this too —
 # but only in CI's `docs` job, and only for names that exist. This runs with the ordinary
 # test suite and needs no docs build. See CLAUDE.md, "Docstring cross-references".
+# `docs/make.jl` runs with `checkdocs=:exports`, so every exported name must appear on a rendered
+# `docs/src/lib/*.md` page or `makedocs` terminates. That check lives only in CI's `docs` job, which
+# is the slowest possible place to learn you forgot a page — and forgetting one is easy, because a new
+# source file needs both the page and an entry in `make.jl`'s hand-maintained group list. This runs
+# with the ordinary suite and needs no docs build, exactly as the two docstring guards below do.
+@testset "every exported name's source file has a docs page" begin
+    src_dir  = joinpath(pkgdir(ModelManager), "src")
+    lib_dir  = joinpath(pkgdir(ModelManager), "docs", "src", "lib")
+    make_jl  = read(joinpath(pkgdir(ModelManager), "docs", "make.jl"), String)
+
+    #! The union of every `Pages = [...]` entry across the lib pages: the set of source files whose
+    #! public docstrings are actually rendered somewhere.
+    covered = Set{String}()
+    rendered_pages = String[]
+    for file in readdir(lib_dir)
+        endswith(file, ".md") || continue
+        text = read(joinpath(lib_dir, file), String)
+        #! A page only counts if `make.jl` lists it; an orphan page renders nothing.
+        occursin("\"$(file)\"", make_jl) || continue
+        push!(rendered_pages, file)
+        for m in eachmatch(r"Pages\s*=\s*\[([^\]]*)\]", text)
+            for jm in eachmatch(r"\"([^\"]+\.jl)\"", m.captures[1])
+                push!(covered, basename(jm.captures[1]))
+            end
+        end
+    end
+    @test !isempty(rendered_pages)
+
+    #! Where each exported name's docstring was written, which is the file `Pages` must name.
+    uncovered = Tuple{Symbol,String}[]
+    for name in names(ModelManager)
+        name === :ModelManager && continue
+        binding = Docs.Binding(ModelManager, name)
+        md = get(Docs.meta(ModelManager), binding, nothing)
+        isnothing(md) && continue
+        for (_, docstr) in md.docs
+            file = basename(String(docstr.data[:path]))
+            isempty(file) && continue
+            file in covered || push!(uncovered, (name, file))
+        end
+    end
+
+    isempty(uncovered) ||
+        @info "Exported names whose source file is on no rendered docs page " *
+              "(checkdocs=:exports will fail the docs build):\n" *
+              join(["  $(n) — src/.../$(f)" for (n, f) in sort(unique(uncovered))], "\n")
+    @test isempty(uncovered)
+end
+
 # Anything between a docstring and the definition it documents makes Julia drop the docstring
 # silently: it is simply absent from `Docs.meta`, with no warning at any point. A comment does it —
 # which the `#!` convention walks straight into, since a rationale comment naturally wants to sit

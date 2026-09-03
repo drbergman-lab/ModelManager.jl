@@ -48,7 +48,7 @@ export simulationsFromIDs
 export XMLPath
 export AbstractVariation, ElementaryVariation, DiscreteVariation, DistributedVariation, CoVariation, LatentVariation
 export UniformDistributedVariation, NormalDistributedVariation
-export GridVariation, LHSVariation, SobolVariation, RBDVariation
+export GridVariation, LHSVariation, MonteCarloVariation, SobolVariation, RBDVariation
 export AddGridVariationsResult, AddLHSVariationsResult, AddSobolVariationsResult, AddRBDVariationsResult
 export columnName, calculateGSA!
 export sqliteDataType

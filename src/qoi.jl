@@ -130,8 +130,14 @@ qoiName(q::QoI) = q.name
 #! Every consumer reaches a simulation by ID, so this is the one place that turns an ID into the object
 #! a user's `compute` expects. Keeping it in one function is what lets `compute` be written against
 #! `Simulation` rather than against whatever each consumer happens to pass.
-function _computeOn(q::QoI, sim_id::Integer)
-    sid = Int(sim_id)
+_computeOn(q::QoI, sim::Simulation) = _computeOn(q, sim.id, sim)
+
+_computeOn(q::QoI, sim_id::Integer) = _computeOn(q, Int(sim_id), nothing)
+
+#! `sim` is the already-constructed `Simulation` when a caller has one (the post-processing sink
+#! does), and `nothing` when only an ID is in hand. Splitting it this way keeps the stored-value
+#! lookup, which needs only the ID, ahead of any database round trip to build the object.
+function _computeOn(q::QoI, sid::Int, sim::Union{Nothing,Simulation})
     if q.stored !== :never
         v = _storedValue(q.name, sid)
         isnothing(v) || return v
@@ -140,7 +146,7 @@ function _computeOn(q::QoI, sim_id::Integer)
             "it. Run the trial with `post_processor` writing \"$(q.name)\" first, or use " *
             "`stored=:prefer` to fall back to computing it."))
     end
-    return q.compute(Simulation(sid))
+    return q.compute(isnothing(sim) ? Simulation(sid) : sim)
 end
 
 """
@@ -221,8 +227,28 @@ function _reduceOverMonad(q, monad_id::Integer)
     sim_ids = constituentIDs(Monad, Int(monad_id))
     isempty(sim_ids) && throw(ArgumentError(
         "Monad $(monad_id) has no simulations, so QoI \"$(qoiName(q))\" cannot be evaluated on it."))
-    return red([f(sid) for sid in sim_ids])
+    vals = [f(sid) for sid in sim_ids]
+    #! Checked BEFORE calling `red`, not by catching around it. A try/catch filtering on MethodError
+    #! cannot tell "`red` has no method for `vals`" from "`red` accepted `vals` and something one
+    #! frame deeper raised" — the motivating case proves it, since `mean(::Vector{Dict})` raises on
+    #! `/`, below `mean`. Catching around the call therefore reported a bug inside a user's own
+    #! `reduce` as `reduce` rejecting its argument. Anything `red` raises now propagates untouched.
+    if red === mean && !_meanApplicable(eltype(vals))
+        throw(ArgumentError("""
+        QoI "$(qoiName(q))": `compute` returned $(eltype(vals)), which the default `reduce=mean` \
+        cannot average, so the $(length(vals)) replicate value(s) of monad $(monad_id) cannot be \
+        combined. To report several named quantities, pass one QoI per quantity (a vector of QoIs) \
+        rather than one QoI whose `compute` returns a Dict; or give this QoI a `reduce` that \
+        accepts a Vector{$(eltype(vals))}."""))
+    end
+    return red(vals)
 end
+
+#! `mean` is `sum(vals) / length(vals)`, so it needs `+` on the element type and `/` by an `Int`.
+#! A non-concrete eltype is deliberately left alone — a heterogeneous `Vector{Any}` of numbers averages
+#! fine, and a false positive here would reject code that works today.
+_meanApplicable(::Type{T}) where {T} =
+    !isconcretetype(T) || (hasmethod(+, Tuple{T,T}) && hasmethod(/, Tuple{T,Int}))
 
 #! A bare `Function` keeps its existing contract exactly: it is called with a simulation *ID* and its
 #! replicates are averaged. Only a `QoI`'s `compute` receives a `Simulation`. Wrapping a plain function
@@ -246,24 +272,58 @@ qoiName(f::Function) = string(nameof(f))
 #! The three consumers differ in what they are handed and what they must return, so each gets its own
 #! adapter — but all of them go through `_qoiEvaluator`, so a `QoI` and a plain `Function` behave the
 #! same way everywhere. The adapters are internal: a user passes the `QoI` itself.
+#! A `CalibrationProblem` stores whatever it was handed rather than collapsing it to a function. The
+#! earlier version converted a `QoI` into a monad-level closure at construction, which threw away the
+#! per-simulation `compute` — so nothing downstream could evaluate the quantity on a single simulation
+#! even though the user had supplied exactly the object that knows how. Reversing the direction is not
+#! possible: a plain `summary_statistic` is called with a *monad ID* by contract and has no
+#! per-simulation decomposition inside it, so it cannot be wrapped into a `QoI`, whose `compute`
+#! receives one `Simulation`. Preserving and dispatching is what GSA's `functions=` already does.
 """
-    _asSummaryStatistic(x) → Function
+    _validateSummaryStatistic(x) → Function | QoI | Vector{QoI}
 
-Adapt a `QoI`, a vector of them, or an existing summary-statistic function for
-[`CalibrationProblem`](@ref), which calls it with a monad ID.
+Check that `x` can serve as a [`CalibrationProblem`](@ref)'s `summary_statistic` and return it in
+canonical form, unchanged in kind. Validation is eager — at construction, not at first evaluation —
+so a duplicate QoI name is reported before any simulation runs.
 """
-_asSummaryStatistic(f::Function) = f
+_validateSummaryStatistic(f::Function) = f
 
-_asSummaryStatistic(q::QoI) = _asSummaryStatistic([q])
+_validateSummaryStatistic(q::QoI) = q
 
-function _asSummaryStatistic(qs::AbstractVector{QoI})
+function _validateSummaryStatistic(qs::AbstractVector{QoI})
     isempty(qs) && throw(ArgumentError("A summary statistic needs at least one QoI."))
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one summary statistic; got $(names)."))
-    return (monad_id::Integer) -> Dict{String,Any}(
-        q.name => _reduceOverMonad(q, monad_id) for q in qs)
+    return collect(qs)
 end
+
+_validateSummaryStatistic(x) = throw(ArgumentError(
+    "A summary statistic must be a Function, a QoI, or a vector of QoIs; got $(typeof(x))."))
+
+"""
+    _evaluateSummary(ss, monad_id) → value
+
+Evaluate a [`CalibrationProblem`](@ref)'s `summary_statistic` on one monad. A plain `Function` is
+called with the monad ID; a `QoI` is reduced over the monad's simulations and reported under its name.
+"""
+_evaluateSummary(f::Function, monad_id::Integer) = f(monad_id)
+
+_evaluateSummary(q::QoI, monad_id::Integer) =
+    Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id))
+
+_evaluateSummary(qs::AbstractVector{QoI}, monad_id::Integer) =
+    Dict{String,Any}(q.name => _reduceOverMonad(q, monad_id) for q in qs)
+
+"""
+    _summaryQoIs(ss) → Vector{QoI}
+
+The QoIs behind a `summary_statistic`, or empty for a plain function. Empty means the quantity can
+only be evaluated per monad.
+"""
+_summaryQoIs(::Function) = QoI[]
+_summaryQoIs(q::QoI) = QoI[q]
+_summaryQoIs(qs::AbstractVector{QoI}) = collect(qs)
 
 #! No reducer here, and none possible: the hook fires once per simulation, so there is exactly one
 #! value and nothing to combine. A QoI's `reduce` is simply unused by the sink.
@@ -282,9 +342,10 @@ function _asPostProcessor(qs::AbstractVector{QoI})
     names = qoiName.(qs)
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one post-processor; got $(names)."))
+    #! `sp` already carries the `Simulation`, so pass it through rather than re-querying it by ID:
+    #! `_computeOn(q, sid)` would build a fresh one per QoI per simulation.
     return function (sp::SimulationProcess)
-        sid = simulationID(sp)
-        return Dict{String,Any}(q.name => _computeOn(q, sid) for q in qs)
+        return Dict{String,Any}(q.name => _computeOn(q, sp.simulation) for q in qs)
     end
 end
 

@@ -3635,3 +3635,204 @@ the bundle is checked to actually reach the simulator hook rather than only to p
 `run`'s *own* docstring and its definition, detaching documentation I had not written. Worth noting because
 the previous three were all comments I had placed above my own functions.
 
+## 2026-08-31 — Training-set export (item 8, first increment)
+
+`exportTrainingSet(problem; n)` simulates a space-filling design over the problem's priors and writes
+the parameters and their summary statistics as a table. Offline training on one fixed pre-simulated
+design is the documented recommendation for expensive simulators, so this is the happy path rather than
+a compromise.
+
+**Three of the four column groups existed only in process.** The CDF design matrix is dropped by
+`createTrial`, and `summary_statistic`'s output is consumed by `distance` on the very next line and never
+stored. So this is a persistence change more than a formatting one.
+
+**CSV plus TOML, no new dependency.** It is the shape the calibration folder already uses, and Python
+BayesFlow, `NeuralEstimators.jl` and `InvertibleNetworks.jl` can all read it. `.npz` or HDF5 would each
+cost a dependency for no gain at this size.
+
+**`LHSVariation` only, against the plan's `Union{LHSVariation,SobolVariation}`.** Only those two carry a
+`cdfs` field, but Sobol's is `(latent, sample, design_matrix)` with `variation_ids` shaped
+`(n, n_matrices)`: its samples are structured into the A/B/AB matrices the index estimator needs, not a
+flat design. Flattening them mixes those roles, which is a modelling decision rather than a formatting
+one, so it is deferred rather than guessed at.
+
+**A real bug the test caught.** For a `DistributedVariation`, `latent_parameter_names` and
+`_displayColumns` are *both* `[variationName(dv)]` — identical. Merging the two groups into one row by
+name therefore dropped every CDF column silently, leaving the target value under the latent column's
+name. The failing assertion was `0 < cdf < 1`, on a column that actually held a value in `[0.5, 3.0]`.
+Columns are now prefixed `cdf.`, `target.` and `summary.`, which fixes it and tells a consumer which
+space a column is in without consulting the manifest; a duplicate-name guard covers any future collision.
+
+**Not done, and deliberately so:** the time-boxed spike. Its deliverable is a written verdict on whether
+a pure-Julia neural-posterior-estimation package can replace the Python bridge, produced in a scratch
+environment with no dependency added here. That is an experiment, not code, and it needs this export to
+exist first — which it now does.
+
+### The docs build caught what the test suite should have
+
+CI's `docs` job failed on `#45`: `2 docstrings not included in the manual` — `TrainingSet` and
+`exportTrainingSet`. `docs/make.jl` runs with `checkdocs=:exports`, so an exported name that appears on
+no rendered page terminates `makedocs`. I had added `docs/src/lib/study.md` and `qoi.md` for the two
+previous new files and simply forgot the third.
+
+CLAUDE.md already says the docs build should not be the guard, because it runs only in CI's slowest job
+— and that was written about `@ref` targets, where a test now covers it. The same reasoning applies here
+and there was no test, so there is one now: it collects every `Pages = [...]` entry from the lib pages
+that `make.jl` actually lists, then checks each exported name's docstring source file against that set.
+
+**Two details it has to get right**, both learned from the failure rather than guessed. A page that
+exists but is missing from `make.jl`'s hand-maintained group list renders nothing, so the guard requires
+the filename to appear in `make.jl` — an orphan page must not count as coverage. And the file it compares
+is the one where the *docstring* was written, taken from `Docs.meta`, not where the binding happens to be
+defined.
+
+Verified by reproducing the exact mistake: dropping `training_set.md` from `make.jl` makes the guard fail
+and name both symbols and their source file. Restoring it goes green.
+
+### The BayesFlow API, settled
+
+Asked to stop hedging on this before merge, and rightly — the format depends on it. From BayesFlow's
+own v2 docs:
+
+- It takes a **dict of named, batch-first arrays**. v2 names parameters and data by convention rather
+  than positionally.
+- The conventional keys are **`inference_variables`** (the parameters to infer),
+  **`summary_variables`** (data passed through a summary network) and **`inference_conditions`** (data
+  passed straight to the inference network).
+- Offline training is **`workflow.fit_offline(data=..., epochs=..., batch_size=...)`**.
+- Set- or series-valued observations take shape `(n_simulations, n_observations, n_dim)`, with the
+  observation count **fixed across simulations**.
+
+Nothing here requires a space-filling design, and the CSV-plus-manifest format survives unchanged: each
+column becomes one named array. The manifest now records the group→role mapping directly, so a consumer
+does not infer it from prefixes.
+
+Two consequences worth having on the record. `cdf.*` is the better inference target of the two parameter
+groups — bounded in `(0,1)` and comparably scaled, where `target.*` may span orders of magnitude — with
+draws pushed back through the prior quantile to read them in model units. And the fixed-observation-count
+requirement means the set-valued shape is unavailable when replicate counts differ, which is exactly what
+a partial failure produces; `n_success` is the column that tells a consumer whether reshaping is safe.
+
+**`MonteCarloVariation` is now the default design for the export.** NPE's objective is an expectation
+under the prior and its calibration diagnostics assume independent joint draws; LHS has exactly matched
+marginals but dependent samples, which invalidates those rank statistics even for a perfect
+approximator. Trading away the tool that tells you whether to trust the network is a bad trade, so LHS is
+available but not the default here. `rand` can return exactly `0.0`, whose prior quantile is `-Inf` for an
+unbounded prior, so out-of-range entries are redrawn.
+
+**Both granularities are supported, and the default is the conservative one.** `:monad` combines
+replicates; `:simulation` writes one row per surviving replicate. The rule is to match the observed
+data: a network learns `q(θ|x)` for the x-distribution it saw, so training on replicate means and then
+conditioning on one noisy observation gives tight posteriors in the wrong place. `:simulation` is the
+statistically better choice for single-realization data, but `:monad` is the default because it works
+with any summary statistic.
+
+**`CalibrationProblem` no longer collapses a QoI into a function.** The `:simulation` path first tried
+to read the QoI off `problem.summary_statistic` and could not: the constructor called
+`_asSummaryStatistic`, which turned a `QoI` into a monad-level closure and discarded the per-simulation
+`compute`. My first fix was an explicit `qoi=` keyword, i.e. asking the user to pass the same object
+twice. That was papering over the actual defect.
+
+The question that killed it was whether the conversion should run the other way — wrap a plain function
+into a `QoI`. It cannot: a `QoI`'s `compute` is called with one `Simulation`, while a
+`summary_statistic` function is called with a *monad ID* by contract, and there is no per-simulation
+decomposition hiding inside a monad-level function to recover. (The same asymmetry is already noted in
+`qoi.jl` for GSA's `functions=`, where a bare function is simulation-level — so "plain Function" means
+different things in the two places, which is worth knowing before touching either.)
+
+So the fix is not to convert in either direction but **not to collapse at all**: the field is now
+`Union{Function,QoI,Vector{QoI}}`, holding whatever it was handed, with `_evaluateSummary` dispatching
+at the call site and `_summaryQoIs` exposing the QoIs to per-simulation consumers. Validation stays
+eager, so a duplicate QoI name is still caught at construction. This is the pattern GSA's `functions=`
+already used — calibration was the inconsistent one. The `qoi=` keyword is gone.
+
+Two things checked rather than assumed. The manifest's `summary_statistic` field is untyped, so storing
+a `QoI` there is a JLD2-compatible widening — verified by round-tripping one and calling
+`compute` after load, now a test rather than a scratch probe. And `_isAnonymousFunction` needed QoI
+methods: a QoI is restorable only if *both* its functions are named. `reduce` is the one that matters,
+since a named `compute` with an anonymous `reduce` would otherwise come back as a QoI that silently
+averages instead of doing the monad-level step it was written for.
+
+### What an adversarial audit of this PR turned up
+
+Ran a breakage audit over the whole diff plus the downstream package, then had every
+breaking/behaviour-change claim independently refuted rather than trusting the finder. 15 claims, 2
+refuted, and four of the survivors were real defects in code I had just written.
+
+**The reduce-error guard was reaching too far.** I had wrapped `red(vals)` in a `try/catch` that
+converted *any* `MethodError` into a friendly ArgumentError about the reducer's argument type. The
+filter is `e isa MethodError`, which cannot distinguish "`red` has no method for `vals`" from "`red`
+accepted `vals` and something one frame deeper raised" — and the motivating case proves the point,
+since `mean(::Vector{Dict})` raises on `/`, *below* `mean`. So a user whose own `reduce` had an
+internal type bug would be told, falsely, that `reduce` does not accept its input. The fix is to
+decide before calling: `_meanApplicable` asks whether the element type supports the `+` and `/` that
+`mean` needs, and only the default reducer is ever second-guessed. Anything `red` itself raises now
+propagates untouched, with its own backtrace. A non-concrete eltype is deliberately left alone — a
+heterogeneous `Vector{Any}` of numbers averages fine, and a false positive would reject working code.
+
+**`on_monad_failure` was accepted, validated, and then never read**, so `:error` behaved exactly like
+`:reject`: a caller asking to be told about a broken model got a warning and a short table. Now
+honoured before the row loop.
+
+**`n` and `design.n` could silently disagree.** `n` only ever built the *default* design;
+`addVariations` reads the count off the design itself, so `exportTrainingSet(prob; n=2000,
+design=LHSVariation(50))` simulated 50 sets while `manifest.toml` recorded 2000. Rather than pick a
+winner, the mismatch is now refused.
+
+**`simulation_id` was written but undocumented and outside the collision guard** — it was missing
+from `all_names`, so a summary key called `simulation_id` would have silently shadowed it. Also, a
+monad yielding no rows was skipped without being counted, so the closing warning under-reported.
+
+One behaviour change is intended and stays: a QoI-backed problem now writes a *restorable*
+`problem.jld2` where it previously wrote `nothing` plus a warning, because the QoI is no longer
+collapsed into an anonymous closure at construction. A calibration saved by an older version still
+holds `nothing` and will keep asking for `problem=` on resume; one saved by this version will not.
+
+**Downstream is fine, and I checked rather than assumed.** PCMM's full source compiles against this
+branch, and a `CalibrationProblem` built from its real `endpointPopulationCounts` works unchanged.
+The one failure — `ModelManager.packageName` no longer existing — reproduces *identically* against
+`origin/main`, so it is version drift PCMM already owed (it also still pins `ModelManager = "0.8"`
+against a `0.9.0` main), not anything this PR introduced.
+
+### Sobol admitted as a training design, and a correction to why it wasn't
+
+I had said Sobol's samples are "structured into the A/B/AB matrices the Sobol index estimator needs",
+so flattening them would mix roles. **That is wrong about this code.** `addVariations(::SobolVariation,
+...)` draws one `SobolSeq(d * n_matrices)` and slices it into `n_matrices` blocks; every column is a
+Sobol point pushed through the prior quantile, and no AB matrix is constructed or simulated here at
+all — the A/B/AB construction happens downstream in the estimator, which is why the GSA method asks
+for `n_matrices=2`. There was never a modelling decision to defer.
+
+I also overstated the statistics. The amortized-NPE objective is an expectation **against the prior
+measure**; what it requires is that the design *target the prior*, not that its points be
+independent. LHS gets there with matched marginals and lower variance than i.i.d.; Sobol gets there
+faster still, at the QMC rate. What would actually be wrong is changing the measure — training on a
+uniform box when the prior is Gaussian teaches the network the posterior under *that* prior — and
+none of these designs do that, since all push through the prior quantile. Independence matters for
+the **diagnostic** set: SBC's rank statistics assume i.i.d. draws from the joint, and stratified or
+low-discrepancy points break their null distribution. So: train on whatever explores best, hold out a
+`MonteCarloVariation` draw for SBC. MC stays the default only because it needs no power-of-two sizing
+and doubles as a valid SBC set — not because the others are worse for training.
+
+Two things the implementation turned up that reading alone would not have.
+
+**Sobol is restricted to `n_matrices == 1`.** The blocks are slices of one sequence, so in low
+dimension they are permutations of the same projection: measured, `SobolVariation(4; n_matrices=2)`
+over a single parameter yields **4** distinct coordinate values, not 8. With `use_previous=true` those
+collapse into fewer monads than rows were requested, silently. `SobolVariation(2n)` is both
+unambiguous and better distributed than two blocks of `n`.
+
+**Sobol can emit exact 0.0 and 1.0.** With `skip_start=false` the first point is the all-zeros corner
+and `include_one=true` appends the all-ones one — both map to prior endpoints, infinite for an
+unbounded prior. Unlike `MonteCarloVariation` it cannot redraw, being deterministic, so the guard now
+names `skip_start` and `include_one` instead of saying "this is a bug, please report it".
+
+The pairing is the part worth a test rather than an argument: Sobol stores cdfs as
+`(latent, n_matrices, sample)` while its `variation_ids` are `(sample, n_matrices)` — transposed — so
+flattening without swapping axes pairs every row with the wrong parameter set. Nothing downstream
+would notice, because `target.*` is derived from the same cdf column rather than read back. The test
+therefore checks each row against `getParameterValue` on the monad that actually ran.
+
+**RBD is dropped deliberately**: with its default `use_sobol=true` it is a Sobol draw plus a
+per-column `sortperm`, and the sorting is what makes it RBD, not the coordinates.
+
