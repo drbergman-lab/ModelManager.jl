@@ -3794,3 +3794,45 @@ The one failure — `ModelManager.packageName` no longer existing — reproduces
 `origin/main`, so it is version drift PCMM already owed (it also still pins `ModelManager = "0.8"`
 against a `0.9.0` main), not anything this PR introduced.
 
+### Sobol admitted as a training design, and a correction to why it wasn't
+
+I had said Sobol's samples are "structured into the A/B/AB matrices the Sobol index estimator needs",
+so flattening them would mix roles. **That is wrong about this code.** `addVariations(::SobolVariation,
+...)` draws one `SobolSeq(d * n_matrices)` and slices it into `n_matrices` blocks; every column is a
+Sobol point pushed through the prior quantile, and no AB matrix is constructed or simulated here at
+all — the A/B/AB construction happens downstream in the estimator, which is why the GSA method asks
+for `n_matrices=2`. There was never a modelling decision to defer.
+
+I also overstated the statistics. The amortized-NPE objective is an expectation **against the prior
+measure**; what it requires is that the design *target the prior*, not that its points be
+independent. LHS gets there with matched marginals and lower variance than i.i.d.; Sobol gets there
+faster still, at the QMC rate. What would actually be wrong is changing the measure — training on a
+uniform box when the prior is Gaussian teaches the network the posterior under *that* prior — and
+none of these designs do that, since all push through the prior quantile. Independence matters for
+the **diagnostic** set: SBC's rank statistics assume i.i.d. draws from the joint, and stratified or
+low-discrepancy points break their null distribution. So: train on whatever explores best, hold out a
+`MonteCarloVariation` draw for SBC. MC stays the default only because it needs no power-of-two sizing
+and doubles as a valid SBC set — not because the others are worse for training.
+
+Two things the implementation turned up that reading alone would not have.
+
+**Sobol is restricted to `n_matrices == 1`.** The blocks are slices of one sequence, so in low
+dimension they are permutations of the same projection: measured, `SobolVariation(4; n_matrices=2)`
+over a single parameter yields **4** distinct coordinate values, not 8. With `use_previous=true` those
+collapse into fewer monads than rows were requested, silently. `SobolVariation(2n)` is both
+unambiguous and better distributed than two blocks of `n`.
+
+**Sobol can emit exact 0.0 and 1.0.** With `skip_start=false` the first point is the all-zeros corner
+and `include_one=true` appends the all-ones one — both map to prior endpoints, infinite for an
+unbounded prior. Unlike `MonteCarloVariation` it cannot redraw, being deterministic, so the guard now
+names `skip_start` and `include_one` instead of saying "this is a bug, please report it".
+
+The pairing is the part worth a test rather than an argument: Sobol stores cdfs as
+`(latent, n_matrices, sample)` while its `variation_ids` are `(sample, n_matrices)` — transposed — so
+flattening without swapping axes pairs every row with the wrong parameter set. Nothing downstream
+would notice, because `target.*` is derived from the same cdf column rather than read back. The test
+therefore checks each row against `getParameterValue` on the monad that actually ran.
+
+**RBD is dropped deliberately**: with its default `use_sobol=true` it is a Sobol draw plus a
+per-column `sortperm`, and the sorting is what makes it RBD, not the coordinates.
+

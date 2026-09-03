@@ -4311,6 +4311,51 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test length(res.generations) == 1
             end
 
+            @testset "training-set accepts a Sobol design and pairs rows to the right monad" begin
+                # Sobol stores cdfs as (latent, n_matrices, sample) while its variation_ids are
+                # (sample, n_matrices) -- transposed axes. Flattening without swapping them pairs
+                # every row with the WRONG parameter set, and nothing downstream would notice,
+                # because target.* is derived from the same cdf column rather than read back from
+                # the database. So this checks the row against the monad's ACTUAL parameter value.
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                          _test_named_ss, mseDistance)
+                design = SobolVariation(8; skip_start=true)
+                ts = exportTrainingSet(prob; n=8, design=design,
+                                       description="sobol design", progress=:none)
+                waitForDiagnostics()
+
+                tbl = CSV.read(joinpath(ts.path, "training_set.csv"), DataFrame)
+                @test nrow(tbl) == 8
+                man = TOML.parsefile(joinpath(ts.path, "manifest.toml"))
+                @test man["design"] == "SobolVariation"
+
+                target_col = only(filter(startswith("target."), names(tbl)))
+                for row in eachrow(tbl)
+                    actual = getParameterValue(Monad(row.monad_id), :config, xp_x)
+                    @test row[target_col] ≈ actual
+                end
+                @test length(unique(tbl.monad_id)) == 8   # no monad claimed twice
+
+                # n_matrices > 1 is refused: the blocks are slices of ONE sequence, so in low
+                # dimension they repeat each other's points and you get fewer distinct parameter
+                # sets than rows asked for. Measured: SobolVariation(4; n_matrices=2) over a single
+                # parameter yields 4 distinct sets, not 8.
+                @test length(unique(vec(ModelManager.generateSobolCDFs(
+                    SobolVariation(4; n_matrices=2, skip_start=true), 1)))) == 4
+                @test_throws ArgumentError exportTrainingSet(
+                    prob; n=8, design=SobolVariation(4; n_matrices=2, skip_start=true),
+                    progress=:none)
+
+                # The all-zeros corner maps to a prior endpoint, and the error must say how to fix it.
+                err = try
+                    exportTrainingSet(prob; n=4, design=SobolVariation(4; skip_start=false),
+                                      progress=:none); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("skip_start", err.msg)
+            end
+
             @testset "training-set n_success counts successes, not simulations" begin
                 # A monad with one failed replicate must report 1, not 2: the column is the precision
                 # of that row's summary, and reporting the created count would overstate it.

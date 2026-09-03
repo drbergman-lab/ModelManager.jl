@@ -72,16 +72,35 @@ _flattenSummary(x, base::AbstractString="value") = throw(ArgumentError(
     "A summary statistic must flatten to numbers for a training set; got $(typeof(x)) at \"$(base)\". " *
     "Supported: Real, Bool, AbstractDict, AbstractVector and NamedTuple of those."))
 
-#! Why only these two designs, and not `SobolVariation` or `RBDVariation`: a training set's inputs are
-#! the CDF coordinates, so a design can only be used here if it hands them back. `AddLHSVariationsResult`
-#! and `AddMonteCarloVariationsResult` are the only ones carrying a flat `cdfs::Matrix{Float64}`.
-#! `AddRBDVariationsResult` has no `cdfs` field at all (only `variation_ids` and `variation_matrix`), so
-#! there is simply nothing to read. `AddSobolVariationsResult` does have one, but shaped
-#! `Array{Float64,3}` -- (latent, sample, design_matrix) -- because its samples are structured into the
-#! A/B/AB matrices the Sobol index estimator needs. The A and B matrices are honest prior draws and
-#! could be flattened into training rows; the AB matrices are column-swapped hybrids of them, so they
-#! are neither independent nor prior-distributed. Choosing which to keep is a modelling decision rather
-#! than a formatting one, so Sobol is left out until someone wants it and says which.
+#! Which designs are admissible, and why. A training set's inputs are the CDF coordinates, so a
+#! design qualifies only if it hands them back AND every column it hands back is an honest draw
+#! targeting the prior. `AddLHSVariationsResult` and `AddMonteCarloVariationsResult` carry a flat
+#! `cdfs::Matrix{Float64}`. `AddSobolVariationsResult` carries `Array{Float64,3}` sized
+#! `(latent, n_matrices, sample)` -- but that middle axis is not an A/B/AB role split: `addVariations`
+#! draws one `SobolSeq(d * n_matrices)` and slices it into `n_matrices` blocks, so *every* column is a
+#! Sobol point pushed through the prior quantile. (The A/B/AB construction for Sobol indices happens
+#! downstream in the estimator, which is why the GSA method asks for `n_matrices=2`.) Flattening is
+#! therefore a formatting step, not a modelling decision, and Sobol is admitted -- restricted to
+#! `n_matrices == 1`, because slices of one sequence repeat each other in low dimension.
+#!
+#! `RBDVariation` is deliberately excluded: with its default `use_sobol=true` it *is* a Sobol draw
+#! plus a per-column `sortperm`, and the sorting is what makes it RBD rather than anything the
+#! coordinates gain. Anyone wanting that point set can ask for `SobolVariation` directly.
+#!
+#! `GridVariation` has no `cdfs` field, so there is nothing to read.
+
+#! Number of parameter sets a design will actually produce. Sobol is restricted to `n_matrices == 1`
+#! (see the constructor check), so this is `d.n` for every admissible design.
+_designSampleCount(d::Union{LHSVariation,MonteCarloVariation,SobolVariation}) = d.n
+
+#! Flatten a design result to `(latent, sample)` in the SAME order as `vec(variation_ids)`, which is
+#! what pairs a row's coordinates with the monad that was run for it. Sobol stores
+#! `(latent, n_matrices, sample)` while its `variation_ids` are `(sample, n_matrices)`, so the two
+#! axes must be swapped before reshaping or every row is paired with the wrong parameter set.
+_designCDFMatrix(r::AddVariationsResult) = r.cdfs
+_designCDFMatrix(r::AddSobolVariationsResult) =
+    reshape(permutedims(r.cdfs, (1, 3, 2)), size(r.cdfs, 1), :)
+
 """
     exportTrainingSet(problem::CalibrationProblem; n, kwargs...) → TrainingSet
 
@@ -103,10 +122,34 @@ need simulation on demand.
 
 # Keywords
 - `n`: number of parameter sets.
-- `design`: `MonteCarloVariation(n)` by default — independent prior draws, because amortized neural
-  posterior estimation's objective is an expectation under the prior and its calibration diagnostics
-  assume independent joint draws. `LHSVariation(n; add_noise=true)` covers the space better per
-  simulation but makes those diagnostics invalid; pass it when coverage matters more.
+- `design`: `MonteCarloVariation(n)` by default. `LHSVariation(n)` and `SobolVariation(n)` are also
+  accepted, and for *training* they are not a compromise — they are usually better. What the
+  amortized-NPE objective requires is that the design **target the prior**, not that its points be
+  independent: it is an expectation against the prior measure, so any design whose empirical
+  distribution converges to the prior estimates it correctly. LHS gets there with matched marginals
+  and lower variance than i.i.d.; Sobol gets there faster still, at the QMC rate. All three push
+  through the prior quantile, so none of them changes the measure — which is the thing that would
+  actually be wrong, since training on a different measure teaches the network the posterior under
+  *that* prior.
+
+  Independence matters for the **diagnostic** set, not the training set. Rank-based calibration
+  checks (SBC) assume i.i.d. draws from the joint, and stratified or low-discrepancy points break the
+  null distribution of the ranks. So hold out a separate `MonteCarloVariation` draw for SBC and train
+  on whichever design explores best. `MonteCarloVariation` is merely the safe default: it needs no
+  power-of-two sizing and doubles as a valid SBC set.
+
+  Two practical notes. `MonteCarloVariation` redraws any coordinate that lands outside `(0, 1)`,
+  since `rand` can return exactly `0.0`, whose prior quantile is `-Inf` for an unbounded prior. Sobol
+  cannot redraw — it is deterministic — and its sequence includes the all-zeros corner unless
+  `skip_start` is set, so pass `SobolVariation(n; skip_start=true)`. `n_matrices` must be `1`: extra
+  matrices exist for the Sobol index estimator and are slices of a single sequence, so in low
+  dimension they repeat each other's points — `SobolVariation(4; n_matrices=2)` over one parameter
+  gives 4 distinct sets, not 8. Ask for `SobolVariation(2n)` rather than two matrices of `n`; it is
+  unambiguous and better distributed.
+
+  `RBDVariation` is not accepted: with its default `use_sobol=true` it is a Sobol draw plus a
+  per-column `sortperm`, and the sorting is what makes it RBD, not the coordinates. Ask for
+  `SobolVariation` directly.
 - `granularity`: `:monad` (default) writes one row per parameter set with the replicates combined;
   `:simulation` writes one row per surviving simulation.
 
@@ -159,7 +202,7 @@ ts   = exportTrainingSet(prob; n=2000)
 """
 function exportTrainingSet(problem::CalibrationProblem;
                            n::Integer,
-                           design::Union{LHSVariation,MonteCarloVariation}=MonteCarloVariation(Int(n)),
+                           design::Union{LHSVariation,MonteCarloVariation,SobolVariation}=MonteCarloVariation(Int(n)),
                            granularity::Symbol=:monad,
                            description::String="",
                            tags=(),
@@ -170,10 +213,23 @@ function exportTrainingSet(problem::CalibrationProblem;
     #! `n` only ever built the DEFAULT design; `addVariations` reads the count off the design itself.
     #! So an explicit `design` silently won, and `manifest.toml` recorded the ignored `n`. Rather than
     #! pick a winner, refuse the ambiguity.
-    design.n == n || throw(ArgumentError(
-        "exportTrainingSet: n=$(n) but `design` will draw $(design.n) samples. `n` is the shorthand " *
-        "for the default design, and the design's own n is what actually runs, so these must agree. " *
-        "Pass `design=$(nameof(typeof(design)))($(n))`, or set n=$(design.n)."))
+    _designSampleCount(design) == n || throw(ArgumentError(
+        "exportTrainingSet: n=$(n) but `design` will draw $(_designSampleCount(design)) parameter " *
+        "sets. `n` is the shorthand for the default design, and the design's own count is what " *
+        "actually runs, so these must agree. Set n=$(_designSampleCount(design))."))
+    #! `n_matrices > 1` exists for the Sobol index estimator, which needs its samples split into
+    #! blocks. A training set wants one well-distributed point set, and asking for blocks actively
+    #! hurts: the blocks are slices of ONE `SobolSeq(d * n_matrices)`, so in low dimension they are
+    #! permutations of the same projection -- measured, `SobolVariation(4; n_matrices=2)` over a
+    #! single parameter yields 4 distinct sets, not 8, and `use_previous=true` then collapses them
+    #! into fewer monads than rows were asked for. `SobolVariation(n * n_matrices)` is both
+    #! unambiguous and better distributed than the blocks it replaces.
+    design isa SobolVariation && design.n_matrices != 1 && throw(ArgumentError(
+        "exportTrainingSet: SobolVariation(n_matrices=$(design.n_matrices)) is not usable as a " *
+        "training design. Multiple matrices exist for the Sobol index estimator; they are slices " *
+        "of one sequence, and in low dimension they repeat each other's points, so you would get " *
+        "fewer distinct parameter sets than rows requested. Use " *
+        "`SobolVariation($(design.n * design.n_matrices))` instead."))
     granularity in (:simulation, :monad) || throw(ArgumentError(
         "granularity must be :simulation or :monad; got :$(granularity)."))
     #! A plain `summary_statistic` is called with a monad ID by contract, so it genuinely cannot be
@@ -200,13 +256,23 @@ function exportTrainingSet(problem::CalibrationProblem;
     cps = problem.parameters
     pv  = ParsedVariations(problem)
     result = addVariations(design, problem.inputs, pv, problem.reference_variation_id)
-    cdfs = result.cdfs                      # (latent dimension, sample)
-    variation_ids = result.variation_ids
+    cdfs = _designCDFMatrix(result)         # (latent dimension, sample)
+    variation_ids = vec(result.variation_ids)
 
     #! The design is the training input, so a coordinate outside the open unit interval would mean a
     #! prior quantile at an endpoint — an infinite parameter value for an unbounded prior. Caught here
     #! rather than as a strange row in the CSV.
+    #! Sobol genuinely can emit exact 0.0 and 1.0: with `skip_start=false` the first point is the
+    #! all-zeros corner, and `include_one=true` appends the all-ones one. Those map to prior
+    #! endpoints -- infinite parameter values for an unbounded prior -- so they must be caught, but
+    #! with advice rather than a "report this bug".
     all(0 .< cdfs .< 1) || throw(ArgumentError(
+        design isa SobolVariation ?
+        "The Sobol design produced CDF coordinates at exactly 0 or 1, which map to prior endpoints " *
+        "(an infinite value for an unbounded prior). The sequence includes the all-zeros corner " *
+        "unless `skip_start` is set, and the all-ones corner when `include_one=true`. Pass " *
+        "`SobolVariation($(design.n); n_matrices=$(design.n_matrices), skip_start=true)` and leave " *
+        "`include_one` unset." :
         "The design produced CDF coordinates outside (0, 1), which map to prior endpoints. " *
         "This is a bug in the sampling design; please report it."))
 
