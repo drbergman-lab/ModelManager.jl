@@ -290,6 +290,12 @@ Return `true` if `f` is an anonymous function or compiler-generated closure
 """
 _isAnonymousFunction(f::Function) = startswith(string(nameof(f)), "#")
 
+#! A `QoI` is only as restorable as the two functions inside it, so it is anonymous if either is. Both
+#! are checked: a named `compute` with an anonymous `reduce` would round-trip as a QoI that silently
+#! averages instead of doing the monad-level step it was written for.
+_isAnonymousFunction(q::QoI) = _isAnonymousFunction(q.compute) || _isAnonymousFunction(q.reduce)
+_isAnonymousFunction(qs::AbstractVector{QoI}) = any(_isAnonymousFunction, qs)
+
 ################## Row conversion: CDF coords → display values ##################
 
 """

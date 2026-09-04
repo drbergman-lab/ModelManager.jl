@@ -19,13 +19,23 @@ A [`CalibrationProblem`](@ref) bundles the model, the parameters to infer, the d
 to compare:
 
 ```julia
-using Distributions
+using Distributions, CSV, DataFrames
 
 # Fix non-calibrated parameters via a reference monad (n_replicates=0 just records the IDs).
 ref = createTrial(inputs, DiscreteVariation(:config, XMLPath(["overall","max_time"]), 120.0);
                   n_replicates=0)
 
-observed = Dict("default" => 100.0)
+# Your own per-simulation measurement: reach into this simulation's output and return a number.
+# Parsing raw output is the backend's job, so in practice you would call the loader your simulator
+# package provides (keyed by `simulationID`); this reads a summary file the simulator wrote.
+function measureTumor(sim::Simulation)
+    counts = joinpath(pathToOutputFolder(sim), "final_cell_counts.csv") |> CSV.File |> DataFrame
+    return Float64(only(counts[counts.cell_type .== "tumor", :count]))
+end
+
+# One quantity, so `observed` is the bare value that quantity should match. Use a vector of QoIs
+# with a `Dict` of observations when you are comparing several named quantities at once.
+observed = 100.0
 
 # The parameter to infer (a rate, say), addressed by its XMLPath.
 xml_path = XMLPath(["cell_definitions", "cell_definition:name:tumor", "phenotype", "death", "rate"])
@@ -34,7 +44,7 @@ problem = CalibrationProblem(
     ref,                                              # base inputs + fixed parameters
     [DistributedVariation(:config, xml_path, Uniform(1e-7, 1e-4))],  # parameters to infer
     observed,                                         # observed data
-    monad_id -> summarize(monad_id),                 # summary statistic
+    QoI("tumor", measureTumor),                       # summary statistic, per simulation
     mseDistance,                                      # distance function
 )
 ```
@@ -46,8 +56,13 @@ The parameters can be any mix of [`DistributedVariation`](@ref),
 
 Two functions you supply:
 
-- **`summary_statistic`** — `monad_id -> T`. Called once per proposed particle; you decide how
-  to aggregate over the monad's replicate simulations (average, pick one, etc.).
+- **`summary_statistic`** — a [`QoI`](@ref), or a vector of them. Each QoI's `compute` is called
+  once per *simulation* with a [`Simulation`](@ref), and its replicates are combined by that QoI's
+  `reduce` (`mean` by default — pass `reduce=` for anything else, and note it receives every
+  replicate's value, so a step that must happen *after* averaging goes there). A single QoI reports
+  its value directly; a vector reports a `Dict` keyed by QoI name. A bare function is refused: it
+  used to be called once per *monad* and aggregate however it liked, and the two cannot be told
+  apart automatically.
 - **`distance`** — `(simulated, observed) -> Float64`. The built-in [`mseDistance`](@ref)
   handles `Dict`, `Vector`, and scalar inputs; supply your own for anything else.
 

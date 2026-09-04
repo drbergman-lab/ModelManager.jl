@@ -46,12 +46,19 @@ SimulationProcess(simulation::Simulation, monad_id::Int, process, success::Bool)
     SimulationProcess(simulation, monad_id, process, success, nothing)
 
 """
+    simulationID(simulation::Simulation)
     simulationID(simulation_process::SimulationProcess)
 
-Return the ID of the simulation this process ran. Accessor for use inside a `post_processor`
-(see [`run`](@ref)) so users need not reach into `simulation_process.simulation.id`.
+Return a simulation's ID.
+
+A `post_processor` (see [`run`](@ref)) is called with a [`Simulation`](@ref), so that is the form to
+use in one — `simulationID(sim)` rather than reaching for `sim.id`. The `SimulationProcess` method
+serves the runner and the `AbstractSimulator` hooks
+([`postSimulationProcessing`](@ref), [`postSimulationCleanup`](@ref)), which still receive that type.
 """
 simulationID(simulation_process::SimulationProcess) = simulation_process.simulation.id
+
+simulationID(simulation::Simulation) = simulation.id
 
 """
     monadID(simulation_process::SimulationProcess)
@@ -392,9 +399,12 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   **successfully completed** simulation, after the simulator's non-destructive
   [`postSimulationProcessing`](@ref) and before its destructive [`postSimulationCleanup`](@ref)
   — so the callback always sees the intact (but processed) output folder.
-  It is called as `post_processor(simulation_process::SimulationProcess)`. Use the accessors
-  [`simulationID`](@ref), [`monadID`](@ref), [`wasSuccessful`](@ref), and
-  [`pathToOutputFolder`](@ref)`(simulation_process)` to access these fields;
+  It is called as `post_processor(simulation::Simulation)` — the same argument a [`QoI`](@ref)'s
+  `compute` receives, so one measurement function serves the sink, sensitivity analysis and
+  calibration alike. A [`QoI`](@ref) or a vector of them may be passed instead of a function. Use
+  [`simulationID`](@ref) and [`pathToOutputFolder`](@ref)`(simulation)` rather than reaching into
+  fields; the hook only fires for simulations that succeeded, and the owning monad is
+  `only(monadIDs(simulation))` (which queries the database, and throws if the simulation is gone);
   reading the actual simulation output into usable data is the responsibility of the user
   or the simulator package (e.g. PhysiCellModelManager loaders keyed by `simulationID`).
   Its return value determines storage:
@@ -644,7 +654,10 @@ function processSimulationTask(simulation_task; post_processor::Union{Nothing,Fu
               () -> postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...))
     qoi = nothing
     if !isnothing(post_processor) && simulation_process.success
-        qoi = _runStage(:post_processor, sid, () -> post_processor(simulation_process))
+        #! The user's callback takes a `Simulation`; the adapter no longer re-wraps it back into
+        #! something that accepts a `SimulationProcess`, so the field is read here instead.
+        qoi = _runStage(:post_processor, sid,
+                        () -> post_processor(simulation_process.simulation))
     end
     _runStage(:postSimulationCleanup, sid,
               () -> postSimulationCleanup(mm_globals().simulator, simulation_process; kwargs...))

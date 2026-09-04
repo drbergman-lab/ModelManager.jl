@@ -26,14 +26,16 @@ Because your callback runs *before* cleanup, it always sees the intact (but proc
 folder:
 
 ```julia
-run(sampling; post_processor = sp -> (; final_count = countCells(simulationID(sp))))
+run(sampling; post_processor = sim -> (; final_count = countCells(simulationID(sim))))
 ```
 
 ## The callback signature
 
-The callback receives a [`SimulationProcess`](@ref). Use the accessors
-[`simulationID`](@ref), [`monadID`](@ref), [`wasSuccessful`](@ref), and
-[`pathToOutputFolder`](@ref)`(sp)` rather than reaching into its fields. Reading the actual
+The callback receives a [`Simulation`](@ref) — the same thing a [`QoI`](@ref)'s `compute` receives,
+so one measurement function works in the sink, in sensitivity analysis, and in calibration alike.
+Use [`simulationID`](@ref) and [`pathToOutputFolder`](@ref) rather than reaching into its fields.
+The hook only fires for simulations that succeeded, and the owning monad is available as
+`only(monadIDs(sim))` if you need it. Reading the actual
 simulation output into usable data is the backend's job — expect your simulator package to
 provide loaders keyed by `simulationID`.
 

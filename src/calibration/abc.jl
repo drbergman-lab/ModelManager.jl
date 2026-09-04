@@ -214,7 +214,7 @@ function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_
         "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
         "they would have produced is missing."
     distance = try
-        simulated = problem.summary_statistic(monad_id)
+        simulated = _evaluateSummary(problem.summary_statistic, monad_id)
         problem.distance(simulated, problem.observed_data)
     catch
         @error """
@@ -624,7 +624,7 @@ struct _ProblemManifest
     observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID
-    summary_statistic          # named Function or nothing (anonymous/not restorable)
+    summary_statistic          # QoI(s) with named functions, or nothing (not restorable)
     distance                   # named Function or nothing (anonymous/not restorable)
 end
 
@@ -659,6 +659,11 @@ without re-supplying the original problem — i.e. neither `summary_statistic` n
 """
 function _isCompleteManifest(manifest::_ProblemManifest)
     isnothing(manifest.summary_statistic) && return false
+    #! A calibration saved before summary statistics became QoIs stored a bare `Function` here.
+    #! Treating that as incomplete routes it to the existing "re-supply the problem via `problem=`"
+    #! message instead of a raw `MethodError` from the `CalibrationProblem` constructor -- and there
+    #! is no version row to gate on, so the shape of the value is the only signal available.
+    manifest.summary_statistic isa Union{QoI,Vector{QoI}} || return false
     isnothing(manifest.distance)          && return false
     any(s -> s isa _StrippedLVSource, manifest.sources) && return false
     return true
