@@ -82,6 +82,20 @@ const _last_stray_sweep = Ref{UInt64}(0)
 _elapsedSeconds(since::UInt64) = (time_ns() - since) / 1e9
 
 """
+    _isStale(since::UInt64, ttl::Real) → Bool
+
+Whether something last done at `since` (a `time_ns()` stamp) is older than `ttl` seconds, treating
+`0` as "never done" and therefore always stale.
+
+The zero case is the whole point. `time_ns()` counts from an arbitrary epoch -- in practice, boot --
+so a zero-initialised stamp does *not* read as "long ago"; `_elapsedSeconds(0)` is the machine's
+uptime. Comparing it against a TTL means a freshly booted host silently skips the first sweep or
+refresh of the session, for up to `ttl` after start. A developer's long-lived laptop never sees it;
+a CI runner, a container, or a rebooted login node does.
+"""
+_isStale(since::UInt64, ttl::Real) = since == 0 || _elapsedSeconds(since) >= ttl
+
+"""
     _currentUser() → String
 
 Username to pass to `squeue -u`. Prefers `\$USER`, falling back to `id -un`; warns once if neither
@@ -164,11 +178,11 @@ function _queueSnapshot()
     reap = mm_globals().hpc_completion.reap_interval
     ttl(s) = isnothing(s.jobs) ? min(_FAILED_QUERY_TTL_S, reap) : reap
     snap = _queue_snapshot[]
-    _elapsedSeconds(snap.taken_at) < ttl(snap) && return snap
+    _isStale(snap.taken_at, ttl(snap)) || return snap
     trylock(_queue_lock) || return snap
     try
         snap = _queue_snapshot[]
-        _elapsedSeconds(snap.taken_at) < ttl(snap) && return snap
+        _isStale(snap.taken_at, ttl(snap)) || return snap
         started = time_ns()
         snap = _QueueSnapshot(started, _squeueUserJobs())
         _queue_snapshot[] = snap
@@ -260,7 +274,7 @@ is safe.
 """
 function _sweepStraysIfDue(done_dir::String)
     opts = mm_globals().hpc_completion
-    _elapsedSeconds(_last_stray_sweep[]) < opts.reap_interval && return
+    _isStale(_last_stray_sweep[], opts.reap_interval) || return
     _last_stray_sweep[] = time_ns()
     max_age = max(4 * opts.grace_period, 3600.0)
     try

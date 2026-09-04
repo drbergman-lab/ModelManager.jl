@@ -6338,7 +6338,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 timedwait(() -> isfile(log) && count(!isempty, readlines(log)) >= nth, 10.0) === :ok ||
                     error("submission $(nth) never reached sbatch")
                 argv = filter(!isempty, readlines(log))[nth]
-                m = match(r"mv \"([^\"]+)\.tmp\" \"\1\"", argv)
+                # The wrap binds the path once, single-quoted, then the trap refers to the variable.
+                m = match(r"mm_sentinel='([^']*)'", argv)
                 isnothing(m) && error("no sentinel path in sbatch argv: $(argv)")
                 return String(m.captures[1])
             end
@@ -6372,9 +6373,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _next_job!(9101)
                 touch(joinpath(shim, "squeue.fail"))
                 tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:3]
-                sleep(0.5)
-                @test _calls("squeue.log") > 1                  # the reaper kept trying
-                @test all(!istaskdone(t) for t in tasks)        # and concluded nothing
+                @test timedwait(() -> _calls("squeue.log") >= 2, 15.0) === :ok   # the reaper kept trying
+                @test all(!istaskdone(t) for t in tasks)        # and concluded nothing from failures
                 for n in 1:3
                     _publish(0; nth=n)
                 end
@@ -6433,8 +6433,12 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _next_job!(9400)
                 _queue!(9400:9419...)
                 tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:20]
-                sleep(0.6)                                       # ~6 intervals; per-job polling would be hundreds
-                @test 3 <= _calls("squeue.log") <= 9
+                # Wait for the reaper to have refreshed a few times, rather than sleeping a fixed
+                # span and asserting a rate -- the rate depends on machine load, and the invariant
+                # under test does not. Over this window 20 workers poll ~dozens of times each; if
+                # each queried the scheduler itself that would be hundreds of calls.
+                @test timedwait(() -> _calls("squeue.log") >= 3, 15.0) === :ok
+                @test _calls("squeue.log") < 20                  # one per job would be >= 20
                 for n in 1:20
                     _publish(0; nth=n)
                 end
@@ -6508,6 +6512,16 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 setHPCCompletionOptions(poll_interval=0.02)
             end
 
+            @testset "staleness treats a zero stamp as never, not as uptime-ago" begin
+                # `time_ns()` counts from boot, so `_elapsedSeconds(0)` is the machine's uptime.
+                # Comparing that against a TTL makes a freshly booted host skip its first sweep or
+                # refresh -- invisible on a long-lived laptop, caught by CI. Pin the semantics here
+                # rather than in a test whose outcome depends on how long the machine has been up.
+                @test MM._isStale(UInt64(0), 3600.0)                     # never done => due
+                @test !MM._isStale(time_ns(), 3600.0)                    # just done => not due
+                @test MM._isStale(time_ns() - UInt64(2_000_000_000), 1.0)  # 2s ago, 1s ttl => due
+            end
+
             @testset "stale strays are swept once per reap interval; fresh ones are left alone" begin
                 _reset_hpc!()
                 setHPCCompletionOptions(reap_interval=3600.0)
@@ -6518,7 +6532,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     write(f, "0")
                 end
                 run(`touch -t 202001010000 $(old_tmp) $(old_sentinel)`)
-                MM._sweepStraysIfDue(done_dir)                    # due: _last_stray_sweep is 0
+                MM._sweepStraysIfDue(done_dir)                    # due: _last_stray_sweep is 0 = never
                 @test !isfile(old_tmp)
                 @test !isfile(old_sentinel)
                 @test isfile(fresh_tmp)                           # a live job may still be about to mv this
@@ -6606,6 +6620,45 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                     @test !isfile(sentinel * ".tmp")                        # staged name did not leak
                     rm(sentinel; force=true)
                 end
+            end
+
+            @testset "the sentinel path is shell-quoted, not interpolated" begin
+                # `done_dir` is user-settable and the trap body is re-parsed by the shell when it
+                # fires, so a path interpolated into double quotes there would expand `$VAR` and
+                # backticks and break on a `"`. Bind-once-single-quoted makes every path literal.
+                @test MM._shQuote("/tmp/plain") == "'/tmp/plain'"
+                @test MM._shQuote("/a b") == "'/a b'"
+                @test MM._shQuote(raw"/a$USER") == raw"'/a$USER'"
+                @test MM._shQuote("/it's") == raw"'/it'\''s'"
+                hostile = ["plain", "has space", raw"dollar$USER", "quote\"d", raw"back`tick`",
+                           raw"it's", "semi;rm -rf x"]
+                for shell in ("sh", "dash")
+                    Sys.which(shell) === nothing && continue
+                    for name in hostile
+                        dir = mktempdir(); target = joinpath(dir, name)
+                        wrap = MM._sentinelWrap("exit 7", target)
+                        script = joinpath(dir, "job.sh"); write(script, "#!/bin/sh\n$(wrap)\n")
+                        pr = run(ignorestatus(`$shell $script`))
+                        @test pr.exitcode == 7                       # status still the job's
+                        @test isfile(target)                         # written to the literal path
+                        @test strip(read(target, String)) == "7"
+                    end
+                end
+            end
+
+            @testset "sbatch option values may be any type and are never quoted" begin
+                # sbatch_options is Dict{String,Any}: a numeric value is ordinary, and each flag is
+                # one argv element, so added quotes would reach sbatch as part of the value.
+                setJobOptions(Dict("cpus-per-task" => 4, "comment" => "two words"))
+                flags = collect(MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "s")).exec)
+                @test "--cpus-per-task=4" in flags
+                @test "--comment=two words" in flags                 # one argv element, no quotes
+                # Only the option flags: --wrap legitimately contains quotes of its own.
+                opts = filter(f -> startswith(f, "--cpus-per-task=") || startswith(f, "--comment="), flags)
+                @test length(opts) == 2
+                @test !any(f -> occursin("\"", f), opts)
+                delete!(mm_globals().sbatch_options, "cpus-per-task")
+                delete!(mm_globals().sbatch_options, "comment")
             end
 
             @testset "sbatch options cannot claim reserved flags" begin

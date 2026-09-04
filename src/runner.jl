@@ -73,6 +73,15 @@ function prepCmdForWrap(cmd::Cmd)
 end
 
 """
+    _shQuote(s::AbstractString) → String
+
+Wrap `s` in POSIX single quotes so the shell reads it as a literal, escaping any single quotes it
+contains via the standard `'\\''` idiom. Nothing inside single quotes is expanded, so a path
+containing `\$`, a backtick, a double quote, or a space survives intact.
+"""
+_shQuote(s::AbstractString) = "'" * replace(s, "'" => "'\\''") * "'"
+
+"""
     _sentinelWrap(cmd_str::AbstractString, sentinel::String) → String
 
 Prefix `cmd_str` with a shell trap that records the command's exit code at `sentinel` when the job
@@ -80,8 +89,14 @@ script exits.
 
 The trap writes to `<sentinel>.tmp` and `mv`s it into place. That rename is atomic, so the waiting
 worker only ever sees a sentinel whose contents are already complete. The path is fixed before
-submission -- the trap needs no `\$SLURM_JOB_ID` and nothing about the job's identity -- which is
-what makes the name unique per submission and the wait race-free.
+submission -- the trap needs nothing about the job's identity -- which is what makes the name unique
+per submission and the wait race-free.
+
+The path is bound to a shell variable, single-quoted, *before* the trap is installed, and the trap
+body then refers only to that variable. Interpolating the path into the trap body directly would
+put it inside double quotes in code that is re-parsed when the trap fires, so a `done_dir`
+containing `\$`, a backtick or a `"` would be expanded or would break the quoting -- and `done_dir`
+is user-settable. Binding it once means exactly one thing needs escaping, by exactly one rule.
 
 Only `EXIT` is trapped, not `TERM`. A job killed by the scheduler produces no sentinel at all, and
 that is already handled correctly: it leaves the queue, the reaper notices, and after the grace
@@ -89,9 +104,9 @@ period the simulation is failed. Trapping signals would make that detection fast
 it more correct, at the cost of shell that has to be right under every `sh`.
 """
 function _sentinelWrap(cmd_str::AbstractString, sentinel::String)
-    @assert !occursin('\'', sentinel) "The HPC sentinel path must not contain a single quote: $(sentinel)"
-    trap_body = "mm_ec=\$?; echo \$mm_ec > \"$(sentinel).tmp\" && mv \"$(sentinel).tmp\" \"$(sentinel)\""
-    return "trap '$(trap_body)' EXIT; $(cmd_str)"
+    bind = "mm_sentinel=$(_shQuote(sentinel))"
+    trap_body = "mm_ec=\$?; echo \$mm_ec > \"\${mm_sentinel}.tmp\" && mv \"\${mm_sentinel}.tmp\" \"\${mm_sentinel}\""
+    return "$(bind); trap '$(trap_body)' EXIT; $(cmd_str)"
 end
 
 """
@@ -107,10 +122,11 @@ function _userJobFlags(simulation_id::Int)
         if typeof(v) <: Function
             v = v(simulation_id)
         end
-        if occursin(" ", v)
-            v = "\"$v\""
-        end
-        push!(flags, "--$k=$v")
+        #! `sbatch_options` is a `Dict{String,Any}`, so a numeric value like
+        #! `"cpus-per-task" => 4` is ordinary; stringify rather than assuming `AbstractString`.
+        #! A value containing a space needs no quoting: each flag is one argv element, so no shell
+        #! ever word-splits it, and added quotes would reach sbatch as part of the value.
+        push!(flags, "--$k=$(v)")
     end
     return flags
 end
