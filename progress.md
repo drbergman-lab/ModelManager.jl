@@ -188,8 +188,25 @@ This predates the branch and applies to any throwing simulator hook, but #47 mak
 reachable: the two `ArgumentError`s guarding the `simulationCommand` contract (an environment on the
 `Cmd`, or a `pipeline`) fire on the *first* simulation of a run. Both are backend programming
 errors that a simulator author hits once and fixes, so the stranded rows are collateral from a
-run that was never going to work — but the recovery is non-obvious, and worth fixing where the
-runner's error handling lives rather than in the HPC path. Raised by a parallel review session.
+run that was never going to work — but the recovery is non-obvious. Raised by a parallel review
+session, then sharpened in discussion:
+
+- **The bug surface is a message, not the status.** A re-run prints "ModelManager found matching
+  simulations and will save you time by not re-running them!" (`runner.jl:529`) about simulations
+  that never ran. That is what makes it silent.
+- **`"Failed"` is the honest status, and does not need subdividing** — but it is skipped by the same
+  `isStarted` line, so it does not make the work re-runnable either. Only `"Not Started"` does, and
+  MM has no "retry this simulation" notion at all. Those are two different goals; conflating them
+  is what made the first framing of this confused.
+- **Not via `simulationFailed`.** It also erases the simulation from its monad and calls
+  `deleteMonad(...; delete_supers=true)` when it was the last one, so using it for an abort would
+  destroy trial structure across the run. The real question is not the status name but whether
+  constituent erasure happens — for an abort it should not, since nothing about the
+  parameterization failed.
+
+Deferred rather than bolted onto #47: it is runner error-handling work, and simulations genuinely
+in flight on SLURM keep running and keep writing sentinels, so the choice must not invite duplicate
+submission. Recorded in CLAUDE.md's To-dos.
 
 ### Known limits
 - NFS caches directory attributes (`acdirmin`/`acdirmax`, 30 s/60 s), so a sentinel written on a
