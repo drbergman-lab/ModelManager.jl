@@ -226,9 +226,12 @@ A backend only overrides this if its simulation is not an external process; for 
 simulation; that is recorded as a failed simulation and the rest of the trial continues.
 
 Otherwise the command must be a bare `Cmd`. Redirections and pipelines are added here, so a
-`pipeline(...)` is rejected; and it must not carry an environment (`setenv`/`addenv`), because Julia's `Cmd.env`
-*replaces* the environment while `sbatch --export` extends it -- the two paths would silently
-disagree. Put what the simulation needs in the command's arguments or its working directory.
+`pipeline(...)` is rejected; and it must not carry an environment (`Cmd(...; env=...)`, `setenv`,
+`addenv`). Julia's `Cmd.env` *replaces* the environment, so locally the simulation would see only
+the variables listed; as a SLURM job the environment is not forwarded at all and the job inherits
+the submitting one. The same command would mean two different things, so it is refused rather than
+made silently path-dependent. Put what the simulation needs in the command's arguments or its
+working directory.
 
 A local process that fails to start (missing executable, unwritable folder) is recorded as a failed
 simulation, not raised: one broken simulation should not abort a campaign of thousands. A process
@@ -246,11 +249,13 @@ function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
     #! what happens without it. Say so, because the fix is a deletion and the generic message would
     #! send someone looking for a way to pass variables they never needed to pass.
     isnothing(cmd.env) || throw(ArgumentError("""
-        simulationCommand returned a Cmd carrying an environment, which ModelManager cannot honour \
-        consistently: Julia's `Cmd.env` *replaces* the environment locally, while `sbatch --export` \
-        *extends* it, so the local and cluster paths would silently disagree.
+        simulationCommand returned a Cmd carrying an environment, which ModelManager cannot apply \
+        the same way on both paths. Locally, Julia's `Cmd.env` *replaces* the environment, so the \
+        simulation would see only the variables listed -- no PATH, no HOME, no module state. As a \
+        SLURM job the environment is not forwarded at all: the job inherits the submitting one. So \
+        the same command would mean two different things depending on where it ran.
         If you wrote `env=ENV`, delete it -- a child process inherits the environment anyway, so \
-        removing it changes nothing locally and matches what the cluster already did.
+        removing it changes nothing locally, and it never reached the cluster to begin with.
         If you need specific variables, put them in the command's arguments or its working directory."""))
     simulation_id = spec.simulation.id
     folder = trialFolder(Simulation, simulation_id)

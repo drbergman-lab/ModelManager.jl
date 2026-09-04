@@ -6628,7 +6628,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test occursin("trap ", wrap)
                 @test occursin(sentinel, wrap)
                 @test endswith(wrap, "echo hello")
-                # A Cmd carrying its own dir is honoured, the same as the local path does.
+                # A Cmd carrying its own dir is honored, the same as the local path does.
                 flags2 = collect(MM._prepareHPCSubmitCommand(Cmd(`echo hi`; dir="/tmp"), sim.id, sentinel).exec)
                 @test "--chdir=/tmp" in flags2
             end

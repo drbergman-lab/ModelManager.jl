@@ -95,7 +95,7 @@ Two things that comparison changed:
   the runner and the concurrency limit, so it should own the wait. The cost is that a function
   named `prepare…` blocks for the length of a simulation, which is a lie the docstring states
   outright and which is paid back in v0.9.0, where the major bump forces every simulator package
-  to change its compat entry anyway and `prepareHPCCommand` is removed in favour of
+  to change its compat entry anyway and `prepareHPCCommand` is removed in favor of
   `runHPCSimulation`.
 
   **Residual risk, unverified:** if PCMM reads anything off `SimulationProcess.process` beyond
@@ -110,7 +110,7 @@ Two things that comparison changed:
 ### Second pass (v0.9.0): the maintainer asked for simpler, and dropped the compat requirement
 
 The worry, verbatim: "I still worry this is over-engineered and we're missing a simpler solution."
-With backward compatibility no longer required, a four-angle design panel (minimise shared state /
+With backward compatibility no longer required, a four-angle design panel (minimize shared state /
 shrink the interface / delete everything not load-bearing / first principles) was run, each
 proposal then attacked by two refuters (correctness against R1-R10; is it *actually* simpler for a
 cold reader). **All four converged on the same shape**, and all eight judges agreed it is simpler by
@@ -222,7 +222,7 @@ first release with `run_on_hpc` auto-detection. Nothing in the shipped source me
 
 Downstream, PhysiCellModelManager must implement `simulationCommand` and drop its `runSimulation`
 override. It should take a **minor** bump (0.4.0), not a patch: a patch is pulled in automatically
-by anyone pinning `"0.3"`, which would change cluster behaviour under a running campaign.
+by anyone pinning `"0.3"`, which would change cluster behavior under a running campaign.
 ## Session: mid-session package update silently skipped migrations (2026-08-17)
 
 ### The bug

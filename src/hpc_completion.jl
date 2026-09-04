@@ -88,7 +88,7 @@ Whether something last done at `since` (a `time_ns()` stamp) is older than `ttl`
 `0` as "never done" and therefore always stale.
 
 The zero case is the whole point. `time_ns()` counts from an arbitrary epoch -- in practice, boot --
-so a zero-initialised stamp does *not* read as "long ago"; `_elapsedSeconds(0)` is the machine's
+so a zero-initialized stamp does *not* read as "long ago"; `_elapsedSeconds(0)` is the machine's
 uptime. Comparing it against a TTL means a freshly booted host silently skips the first sweep or
 refresh of the session, for up to `ttl` after start. A developer's long-lived laptop never sees it;
 a CI runner, a container, or a rebooted login node does.
