@@ -6282,7 +6282,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         write(joinpath(shim, "sbatch"), """
             #!/bin/sh
             echo "\$@" >> "$shim/sbatch.log"
-            [ -e "$shim/sbatch.fail" ] && exit 1
+            [ -e "$shim/sbatch.fail" ] && { echo "boom: bad partition" >&2; exit 1; }
             while ! mkdir "$shim/sbatch.lock" 2>/dev/null; do sleep 0.01; done
             id=\$(cat "$shim/sbatch.next_id")
             echo \$((id + 1)) > "$shim/sbatch.next_id"
@@ -6456,6 +6456,26 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _reset_hpc!()
                 touch(joinpath(shim, "sbatch.fail"))
                 @test MM._runHPCSimulation(`true`, sim.id) === nothing
+                # The rejection reason is on disk, not only in the log.
+                @test occursin("boom", read(joinpath(MM.trialFolder(Simulation, sim.id), "hpc.err"), String))
+            end
+
+            @testset "the submission's own streams are kept as hpc.out / hpc.err" begin
+                # Distinct from output.log/output.err, which sbatch fills with what the job printed
+                # on the compute node. These are the sbatch *client's* streams, and hpc.out is the
+                # only place a simulation's SLURM job id lands on disk.
+                _reset_hpc!()
+                folder = MM.trialFolder(Simulation, sim.id)
+                rm(joinpath(folder, "hpc.out"); force=true)
+                rm(joinpath(folder, "hpc.err"); force=true)
+                _next_job!(9950)
+                _queue!(9950)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                @test timedwait(() -> isfile(joinpath(folder, "hpc.out")), 10.0) === :ok
+                @test strip(read(joinpath(folder, "hpc.out"), String)) == "9950"   # the job id
+                @test isfile(joinpath(folder, "hpc.err"))                          # created even when empty
+                _publish(0)
+                @test fetch(t) == 0
             end
 
             @testset "a leftover sentinel for the same simulation cannot be read as the new result" begin
@@ -6706,6 +6726,12 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _test_sim_cmd[] = Cmd(`sh -c pwd`; dir=other)           # ... or the Cmd's own dir
                 default(spec)
                 @test realpath(log_of("output.log")) == other
+
+                _test_sim_cmd[] = nothing                              # "cannot build a command"
+                sp = default(spec)
+                @test !sp.success && isnothing(sp.process)             # this simulation fails...
+                @test sp.simulation.id == sim.id                       # ...and nothing is thrown,
+                                                                       # so the trial carries on
 
                 _test_sim_cmd[] = setenv(`true`, "A" => "1")           # env on the Cmd is rejected
                 @test_throws ArgumentError default(spec)

@@ -13,7 +13,7 @@ any simulator. To support a new simulator:
 2. Implement the required interface methods listed below
 
 # Required interface methods
-- [`simulationCommand`](@ref)`(::MySimulator, spec::SimulationSpec)::Cmd`
+- [`simulationCommand`](@ref)`(::MySimulator, spec::SimulationSpec)::Union{Nothing,Cmd}`
 - [`simulatorDir`](@ref)`(::MySimulator)::String`
 - [`simulatorVersionSchema`](@ref)`(::MySimulator)::String`
 - [`simulatorVersionIDName`](@ref)`(::MySimulator)::String`
@@ -40,10 +40,15 @@ abstract type AbstractSimulator end
 ########################################################
 
 """
-    simulationCommand(::AbstractSimulator, spec::SimulationSpec) -> Cmd
+    simulationCommand(::AbstractSimulator, spec::SimulationSpec) -> Union{Nothing,Cmd}
 
 Return the command that runs the simulation described by `spec`: the one thing about launching a
 simulation that only the backend knows.
+
+Return `nothing` if no command can be built for this simulation -- a missing input, a failed
+lookup. That records this one simulation as failed and lets the rest of the trial continue, so it
+is the right way to report a per-simulation problem; raising instead aborts the whole run. Say why
+in a log message before returning, because ModelManager has nothing to add.
 
 Everything else -- running it locally or submitting it to SLURM, the working directory, where
 `output.log` and `output.err` go, waiting for it, and reporting the outcome -- is done by
@@ -61,7 +66,7 @@ ModelManager.simulationCommand(::MySimulator, spec::SimulationSpec) =
 ```
 """
 function simulationCommand(sim::AbstractSimulator, args...)
-    error("$(nameof(typeof(sim))) must implement: simulationCommand(::$(nameof(typeof(sim))), spec::SimulationSpec)::Cmd")
+    error("$(nameof(typeof(sim))) must implement: simulationCommand(::$(nameof(typeof(sim))), spec::SimulationSpec)::Union{Nothing,Cmd}")
 end
 
 """

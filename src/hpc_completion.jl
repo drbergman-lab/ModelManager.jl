@@ -291,6 +291,31 @@ function _sweepStraysIfDue(done_dir::String)
 end
 
 """
+    _recordSubmissionOutput(simulation_id::Int, stdout_text, stderr_text)
+
+Write the `sbatch` client's own output to `hpc.out` and `hpc.err` in the simulation's folder.
+
+These are the *submission's* streams, not the job's: `hpc.out` holds the job ID, `hpc.err` a
+rejection message. They sit alongside `output.log`/`output.err`, which `sbatch` fills with what the
+simulation itself printed on the compute node. Keeping them is what puts a simulation's SLURM job
+ID somewhere on disk, so a run can be correlated with `sacct` afterwards.
+
+Never throws: losing a diagnostic file must not fail a submission that succeeded.
+"""
+function _recordSubmissionOutput(simulation_id::Int, stdout_text::AbstractString, stderr_text::AbstractString)
+    try
+        folder = trialFolder(Simulation, simulation_id)
+        #! `mkpath` rather than assuming the caller made it: the default `runSimulation` does, but
+        #! depending on that would make these files quietly vanish for any other entry point.
+        mkpath(folder)
+        write(joinpath(folder, "hpc.out"), stdout_text)
+        write(joinpath(folder, "hpc.err"), stderr_text)
+    catch
+    end
+    return
+end
+
+"""
     _submitHPCJob(cmd::Cmd, simulation_id::Int) → Union{Nothing,Int}
 
 Run the prepared `sbatch` command and return the job ID, or `nothing` if submission failed.
@@ -302,13 +327,17 @@ function _submitHPCJob(cmd::Cmd, simulation_id::Int)
         run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
     catch e
         @error "Failed to invoke sbatch for simulation $(simulation_id)." exception=(e, catch_backtrace())
+        _recordSubmissionOutput(simulation_id, "", "sbatch could not be invoked: $(e)")
         return nothing
     end
-    if !success(p)
-        @error "sbatch rejected the job for simulation $(simulation_id) (exit $(p.exitcode)): $(strip(String(take!(err))))"
-        return nothing
-    end
+    #! Drained once: an IOBuffer cannot be read twice, and both the log line and the file need it.
     stdout_text = String(take!(out))
+    stderr_text = String(take!(err))
+    _recordSubmissionOutput(simulation_id, stdout_text, stderr_text)
+    if !success(p)
+        @error "sbatch rejected the job for simulation $(simulation_id) (exit $(p.exitcode)): $(strip(stderr_text))"
+        return nothing
+    end
     job_id = _parseJobID(stdout_text)
     #! Getting this wrong is worse than a failed submission: the job runs, and nothing waits for it.
     #! So the raw output goes in the message -- a site wrapper with an unexpected format is then a

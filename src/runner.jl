@@ -209,8 +209,11 @@ a SLURM job instead and waits for it. Called by [`run`](@ref) inside each worker
 A backend only overrides this if its simulation is not an external process; for those,
 `SimulationProcess.process` may be `nothing`.
 
-The command must be a bare `Cmd`. Redirections and pipelines are added here, so a `pipeline(...)` is
-rejected; and it must not carry an environment (`setenv`/`addenv`), because Julia's `Cmd.env`
+[`simulationCommand`](@ref) may return `nothing` to say no command could be built for this
+simulation; that is recorded as a failed simulation and the rest of the trial continues.
+
+Otherwise the command must be a bare `Cmd`. Redirections and pipelines are added here, so a
+`pipeline(...)` is rejected; and it must not carry an environment (`setenv`/`addenv`), because Julia's `Cmd.env`
 *replaces* the environment while `sbatch --export` extends it -- the two paths would silently
 disagree. Put what the simulation needs in the command's arguments or its working directory.
 
@@ -221,7 +224,11 @@ killed by a signal is also a failure -- Julia reports `exitcode == 0` for those,
 """
 function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
     cmd = simulationCommand(sim, spec)
-    cmd isa Cmd || throw(ArgumentError("simulationCommand must return a bare Cmd, got $(typeof(cmd)); ModelManager adds redirections itself."))
+    #! A backend that cannot build a command for one simulation says so with `nothing`. Failing
+    #! just that simulation is the point: throwing here would reach run()'s fail-fast completion
+    #! loop and discard every other simulation in the trial.
+    isnothing(cmd) && return SimulationProcess(spec.simulation, spec.monad_id, nothing, false)
+    cmd isa Cmd || throw(ArgumentError("simulationCommand must return a bare Cmd or nothing, got $(typeof(cmd)); ModelManager adds redirections itself."))
     isnothing(cmd.env) || throw(ArgumentError("simulationCommand must not set an environment on the Cmd: Cmd.env replaces the environment locally but sbatch --export extends it, so the two paths would disagree. Pass what the simulation needs as arguments or via its working directory."))
     simulation_id = spec.simulation.id
     folder = trialFolder(Simulation, simulation_id)
