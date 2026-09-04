@@ -17,16 +17,19 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function that **declares it
-  takes a [`Simulation`](@ref)** — `f(s::Simulation)`, or `(s::Simulation) -> …`. In every case the
+- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function — ideally one that
+  **declares it takes a [`Simulation`](@ref)**, `f(s::Simulation)` or `(s::Simulation) -> …`, since
+  one that does not is warned about. In every case the
   measurement is made once per *simulation* and the replicates are combined by `reduce` (`mean` for a
   plain function; a `QoI` is how you choose otherwise, and its `reduce` receives every replicate's
   value, so a step that must happen *after* averaging goes there). A single QoI or a plain function
   reports its value directly; a vector of QoIs reports a `Dict` keyed by QoI name.
 
-  The annotation is required because the previous contract called a bare function once per *monad*
-  and let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
-  reinterpreting one silently would change results without raising; the error explains the migration.
+  The annotation matters because the previous contract called a bare function once per *monad* and
+  let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
+  reinterpreting one silently would change results without raising. It is warned about rather than
+  refused, since refusing every unannotated function would also reject `sim -> measure(sim)`, the
+  natural way to write a new-contract lambda. The warning is transitional and goes in v0.10.
 - `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
   of `summary_statistic`; `observed` is `observed_data`.
   Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.

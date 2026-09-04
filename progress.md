@@ -5,6 +5,139 @@
 
 ---
 
+## Session: GSA spreads a keyed measurement (2026-09-04) — ships in v0.9.0
+
+### Trigger
+Issue #48, raised from PCMM. A `QoI` whose `reduce` yields `Dict(name => value)` fed calibration and
+the post-processing sink unchanged, and GSA refused it — so `endpointPopulationCountQoI()` had to be
+rewritten as one scalar QoI per cell type to ask a sensitivity question about the same numbers. The
+QoI seam's premise is one measurement, three consumers; that is the seam leaking.
+
+### What the issue did not know
+Two things surfaced while checking its claims, and both changed the shape of the fix.
+
+1. **`_gsaFunctionLabel` had only a `::Function` method.** `QoI` is a plain struct, so `_gsaFunctions`
+   — which every recipe routes through — threw a `MethodError` on a results dict holding QoI keys,
+   before drawing anything. **It took two entries**, and the reason is the reason it went unnoticed:
+   the sole unguarded call is `sort(collect(keys(results)); by=_gsaFunctionLabel)`, and Julia's `sort`
+   never invokes `by` on a one-element vector, while every other call site is behind
+   `multi = length(...) > 1`. So a single-QoI analysis plotted fine and a two-quantity one threw.
+   (My first regression test for this used one QoI and would have passed against the old code —
+   caught by the adversarial review pass, not by me.) The existing tests missed the bug because all
+   three end-to-end recipe testsets pass a single bare `Function`. Spreading produces *more*
+   QoI-shaped keys, and more of them at once, so this had to be fixed regardless.
+2. **The existing failure was legible only in its location, not its text.** A `Dict` reduce died at
+   `value_dict[monad_id] = q.reduce(...)` with `MethodError: Cannot convert an object of type
+   Dict{String, Float64} to an object of type Float64`. The comment above it claimed the `Float64`
+   type "fails here, at the QoI, rather than deep inside GlobalSensitivity" — true about where, but
+   the message names neither the QoI nor the expected shape.
+
+### Decision: results are keyed by a `String` label
+The load-bearing choice, and the breaking one. `Dict{Union{Function,QoI},T}` → `Dict{String,T}`.
+
+Once one QoI yields several analyses, the user needs `gsa.results["counts.tumor"]`. With object keys
+they would have to reconstruct a derived `QoI` or iterate keys through an unexported `qoiName`. Label
+keys also *delete* `_gsaFunctionLabel` rather than patching it, which is why bug (1) above stops being
+possible instead of merely being fixed, and they make `show` print `counts.tumor` instead of a closure.
+
+**Rejected:** keep object keys and file spread results under derived
+`QoI(string(k), q.compute; reduce = v -> q.reduce(v)[k])` objects. Non-breaking, and genuinely
+re-evaluable — `QoI` hashes by content, and closures over equal captures compare equal, so the keys
+would even be stable across calls (measured). Rejected because the new per-key analyses would not be
+addressable by name, which defeats the feature, and because two QoIs sharing a name would sit in the
+dict as distinct keys and plot as two identically-labelled series.
+
+Breaking-change exposure turned out to be small: `results` is a struct field documented nowhere in the
+manual, and its QoI-key half crashed on any plot, so nothing could depend on it.
+
+### Decision: one naming rule, `"<qoi name>.<key>"`, in GSA *and* the sink
+The sink used to drop the QoI's name and use the bare key. It now namespaces the same way GSA does,
+so one measurement names its parts identically wherever it is consumed.
+
+The separator is `.` rather than `_` because `_` is legal inside both a QoI name and a dict key, so
+`"a_b_c"` is genuinely ambiguous between QoI `a` + key `b_c` and QoI `a_b` + key `c` — the collision
+the per-call label check exists for. A dot does not make that impossible (a key may contain one, so
+the check stays) but makes it vanishingly unlikely, and `counts.tumor` reads as the component of
+`counts` that it is.
+
+**Aligning the sink was argued against first, and the objections were overruled with better
+arguments.** Recording both, since the objections are the ones a future reader will re-raise:
+
+1. *"It reopens the gensym-column bug."* `_asPostProcessor` refuses an anonymous function returning a
+   *scalar* because the derived `anon_9` would become a persistent column; the Dict branch was exempt
+   precisely because "those names come from the user, and the branch above never consults the QoI's
+   name." Prefixing makes it consult the name, so the guard has to extend to spreads — which removes
+   a capability rather than renaming a column. **Counter, accepted:** it is entirely reasonable for
+   several QoIs to return Dicts with the same keys, and namespacing is worth more than the
+   convenience of an unnamed lambda. The rule is now simply: to write to the sink, name your QoI or
+   pass a named function.
+2. *"It is a schema migration, not a rename."* Columns are added by `ALTER TABLE ... ADD COLUMN`, so
+   the same script writes `counts.tumor` beside an existing `tumor` and `postProcessingTable`
+   silently returns a split quantity — apparently needing an `up.jl` milestone, which every
+   downstream simulator would have to implement. **Counter, accepted:** the sink never promised
+   column stability in the first place. A bare function's column name comes from `nameof`, so
+   renaming the function already starts a new column silently. This is a pre-existing property of a
+   sink with no provenance, not a regression introduced here, and no milestone was added.
+
+The cost is real and was paid: every anonymous `post_processor` returning a `NamedTuple`/`Dict` — the
+shape used in most of the sink tests and in every manual example — now throws, and each was rewritten
+to a named `QoI`. A callback returning `nothing` is untouched, because the guard sits after the
+`isnothing`/`ismissing` skip and there is nothing to name.
+
+One deliberate non-change: the guard stays **lazy**, firing per simulation rather than at
+`_asPostProcessor` construction. Eager checking would refuse an anonymous callback that returns
+`nothing` (pure side effects — a documented, working pattern) and one returning a `Vector`, which
+should keep flowing to the sink's own type error.
+
+### Decision: a `Vector` is not spread by index
+The obvious accommodation — `q.1`, `q.2` — is unsafe, and the reason is what makes the `Dict` case
+safe. For a `Dict` the cross-monad check is *meaningful*: two monads yielding `{tumor, immune}`
+genuinely name the same quantities. For a `Vector` the only available check is **length**, and equal
+length is not alignment — series sampled at different times, or a run that stopped early, produce
+same-length vectors whose entries mean different things, and the indices would come out confident and
+wrong. `mseDistance`'s permissive key handling is the in-repo precedent for that failure mode, already
+flagged as a hazard in `src/qoi.jl`. The error message carries this reasoning rather than saying
+"unsupported", since the user can always supply both the alignment and the names themselves.
+
+### Decision: the skip stays, re-keyed on the QoI's name, with an explicit `recompute=`
+This one was got wrong first. The old `if f in keys(results); return; end` keyed on the function
+*object*, which cannot see a `compute` redefined in place — so I removed it as unsafe and argued that
+always recomputing was strictly better. **That was not mine to decide, and the argument was wrong on
+the facts that matter.** The dominant reason to call `calculateGSA!` again is *adding* a quantity,
+not correcting one: `run(…; functions=[q1])` then `calculateGSA!(gsa, [q1, q2])`. Editing a
+measurement after running it is the rare case; paying to re-read every simulation's output for q1 on
+every such call is the common one.
+
+So the skip is restored, and the naming decision above turns out to pay for it. **Whether a QoI has
+already been evaluated is decided from its NAME, before any output is read** — which is the only
+version of the check that is actually a saving. A check on *labels* could not do it: a spreading
+QoI's labels come from `reduce`'s return and are unknown until `reduce` has run on a monad, so
+computing them is the very work the skip exists to avoid. Because every label is either the QoI's
+name or its name plus `.` and a key, `_hasGSAResults` answers with a prefix test on the name alone.
+
+`recompute=true` is the explicit escape hatch for the rare case, and it has to be explicit for the
+original reason: nothing can detect that a measurement changed, the same impossibility documented
+around `stored=:never`.
+
+### Decision: label collisions are checked per call, and nothing is filed when one is found
+Checked on the *flattened* labels, since a spreading QoI contributes labels its name does not reveal —
+`_asPostProcessor`'s and `_validateSummaryStatistic`'s name-only checks would miss them. Scoped to one
+`calculateGSA!` call, because checking against the whole results dict would make a re-run an error.
+`_gsaResults` was split out of `calculateGSA!` for this: it computes without storing, so a rejected
+call leaves `results` exactly as it found it instead of half-written.
+
+### Incidental corrections
+- Two PRD bullets were stale before this change and are corrected here: they described a bare
+  `functions=` entry as being called with a simulation *ID*, which stopped being true when every
+  measurement function started receiving a `Simulation`.
+- The `QoI` docstring described `reduce` as combining replicates "into a single value", which reads
+  as *scalar* and caused real confusion. It now says what `reduce` actually collapses — the replicate
+  dimension — and that its result may perfectly well be keyed. That reading is load-bearing here:
+  calibration already accepted a `Dict`-returning `reduce`, which is exactly why GSA refusing one was
+  a gap rather than a design.
+
+---
+
 ## Session: replace `sbatch --wait` polling (2026-09-03) — ships in v0.9.0
 
 ### Trigger

@@ -2,12 +2,10 @@ using RecipesBase
 
 ################## Shared helpers ##################
 
-# Display label for a sensitivity function (drives both the legend and a stable ordering).
-_gsaFunctionLabel(f::Function) = string(nameof(f))
-
-# Functions in a stable, label-sorted order so plots are reproducible across runs
-# (the `results` dict iteration order is otherwise unspecified).
-_gsaFunctions(results::AbstractDict) = sort(collect(keys(results)); by=_gsaFunctionLabel)
+# Labels in sorted order so plots are reproducible across runs (a Dict's iteration order is
+# otherwise unspecified). The keys of a results dict ARE the labels, so there is nothing to derive;
+# `gsaLabels` says the same thing for a whole sampling.
+_gsaLabels(results::AbstractDict) = sort(collect(keys(results)))
 
 # Parameter (latent dimension) names for each GSA sampling type, in the same column
 # order as the corresponding index vectors. The leading bookkeeping columns differ:
@@ -17,7 +15,7 @@ _sobolParameterNames(monad_ids_df::DataFrame) = names(monad_ids_df)[3:end]
 _rbdParameterNames(monad_ids_df::DataFrame)   = names(monad_ids_df)
 
 const _NO_FUNCTIONS_MSG =
-    "No sensitivity functions calculated. Run the GSA with `functions=[...]` (or call `calculateGSA!`) first."
+    "No sensitivity quantities calculated. Run the GSA with `functions=[...]` (or call `calculateGSA!`) first."
 
 ################## Bar recipe (shared) ##################
 
@@ -133,14 +131,14 @@ end
 function _moatBarData(results::AbstractDict, monad_ids_df::DataFrame, show_sigma::Bool)
     isempty(results) && error(_NO_FUNCTIONS_MSG)
     pnames = _moatParameterNames(monad_ids_df)
-    fns    = _gsaFunctions(results)
-    multi  = length(fns) > 1
+    labels = _gsaLabels(results)
+    multi  = length(labels) > 1
     groups = _GSABarGroup[]
-    for f in fns
-        res   = results[f]
+    for name in labels
+        res   = results[name]
         mu    = Float64.(vec(res.means_star))
         yerr  = show_sigma ? sqrt.(Float64.(vec(res.variances))) : nothing
-        label = multi ? "µ*: $(_gsaFunctionLabel(f))" : "µ*"
+        label = multi ? "µ*: $(name)" : "µ*"
         push!(groups, _GSABarGroup(label, mu, 1.0, yerr))
     end
     return _GSABarData(pnames, groups)
@@ -149,12 +147,12 @@ end
 function _moatViolinData(results::AbstractDict, monad_ids_df::DataFrame)
     isempty(results) && error(_NO_FUNCTIONS_MSG)
     pnames = _moatParameterNames(monad_ids_df)
-    fns    = _gsaFunctions(results)
-    multi  = length(fns) > 1
+    labels = _gsaLabels(results)
+    multi  = length(labels) > 1
     groups = Tuple{String,Matrix{Float64}}[]
-    for f in fns
-        res   = results[f]
-        label = multi ? _gsaFunctionLabel(f) : "elementary effects"
+    for name in labels
+        res   = results[name]
+        label = multi ? name : "elementary effects"
         push!(groups, (label, Float64.(res.elementary_effects)))
     end
     return _GSAViolinData(pnames, groups)
@@ -163,14 +161,14 @@ end
 function _moatScatterData(results::AbstractDict, monad_ids_df::DataFrame)
     isempty(results) && error(_NO_FUNCTIONS_MSG)
     pnames = _moatParameterNames(monad_ids_df)
-    fns    = _gsaFunctions(results)
-    multi  = length(fns) > 1
+    labels = _gsaLabels(results)
+    multi  = length(labels) > 1
     groups = Tuple{String,Vector{Float64},Vector{Float64}}[]
-    for f in fns
-        res   = results[f]
+    for name in labels
+        res   = results[name]
         mu    = Float64.(vec(res.means_star))
         sigma = sqrt.(Float64.(vec(res.variances)))
-        label = multi ? _gsaFunctionLabel(f) : "parameters"
+        label = multi ? name : "parameters"
         push!(groups, (label, mu, sigma))
     end
     return _GSAScatterData(pnames, groups)
@@ -183,8 +181,9 @@ end
     plot(m::MOATSampling, style::Symbol; show_sigma=false)
 
 Visualize a Morris One-At-A-Time (MOAT) sensitivity analysis. One series is emitted per
-sensitivity function calculated on the sampling (the series label includes the function
-name when more than one function is present).
+sensitivity quantity calculated on the sampling — see [`gsaLabels`](@ref), which is one per
+`functions=` entry unless a [`QoI`](@ref) spread into several. The series label includes the
+quantity's own label when more than one is present.
 
 `style` selects the chart:
 
@@ -230,15 +229,15 @@ end
 function _sobolBarData(results::AbstractDict, monad_ids_df::DataFrame, show_ST::Bool)
     isempty(results) && error(_NO_FUNCTIONS_MSG)
     pnames = _sobolParameterNames(monad_ids_df)
-    fns    = _gsaFunctions(results)
-    multi  = length(fns) > 1
+    labels = _gsaLabels(results)
+    multi  = length(labels) > 1
     groups = _GSABarGroup[]
-    for f in fns
-        res = results[f]
-        push!(groups, _GSABarGroup(multi ? "S1: $(_gsaFunctionLabel(f))" : "S1",
+    for name in labels
+        res = results[name]
+        push!(groups, _GSABarGroup(multi ? "S1: $(name)" : "S1",
                                    Float64.(res.S1), 1.0, nothing))
         if show_ST && !isnothing(res.ST)
-            push!(groups, _GSABarGroup(multi ? "ST: $(_gsaFunctionLabel(f))" : "ST",
+            push!(groups, _GSABarGroup(multi ? "ST: $(name)" : "ST",
                                        Float64.(res.ST), 0.45, nothing))
         end
     end
@@ -248,10 +247,10 @@ end
 """
     plot(s::SobolSampling; show_ST=true)
 
-Grouped bar chart of Sobolʼ sensitivity indices. For each sensitivity function, the
-first-order index `S1` is shown per parameter; when `show_ST=true` (default) the
-total-order index `ST` is overlaid at reduced opacity. Labels include the function name
-when more than one function is present.
+Grouped bar chart of Sobolʼ sensitivity indices. For each sensitivity quantity (see
+[`gsaLabels`](@ref)), the first-order index `S1` is shown per parameter; when `show_ST=true`
+(default) the total-order index `ST` is overlaid at reduced opacity. Labels include the
+quantity's own label when more than one is present.
 
 # Examples
 ```julia
@@ -270,12 +269,12 @@ end
 function _rbdBarData(results::AbstractDict, monad_ids_df::DataFrame)
     isempty(results) && error(_NO_FUNCTIONS_MSG)
     pnames = _rbdParameterNames(monad_ids_df)
-    fns    = _gsaFunctions(results)
-    multi  = length(fns) > 1
+    labels = _gsaLabels(results)
+    multi  = length(labels) > 1
     groups = _GSABarGroup[]
-    for f in fns
-        label = multi ? "S1: $(_gsaFunctionLabel(f))" : "S1"
-        push!(groups, _GSABarGroup(label, Float64.(results[f]), 1.0, nothing))
+    for name in labels
+        label = multi ? "S1: $(name)" : "S1"
+        push!(groups, _GSABarGroup(label, Float64.(results[name]), 1.0, nothing))
     end
     return _GSABarData(pnames, groups)
 end
@@ -284,8 +283,8 @@ end
     plot(r::RBDSampling)
 
 Grouped bar chart of Random Balance Design (RBD) first-order sensitivity indices, one
-bar series per sensitivity function (labels include the function name when more than one
-function is present).
+bar series per sensitivity quantity (see [`gsaLabels`](@ref); labels include the quantity's
+own label when more than one is present).
 
 # Example
 ```julia

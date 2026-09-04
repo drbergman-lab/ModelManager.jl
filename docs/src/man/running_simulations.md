@@ -97,7 +97,7 @@ the backend's [`postSimulationCleanup`](@ref) hook. The callback is how you comp
 quantities of interest from a finished run:
 
 ```julia
-run(sampling; post_processor = sp -> (; final_count = countCells(simulationID(sp))))
+run(sampling; post_processor = QoI("counts", sp -> (; final_count = countCells(simulationID(sp)))))
 ```
 
 See [Post-processing and quantities of interest](@ref post_processing) for the callback

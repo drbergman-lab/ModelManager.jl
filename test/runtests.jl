@@ -189,10 +189,14 @@ end
 
 
 
-# Named functions used as keys in the GSA sensitivity-recipe tests, so legend labels
-# are stable strings ("_gsa_fA", "_gsa_fB") rather than gensym closure names.
-_gsa_fA(mid) = 0.0
-_gsa_fB(mid) = 0.0
+# Labels used as keys in the GSA sensitivity-recipe tests. `results` is keyed by label, so these
+# are plain strings; they used to be named functions purely so `nameof` gave a stable legend label.
+const _GSA_LABEL_A = "_gsa_fA"
+const _GSA_LABEL_B = "_gsa_fB"
+
+# A NAMED post-processor: its own name prefixes the columns it writes ("_pp_named.a"), so unlike an
+# anonymous lambda it needs no QoI wrapper.
+_pp_named(s::Simulation) = (; a = 9.0)
 
 _count_replicates(vals)    = Float64(length(vals))
 # The `missing`-for-a-dead-monad path is unreachable now: `_reduceOverMonad` raises when a
@@ -2975,10 +2979,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 dv   = DiscreteVariation(:config, xp_x, [301.0, 302.0])
                 samp = createTrial(inputs, [dv]; n_replicates=1)
                 calls = Ref(0)
-                out = run(samp; post_processor = sim -> begin
+                out = run(samp; post_processor = QoI("pp", sim -> begin
                     calls[] += 1
                     (; sid = sim.id, doubled = 2.0 * sim.id)
-                end)
+                end))
                 @test out.n_success == 2
                 @test calls[] == 2                       # fired once per successful sim
 
@@ -3001,42 +3005,59 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # A NamedTuple's field order reaches the columns. Routing through a Dict scrambled
                 # it into hash order, so the table came back shuffled relative to what was written.
                 ordered = createTrial(inputs, [DiscreteVariation(:config, xp_x, 353.0)]; n_replicates=1)
-                run(ordered; post_processor = sim -> (; zeta=1.0, alpha=2.0, mid=3.0, beta=4.0))
+                run(ordered; post_processor = QoI("ord", sim -> (; zeta=1.0, alpha=2.0, mid=3.0, beta=4.0)))
                 ot = postProcessingTable(simulationIDs(ordered))
-                @test filter(in(["zeta","alpha","mid","beta"]), names(ot)) ==
-                      ["zeta", "alpha", "mid", "beta"]
+                @test filter(in(["ord.zeta","ord.alpha","ord.mid","ord.beta"]), names(ot)) ==
+                      ["ord.zeta", "ord.alpha", "ord.mid", "ord.beta"]
 
-                # An anonymous function returning a scalar has no name to store it under, and the
-                # regularised gensym varies between sessions -- it must never become a column.
+                # An anonymous function has no name to store under, and the regularised gensym
+                # varies between sessions -- it must never become a column. Now that every column is
+                # named "<qoi>.<key>", that covers a spread return too, not only a scalar one.
                 @test_throws Exception run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 354.0)]; n_replicates=1);
                     post_processor = sim -> 7.0)
+                @test_throws Exception run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 356.0)]; n_replicates=1);
+                    post_processor = sim -> (; a = 7.0))
                 @test !any(startswith("anon"), names(postProcessingTable(simulationIDs(samp))))
-                # Naming it is the fix, and a NamedTuple return is unaffected either way.
+                # Naming it is the fix, for either return shape.
                 named_ok = createTrial(inputs, [DiscreteVariation(:config, xp_x, 355.0)]; n_replicates=1)
                 run(named_ok; post_processor = QoI("named_scalar", sim -> 7.0))
                 @test postProcessingTable(simulationIDs(named_ok)).named_scalar[1] == 7.0
+                # ...and a named function needs no wrapping, since its name is stable.
+                named_fn = createTrial(inputs, [DiscreteVariation(:config, xp_x, 357.0)]; n_replicates=1)
+                run(named_fn; post_processor = _pp_named)
+                @test postProcessingTable(simulationIDs(named_fn))[1, "_pp_named.a"] == 9.0
+
+                # Two QoIs measuring the same key no longer collide in one column — the reason the
+                # QoI's name prefixes it at all.
+                both = createTrial(inputs, [DiscreteVariation(:config, xp_x, 358.0)]; n_replicates=1)
+                run(both; post_processor = [QoI("left", sim -> (; shared = 1.0)),
+                                            QoI("right", sim -> (; shared = 2.0))])
+                bt = postProcessingTable(simulationIDs(both))
+                @test bt[1, "left.shared"] == 1.0
+                @test bt[1, "right.shared"] == 2.0
 
                 # simulationsTable(...; post_processing=true) joins the QoIs by :SimID.
                 st_pp = simulationsTable(samp; post_processing=true, remove_constants=false)
-                @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(st_pp))
+                @test Set(["SimID", "pp.sid", "pp.doubled"]) ⊆ Set(names(st_pp))
                 @test nrow(st_pp) == 2
                 for row in eachrow(st_pp)
-                    @test row.doubled == 2.0 * row.SimID   # joined on the right SimID
+                    @test row."pp.doubled" == 2.0 * row.SimID   # joined on the right SimID
                 end
                 # Without the kwarg, no QoI columns appear.
-                @test "doubled" ∉ names(simulationsTable(samp))
+                @test "pp.doubled" ∉ names(simulationsTable(samp))
 
                 pt = postProcessingTable(samp)
                 @test pt isa DataFrame
                 @test nrow(pt) == 2
                 @test :SimID in propertynames(pt)
-                @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(pt))
-                @test all(pt.doubled .== 2.0 .* pt.SimID) # values round-trip
+                @test Set(["SimID", "pp.sid", "pp.doubled"]) ⊆ Set(names(pt))
+                @test all(pt[!, "pp.doubled"] .== 2.0 .* pt.SimID) # values round-trip
 
                 # use_previous ⇒ nothing re-scheduled ⇒ callback not fired again.
                 calls[] = 0
-                run(samp; post_processor = sim -> (; sid = sim.id))
+                run(samp; post_processor = QoI("pp", sim -> (; sid = sim.id)))
                 @test calls[] == 0
 
                 # Callback returning `nothing` ⇒ no sink row for that sim.
@@ -3048,13 +3069,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
                 # AbstractDict return + a *new* quantity ⇒ dynamic column; earlier rows get `missing`.
                 m_new = createTrial(inputs, [DiscreteVariation(:config, xp_x, 321.0)]; n_replicates=1)
-                run(m_new; post_processor = sp -> Dict("newq" => 7.0))
+                run(m_new; post_processor = QoI("nq", sp -> Dict("newq" => 7.0)))
                 pt2 = postProcessingTable()
-                @test "newq" in names(pt2)
+                @test "nq.newq" in names(pt2)
                 new_id = simulationIDs(m_new)[1]
-                @test pt2.newq[findfirst(==(new_id), pt2.SimID)] == 7.0
+                @test pt2[findfirst(==(new_id), pt2.SimID), "nq.newq"] == 7.0
                 first_samp_id = simulationIDs(samp)[1]
-                @test ismissing(pt2.newq[findfirst(==(first_samp_id), pt2.SimID)])
+                @test ismissing(pt2[findfirst(==(first_samp_id), pt2.SimID), "nq.newq"])
 
                 # Upsert: writing the same simulation_id twice overwrites and adds columns.
                 db = ModelManager._openPostProcessingDB()
@@ -3075,7 +3096,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     post_processor = sp -> [1, 2, 3])
                 @test_throws ArgumentError run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 332.0)]; n_replicates=1);
-                    post_processor = sp -> (; bad = [1.0, 2.0]))
+                    post_processor = QoI("bq", sp -> (; bad = [1.0, 2.0])))
 
                 # printPostProcessingTable routes the DataFrame through the sink.
                 captured = Ref{Any}(nothing)
@@ -3089,10 +3110,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 m_ord = createTrial(inputs, [DiscreteVariation(:config, xp_x, 401.0)]; n_replicates=1)
                 ord_id = simulationIDs(m_ord)[1]
                 empty!(_post_order_log)
-                run(m_ord; post_processor = sim -> begin
+                run(m_ord; post_processor = QoI("ordq", sim -> begin
                     push!(_post_order_log, "user:$(sim.id)")
                     (; q = 1.0)
-                end)
+                end))
                 @test _post_order_log == ["processing:$(ord_id)", "user:$(ord_id)", "cleanup:$(ord_id)"]
             end
 
@@ -3128,21 +3149,21 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # QoI names are safely quoted: a name containing a double quote round-trips.
                 weird = "od\"d"
                 samp = createTrial(inputs, [DiscreteVariation(:config, xp_x, 371.0)]; n_replicates=1)
-                run(samp; post_processor = sp -> Dict(weird => 5.0))
+                run(samp; post_processor = QoI("wq", sp -> Dict(weird => 5.0)))
                 pt = postProcessingTable(samp)
-                @test weird in names(pt)
-                @test pt[1, weird] == 5.0
+                @test "wq.$(weird)" in names(pt)
+                @test pt[1, "wq.$(weird)"] == 5.0
 
                 # Dict keys that collide after string conversion (1 vs "1") → ArgumentError.
                 @test_throws ArgumentError run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 372.0)]; n_replicates=1);
-                    post_processor = sp -> Dict(1 => 1.0, "1" => 2.0))
+                    post_processor = QoI("cq", sp -> Dict(1 => 1.0, "1" => 2.0)))
             end
 
             @testset "post-processing sink follows deletions" begin
                 dv   = DiscreteVariation(:config, xp_x, [501.0, 502.0])
                 samp = createTrial(inputs, [dv]; n_replicates=2)   # 2 monads × 2 replicates
-                run(samp; post_processor = sim -> (; v = simulationID(sim)))
+                run(samp; post_processor = QoI("dq", sim -> (; v = simulationID(sim))))
                 sids = simulationIDs(samp)
                 @test nrow(postProcessingTable(sids)) == 4
 
@@ -4315,7 +4336,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 gsa = run(MOAT(), spec; functions=[q])
                 waitForDiagnostics()
                 @test gsa isa ModelManager.GSASampling
-                @test haskey(gsa.results, q)
+                # A scalar reduce yields one analysis, filed under the QoI's own name.
+                @test haskey(gsa.results, "mse")
+                @test ModelManager.gsaLabels(gsa) == ["mse"]
 
                 # And the arithmetic the workflow depends on: averaging first is not the same as
                 # squaring first, so which side of `reduce` the nonlinearity sits on matters.
@@ -4339,6 +4362,163 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 gsa2 = run(MOAT(), spec; functions=[QoI("x", _qoi_sim; reduce=maximum)])
                 waitForDiagnostics()
                 @test gsa2 isa ModelManager.GSASampling
+
+                # Results are filed by label. A bare function's label is its regularised QoI name,
+                # a QoI's is the name it was given.
+                @test ModelManager.gsaLabels(gsa1) == ["_qoi_by_id"]
+                @test ModelManager.gsaLabels(gsa2) == ["x"]
+            end
+
+            @testset "a Dict-valued reduce spreads into one analysis per key" begin
+                # The gap this closes: a measurement shaped `name => value` fed calibration and the
+                # sink unchanged, but GSA refused it, so the same quantity had to be rewritten once
+                # per key. Now one QoI yields one analysis per key, labelled "<qoi>.<key>".
+                function _pair(s::Simulation)
+                    return Dict("x" => getParameterValue(s, :config, XMLPath(["data", "x"])),
+                                "y" => getParameterValue(s, :config, XMLPath(["data", "y"])))
+                end
+                spread = QoI("counts", _pair; reduce=per_sim -> Dict(k => mean(getindex.(per_sim, k))
+                                                                     for k in ("x", "y")))
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0)),
+                                          DistributedVariation(:config, xp_y, Uniform(1.0, 4.0))];
+                                 n_replicates=2)
+
+                gsa = run(MOAT(3), spec; functions=[spread])
+                waitForDiagnostics()
+                @test ModelManager.gsaLabels(gsa) == ["counts.x", "counts.y"]
+                @test gsa.results["counts.x"] isa GlobalSensitivity.MorrisResult
+
+                # Every spread series reaches the plot, which is what makes several analyses from
+                # one QoI legible: two labels → two µ* series, each named by its label.
+                bd = ModelManager._moatBarData(gsa.results, gsa.monad_ids_df, false)
+                @test [g.label for g in bd.groups] == ["µ*: counts.x", "µ*: counts.y"]
+
+                # The load-bearing property: a spread component is the SAME analysis a scalar QoI
+                # measuring that key on its own would give. Computed on THIS sampling rather than a
+                # second `run`, because each run draws a fresh LHS design — comparing across two
+                # designs would compare two different questions.
+                calculateGSA!(gsa, [QoI("x", s -> _pair(s)["x"]), QoI("y", s -> _pair(s)["y"])])
+                @test ModelManager.gsaLabels(gsa) == ["counts.x", "counts.y", "x", "y"]
+                @test vec(gsa.results["counts.x"].means_star) ≈ vec(gsa.results["x"].means_star)
+                @test vec(gsa.results["counts.y"].means_star) ≈ vec(gsa.results["y"].means_star)
+                # ...and the two keys are genuinely different analyses, not one value duplicated.
+                @test !(vec(gsa.results["counts.x"].means_star) ≈ vec(gsa.results["counts.y"].means_star))
+
+                # A NamedTuple spreads too, and keeps its declaration order rather than sorting.
+                nt = QoI("nt", _pair; reduce=per_sim -> (y=mean(getindex.(per_sim, "y")),
+                                                         x=mean(getindex.(per_sim, "x"))))
+                gsa_nt = run(MOAT(3), spec; functions=[nt])
+                waitForDiagnostics()
+                @test ModelManager.gsaLabels(gsa_nt) == ["nt.x", "nt.y"]      # gsaLabels sorts
+                @test first.(ModelManager.evaluateFunctionOnSampling(gsa_nt, nt)) == ["nt.y", "nt.x"]
+
+                # Sobolʼ and RBD spread by the same rule, so this is a property of the QoI seam and
+                # not of one method's index arithmetic.
+                sob = run(Sobolʼ(4), spec; functions=[spread])
+                waitForDiagnostics()
+                @test ModelManager.gsaLabels(sob) == ["counts.x", "counts.y"]
+                @test sob.results["counts.y"] isa GlobalSensitivity.SobolResult
+                rbd = run(RBD(4), spec; functions=[spread])
+                waitForDiagnostics()
+                @test ModelManager.gsaLabels(rbd) == ["counts.x", "counts.y"]
+                @test length(rbd.results["counts.x"]) == 2   # one index per parameter
+            end
+
+            @testset "a QoI-keyed result plots" begin
+                # Regression: `results` used to be keyed by the QoI object, and the label function
+                # had only a `::Function` method. TWO quantities are needed to reproduce it, and the
+                # reason is worth stating because it is why the bug went unnoticed: the sole
+                # unguarded call was `sort(keys(results); by=_gsaFunctionLabel)`, and `sort` never
+                # invokes `by` on a one-element vector, while every other call site sits behind
+                # `multi = length(...) > 1`. So a single-QoI analysis plotted fine and any
+                # QoI-driven analysis with two entries threw before drawing anything. Labels are
+                # strings now, so there is nothing left to dispatch on.
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=1)
+                gsa = run(MOAT(3), spec; functions=[QoI("plotted", _qoi_sim),
+                                                    QoI("plotted2", _qoi_sim; reduce=maximum)])
+                waitForDiagnostics()
+                @test ModelManager.gsaLabels(gsa) == ["plotted", "plotted2"]
+                rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), gsa)
+                @test rd[1].args[1] isa ModelManager._GSABarData
+                # Two series, each named by its label — the path that used to MethodError.
+                @test [g.label for g in rd[1].args[1].groups] == ["µ*: plotted", "µ*: plotted2"]
+                @test RecipesBase.apply_recipe(Dict{Symbol,Any}(), gsa, :violin)[1].args[1] isa ModelManager._GSAViolinData
+                @test RecipesBase.apply_recipe(Dict{Symbol,Any}(), gsa, :scatter)[1].args[1] isa ModelManager._GSAScatterData
+                # `show` names the quantities rather than printing a closure.
+                @test occursin("plotted2", sprint(show, gsa))
+            end
+
+            @testset "GSA refuses what it cannot turn into an index" begin
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=1)
+                gsa = run(MOAT(3), spec; functions=Any[])
+                waitForDiagnostics()
+
+                # A Vector reduce is refused, and the message says why per-index spreading is not
+                # offered rather than merely that it is unsupported.
+                vec_q = QoI("series", _qoi_sim; reduce=per_sim -> collect(per_sim))
+                err = try; calculateGSA!(gsa, [vec_q]); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("equal length is not equal meaning", err.msg)
+                @test occursin("series", err.msg)
+
+                # A Dict of non-numbers passes the key check and is caught at the value.
+                str_q = QoI("labels", _qoi_sim; reduce=per_sim -> Dict("a" => "not a number"))
+                err = try; calculateGSA!(gsa, [str_q]); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("labels.a", err.msg)
+
+                # Key sets must agree across monads: a hole in a design matrix has no defensible
+                # fill, so this refuses rather than imputing as `mseDistance` does.
+                ragged = QoI("ragged", _qoi_sim;
+                             reduce=per_sim -> first(per_sim) < 2.0 ? Dict("a" => 1.0) :
+                                                                      Dict("a" => 1.0, "b" => 2.0))
+                err = try; calculateGSA!(gsa, [ragged]); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("same keys", err.msg)
+
+                # Two QoIs producing one label is refused, and nothing is filed when it is.
+                dup = [QoI("dup", _qoi_sim), QoI("dup", _qoi_sim; reduce=maximum)]
+                err = try; calculateGSA!(gsa, dup); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("unique within one `calculateGSA!` call", err.msg)
+                @test isempty(ModelManager.gsaLabels(gsa))
+
+                # A measurement already evaluated is skipped, so adding a quantity costs only the
+                # new one. The skip is decided from the QoI's NAME, before any output is read —
+                # which is what makes it a saving rather than a late no-op.
+                calculateGSA!(gsa, [QoI("again", _qoi_sim)])
+                before = vec(gsa.results["again"].means_star)
+                calculateGSA!(gsa, [QoI("again", _qoi_sim; reduce=per_sim -> 3 * mean(per_sim))])
+                @test vec(gsa.results["again"].means_star) ≈ before      # skipped, not overwritten
+
+                # `recompute=true` is how you force it after changing the measurement, since nothing
+                # can detect that the measurement changed.
+                calculateGSA!(gsa, [QoI("again", _qoi_sim; reduce=per_sim -> 3 * mean(per_sim))];
+                              recompute=true)
+                @test ModelManager.gsaLabels(gsa) == ["again"]
+                @test vec(gsa.results["again"].means_star) ≈ 3 .* before
+
+                # A SPREADING QoI is recognised by name too, even though its labels ("spr.a") are
+                # not known until its reducer has run — the case a label-based check could not skip
+                # without first doing the work it was meant to avoid.
+                spread_calls = Ref(0)
+                spr = QoI("spr", s -> (spread_calls[] += 1; _qoi_sim(s));
+                          reduce=per_sim -> Dict("a" => mean(per_sim)))
+                calculateGSA!(gsa, [spr])
+                @test "spr.a" in ModelManager.gsaLabels(gsa)
+                after_first = spread_calls[]
+                @test after_first > 0
+                calculateGSA!(gsa, [spr])
+                @test spread_calls[] == after_first                      # no output re-read
+                calculateGSA!(gsa, [spr]; recompute=true)
+                @test spread_calls[] > after_first
+
+                # Adding a quantity evaluates only the new one.
+                calculateGSA!(gsa, [spr, QoI("fresh", _qoi_sim)])
+                @test spread_calls[] == 2 * after_first                  # spr untouched again
+                @test "fresh" in ModelManager.gsaLabels(gsa)
             end
 
             @testset "run_kwargs is one channel with the loose splat" begin
@@ -5042,7 +5222,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             inputs = InputFolders(config="default")
             dv = DiscreteVariation(:config, XMLPath(["data", "x"]), 601.0)
-            run(createTrial(inputs, [dv]; n_replicates=1); post_processor = sp -> (; v = 1.0))
+            run(createTrial(inputs, [dv]; n_replicates=1); post_processor = QoI("vq", sp -> (; v = 1.0)))
             @test isfile(postProcessingDBPath())
 
             resetDatabase(; force_reset=true, force_continue=true)
@@ -5065,7 +5245,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test !isfile(postProcessingDBPath())   # nothing stored ⇒ no sink file
 
             run(createTrial(inputs, [DiscreteVariation(:config, xp, 702.0)]; n_replicates=1);
-                post_processor = sp -> (; v = 1.0))
+                post_processor = QoI("vq", sp -> (; v = 1.0)))
             @test isfile(postProcessingDBPath())     # first stored quantity creates it
         end
     end
@@ -5345,7 +5525,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
 
         @testset "MOAT — bar" begin
-            res1 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1))
+            res1 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(1))
             bd   = ModelManager._moatBarData(res1, moat_df, false)
             @test bd.param_names == pnames
             @test nseries(apply(bd)) == 1                 # one function → one series
@@ -5358,36 +5538,36 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test nseries(apply(bd_s)) == 1
 
             # two functions → two series, function-labeled
-            res2 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1), _gsa_fB => morris(2))
+            res2 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(1), _GSA_LABEL_B => morris(2))
             bd2  = ModelManager._moatBarData(res2, moat_df, false)
             @test nseries(apply(bd2)) == 2
             @test Set(g.label for g in bd2.groups) == Set(["µ*: _gsa_fA", "µ*: _gsa_fB"])
         end
 
         @testset "MOAT — violin" begin
-            res1 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1))
+            res1 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(1))
             vd   = ModelManager._moatViolinData(res1, moat_df)
             @test vd.param_names == pnames
             @test nseries(apply(vd)) == 1
 
-            res2 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1), _gsa_fB => morris(2))
+            res2 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(1), _GSA_LABEL_B => morris(2))
             @test nseries(apply(ModelManager._moatViolinData(res2, moat_df))) == 2
         end
 
         @testset "MOAT — scatter" begin
-            res1 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1))
+            res1 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(1))
             sd   = ModelManager._moatScatterData(res1, moat_df)
             @test sd.param_names == pnames
             @test sd.groups[1][2] ≈ [0.1, 0.5, 0.2]                  # µ*
             @test sd.groups[1][3] ≈ sqrt.([0.01, 0.04, 0.02])       # σ
             @test nseries(apply(sd)) == 1
 
-            res2 = Dict{Function,GlobalSensitivity.MorrisResult}(_gsa_fA => morris(1), _gsa_fB => morris(2))
+            res2 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(1), _GSA_LABEL_B => morris(2))
             @test nseries(apply(ModelManager._moatScatterData(res2, moat_df))) == 2
         end
 
         @testset "Sobolʼ" begin
-            res1 = Dict{Function,GlobalSensitivity.SobolResult}(_gsa_fA => sobol())
+            res1 = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol())
             @test nseries(apply(ModelManager._sobolBarData(res1, sobol_df, true)))  == 2  # S1 + ST
             @test nseries(apply(ModelManager._sobolBarData(res1, sobol_df, false))) == 1  # S1 only
 
@@ -5396,23 +5576,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test [g.label for g in bd.groups] == ["S1", "ST"]
             @test bd.groups[2].fillalpha == 0.45                     # ST de-emphasized
 
-            res2 = Dict{Function,GlobalSensitivity.SobolResult}(_gsa_fA => sobol(), _gsa_fB => sobol())
+            res2 = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol(), _GSA_LABEL_B => sobol())
             @test nseries(apply(ModelManager._sobolBarData(res2, sobol_df, true))) == 4   # 2 fns × (S1+ST)
         end
 
         @testset "RBD" begin
-            res1 = Dict{Function,Vector{<:Real}}(_gsa_fA => [0.1, 0.2, 0.3])
+            res1 = Dict{String,Vector{<:Real}}(_GSA_LABEL_A => [0.1, 0.2, 0.3])
             bd   = ModelManager._rbdBarData(res1, rbd_df)
             @test bd.param_names == pnames
             @test bd.groups[1].label == "S1"
             @test nseries(apply(bd)) == 1
 
-            res2 = Dict{Function,Vector{<:Real}}(_gsa_fA => [0.1, 0.2, 0.3], _gsa_fB => [0.4, 0.5, 0.6])
+            res2 = Dict{String,Vector{<:Real}}(_GSA_LABEL_A => [0.1, 0.2, 0.3], _GSA_LABEL_B => [0.4, 0.5, 0.6])
             @test nseries(apply(ModelManager._rbdBarData(res2, rbd_df))) == 2
         end
 
         @testset "empty results error" begin
-            empty_morris = Dict{Function,GlobalSensitivity.MorrisResult}()
+            empty_morris = Dict{String,GlobalSensitivity.MorrisResult}()
             @test_throws ErrorException ModelManager._moatBarData(empty_morris, moat_df, false)
             @test_throws ErrorException ModelManager._moatViolinData(empty_morris, moat_df)
             @test_throws ErrorException ModelManager._moatScatterData(empty_morris, moat_df)
