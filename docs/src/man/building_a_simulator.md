@@ -23,7 +23,7 @@ You define one concrete type and implement a handful of methods on it:
 
 ModelManager calls your methods at the right moments during a run:
 
-  runner                ──▶  runSimulation(sim, spec)     dispatch each pending simulation
+  runner                ──▶  simulationCommand(sim, spec) the command that runs one simulation
   prepareTrialHierarchy ──▶  setupSampling / setupMonad   prepare before running
   database + versioning ──▶  simulatorVersion* methods    schema + version tracking
   migration framework   ──▶  upgrade* methods             schema migrations
@@ -82,13 +82,19 @@ Dispatch each on your concrete type.
 ### Running a simulation
 
 ```julia
-ModelManager.runSimulation(sim::MySimulator, spec::SimulationSpec)::SimulationProcess
+ModelManager.simulationCommand(sim::MySimulator, spec::SimulationSpec)::Cmd
 ```
 
-The workhorse. Called by the [runner](@ref running_simulations) inside a task for each pending
-simulation. Setup has already happened (see below), so everything you need is in the
-[`SimulationSpec`](@ref). Return a [`SimulationProcess`](@ref) describing the outcome. No
-keyword arguments — encode all per-simulation configuration in `spec`.
+The one thing about launching a simulation that only you know: which command runs it. Setup has
+already happened (see below), so everything you need is in the [`SimulationSpec`](@ref). Return a
+bare `Cmd` — set its `dir` if it must run somewhere other than [`simulatorDir`](@ref), but do not
+attach an environment or wrap it in a `pipeline`; both are rejected, for reasons the
+[`runSimulation`](@ref) docstring explains.
+
+Everything else is done for you by the default [`runSimulation`](@ref): it creates the simulation's
+output folder, sends stdout and stderr to `output.log` and `output.err` there, runs the command in
+the right directory, and — when HPC mode is on — submits it to SLURM and waits for it instead. You
+override `runSimulation` only if your simulation is not an external process at all.
 
 ### Setup hooks
 

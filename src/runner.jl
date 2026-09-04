@@ -21,15 +21,29 @@ Holds the outcome of a single simulation run.
 # Fields
 - `simulation::Simulation`
 - `monad_id::Int`
-- `process::Union{Nothing,Base.Process}`: `nothing` if the command could not be built.
+- `process::Union{Nothing,Base.Process}`: the local process, or `nothing` when the simulation ran
+  as a SLURM job (there is no local process to hold) or no command could be built.
 - `success::Bool`
+- `cmd::Union{Nothing,Cmd}`: the command [`simulationCommand`](@ref) returned, or `nothing` if it
+  could not build one.
+
+`process` alone cannot tell a simulator hook what happened, because it is `nothing` for two
+unrelated reasons: a SLURM job (which ran, elsewhere) and a simulation that never had a command.
+`cmd` separates them — `isnothing(cmd)` means nothing was ever launched — and it is also the field
+to print when reporting a failure, since it is the simulator's own command on both paths rather
+than the `sbatch` wrapper.
 """
 struct SimulationProcess
     simulation::Simulation
     monad_id::Int
     process::Union{Nothing,Base.Process}
     success::Bool
+    cmd::Union{Nothing,Cmd}
 end
+
+#! Four-argument form for the "no command" case and for backends constructing this themselves.
+SimulationProcess(simulation::Simulation, monad_id::Int, process, success::Bool) =
+    SimulationProcess(simulation, monad_id, process, success, nothing)
 
 """
     simulationID(simulation::Simulation)
@@ -79,31 +93,97 @@ function prepCmdForWrap(cmd::Cmd)
 end
 
 """
-    prepareHPCCommand(cmd::Cmd, simulation_id::Int)
+    _shQuote(s::AbstractString) → String
 
-Wrap `cmd` in an `sbatch` invocation using the global job options.
+Wrap `s` in POSIX single quotes so the shell reads it as a literal, escaping any single quotes it
+contains via the standard `'\\''` idiom. Nothing inside single quotes is expanded, so a path
+containing `\$`, a backtick, a double quote, or a space survives intact.
 """
-function prepareHPCCommand(cmd::Cmd, simulation_id::Int)
-    path_to_simulation_folder = trialFolder(Simulation, simulation_id)
-    base_cmd_str = "sbatch"
-    flags = ["--wrap=$(prepCmdForWrap(Cmd(cmd.exec)))",
-             "--wait",
-             "--output=$(joinpath(path_to_simulation_folder, "output.log"))",
-             "--error=$(joinpath(path_to_simulation_folder, "output.err"))",
-             "--chdir=$(simulatorDir(mm_globals().simulator))"
-            ]
+_shQuote(s::AbstractString) = "'" * replace(s, "'" => "'\\''") * "'"
+
+"""
+    _sentinelWrap(cmd_str::AbstractString, sentinel::String) → String
+
+Prefix `cmd_str` with a shell trap that records the command's exit code at `sentinel` when the job
+script exits.
+
+The trap writes to `<sentinel>.tmp` and `mv`s it into place. That rename is atomic, so the waiting
+worker only ever sees a sentinel whose contents are already complete. The path is fixed before
+submission -- the trap needs nothing about the job's identity -- which is what makes the name unique
+per submission and the wait race-free.
+
+The path is bound to a shell variable, single-quoted, *before* the trap is installed, and the trap
+body then refers only to that variable. Interpolating the path into the trap body directly would
+put it inside double quotes in code that is re-parsed when the trap fires, so a `done_dir`
+containing `\$`, a backtick or a `"` would be expanded or would break the quoting -- and `done_dir`
+is user-settable. Binding it once means exactly one thing needs escaping, by exactly one rule.
+
+Only `EXIT` is trapped, not `TERM`. A job killed by the scheduler produces no sentinel at all, and
+that is already handled correctly: it leaves the queue, the reaper notices, and after the grace
+period the simulation is failed. Trapping signals would make that detection faster without making
+it more correct, at the cost of shell that has to be right under every `sh`.
+"""
+function _sentinelWrap(cmd_str::AbstractString, sentinel::String)
+    bind = "mm_sentinel=$(_shQuote(sentinel))"
+    trap_body = "mm_ec=\$?; echo \$mm_ec > \"\${mm_sentinel}.tmp\" && mv \"\${mm_sentinel}.tmp\" \"\${mm_sentinel}\""
+    return "$(bind); trap '$(trap_body)' EXIT; $(cmd_str)"
+end
+
+"""
+    _userJobFlags(simulation_id::Int) → Vector{String}
+
+Render the global `sbatch_options` as `--key=value` flags, resolving `Function` values against
+`simulation_id` and rejecting any key ModelManager sets itself.
+"""
+function _userJobFlags(simulation_id::Int)
+    flags = String[]
     for (k, v) in mm_globals().sbatch_options
-        @assert !(k in ["wrap", "output", "error", "wait", "chdir"]) "The key $k is reserved for ModelManager to set in the sbatch command."
+        @assert !(k in _RESERVED_SBATCH_KEYS) "The key $k is reserved for ModelManager to set in the sbatch command."
         if typeof(v) <: Function
             v = v(simulation_id)
         end
-        if occursin(" ", v)
-            v = "\"$v\""
-        end
-        push!(flags, "--$k=$v")
+        #! `sbatch_options` is a `Dict{String,Any}`, so a numeric value like
+        #! `"cpus-per-task" => 4` is ordinary; stringify rather than assuming `AbstractString`.
+        #! A value containing a space needs no quoting: each flag is one argv element, so no shell
+        #! ever word-splits it, and added quotes would reach sbatch as part of the value.
+        push!(flags, "--$k=$(v)")
     end
-    return `$base_cmd_str $flags`
+    return flags
 end
+
+const _RESERVED_SBATCH_KEYS = ["wrap", "output", "error", "wait", "parsable", "chdir"]
+
+"""
+    _prepareHPCSubmitCommand(cmd::Cmd, simulation_id::Int, sentinel::String) → Cmd
+
+Wrap `cmd` in the `sbatch` invocation `_runHPCSimulation` submits: `--parsable` (never `--wait`),
+the exit-code sentinel installed by `_sentinelWrap` at `sentinel`, per-simulation
+`--output`/`--error` so each simulation keeps its own `output.log` and `output.err`, and the global
+job options.
+
+`--chdir` honors the `Cmd`'s own `dir` when the backend set one, and falls back to the simulator
+directory otherwise -- the same rule the local path applies, so a command means the same thing on
+the cluster as on a laptop.
+"""
+function _prepareHPCSubmitCommand(cmd::Cmd, simulation_id::Int, sentinel::String)
+    path_to_simulation_folder = trialFolder(Simulation, simulation_id)
+    flags = ["--wrap=$(_sentinelWrap(prepCmdForWrap(Cmd(cmd.exec)), sentinel))",
+             "--parsable",
+             "--output=$(joinpath(path_to_simulation_folder, "output.log"))",
+             "--error=$(joinpath(path_to_simulation_folder, "output.err"))",
+             "--chdir=$(_workingDirectory(cmd))"
+            ]
+    append!(flags, _userJobFlags(simulation_id))
+    return `sbatch $flags`
+end
+
+"""
+    _workingDirectory(cmd::Cmd) → String
+
+Where a simulation command runs: the `Cmd`'s own `dir` if the backend set one, else the simulator
+directory. Applied identically by the local and SLURM paths.
+"""
+_workingDirectory(cmd::Cmd) = isempty(cmd.dir) ? simulatorDir(mm_globals().simulator) : cmd.dir
 
 """
     SimulationSpec
@@ -131,12 +211,80 @@ end
 #! docs. See CLAUDE.md, "Docstring cross-references".
 @compat public SimulationSpec, SimulationProcess
 
-#! Public despite not being exported: PhysiCellModelManager depends on `prepareHPCCommand` at
-#! `src/simulator_interface.jl:41`, and its interface docstrings `@ref`
+#! Public despite not being exported: PhysiCellModelManager's interface docstrings `@ref`
 #! `ModelManager.prepareTrialHierarchy` (`src/simulator_interface.jl:28`, `:192`), which cannot
 #! resolve in a downstream build that renders only our public API.
 #! See CLAUDE.md, "Docstring cross-references".
-@compat public prepareTrialHierarchy, prepareHPCCommand
+@compat public prepareTrialHierarchy
+
+"""
+    runSimulation(sim::AbstractSimulator, spec::SimulationSpec) → SimulationProcess
+
+Run the simulation described by `spec` and report how it went. This default asks the backend for
+the command via [`simulationCommand`](@ref) and does everything else: it creates the simulation's
+output folder, sends stdout and stderr to `output.log` and `output.err` there, runs the command in
+[`simulatorDir`](@ref) (or the `Cmd`'s own `dir`), and -- when `run_on_hpc` is set -- submits it as
+a SLURM job instead and waits for it. Called by [`run`](@ref) inside each worker task.
+
+A backend only overrides this if its simulation is not an external process; for those,
+`SimulationProcess.process` may be `nothing`.
+
+[`simulationCommand`](@ref) may return `nothing` to say no command could be built for this
+simulation; that is recorded as a failed simulation and the rest of the trial continues.
+
+Otherwise the command must be a bare `Cmd`. Redirections and pipelines are added here, so a
+`pipeline(...)` is rejected; and it must not carry an environment (`Cmd(...; env=...)`, `setenv`,
+`addenv`). Julia's `Cmd.env` *replaces* the environment, so locally the simulation would see only
+the variables listed; as a SLURM job the environment is not forwarded at all and the job inherits
+the submitting one. The same command would mean two different things, so it is refused rather than
+made silently path-dependent. Put what the simulation needs in the command's arguments or its
+working directory.
+
+A local process that fails to start (missing executable, unwritable folder) is recorded as a failed
+simulation, not raised: one broken simulation should not abort a campaign of thousands. A process
+killed by a signal is also a failure -- Julia reports `exitcode == 0` for those, so the check is
+`success(p)`, not the exit code.
+"""
+function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
+    cmd = simulationCommand(sim, spec)
+    #! A backend that cannot build a command for one simulation says so with `nothing`. Failing
+    #! just that simulation is the point: throwing here would reach run()'s fail-fast completion
+    #! loop and discard every other simulation in the trial.
+    isnothing(cmd) && return SimulationProcess(spec.simulation, spec.monad_id, nothing, false)
+    cmd isa Cmd || throw(ArgumentError("simulationCommand must return a bare Cmd or nothing, got $(typeof(cmd)); ModelManager adds redirections itself."))
+    #! The overwhelmingly likely spelling here is `env=ENV`, which means "inherit" -- and is already
+    #! what happens without it. Say so, because the fix is a deletion and the generic message would
+    #! send someone looking for a way to pass variables they never needed to pass.
+    isnothing(cmd.env) || throw(ArgumentError("""
+        simulationCommand returned a Cmd carrying an environment, which ModelManager cannot apply \
+        the same way on both paths. Locally, Julia's `Cmd.env` *replaces* the environment, so the \
+        simulation would see only the variables listed -- no PATH, no HOME, no module state. As a \
+        SLURM job the environment is not forwarded at all: the job inherits the submitting one. So \
+        the same command would mean two different things depending on where it ran.
+        If you wrote `env=ENV`, delete it -- a child process inherits the environment anyway, so \
+        removing it changes nothing locally, and it never reached the cluster to begin with.
+        If you need specific variables, put them in the command's arguments or its working directory."""))
+    simulation_id = spec.simulation.id
+    folder = trialFolder(Simulation, simulation_id)
+    mkpath(folder)
+
+    if mm_globals().run_on_hpc
+        exit_code = _runHPCSimulation(cmd, simulation_id)
+        return SimulationProcess(spec.simulation, spec.monad_id, nothing, exit_code == 0, cmd)
+    end
+
+    local_cmd = Cmd(cmd; dir=_workingDirectory(cmd))
+    p = try
+        run(pipeline(ignorestatus(local_cmd);
+                     stdout=joinpath(folder, "output.log"),
+                     stderr=joinpath(folder, "output.err")))
+    catch e
+        @error "Simulation $(simulation_id) could not be started." exception=(e, catch_backtrace())
+        #! `cmd` is carried even here: a command existed, it just could not be spawned.
+        return SimulationProcess(spec.simulation, spec.monad_id, nothing, false, cmd)
+    end
+    return SimulationProcess(spec.simulation, spec.monad_id, p, success(p), cmd)
+end
 
 """
     prepareTrialHierarchy(T::AbstractTrial; kwargs...) → Bool
@@ -312,7 +460,18 @@ function run(T::AbstractTrial; quiet::Bool=false,
                 flush(stdout)
             end
             DBInterface.execute(centralDB(), "UPDATE simulations SET status_code_id=$(statusCodeID("Running")) WHERE simulation_id=$(spec.simulation.id);")
-            runSimulation(mm_globals().simulator, spec)
+            #! A throwing `runSimulation` would otherwise leave the row at "Running" forever:
+            #! `isStarted` treats everything except "Not Started" as started, so every later run
+            #! skips it *and* reports "found matching simulations ... not re-running them". A
+            #! backend bug that throws for every simulation therefore bricks the whole trial.
+            #! Record it the same way any other unsuccessful simulation is recorded, then rethrow
+            #! so `run` still fails fast -- a bug in the backend is not a result.
+            try
+                runSimulation(mm_globals().simulator, spec)
+            catch
+                updateDatabaseOnCompletion(spec.simulation.id, spec.monad_id, false)
+                rethrow()
+            end
         end
         for spec in specs
     ]

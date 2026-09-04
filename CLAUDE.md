@@ -310,6 +310,28 @@ Deliberate decisions whose symptoms would otherwise look like bugs. Check here b
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
+- **Give a simulator a supported way to set environment variables.** `runSimulation`'s default
+  rejects a `Cmd` carrying an environment, because Julia's `Cmd.env` *replaces* the environment
+  (a child asking for one variable loses `PATH`, `HOME`, `LD_LIBRARY_PATH` and module state) while
+  a SLURM job just inherits the submitting environment — so one `Cmd` would mean two different
+  things depending on where it ran. That refusal is about the *mechanism*, not the need: wanting
+  `OMP_NUM_THREADS` set is entirely reasonable and there is currently nowhere to put it. The fix is
+  an explicit channel with additive semantics on both paths — merged into the inherited environment
+  locally, `--export=ALL,K=V` on the cluster — rather than smuggling it on the `Cmd`, where the
+  semantics are Julia's and cannot be reconciled. Watch for `--export` quirks with values containing
+  commas or `=`. Surfaced reviewing PR #47; PCMM only ever passed `env=ENV`, which is a no-op, so
+  nothing needs this yet.
+- **Let diagnostics notice simulations abandoned by a dead session.** A simulation is marked
+  `"Running"` before the backend is called; if the *process* then dies — Ctrl-C, a kill, a reboot —
+  nothing in-process can record what happened, and the row stays `"Running"`. `isStarted`
+  (`src/database.jl:386`) counts everything except `"Not Started"` as started, so later runs skip it
+  *and* print "ModelManager found matching simulations and will save you time by not re-running
+  them", about a simulation that never ran. A *thrown* exception is already handled — `run()` wraps
+  the launch and records the simulation before rethrowing — so what is left is only the case no
+  try/catch can reach, which makes `databaseDiagnostics` the right home: it already runs at session
+  start and already reports staged `.trash` paths this way. Note it cannot distinguish "abandoned"
+  from "another live session is running this", so the wording has to be conditional; remediation can
+  point at the existing `deleteSimulations` rather than adding new API.
 
 - **Remove the `summary_statistic` migration warning in v0.10.** Added in 0.9 (PR #46), when a
   measurement function's contract changed from "called once per *monad*, aggregates its own
