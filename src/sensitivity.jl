@@ -198,10 +198,16 @@ function calculateGSA!(gsa_sampling::GSASampling, f::Union{Function,QoI}; recomp
 end
 
 #! Decided from the NAME, not from the labels, and that is the whole point: a spreading QoI's labels
-#! are not known until `reduce` has run on a monad, so a check that needed them would have to do the
-#! expensive work first and save nothing. Every label a QoI produces is either its name or its name
-#! followed by `.` and a key, so the name alone answers the question before any output is read --
-#! which is also why the separator is a `.` rather than something that can start a key.
+#! come from `reduce`'s return and are unknown until it has run on a monad, so a check that needed
+#! them would have to do the expensive work first and save nothing. Every label a QoI produces is
+#! either its name or its name followed by `.` and a key, so the name alone answers the question
+#! before any output is read.
+#!
+#! The inference is EXACT, not a heuristic, and only because `QoI` refuses a name containing a `.`.
+#! Without that, `QoI("counts.x", …)` and a `QoI("counts", …)` spreading to key `"x"` would both
+#! claim the label `counts.x`: caught within one `calculateGSA!` call by the collision check, but
+#! across calls it would silently skip one of them -- in one ordering the whole spreading QoI, so
+#! `counts.y` would never be computed. See the constructor in `src/qoi.jl`.
 """
     _hasGSAResults(gsa_sampling, q) → Bool
 

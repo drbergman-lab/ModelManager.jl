@@ -11,7 +11,8 @@ measurement written once and passed to any of them.
 
 # Arguments
 - `name`: identifies the quantity. It is the sink's column name and the key under which
-  [`CalibrationProblem`](@ref) reports the value to its `distance`.
+  [`CalibrationProblem`](@ref) reports the value to its `distance`. It may not contain a `.`, which
+  is reserved as the separator between a quantity and its components (see below).
 - `compute`: called with one [`Simulation`](@ref). It may return anything `reduce` understands — a
   scalar, a vector, a `Dict` — **except** when the QoI is used as a `post_processor`, where `reduce`
   is never called and `compute`'s own return value is what gets stored.
@@ -141,10 +142,26 @@ end
 
 const _QOI_STORED_MODES = (:never, :prefer, :require)
 
+#! The separator is reserved so that a label can be read backwards. Every name a spread quantity
+#! produces is `"<qoi name>.<key>"`, and sensitivity analysis decides whether a QoI has already been
+#! evaluated by testing exactly that shape against its name -- before reading any output, which is
+#! what makes the check a saving rather than a late no-op. Allow a `.` inside a name and the shape is
+#! ambiguous: `QoI("counts.x", …)` alongside a `QoI("counts", …)` that spreads to `x` gives two
+#! different QoIs a claim on the label `counts.x`. Within one call that collides and is refused, but
+#! across calls it silently skips -- either the second QoI (leaving the first's value under its
+#! label) or, worse, the whole spreading QoI, so a legitimate `counts.y` is never computed.
+#!
+#! Refused at construction rather than inferred later because provenance cannot be recovered from a
+#! label once it exists. `_qoiNameFromFunction` already regularises to `[A-Za-z_][A-Za-z0-9_]*`, so
+#! nothing ModelManager derives can trip this -- only a name a user chose.
 function QoI(name::AbstractString, compute::Function;
              reduce::Function=mean, stored::Symbol=:never)
     stored in _QOI_STORED_MODES || throw(ArgumentError(
         "QoI `stored` must be one of $(_QOI_STORED_MODES); got :$(stored)."))
+    occursin('.', name) && throw(ArgumentError(
+        "QoI names cannot contain a `.`; got \"$(name)\". The dot separates a quantity from its " *
+        "components — a `Dict`-valued measurement is labelled \"$(name)\" plus `.` plus each key — " *
+        "so a name carrying one would be indistinguishable from another QoI's component. Use `_`."))
     return QoI(String(name), compute, reduce, stored)
 end
 

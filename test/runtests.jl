@@ -4271,6 +4271,22 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test QoI("stored_x", _qoi_sim).stored === :never
                 @test_throws ArgumentError QoI("stored_x", _qoi_sim; stored=:sometimes)
 
+                # A `.` is reserved as the quantity/component separator, so a name carrying one is
+                # refused at construction. Without this, `QoI("counts.x", …)` and a `QoI("counts",
+                # …)` spreading to key "x" both claim the label "counts.x": within one
+                # `calculateGSA!` call that collides and is caught, but across calls the name-based
+                # skip silently drops one of them — and in one ordering drops the whole spreading
+                # QoI, so its other components are never computed.
+                err = try; QoI("counts.x", _qoi_sim); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("cannot contain a `.`", err.msg)
+                @test occursin("counts.x", err.msg)
+                # An underscore is not the separator, so it cannot shadow anything.
+                @test QoI("counts_x", _qoi_sim).name == "counts_x"
+                # Nothing ModelManager derives can trip it: bare functions are regularised first.
+                @test !occursin('.', ModelManager._asQoI(s -> 1.0).name)
+                @test !occursin('.', ModelManager._asQoI(_qoi_by_id).name)
+
                 # :require before anything is stored names the fix rather than failing obscurely.
                 sid_probe = 1
                 @test_throws ArgumentError ModelManager._computeOn(
@@ -4519,6 +4535,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 calculateGSA!(gsa, [spr, QoI("fresh", _qoi_sim)])
                 @test spread_calls[] == 2 * after_first                  # spr untouched again
                 @test "fresh" in ModelManager.gsaLabels(gsa)
+
+                # The name-based skip is exact, not a loose prefix match: "spr" must not be
+                # considered already-evaluated because of an unrelated name that starts with it.
+                # (The one way it COULD be ambiguous — a QoI actually named "spr.a" — is refused at
+                # construction, which is what makes this inference sound rather than heuristic.)
+                calculateGSA!(gsa, [QoI("spread_out", _qoi_sim)])
+                @test "spread_out" in ModelManager.gsaLabels(gsa)
+                @test ModelManager._hasGSAResults(gsa, QoI("spread_ou", _qoi_sim)) == false
             end
 
             @testset "run_kwargs is one channel with the loose splat" begin

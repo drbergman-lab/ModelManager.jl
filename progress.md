@@ -119,6 +119,28 @@ name or its name plus `.` and a key, `_hasGSAResults` answers with a prefix test
 original reason: nothing can detect that a measurement changed, the same impossibility documented
 around `stored=:never`.
 
+### Decision: a QoI name may not contain a `.`
+Found by probing the skip rather than by reading it, and it is the price of inferring provenance from
+a name. `_hasGSAResults` tests `k == q.name || startswith(k, q.name * ".")`. If a name may itself
+contain a dot, `QoI("counts.x", …)` and a `QoI("counts", …)` spreading to key `"x"` both claim the
+label `counts.x`, and the two are indistinguishable afterwards. Measured behaviour:
+
+- **Same `calculateGSA!` call** — caught. Results are staged in a local vector and only written after
+  the loop, so neither QoI is skipped, both are evaluated, and the second collides in `sources`.
+  Throws, and `results` is untouched.
+- **Across calls** — silent, in *both* orderings. Evaluate `counts` first and the later `counts.x` is
+  skipped, leaving `counts`'s value under its label. Evaluate `counts.x` first and **the entire
+  spreading QoI is skipped**, so `counts.y` is never computed at all. That second ordering is the
+  worse one and was not in the original write-up of the edge.
+
+Three options were put up — forbid the dot in a name, carry a `Set` of evaluated QoI names as a
+fourth struct field, or document the hole — and forbidding it was chosen: the ambiguity exists
+*solely* because a name may contain the separator, so removing that possibility fixes the cause
+rather than compensating for it, and it fails at construction where the user can still act. It costs
+a new validation on `QoI`, which is breaking for anyone with a dotted name today; nothing in the repo
+had one, and `_qoiNameFromFunction` already regularises derived names to `[A-Za-z_][A-Za-z0-9_]*`, so
+only a user-chosen name can trip it.
+
 ### Decision: label collisions are checked per call, and nothing is filed when one is found
 Checked on the *flattened* labels, since a spreading QoI contributes labels its name does not reveal —
 `_asPostProcessor`'s and `_validateSummaryStatistic`'s name-only checks would miss them. Scoped to one

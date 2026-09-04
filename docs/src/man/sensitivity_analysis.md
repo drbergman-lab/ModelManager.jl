@@ -54,6 +54,10 @@ Two constraints follow from what a sensitivity index needs:
   and different contents. Return a `Dict` whose keys name the components — you know what they mean,
   and the framework does not.
 
+A QoI's `name` may not contain a `.`, since that is the separator: reserving it is what lets a label
+be read back to the QoI that produced it, and so what lets [`calculateGSA!`](@ref) decide from a name
+alone whether that measurement has already been evaluated.
+
 ## MOAT — Morris screening
 
 [`MOAT`](@ref) (Morris One-At-A-Time) is a cheap screening method: it perturbs one parameter
