@@ -5,7 +5,7 @@
 
 ---
 
-## Session: GSA spreads a keyed measurement (2026-09-04) — ships in v0.9.0
+## Session: GSA spreads a keyed measurement (2026-09-04) — ships in v0.9.1
 
 ### Trigger
 Issue #48, raised from PCMM. A `QoI` whose `reduce` yields `Dict(name => value)` fed calibration and

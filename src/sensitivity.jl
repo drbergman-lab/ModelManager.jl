@@ -654,7 +654,7 @@ function _gsaDuplicateLabelMessage(component_keys, labels)
     return "keys $(join(repr.(culprits), ", ")) all produce the label " *
            "$(join(repr.(dups), ", ")). Distinct keys that collide once written into a label are " *
            "not allowed — each label is its own sensitivity analysis, so one would silently " *
-           "replace the other. `1` and \"1\" are the usual way this happens."
+           "replace the other. `1` and \"1\" are one way to get here."
 end
 
 """
