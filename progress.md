@@ -178,6 +178,19 @@ stale can share its name, no `rm`, no race — and the trap no longer needs `\$S
 The test helper now reads the sentinel path back out of the shim's recorded `sbatch` argv, which
 also forces publish-after-submit.
 
+### Deliberately not fixed here: a throwing `runSimulation` strands rows at "Running"
+
+`run()` marks a simulation `"Running"` and *then* calls `runSimulation`. If that throws, the
+completion loop's fail-fast rethrow leaves the row at `"Running"`, and `pendingSimulationSpecs`
+skips anything already started — so a re-run silently does nothing for those simulations.
+
+This predates the branch and applies to any throwing simulator hook, but #47 makes it newly
+reachable: the two `ArgumentError`s guarding the `simulationCommand` contract (an environment on the
+`Cmd`, or a `pipeline`) fire on the *first* simulation of a run. Both are backend programming
+errors that a simulator author hits once and fixes, so the stranded rows are collateral from a
+run that was never going to work — but the recovery is non-obvious, and worth fixing where the
+runner's error handling lives rather than in the HPC path. Raised by a parallel review session.
+
 ### Known limits
 - NFS caches directory attributes (`acdirmin`/`acdirmax`, 30 s/60 s), so a sentinel written on a
   compute node can take up to a minute to appear in a `readdir` on an NFS mount. Lustre/GPFS have

@@ -6732,9 +6732,22 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test !sp.success && isnothing(sp.process)             # this simulation fails...
                 @test sp.simulation.id == sim.id                       # ...and nothing is thrown,
                                                                        # so the trial carries on
+                @test isnothing(sp.cmd)                                # nothing was ever launched
+
+                # `process === nothing` means two unrelated things now (SLURM job, or never built);
+                # `cmd` is what separates them, and it is the simulator's own command on both paths.
+                _test_sim_cmd[] = `sh -c "exit 3"`
+                sp = default(spec)
+                @test !sp.success && !isnothing(sp.cmd)                # ran locally and failed
+                @test sp.cmd == `sh -c "exit 3"`
+                _test_sim_cmd[] = `definitely-not-a-command-mm-test`
+                sp = default(spec)
+                @test isnothing(sp.process) && !isnothing(sp.cmd)      # had a command, could not spawn
 
                 _test_sim_cmd[] = setenv(`true`, "A" => "1")           # env on the Cmd is rejected
-                @test_throws ArgumentError default(spec)
+                err = try; default(spec); catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("env=ENV", sprint(showerror, err))      # the message names the fix
                 _test_sim_cmd[] = pipeline(`true`; stdout=devnull)     # so is a pipeline
                 @test_throws ArgumentError default(spec)
 
@@ -6750,6 +6763,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 _publish(0)
                 sp = fetch(t)
                 @test sp.success && isnothing(sp.process)
+                @test sp.cmd == `true`                                 # ran, on a compute node
                 useHPC(false)
                 _test_sim_cmd[] = `true`
             end

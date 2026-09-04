@@ -22,15 +22,28 @@ Holds the outcome of a single simulation run.
 - `simulation::Simulation`
 - `monad_id::Int`
 - `process::Union{Nothing,Base.Process}`: the local process, or `nothing` when the simulation ran
-  as a SLURM job (there is no local process to hold) or the command could not be built.
+  as a SLURM job (there is no local process to hold) or no command could be built.
 - `success::Bool`
+- `cmd::Union{Nothing,Cmd}`: the command [`simulationCommand`](@ref) returned, or `nothing` if it
+  could not build one.
+
+`process` alone cannot tell a simulator hook what happened, because it is `nothing` for two
+unrelated reasons: a SLURM job (which ran, elsewhere) and a simulation that never had a command.
+`cmd` separates them — `isnothing(cmd)` means nothing was ever launched — and it is also the field
+to print when reporting a failure, since it is the simulator's own command on both paths rather
+than the `sbatch` wrapper.
 """
 struct SimulationProcess
     simulation::Simulation
     monad_id::Int
     process::Union{Nothing,Base.Process}
     success::Bool
+    cmd::Union{Nothing,Cmd}
 end
+
+#! Four-argument form for the "no command" case and for backends constructing this themselves.
+SimulationProcess(simulation::Simulation, monad_id::Int, process, success::Bool) =
+    SimulationProcess(simulation, monad_id, process, success, nothing)
 
 """
     simulationID(simulation_process::SimulationProcess)
@@ -229,14 +242,23 @@ function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
     #! loop and discard every other simulation in the trial.
     isnothing(cmd) && return SimulationProcess(spec.simulation, spec.monad_id, nothing, false)
     cmd isa Cmd || throw(ArgumentError("simulationCommand must return a bare Cmd or nothing, got $(typeof(cmd)); ModelManager adds redirections itself."))
-    isnothing(cmd.env) || throw(ArgumentError("simulationCommand must not set an environment on the Cmd: Cmd.env replaces the environment locally but sbatch --export extends it, so the two paths would disagree. Pass what the simulation needs as arguments or via its working directory."))
+    #! The overwhelmingly likely spelling here is `env=ENV`, which means "inherit" -- and is already
+    #! what happens without it. Say so, because the fix is a deletion and the generic message would
+    #! send someone looking for a way to pass variables they never needed to pass.
+    isnothing(cmd.env) || throw(ArgumentError("""
+        simulationCommand returned a Cmd carrying an environment, which ModelManager cannot honour \
+        consistently: Julia's `Cmd.env` *replaces* the environment locally, while `sbatch --export` \
+        *extends* it, so the local and cluster paths would silently disagree.
+        If you wrote `env=ENV`, delete it -- a child process inherits the environment anyway, so \
+        removing it changes nothing locally and matches what the cluster already did.
+        If you need specific variables, put them in the command's arguments or its working directory."""))
     simulation_id = spec.simulation.id
     folder = trialFolder(Simulation, simulation_id)
     mkpath(folder)
 
     if mm_globals().run_on_hpc
         exit_code = _runHPCSimulation(cmd, simulation_id)
-        return SimulationProcess(spec.simulation, spec.monad_id, nothing, exit_code == 0)
+        return SimulationProcess(spec.simulation, spec.monad_id, nothing, exit_code == 0, cmd)
     end
 
     local_cmd = Cmd(cmd; dir=_workingDirectory(cmd))
@@ -246,9 +268,10 @@ function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
                      stderr=joinpath(folder, "output.err")))
     catch e
         @error "Simulation $(simulation_id) could not be started." exception=(e, catch_backtrace())
-        return SimulationProcess(spec.simulation, spec.monad_id, nothing, false)
+        #! `cmd` is carried even here: a command existed, it just could not be spawned.
+        return SimulationProcess(spec.simulation, spec.monad_id, nothing, false, cmd)
     end
-    return SimulationProcess(spec.simulation, spec.monad_id, p, success(p))
+    return SimulationProcess(spec.simulation, spec.monad_id, p, success(p), cmd)
 end
 
 """
