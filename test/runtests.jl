@@ -6341,7 +6341,13 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # The wrap binds the path once, single-quoted, then the trap refers to the variable.
                 m = match(r"mm_sentinel='([^']*)'", argv)
                 isnothing(m) && error("no sentinel path in sbatch argv: $(argv)")
-                return String(m.captures[1])
+                path = String(m.captures[1])
+                # Guard against a helper that parses the wrap wrongly: a relative path here would
+                # make _publish write into the repo working directory instead of the test project.
+                # That is exactly what happened once when this regex went stale against a changed
+                # wrap format and captured the literal "\${mm_sentinel}".
+                isabspath(path) || error("parsed a non-absolute sentinel path: $(repr(path))")
+                return path
             end
             function _publish(exit_code::Int; nth::Int=1)
                 path = _sentinel_of(nth)
