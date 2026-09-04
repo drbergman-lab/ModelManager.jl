@@ -321,19 +321,17 @@ When setting you off on a task, check this list and assess if any of these shoul
   semantics are Julia's and cannot be reconciled. Watch for `--export` quirks with values containing
   commas or `=`. Surfaced reviewing PR #47; PCMM only ever passed `env=ENV`, which is a no-op, so
   nothing needs this yet.
-- **Decide what a simulation's status should be when a run aborts mid-flight.** `run()` marks a
-  simulation `"Running"` then calls `runSimulation`; if anything throws, the row stays `"Running"`
-  forever. `isStarted` (`src/database.jl:386`) treats everything except `"Not Started"` as started,
-  so a re-run skips those rows *and* prints "ModelManager found matching simulations and will save
-  you time by not re-running them!" — a reassuring message about simulations that never ran. That
-  message is the actual bug surface. `"Failed"` is the honest status (no need to subdivide it), but
-  note it is skipped by that same line, so this does not by itself make the work re-runnable — MM
-  has no "retry this simulation" notion at all. Two traps: do **not** route this through
-  `simulationFailed`, which also erases the simulation from its monad and calls
-  `deleteMonad(...; delete_supers=true)` when it was the last one, so an abort would destroy trial
-  structure; and simulations genuinely in flight on SLURM keep running and keep writing sentinels,
-  so whatever is chosen must not invite duplicate submission. Pre-existing and general — any
-  throwing simulator hook does it.
+- **Let diagnostics notice simulations abandoned by a dead session.** A simulation is marked
+  `"Running"` before the backend is called; if the *process* then dies — Ctrl-C, a kill, a reboot —
+  nothing in-process can record what happened, and the row stays `"Running"`. `isStarted`
+  (`src/database.jl:386`) counts everything except `"Not Started"` as started, so later runs skip it
+  *and* print "ModelManager found matching simulations and will save you time by not re-running
+  them", about a simulation that never ran. A *thrown* exception is already handled — `run()` wraps
+  the launch and records the simulation before rethrowing — so what is left is only the case no
+  try/catch can reach, which makes `databaseDiagnostics` the right home: it already runs at session
+  start and already reports staged `.trash` paths this way. Note it cannot distinguish "abandoned"
+  from "another live session is running this", so the wording has to be conditional; remediation can
+  point at the existing `deleteSimulations` rather than adding new API.
 - Merge `DiscreteVariation` into `DistributedVariation`, with a discrete variation becoming the special case
   carrying a `DiscreteNonParametric` distribution over its value vector. Today the two are separate types with
   parallel machinery: `LatentVariation` has one branch per kind, calibration has `DVSource`/`CVSource` alongside
