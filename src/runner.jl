@@ -251,9 +251,12 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   **successfully completed** simulation, after the simulator's non-destructive
   [`postSimulationProcessing`](@ref) and before its destructive [`postSimulationCleanup`](@ref)
   — so the callback always sees the intact (but processed) output folder.
-  It is called as `post_processor(simulation_process::SimulationProcess)`. Use the accessors
-  [`simulationID`](@ref), [`monadID`](@ref), [`wasSuccessful`](@ref), and
-  [`pathToOutputFolder`](@ref)`(simulation_process)` to access these fields;
+  It is called as `post_processor(simulation::Simulation)` — the same argument a [`QoI`](@ref)'s
+  `compute` receives, so one measurement function serves the sink, sensitivity analysis and
+  calibration alike. A [`QoI`](@ref) or a vector of them may be passed instead of a function. Use
+  [`simulationID`](@ref) and [`pathToOutputFolder`](@ref)`(simulation)` rather than reaching into
+  fields; the hook only fires for simulations that succeeded, and the owning monad is
+  `only(monadIDs(simulation))` (which queries the database, and throws if the simulation is gone);
   reading the actual simulation output into usable data is the responsibility of the user
   or the simulator package (e.g. PhysiCellModelManager loaders keyed by `simulationID`).
   Its return value determines storage:

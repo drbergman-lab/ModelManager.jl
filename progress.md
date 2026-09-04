@@ -3790,3 +3790,55 @@ and proceeds rather than refusing. That is a deliberate trade: the silent-renumb
 (225 vs 250 on the worked example) and a warning is weaker than a refusal, but refusing the common
 lambda was the worse cost. Easy to flip if that judgement changes.
 
+### What an adversarial design review found
+
+Ran five adversarial lenses over this PR plus four independently-derived alternative architectures
+(measurement-as-data, sink-as-the-only-path, level-in-the-type, and one with no anchoring), then three
+judges with deliberately opposed biases scored them with this PR as a candidate.
+
+**The verdict on the shape: keep it.** All four alternative authors concluded their own design does not
+beat this one, and two of three judges agreed outright. The third ranked an alternative first on design
+merit but still recommended shipping this, and marked "beats" only because the PR *as committed did not
+work*. The common reasoning is that the reported bug — two dense positive-`Int` ID spaces colliding —
+is cured by nominal typing, and every alternative presupposes that cure rather than replacing it. Their
+benefits are bought with a change to a type, a contract, or a persisted format, in a package that has
+no migration channel to change them through.
+
+**The ship blocker was in the guard I added to make migration safe.** `_declaresSimulation` reached for
+`m.sig.parameters[2]` on every method. Measured: that throws `FieldError` on any method with a `where`
+clause and `BoundsError` on a zero-argument one — so `f(s::S) where {S<:Simulation}`, a *correctly
+migrated* function, could not be passed to `CalibrationProblem` at all. The introspection is now
+guarded at every step, and a `where` parameter is resolved through its `TypeVar` upper bound so the
+generic form counts while an unbounded `where {S}` (which is `Any`, and carries no intent) does not.
+
+Others found and fixed:
+
+- **A gensym could become a persistent database column.** A bare anonymous post-processor returning a
+  scalar wrote a column literally named `anon_9` — and the number varies with how many closures were
+  compiled earlier, so re-running the same script would add a *second*, half-empty column. Refused now,
+  narrowed twice: only for values the sink would actually store (a `Vector` keeps flowing to the sink's
+  own error, which is raised outside the per-simulation stage and so stays an `ArgumentError` at the
+  call site), and only when the name was auto-derived — `QoI("counts", sim -> …)` has an anonymous
+  `compute` but a perfectly good name. The test caught the second narrowing; I had it wrong first.
+- **The migration warning fired once per session, not once per unmigrated function.** `maxlog=1` counts
+  callsite hits, so a script building several problems warned about the first and went silent for the
+  rest — exactly the case the warning exists for. Suppression is now keyed on the function.
+- **Resuming a calibration saved before this change** died with a raw conversion `MethodError`.
+  `_isCompleteManifest` now also requires the stored summary to be a `QoI`, so a legacy manifest routes
+  to the "re-supply the problem via `problem=`" message that already exists.
+- **`NamedTuple` field order was destroyed** by round-tripping the sink payload through a `Dict`, so
+  columns were added in hash order. The adapter now hands the sink ordered pairs.
+- **The N+1 query pattern** that `simulationsFromIDs`' own docstring warns against had been
+  reintroduced, and now runs for every replicate of every particle. `_reduceOverMonad` batches.
+- **`run`'s docstring** still described the `SimulationProcess` callback and pointed at `monadID`/
+  `wasSuccessful`, which no longer have a method for what the hook now passes.
+
+**One finding is left open deliberately, because it is a decision rather than a defect.** The
+correctness judge's strongest recommendation is to **delete `stored` and `verifyStoredValues`
+outright**. The argument: `stored`'s own docstring already concedes no fingerprint can authenticate a
+stored value in either direction, and its stated mitigation is `verifyStoredValues`, whose documented
+pass condition — `n_mismatched == 0` — is *also* what you get when nothing was compared at all,
+because every simulation was skipped as missing or unverifiable. One flag guarded by one verifier that
+can report clean on an empty check is worse than neither. I have tightened the documented pass
+condition to require `n_agreed > 0`, but whether the feature should exist is not mine to decide.
+

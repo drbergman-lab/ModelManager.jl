@@ -193,6 +193,10 @@ a stored value records which `compute` produced it, so recomputation is the only
 # Example
 ```julia
 report = verifyStoredValues(tumor, my_sampling)
+# `n_mismatched == 0` alone is NOT a pass: it is also what you get when every simulation was
+# skipped. Require that something was actually compared.
+report.n_agreed > 0 || error("nothing was verified: \$(report.n_missing) had no stored value " *
+                             "and \$(report.n_unverifiable) had no output folder to recompute from")
 report.n_mismatched == 0 || error("stored values disagree with a fresh computation")
 ```
 """
@@ -233,7 +237,14 @@ function _reduceOverMonad(x, monad_id::Integer)
     sim_ids = constituentIDs(Monad, Int(monad_id))
     isempty(sim_ids) && throw(ArgumentError(
         "Monad $(monad_id) has no simulations, so QoI \"$(q.name)\" cannot be evaluated on it."))
-    return q.reduce([_computeOn(q, sid) for sid in sim_ids])
+    #! One query for the whole monad, as `simulationsFromIDs`' own docstring asks. Building them one
+    #! at a time is the N+1 pattern that docstring warns against, and this path now runs for every
+    #! replicate of every particle. It skips missing IDs rather than throwing, so that is checked.
+    sims = simulationsFromIDs(sim_ids)
+    length(sims) == length(sim_ids) || throw(ArgumentError(
+        "Monad $(monad_id) lists $(length(sim_ids)) simulations but only $(length(sims)) are in the " *
+        "database, so QoI \"$(q.name)\" cannot be evaluated on it."))
+    return q.reduce([_computeOn(q, sim) for sim in sims])
 end
 
 #! One contract, and one internal representation. A user may hand any consumer a bare `Function`; it
@@ -299,9 +310,25 @@ Whether `f` has a method whose first argument is declared to accept a [`Simulati
 `Simulation` itself or a supertype of it, but not `Any`. An untyped argument carries no intent, so it
 does not count.
 """
-_declaresSimulation(f::Function) = any(methods(f)) do m
-    T = m.sig.parameters[2]
-    T !== Any && Simulation <: T
+function _declaresSimulation(f::Function)
+    for m in methods(f)
+        #! `m.sig` is a `UnionAll` for any method with a `where` clause, and indexing its `.parameters`
+        #! throws. A method can also have no argument at all, or a `Vararg` in first position -- so
+        #! every step here is guarded. Reaching for `parameters[2]` unguarded made a CORRECTLY migrated
+        #! `f(s::S) where {S<:Simulation}` unconstructable, which is the opposite of this guard's job.
+        sig = Base.unwrap_unionall(m.sig)
+        sig isa DataType || continue
+        length(sig.parameters) >= 2 || continue
+        T = sig.parameters[2]
+        #! A `where` parameter arrives as a `TypeVar`, whose upper bound is the declared constraint:
+        #! `f(s::S) where {S<:Simulation}` has `S.ub === Simulation`. Without this the guard reads the
+        #! TypeVar itself, decides it is not a type, and rejects a correctly written function.
+        T isa TypeVar && (T = T.ub)
+        T = Base.unwrap_unionall(T)
+        T isa Type || continue
+        T !== Any && Simulation <: T && return true
+    end
+    return false
 end
 
 """
@@ -321,23 +348,34 @@ function _validateSummaryStatistic(qs::AbstractVector{QoI})
     return collect(qs)
 end
 
+#! Suppression is keyed on the FUNCTION, not on the log site. `maxlog=1` counts callsite hits, so a
+#! script building several problems in one session warned about the first and went silent for the
+#! rest -- exactly the case the warning exists for.
+const _WARNED_SUMMARIES = Base.IdSet{Any}()
+
 function _validateSummaryStatistic(f::Function)
     #! Warned, not refused. The declared argument type is the only available signal that a function was
     #! written for the new contract -- an old monad-level summary is untyped or `::Int` -- but refusing
     #! every unannotated function also rejects `sim -> measure(sim)`, the natural new-contract lambda.
-    #! So it is accepted and flagged. The risk is real: an old summary that aggregated its own
-    #! replicates now returns a different number rather than an error, and `mseDistance` will not catch
-    #! it (on a key mismatch it warns once and computes anyway, treating absent keys as zero).
-    _declaresSimulation(f) || @warn """
-        `summary_statistic` was given a function that does not declare it takes a `Simulation`.
+    #! The risk is real: an old summary that aggregated its own replicates now returns a different
+    #! number rather than an error, and `mseDistance` will not catch it (on a key mismatch it warns
+    #! once and computes anyway, treating absent keys as zero).
+    if !_declaresSimulation(f) && !(f in _WARNED_SUMMARIES)
+        push!(_WARNED_SUMMARIES, f)
+        #! Named by where it was written, not by the regularised `anon_N`: that name is an internal
+        #! column identifier and means nothing to someone reading a warning.
+        who = _isAnonymousFunction(f) ? "the anonymous function defined at $(functionloc(f))" :
+                                        "`$(nameof(f))`"
+        @warn """
+            `summary_statistic` was given a function that does not declare it takes a `Simulation`.
 
-        Measurement functions are now called once per *simulation*, and their replicates are combined
-        by `reduce` (`mean` here). If `$(_qoiNameFromFunction(f))` was written for the previous
-        contract -- called once per *monad*, doing its own aggregation -- it will now return a
-        different value with no error. Annotate it `(s::Simulation)` to silence this, or pass a `QoI`
-        to choose the reduction:
-            QoI("$(_qoiNameFromFunction(f))", s -> <per-simulation>; reduce = vals -> <after averaging>)
-        """ maxlog=1
+            Measurement functions are now called once per *simulation*, and their replicates are
+            combined by `reduce` (`mean` here). If $(who) was written for the previous contract --
+            called once per *monad*, doing its own aggregation -- it will now return a different value
+            with no error. Annotate it `(s::Simulation)` to silence this, or pass a `QoI` to choose the
+            reduction.
+            """
+    end
     return _asQoI(f)
 end
 
@@ -382,10 +420,10 @@ function _asPostProcessor(qs::AbstractVector{QoI})
     length(unique(names)) == length(names) || throw(ArgumentError(
         "QoI names must be unique within one post-processor; got $(names)."))
     return function (sim::Simulation)
-        #! Keys are NOT stringified here. The sink already rejects distinct keys that collide once
-        #! stringified (`1` and `"1"`), and doing that conversion early would collapse them silently
-        #! before its check ever ran -- and would move the error out of the sink and into the
-        #! per-simulation stage, which wraps it.
+        #! Ordered pairs, not a `Dict`: round-tripping through one scrambled a `NamedTuple`'s field
+        #! order, so the sink added its columns in hash order. Keys are also left unstringified --
+        #! the sink rejects distinct keys that collide once stringified (`1` and `"1"`), and
+        #! converting early would collapse them before that check ever ran.
         entries = Pair{Any,Any}[]
         for q in qs
             v = _computeOn(q, sim)
@@ -397,18 +435,28 @@ function _asPostProcessor(qs::AbstractVector{QoI})
                     push!(entries, k => vv)
                 end
             else
+                #! A gensym must never become a persistent database column. An anonymous function
+                #! returning a scalar has no name to store it under, and the regularised `anon_9`
+                #! varies between sessions -- the same script would write a second, half-empty column
+                #! next time. Returning a NamedTuple/Dict is unaffected: those names come from the
+                #! user, and the branch above never consults the QoI's name.
+                #! Two narrowings. Only values the sink would actually store: a return it rejects
+                #! anyway (a Vector, say) keeps flowing to its own error, which is raised outside the
+                #! per-simulation stage and so stays an `ArgumentError` at the call site. And only a
+                #! name that was AUTO-DERIVED from an anonymous function -- `QoI("counts", sim -> …)`
+                #! has an anonymous `compute` but a perfectly good name, and must not be refused.
+                v isa Union{Bool,Integer,Real,AbstractString} &&
+                    _isAnonymousFunction(q.compute) &&
+                    q.name == _qoiNameFromFunction(q.compute) && throw(ArgumentError(
+                    "post_processor: an anonymous function returned a $(typeof(v)), which has to be " *
+                    "stored under a column name, and an anonymous function has none. Either name it " *
+                    "-- `QoI(\"my_quantity\", f)` -- or return a NamedTuple/Dict whose keys are the " *
+                    "column names."))
                 push!(entries, q.name => v)
             end
         end
         isempty(entries) && return nothing
-        out = Dict{Any,Any}(entries)
-        #! Only a collision the `Dict` itself would swallow is caught here: two QoIs contributing the
-        #! very same key. Anything that merely collides after stringification is left to the sink.
-        length(out) == length(entries) || throw(ArgumentError(
-            "post_processor produced the same quantity name from more than one QoI. Names must be " *
-            "unique across the whole post-processor, including keys spliced from a `compute` that " *
-            "returns a NamedTuple or Dict."))
-        return out
+        return entries
     end
 end
 

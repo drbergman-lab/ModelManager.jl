@@ -659,6 +659,11 @@ without re-supplying the original problem — i.e. neither `summary_statistic` n
 """
 function _isCompleteManifest(manifest::_ProblemManifest)
     isnothing(manifest.summary_statistic) && return false
+    #! A calibration saved before summary statistics became QoIs stored a bare `Function` here.
+    #! Treating that as incomplete routes it to the existing "re-supply the problem via `problem=`"
+    #! message instead of a raw `MethodError` from the `CalibrationProblem` constructor -- and there
+    #! is no version row to gate on, so the shape of the value is the only signal available.
+    manifest.summary_statistic isa Union{QoI,Vector{QoI}} || return false
     isnothing(manifest.distance)          && return false
     any(s -> s isa _StrippedLVSource, manifest.sources) && return false
     return true

@@ -141,6 +141,12 @@ ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 # The per-simulation measurements behind them. Named and top-level so the QoIs built from them are
 # restorable: a QoI is only as restorable as its `compute` and `reduce`.
 _sim_one(s::Simulation)    = 1.0
+# Signature shapes that broke `_declaresSimulation`'s method-table introspection. The `where` form is
+# a CORRECTLY migrated function, so rejecting it was worse than not checking at all.
+_sim_where(s::S) where {S<:Simulation}      = 1.0
+_sim_varargs(s::Simulation, extras...)      = 1.0
+_sim_unbounded(s::S) where {S}              = 1.0   # `S` is `Any`: carries no intent
+_sim_zeroarg()                              = 1.0
 _sim_two(s::Simulation)    = 2.0
 _sim_vec(s::Simulation)    = [1.0]
 # A single QoI reports its value directly; a vector reports a Dict keyed by name. That is what keeps
@@ -2981,6 +2987,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test seen[][3] == pathToOutputFolder(acc_id)
                 @test seen[][3] == pathToOutputFolder(Simulation(acc_id))
 
+                # A NamedTuple's field order reaches the columns. Routing through a Dict scrambled
+                # it into hash order, so the table came back shuffled relative to what was written.
+                ordered = createTrial(inputs, [DiscreteVariation(:config, xp_x, 353.0)]; n_replicates=1)
+                run(ordered; post_processor = sim -> (; zeta=1.0, alpha=2.0, mid=3.0, beta=4.0))
+                ot = postProcessingTable(simulationIDs(ordered))
+                @test filter(in(["zeta","alpha","mid","beta"]), names(ot)) ==
+                      ["zeta", "alpha", "mid", "beta"]
+
+                # An anonymous function returning a scalar has no name to store it under, and the
+                # regularised gensym varies between sessions -- it must never become a column.
+                @test_throws Exception run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 354.0)]; n_replicates=1);
+                    post_processor = sim -> 7.0)
+                @test !any(startswith("anon"), names(postProcessingTable(simulationIDs(samp))))
+                # Naming it is the fix, and a NamedTuple return is unaffected either way.
+                named_ok = createTrial(inputs, [DiscreteVariation(:config, xp_x, 355.0)]; n_replicates=1)
+                run(named_ok; post_processor = QoI("named_scalar", sim -> 7.0))
+                @test postProcessingTable(simulationIDs(named_ok)).named_scalar[1] == 7.0
+
                 # simulationsTable(...; post_processing=true) joins the QoIs by :SimID.
                 st_pp = simulationsTable(samp; post_processing=true, remove_constants=false)
                 @test Set(["SimID", "sid", "doubled"]) ⊆ Set(names(st_pp))
@@ -4027,6 +4052,36 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # And a bare function's name is regularised so it can be a column / Dict key.
                 @test ModelManager._qoiNameFromFunction(_sim_one) == "_sim_one"
                 @test occursin(r"^anon_[0-9_]+$", ModelManager._qoiNameFromFunction(s -> 1.0))
+            end
+
+            @testset "_declaresSimulation survives every method signature shape" begin
+                # This guard reads the method table, and reaching for `m.sig.parameters[2]` unguarded
+                # threw on three shapes -- FieldError on a `where` clause, BoundsError on a zero-arg
+                # method -- which made a correctly written `f(s::S) where {S<:Simulation}` impossible
+                # to pass to CalibrationProblem at all. The guard added to make migration safe was
+                # what broke it.
+                @test ModelManager._declaresSimulation(_sim_one)
+                @test ModelManager._declaresSimulation(_sim_where)      # TypeVar upper bound
+                @test ModelManager._declaresSimulation(_sim_varargs)
+                @test !ModelManager._declaresSimulation(_sim_unbounded) # where {S} is Any
+                @test !ModelManager._declaresSimulation(_sim_zeroarg)   # no argument at all
+                # ...and each is constructable, which is the thing that actually broke.
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                for f in (_sim_where, _sim_varargs, _sim_zeroarg, _sim_unbounded)
+                    @test CalibrationProblem(inputs, [dv], 1.0, f, mseDistance) isa CalibrationProblem
+                end
+            end
+
+            @testset "the migration warning is per function, not per session" begin
+                # `maxlog=1` counts callsite hits, so a script building several problems warned about
+                # the first and went silent for the rest -- exactly the case it exists for.
+                empty!(ModelManager._WARNED_SUMMARIES)
+                u1(mid) = 1.0
+                u2(mid) = 2.0
+                @test_logs (:warn,) match_mode=:any ModelManager._validateSummaryStatistic(u1)
+                @test_logs (:warn,) match_mode=:any ModelManager._validateSummaryStatistic(u2)
+                # ...and the same function warns only once.
+                @test_logs ModelManager._validateSummaryStatistic(u1)
             end
 
             @testset "a bare summary statistic is wrapped into a QoI" begin
