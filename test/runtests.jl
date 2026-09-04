@@ -111,8 +111,14 @@ ModelManager.setupMonad(::TestSimulator,    args...; kwargs...) = true
 # (which makes the runner delete the emptied monad, exactly as in the reported bug).
 const _fail_sim_predicate = Ref{Union{Nothing,Function}}(nothing)
 
+# When set, runSimulation throws instead of returning — a *backend bug*, distinct from a simulation
+# that runs and fails. The two land in different places in the runner, which is the point of the
+# "a throwing runSimulation still records the simulation" testset.
+const _throw_in_run = Ref(false)
+
 function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.SimulationSpec)
     # No-op: immediately report success without launching any process.
+    _throw_in_run[] && error("backend blew up launching simulation $(spec.simulation.id)")
     should_fail = !isnothing(_fail_sim_predicate[]) && _fail_sim_predicate[](spec)
     return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, !should_fail)
 end
@@ -6266,6 +6272,41 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
     end
 
+
+    @testset "a throwing runSimulation records the simulation instead of stranding it" begin
+        # `run()` marks a simulation "Running" and then calls the backend. If that call throws, the
+        # row used to stay "Running" forever -- and `isStarted` counts everything except
+        # "Not Started" as started, so every later run skipped it *and* printed "found matching
+        # simulations ... not re-running them". A backend that throws for every simulation therefore
+        # bricked the whole trial. Distinct from a simulation that runs and fails, which was always
+        # recorded correctly (covered elsewhere).
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            statusOf(id) = ModelManager.queryToDataFrame(
+                ModelManager.constructSelectQuery("simulations", "WHERE simulation_id=$(id)";
+                                                  selection="status_code_id"); is_row=true)[1, :status_code_id]
+            FAILED  = ModelManager.statusCodeID("Failed")
+            RUNNING = ModelManager.statusCodeID("Running")
+            QUEUED  = ModelManager.statusCodeID("Queued")
+
+            # IDs captured up front: failing every simulation empties the monad, which deletes it.
+            monad = Monad(InputFolders(config="default"); n_replicates=3)
+            ids = simulationIDs(monad)
+            _throw_in_run[] = true
+            try
+                @test_throws Exception run(monad; quiet=true)
+                # `run` throws from its completion loop the moment it sees the first error, while
+                # the worker tasks are still draining the queue. Wait for them *before* clearing the
+                # flag, or the stragglers run successfully and the end state is not what was tested.
+                @test timedwait(() -> all(statusOf(id) ∉ (RUNNING, QUEUED) for id in ids), 20.0) === :ok
+            finally
+                _throw_in_run[] = false
+            end
+            @test all(statusOf(id) == FAILED for id in ids)   # every one recorded, none stranded
+        end
+    end
 
     # ============================================================================
     # SLURM completion detection (replaces `sbatch --wait` polling)

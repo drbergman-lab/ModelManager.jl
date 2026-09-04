@@ -450,7 +450,18 @@ function run(T::AbstractTrial; quiet::Bool=false,
                 flush(stdout)
             end
             DBInterface.execute(centralDB(), "UPDATE simulations SET status_code_id=$(statusCodeID("Running")) WHERE simulation_id=$(spec.simulation.id);")
-            runSimulation(mm_globals().simulator, spec)
+            #! A throwing `runSimulation` would otherwise leave the row at "Running" forever:
+            #! `isStarted` treats everything except "Not Started" as started, so every later run
+            #! skips it *and* reports "found matching simulations ... not re-running them". A
+            #! backend bug that throws for every simulation therefore bricks the whole trial.
+            #! Record it the same way any other unsuccessful simulation is recorded, then rethrow
+            #! so `run` still fails fast -- a bug in the backend is not a result.
+            try
+                runSimulation(mm_globals().simulator, spec)
+            catch
+                updateDatabaseOnCompletion(spec.simulation.id, spec.monad_id, false)
+                rethrow()
+            end
         end
         for spec in specs
     ]
