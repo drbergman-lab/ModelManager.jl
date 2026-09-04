@@ -30,7 +30,7 @@
 - ModelManager dispatches on `mm_globals().simulator` for all simulator-specific calls.
 
 **Required interface methods:**
-- `simulationCommand(sim, spec::SimulationSpec)` → `Cmd` — the command that runs one simulation
+- `simulationCommand(sim, spec::SimulationSpec)` → `Union{Nothing,Cmd}` — the command that runs one simulation; `nothing` means none could be built, failing that one simulation
 - `runSimulation(sim, spec::SimulationSpec)` → `SimulationProcess` — has a default built on `simulationCommand`; override only for a simulator that is not an external process
 - `simulatorDir(sim)` → `String`
 - `simulatorVersionSchema(sim)` → `String` (SQL sub-schema for version table)
@@ -175,7 +175,10 @@ target location's file type.
 - `run(T::AbstractTrial; force_recompile, kwargs...)` collects simulation tasks, executes up to `mm_globals().max_number_of_parallel_simulations` concurrently, and returns `MMOutput{T}`.
 - `run(Ts::AbstractVector; kwargs...)` bundles a collection of already-built trials (`Simulation`/`Monad`/`Sampling`/`Trial`, possibly in a `Vector{Any}`) into one `Trial` via `createTrial(::AbstractVector)` and runs it as a single parallelized batch. Non-`AbstractTrial` elements and empty vectors raise `ArgumentError`.
 - `kwargs` are forwarded to `prepareTrialHierarchy` (simulator hooks like `force_recompile`) and to `postSimulationProcessing`/`postSimulationCleanup`. The `post_processor` hook (see the Post-Processing feature) runs per successful simulation between them. `runSimulation` takes no kwargs — it receives only the `SimulationSpec`.
-- `runSimulation` has a default: it asks the backend for the command via `simulationCommand(sim, spec)::Cmd` and owns everything else — output folder, `output.log`/`output.err`, working directory, and local-vs-SLURM dispatch. A backend overrides it only if its simulation is not an external process. On HPC each simulation is wrapped in an `sbatch --wrap` invocation submitted with `--parsable`; see the HPC Job Completion feature for how the runner learns it finished.
+- `runSimulation` has a default: it asks the backend for the command via `simulationCommand(sim, spec)::Union{Nothing,Cmd}` and owns everything else — output folder, `output.log`/`output.err`, working directory, and local-vs-SLURM dispatch. A backend overrides it only if its simulation is not an external process. On HPC each simulation is wrapped in an `sbatch --wrap` invocation submitted with `--parsable`; see the HPC Job Completion feature for how the runner learns it finished.
+- The command must be a bare `Cmd`: a `pipeline` is rejected (redirections are added by the runner), and so is a `Cmd` carrying an environment, because `Cmd.env` *replaces* the environment locally while a SLURM job inherits the submitting one — the same command would mean two different things. Both raise `ArgumentError`. A `Cmd`'s own `dir` is honored identically on both paths, falling back to `simulatorDir`.
+- `SimulationProcess` carries `cmd`, the command `simulationCommand` returned, or `nothing` if none could be built. `process` alone cannot say what happened — it is `nothing` both for a SLURM job (which ran elsewhere) and for a simulation that never launched — so `isnothing(cmd)` is the discriminator, and `cmd` is the command to report on failure.
+- A simulation whose launch **throws** is recorded as unsuccessful before the exception is rethrown. Otherwise the row would stay `"Running"`, and since `isStarted` counts everything except `"Not Started"` as started, every later run would skip it while reporting that it had found matching simulations — a backend throwing for every simulation would leave the trial unrecoverable.
 - A simulation that fails is marked `"Failed"` in the database and removed from its monad's constituent list. If the monad becomes empty, it is deleted along with empty parents.
 - Already-started simulations are skipped (idempotent re-runs).
 
@@ -195,6 +198,7 @@ target location's file type.
 
 **Behavioral specification:**
 - Jobs are submitted with `sbatch --parsable`, never `--wait`. `--output`/`--error` point at the simulation's own folder, so each simulation keeps its own `output.log` and `output.err`. `--chdir` is the `Cmd`'s own `dir` if the backend set one, else `simulatorDir`.
+- The `sbatch` client's own streams are written to `hpc.out` and `hpc.err` in the simulation's folder — distinct from `output.log`/`output.err`, which `sbatch` fills with what the job printed on the compute node. With `--parsable`, `hpc.out` is the only place a simulation's SLURM job ID lands on disk, which is what allows a finished run to be correlated with `sacct`. Failure to write them never fails a submission.
 - The wrapped command is prefixed with a shell `trap ... EXIT` that writes the command's exit code to a sentinel path chosen **before submission**: `<done_dir>/<simulation_id>.<time_ns hex>`. The write is staged through `<path>.tmp` and `mv`'d into place, so a listed sentinel always has its content. Because the name is unique per submission, nothing left behind by an earlier submission or a recycled SLURM job ID can be read as this job's result, and no post-submission cleanup step is needed. Only `EXIT` is trapped; a scheduler kill produces no sentinel and is resolved by the reaper.
 - **Each worker waits for its own sentinel** (`isfile` on one path every `poll_interval`, default 1s). There is no central watcher task, no registry, and no channel per job: nothing one worker does can hang or fail another. The wait blocks the worker, so `max_number_of_parallel_simulations` still bounds how many jobs sit in the queue.
 - **The scheduler is a reaper only**, consulted through one `squeue -h -u $USER -t all -o %i` answer shared by every waiting worker and refreshed by whichever worker finds it older than `reap_interval` (default 300s) — one RPC per interval regardless of N. `-u` maps to `slurm_load_job_user`, filtered server-side. `-t all` keeps SUSPENDED jobs visible. `SQUEUE_*` environment variables are cleared for the call so a user's profile cannot filter live jobs out of the answer. The call is bounded by a timeout and killed if it hangs.
@@ -217,7 +221,10 @@ target location's file type.
 - Stale strays are swept, fresh ones left alone, at most once per interval.
 - `squeue` argv contains `-t all`; `SQUEUE_*` variables are absent from its environment; a nonzero exit is `nothing`; a hang returns `nothing` within the timeout rather than blocking on the pipe.
 - `sbatch` output with a banner line before or after the ID, or in the classic `Submitted batch job N` form, parses; two IDs or none is refused.
-- The generated `--wrap` text, run under `/bin/sh`, records the true exit code at the given path and preserves the script's own status.
+- The generated `--wrap` text, run under `/bin/sh`, records the true exit code at the given path and preserves the script's own status, for paths containing spaces, `$`, backticks, quotes and shell metacharacters.
+- `hpc.out` holds the submitted job's ID; a rejected submission puts the scheduler's message in `hpc.err`.
+- `simulationCommand` returning `nothing` fails that one simulation and lets the trial continue; a `Cmd` with an environment or a `pipeline` raises `ArgumentError`.
+- A backend that throws on launch leaves no simulation at `"Running"`.
 - The default `runSimulation` writes `output.log`/`output.err` into the simulation folder, runs in `simulatorDir` or the `Cmd`'s `dir`, records a signal-killed or unstartable process as failed rather than throwing, rejects a `Cmd` with an environment or a `pipeline`, and routes to SLURM when `run_on_hpc` is set.
 
 ---
