@@ -17,10 +17,16 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic::Function`: `(monad_id::Int) → T` for any `T` accepted by `distance`
-  as its first argument. Called once per proposed particle. The user controls how to
-  aggregate over `simulationIDs(Monad, monad_id)` (e.g. averaging, taking a single
-  replicate).
+- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function that **declares it
+  takes a [`Simulation`](@ref)** — `f(s::Simulation)`, or `(s::Simulation) -> …`. In every case the
+  measurement is made once per *simulation* and the replicates are combined by `reduce` (`mean` for a
+  plain function; a `QoI` is how you choose otherwise, and its `reduce` receives every replicate's
+  value, so a step that must happen *after* averaging goes there). A single QoI or a plain function
+  reports its value directly; a vector of QoIs reports a `Dict` keyed by QoI name.
+
+  The annotation is required because the previous contract called a bare function once per *monad*
+  and let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
+  reinterpreting one silently would change results without raising; the error explains the migration.
 - `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
   of `summary_statistic`; `observed` is `observed_data`.
   Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
@@ -36,12 +42,21 @@ and how to compare simulated to observed output.
 # Short run for testing — set max_time via a reference
 ref = createTrial(inputs, DiscreteVariation(["overall","max_time"], 12.0); n_replicates=0)
 
+# Your own per-simulation measurement: reach into this simulation's output and return a number.
+# Parsing raw output is the backend's job, so in practice you would call the loader your simulator
+# package provides (keyed by `simulationID`); this reads a summary file the simulator wrote.
+function countDefaultCells(sim::Simulation)
+    counts = joinpath(pathToOutputFolder(sim), "final_cell_counts.csv") |> CSV.File |> DataFrame
+    return Float64(only(counts[counts.cell_type .== "default", :count]))
+end
+
+# A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
 observed = Dict("default" => 100.0)
 problem = CalibrationProblem(
     ref,
     [DistributedVariation(:config, xml_path, Uniform(1e-7, 1e-4))],
     observed,
-    monad_id -> endpointPopulationCounts(monad_id),
+    [QoI("default", countDefaultCells)],
     mseDistance
 )
 
@@ -59,7 +74,7 @@ struct CalibrationProblem
     inputs::InputFolders
     parameters::Vector{CalibrationParameter}
     observed_data::Any
-    summary_statistic::Function
+    summary_statistic::Union{QoI,Vector{QoI}}
     distance::Function
     n_replicates::Int
     reference_variation_id::VariationID
@@ -72,7 +87,7 @@ function CalibrationProblem(inputs::InputFolders, parameters::AbstractVector,
                              reference_variation_id::VariationID=VariationID(inputs))
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(inputs, cps, observed_data,
-                              _asSummaryStatistic(summary_statistic), distance,
+                              _validateSummaryStatistic(summary_statistic), distance,
                               n_replicates, reference_variation_id)
 end
 
@@ -86,7 +101,7 @@ function CalibrationProblem(ref::AbstractMonad, parameters::AbstractVector,
                              summary_statistic, distance; n_replicates::Int=1)
     cps = _toCalibrationParameters(parameters)
     return CalibrationProblem(ref.inputs, cps, observed_data,
-                              _asSummaryStatistic(summary_statistic), distance,
+                              _validateSummaryStatistic(summary_statistic), distance,
                               n_replicates, ref.variation_id)
 end
 

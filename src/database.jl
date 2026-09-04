@@ -1247,12 +1247,18 @@ end
     _normalizePostProcessingQoI(qoi) -> Vector{Tuple{String,String,Any}}
 
 Normalize a `post_processor` return value into `(column_name, sqlite_type, db_value)` tuples.
-Accepts a `NamedTuple` or an `AbstractDict` of `name => scalar`; throws an `ArgumentError`
+Accepts a `NamedTuple`, an `AbstractDict`, or an ordered vector of `name => scalar` pairs;
+throws an `ArgumentError`
 for any other type.
 """
 function _normalizePostProcessingQoI(qoi)
     named_pairs = if qoi isa NamedTuple
         [String(k) => v for (k, v) in pairs(qoi)]
+    #! Ordered pairs are what `_asPostProcessor` produces. They exist so a `NamedTuple`'s field order
+    #! survives to the columns: a `Dict` would reorder it, and the duplicate check below needs to see
+    #! the collisions a `Dict` would already have swallowed.
+    elseif qoi isa AbstractVector && all(x -> x isa Pair, qoi)
+        [string(first(x)) => last(x) for x in qoi]
     elseif qoi isa AbstractDict
         [string(k) => v for (k, v) in qoi]
     else

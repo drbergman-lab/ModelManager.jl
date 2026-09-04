@@ -507,20 +507,20 @@ end
 Evaluate `f` (a function of `simulation_id`) on each monad in the sampling, averaging replicates.
 """
 function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function,QoI})
-    #! The reducer comes from the QoI rather than being hard-coded. A plain `Function` still gets
-    #! `mean` over its replicates, which is what this always did, so existing `functions=[f]` calls
-    #! are unchanged. `Float64` stays because the sensitivity indices downstream require it: a
-    #! reducer returning something else fails here, at the QoI, rather than deep inside
-    #! GlobalSensitivity.
-    compute, reduce_replicates = _qoiEvaluator(f)
+    #! A bare `Function` is wrapped into a `QoI` here, so the rest of this works on one object with
+    #! one contract: `compute` gets a `Simulation`, `reduce` combines the replicates (`mean` for a
+    #! wrapped function, which is what this always did). `Float64` stays because the sensitivity
+    #! indices downstream require it: a reducer returning something else fails here, at the QoI,
+    #! rather than deep inside GlobalSensitivity.
+    q = _asQoI(f)
     monad_id_df = getMonadIDDataFrame(gsa_sampling)
     value_dict = Dict{Int,Float64}()
     vals = zeros(Float64, size(monad_id_df))
     for (ind, monad_id) in enumerate(monad_id_df |> Matrix)
         if !haskey(value_dict, monad_id)
             simulation_ids = constituentIDs(Monad, monad_id)
-            sim_values = [compute(simulation_id) for simulation_id in simulation_ids]
-            value_dict[monad_id] = reduce_replicates(sim_values)
+            sim_values = [_computeOn(q, simulation_id) for simulation_id in simulation_ids]
+            value_dict[monad_id] = q.reduce(sim_values)
         end
         vals[ind] = value_dict[monad_id]
     end

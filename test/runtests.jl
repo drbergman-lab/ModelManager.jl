@@ -138,21 +138,34 @@ ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
 # Must live here (not inside @testset blocks) so they get stable module-qualified names
 # rather than compiler-generated closures like #249#250.
-_test_named_ss(mid)        = Dict{String,Any}("x" => 1.0)
-_test_named_vec_ss(mid)    = [1.0]
-_test_named_scalar_ss(mid) = 1.0
+# The per-simulation measurements behind them. Named and top-level so the QoIs built from them are
+# restorable: a QoI is only as restorable as its `compute` and `reduce`.
+_sim_one(s::Simulation)    = 1.0
+# Signature shapes that broke `_declaresSimulation`'s method-table introspection. The `where` form is
+# a CORRECTLY migrated function, so rejecting it was worse than not checking at all.
+_sim_where(s::S) where {S<:Simulation}      = 1.0
+_sim_varargs(s::Simulation, extras...)      = 1.0
+_sim_unbounded(s::S) where {S}              = 1.0   # `S` is `Any`: carries no intent
+_sim_zeroarg()                              = 1.0
+_sim_two(s::Simulation)    = 2.0
+_sim_vec(s::Simulation)    = [1.0]
+# A single QoI reports its value directly; a vector reports a Dict keyed by name. That is what keeps
+# the scalar and vector `observed_data` shapes usable.
+_test_named_ss             = [QoI("x", _sim_one)]
+_test_named_vec_ss         = QoI("vec", _sim_vec)
+_test_named_scalar_ss      = QoI("scalar", _sim_one)
 _test_named_dist(s, o)     = 0.0
-# Returns x=2.0 so mseDistance vs observed x=1.0 is always 1.0 (non-zero).
+# Reports x=2.0 so mseDistance vs observed x=1.0 is always 1.0 (non-zero).
 # Used by resumeABC test to prevent premature convergence.
-_test_nonzero_ss(mid)      = Dict{String,Any}("x" => 2.0)
+_test_nonzero_ss           = [QoI("x", _sim_two)]
 
 # ---- QoI test computes ----------------------------------------------------
 # Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
 # values differ; _qoi_monad sees the whole monad at once.
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
-_qoi_monad(m::Monad)      = length(ModelManager.constituentIDs(m))
-# A plain GSA function: takes a simulation ID, as `functions=` always has.
-_qoi_by_id(sim_id)        = getParameterValue(Simulation(Int(sim_id)), :config, XMLPath(["data", "x"]))
+# A bare function in `functions=`: it now receives a `Simulation`, exactly like a QoI's `compute`.
+# Untyped on purpose -- that is how users write them, and it is the case dispatch cannot sniff.
+_qoi_by_id(sim)           = getParameterValue(sim, :config, XMLPath(["data", "x"]))
 
 # Reads a previously-stored post-processing value instead of recomputing from output. This is the
 # write-once-read-later path: the sink survives post-simulation cleanup, the output folder may not.
@@ -170,25 +183,27 @@ end
 _gsa_fA(mid) = 0.0
 _gsa_fB(mid) = 0.0
 
+_count_replicates(vals)    = Float64(length(vals))
+# The `missing`-for-a-dead-monad path is unreachable now: `_reduceOverMonad` raises when a
+# monad's constituents come back empty, before any QoI runs. So this is an ordinary measure.
+_sim_missing(s::Simulation) = 1.0
+_sim_throws(s::Simulation)  = error("summary statistic boom")
+
 # Summary statistics that reproduce the reported calibration failure modes.
 # _test_monad_ss touches the monad, so it would throw "Monad N not in the database" once every
 # simulation in that monad has failed and the emptied monad has been deleted — the failure the
 # calibration loop must now catch before user code is reached.
-function _test_monad_ss(mid)
-    monad = Monad(mid)
-    return Dict{String,Any}("x" => Float64(length(ModelManager.simulationIDs(monad))))
-end
-# _test_missing_ss returns `missing` for a monad that is gone instead of throwing; the failure
-# then surfaces one frame later, inside `distance` (the originally reported MethodError).
-function _test_missing_ss(mid)
-    df = ModelManager.constructSelectQuery("monads", "WHERE monad_id=$(mid);";
-                                           selection="monad_id") |> ModelManager.queryToDataFrame
-    return isempty(df) ? missing : Dict{String,Any}("x" => 1.0)
-end
+# Counting the replicates is now `reduce`'s job: it receives one value per surviving simulation.
+# A monad that has been deleted after total failure no longer reaches user code at all --
+# `_reduceOverMonad` raises first, when `constituentIDs` comes back empty.
+_test_monad_ss = [QoI("x", _sim_one; reduce = _count_replicates)]
+# _test_missing_ss used to return `missing` for a monad that was gone, with the failure surfacing one
+# frame later inside `distance`. User code is no longer reached for a dead monad at all.
+_test_missing_ss = [QoI("x", _sim_missing)]
 # Broken user functions used to check that a healthy monad fails fast rather than silently:
 # a distance that is not a Real, and a summary statistic that throws.
 _test_dict_dist(sim, obs)  = Dict("not" => "a real")
-_test_throwing_ss(mid)     = error("summary statistic boom")
+_test_throwing_ss          = [QoI("x", _sim_throws)]
 
 @testset "ModelManager.jl" begin
 
@@ -1490,7 +1505,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             ModelManager.InputFolders(Pair{Symbol,Union{String,Int}}[]),
             CalibrationParameter[cp_t],
             Dict{String,Any}("default" => 0.0),
-            monad_id -> Dict("default" => 0.0),
+            QoI("default", s -> 0.0),
             mseDistance,
             1,
             ModelManager.VariationID(Pair{Symbol,Int}[])
@@ -1508,7 +1523,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             ModelManager.InputFolders(Pair{Symbol,Union{String,Int}}[]),
             CalibrationParameter[cp_t],
             vec_obs,
-            identity, mseDistance, 1,
+            QoI("v", s -> 0.0), mseDistance, 1,
             ModelManager.VariationID(Pair{Symbol,Int}[])
         )
         @test prob_vec.observed_data === vec_obs
@@ -1518,7 +1533,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             ModelManager.InputFolders(Pair{Symbol,Union{String,Int}}[]),
             CalibrationParameter[cp_t],
             scalar_obs,
-            identity, mseDistance, 1,
+            QoI("v", s -> 0.0), mseDistance, 1,
             ModelManager.VariationID(Pair{Symbol,Int}[])
         )
         @test prob_scalar.observed_data === scalar_obs
@@ -1847,7 +1862,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
         # Anonymous summary_statistic
         prob_anon_ss = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
-                                          mid -> Dict("x" => 1.0), _test_named_dist, 1, var_id)
+                                          QoI("x", s -> 1.0), _test_named_dist, 1, var_id)
         @test ModelManager._hasAnyAnonymousFunction(prob_anon_ss)
 
         # Anonymous distance
@@ -1907,7 +1922,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test loaded.sources[1] isa ModelManager.DVSource  # DV not stripped
 
             # Anonymous summary_statistic → incomplete manifest; distance still preserved
-            anon_ss   = mid -> Dict("x" => 1.0)
+            anon_ss   = QoI("x", s -> 1.0)          # anonymous `compute` => unrestorable QoI
             prob_anon = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
                                            anon_ss, _test_named_dist, 1, var_id)
             manifest_anon = ModelManager._ProblemManifest(prob_anon)
@@ -2103,7 +2118,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
         @test length(result_auto.parameters) == 1
 
         # Incomplete manifest + nothing → error (problem= required)
-        anon_ss   = mid -> Dict("x" => 1.0)
+        anon_ss   = QoI("x", s -> 1.0)          # anonymous `compute` => unrestorable QoI
         prob_anon = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
                                        anon_ss, _test_named_dist, 1, var_id)
         manifest_anon = ModelManager._ProblemManifest(prob_anon)
@@ -2949,26 +2964,47 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 dv   = DiscreteVariation(:config, xp_x, [301.0, 302.0])
                 samp = createTrial(inputs, [dv]; n_replicates=1)
                 calls = Ref(0)
-                out = run(samp; post_processor = sp -> begin
+                out = run(samp; post_processor = sim -> begin
                     calls[] += 1
-                    (; sid = sp.simulation.id, doubled = 2.0 * sp.simulation.id)
+                    (; sid = sim.id, doubled = 2.0 * sim.id)
                 end)
                 @test out.n_success == 2
                 @test calls[] == 2                       # fired once per successful sim
 
-                # Accessors let the callback avoid reaching into struct internals.
+                # The callback receives a Simulation. monadID/wasSuccessful are gone from the sink's
+                # contract along with SimulationProcess: `success` was always true here (run only fires
+                # the hook on success) and the monad is recoverable with monadIDs(sim).
                 acc = createTrial(inputs, [DiscreteVariation(:config, xp_x, 351.0)]; n_replicates=1)
                 acc_id = simulationIDs(acc)[1]
                 seen = Ref{Any}(nothing)
-                run(acc; post_processor = sp -> begin
-                    seen[] = (simulationID(sp), monadID(sp), wasSuccessful(sp), pathToOutputFolder(sp))
+                run(acc; post_processor = sim -> begin
+                    seen[] = (simulationID(sim), only(ModelManager.monadIDs(sim)),
+                              pathToOutputFolder(sim))
                     nothing
                 end)
                 @test seen[][1] == acc_id
                 @test seen[][2] == Monad(acc).id
-                @test seen[][3] == true
-                @test seen[][4] == pathToOutputFolder(acc_id)
-                @test seen[][4] == pathToOutputFolder(Simulation(acc_id))
+                @test seen[][3] == pathToOutputFolder(acc_id)
+                @test seen[][3] == pathToOutputFolder(Simulation(acc_id))
+
+                # A NamedTuple's field order reaches the columns. Routing through a Dict scrambled
+                # it into hash order, so the table came back shuffled relative to what was written.
+                ordered = createTrial(inputs, [DiscreteVariation(:config, xp_x, 353.0)]; n_replicates=1)
+                run(ordered; post_processor = sim -> (; zeta=1.0, alpha=2.0, mid=3.0, beta=4.0))
+                ot = postProcessingTable(simulationIDs(ordered))
+                @test filter(in(["zeta","alpha","mid","beta"]), names(ot)) ==
+                      ["zeta", "alpha", "mid", "beta"]
+
+                # An anonymous function returning a scalar has no name to store it under, and the
+                # regularised gensym varies between sessions -- it must never become a column.
+                @test_throws Exception run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 354.0)]; n_replicates=1);
+                    post_processor = sim -> 7.0)
+                @test !any(startswith("anon"), names(postProcessingTable(simulationIDs(samp))))
+                # Naming it is the fix, and a NamedTuple return is unaffected either way.
+                named_ok = createTrial(inputs, [DiscreteVariation(:config, xp_x, 355.0)]; n_replicates=1)
+                run(named_ok; post_processor = QoI("named_scalar", sim -> 7.0))
+                @test postProcessingTable(simulationIDs(named_ok)).named_scalar[1] == 7.0
 
                 # simulationsTable(...; post_processing=true) joins the QoIs by :SimID.
                 st_pp = simulationsTable(samp; post_processing=true, remove_constants=false)
@@ -2989,7 +3025,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
 
                 # use_previous ⇒ nothing re-scheduled ⇒ callback not fired again.
                 calls[] = 0
-                run(samp; post_processor = sp -> (; sid = sp.simulation.id))
+                run(samp; post_processor = sim -> (; sid = sim.id))
                 @test calls[] == 0
 
                 # Callback returning `nothing` ⇒ no sink row for that sim.
@@ -3042,8 +3078,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 m_ord = createTrial(inputs, [DiscreteVariation(:config, xp_x, 401.0)]; n_replicates=1)
                 ord_id = simulationIDs(m_ord)[1]
                 empty!(_post_order_log)
-                run(m_ord; post_processor = sp -> begin
-                    push!(_post_order_log, "user:$(sp.simulation.id)")
+                run(m_ord; post_processor = sim -> begin
+                    push!(_post_order_log, "user:$(sim.id)")
                     (; q = 1.0)
                 end)
                 @test _post_order_log == ["processing:$(ord_id)", "user:$(ord_id)", "cleanup:$(ord_id)"]
@@ -3095,7 +3131,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @testset "post-processing sink follows deletions" begin
                 dv   = DiscreteVariation(:config, xp_x, [501.0, 502.0])
                 samp = createTrial(inputs, [dv]; n_replicates=2)   # 2 monads × 2 replicates
-                run(samp; post_processor = sp -> (; v = simulationID(sp)))
+                run(samp; post_processor = sim -> (; v = simulationID(sim)))
                 sids = simulationIDs(samp)
                 @test nrow(postProcessingTable(sids)) == 4
 
@@ -3974,13 +4010,126 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 @test q.reduce === mean
                 @test QoI("x", _qoi_sim; reduce=maximum).reduce === maximum
 
-                # A QoI and a plain Function collapse to the same pair, but a plain Function keeps
-                # its existing contract: it is called with an ID, not a Simulation. Wrapping it
-                # would silently change what every existing `functions=[f]` receives.
-                fq, rq = ModelManager._qoiEvaluator(q)
-                ff, rf = ModelManager._qoiEvaluator(_qoi_by_id)
-                @test rq === mean && rf === mean
-                @test_throws ArgumentError ModelManager._qoiEvaluator(42)
+                # A bare Function is wrapped into a QoI at the boundary, so nothing downstream sees
+                # one: it gains a name and reduce=mean, and its `compute` is the function itself.
+                @test ModelManager._asQoI(q) === q
+                wrapped = ModelManager._asQoI(_qoi_by_id)
+                @test wrapped isa QoI
+                @test wrapped.compute === _qoi_by_id
+                @test wrapped.name == "_qoi_by_id"
+                @test wrapped.reduce === mean
+                @test_throws ArgumentError ModelManager._asQoI(42)
+            end
+
+            @testset "one contract: every consumer hands over a Simulation" begin
+                # The point of the change. What a bare function receives no longer depends on which
+                # consumer it was passed to: it was a simulation ID in `functions=`, a MONAD id in
+                # CalibrationProblem, and a SimulationProcess at the sink. Two of those were an Int,
+                # and both ID spaces are dense positive integers, so the wrong one produced a
+                # plausible number with no error.
+                t   = createTrial(inputs, [DiscreteVariation(:config, xp_x, 1487.0)]; n_replicates=1)
+                sid = simulationIDs(t)[1]
+
+                seen = Any[]
+                rec(x) = (push!(seen, typeof(x)); 1.0)
+
+                q = ModelManager._asQoI(rec)           # wrapped at the boundary, never stays a Function
+                @test q isa QoI
+                @test q.compute === rec
+                @test q.reduce === mean                 # the default reduction a bare function gets
+                ModelManager._computeOn(q, sid)
+                @test seen[end] === Simulation          # GSA: a Simulation, not a bare Int
+
+                empty!(seen)
+                ModelManager._asPostProcessor(rec)(Simulation(sid))
+                @test seen[end] === Simulation          # sink: a Simulation, not a SimulationProcess
+
+                # A QoI's compute already received a Simulation, so the two now agree exactly.
+                empty!(seen)
+                ModelManager._computeOn(QoI("rec", rec), sid)
+                @test seen[end] === Simulation
+
+                # And a bare function's name is regularised so it can be a column / Dict key.
+                @test ModelManager._qoiNameFromFunction(_sim_one) == "_sim_one"
+                @test occursin(r"^anon_[0-9_]+$", ModelManager._qoiNameFromFunction(s -> 1.0))
+            end
+
+            @testset "_declaresSimulation survives every method signature shape" begin
+                # This guard reads the method table, and reaching for `m.sig.parameters[2]` unguarded
+                # threw on three shapes -- FieldError on a `where` clause, BoundsError on a zero-arg
+                # method -- which made a correctly written `f(s::S) where {S<:Simulation}` impossible
+                # to pass to CalibrationProblem at all. The guard added to make migration safe was
+                # what broke it.
+                @test ModelManager._declaresSimulation(_sim_one)
+                @test ModelManager._declaresSimulation(_sim_where)      # TypeVar upper bound
+                @test ModelManager._declaresSimulation(_sim_varargs)
+                @test !ModelManager._declaresSimulation(_sim_unbounded) # where {S} is Any
+                @test !ModelManager._declaresSimulation(_sim_zeroarg)   # no argument at all
+                # ...and each is constructable, which is the thing that actually broke.
+                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                for f in (_sim_where, _sim_varargs, _sim_zeroarg, _sim_unbounded)
+                    @test CalibrationProblem(inputs, [dv], 1.0, f, mseDistance) isa CalibrationProblem
+                end
+            end
+
+            @testset "the migration warning is per function, not per session" begin
+                # `maxlog=1` counts callsite hits, so a script building several problems warned about
+                # the first and went silent for the rest -- exactly the case it exists for.
+                empty!(ModelManager._WARNED_SUMMARIES)
+                u1(mid) = 1.0
+                u2(mid) = 2.0
+                @test_logs (:warn,) match_mode=:any ModelManager._validateSummaryStatistic(u1)
+                @test_logs (:warn,) match_mode=:any ModelManager._validateSummaryStatistic(u2)
+                # ...and the same function warns only once.
+                @test_logs ModelManager._validateSummaryStatistic(u1)
+            end
+
+            @testset "a bare summary statistic is wrapped into a QoI" begin
+                # Nothing stays a bare Function internally: the boundary wraps it, supplying the two
+                # things it lacks -- a name and reduce=mean.
+                dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob = CalibrationProblem(inputs, [dv], 1.0, _sim_one, mseDistance)
+                @test prob.summary_statistic isa QoI
+                @test prob.summary_statistic.compute === _sim_one
+                @test prob.summary_statistic.name == "_sim_one"
+                @test prob.summary_statistic.reduce === mean
+
+                # An unannotated function is accepted but flagged: the declared argument type is the
+                # only signal that a function was written for the new per-simulation contract, and an
+                # old monad-level summary would otherwise return a different number silently.
+                @test ModelManager._declaresSimulation(_sim_one)                # f(s::Simulation)
+                @test ModelManager._declaresSimulation((s::Simulation) -> 1.0)  # annotated lambda
+                @test !ModelManager._declaresSimulation(_test_named_dist)       # untyped
+                @test !ModelManager._declaresSimulation(s -> 1.0)               # plain lambda
+                @test_logs (:warn, r"does not declare it takes a `Simulation`") match_mode=:any begin
+                    ModelManager._validateSummaryStatistic(_test_named_dist)
+                end
+                # ...and an annotated one is silent (@test_logs with no patterns asserts no records).
+                @test_logs ModelManager._validateSummaryStatistic(_sim_one)
+
+                # The number that would silently change, for the record:
+                @test mean([10.0, 20.0])^2 != mean([10.0, 20.0] .^ 2)   # 225.0 vs 250.0
+            end
+
+            @testset "a QoI-backed problem stays restorable" begin
+                # The regression this change must not introduce. Collapsing a QoI into a closure at
+                # construction made `_isAnonymousFunction` true for EVERY QoI-backed problem, so the
+                # manifest stored `nothing` and resume demanded `problem=`. Since a QoI is now the
+                # only accepted summary statistic, collapsing would have made every calibration
+                # unrestorable. The QoI is preserved instead.
+                dv     = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob   = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                            _test_named_ss, _test_named_dist)
+                # Stored, not collapsed. The vector is copied by validation, so identity is on the
+                # QoI itself -- that object is what a per-simulation consumer needs back.
+                @test prob.summary_statistic == _test_named_ss
+                @test only(prob.summary_statistic) === only(_test_named_ss)
+                @test ModelManager._isCompleteManifest(ModelManager._ProblemManifest(prob))
+
+                # A QoI is only as restorable as the functions inside it -- both are checked.
+                @test !ModelManager._isAnonymousFunction(QoI("x", _sim_one))
+                @test ModelManager._isAnonymousFunction(QoI("x", s -> 1.0))
+                @test ModelManager._isAnonymousFunction(QoI("x", _sim_one; reduce = v -> sum(v)))
             end
 
             @testset "QoI passes straight to all three consumers" begin
@@ -4003,8 +4152,10 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                                                                         Uniform(0.5, 3.0))],
                                           Dict{String,Any}("x" => 1.0),
                                           QoI("x", _qoi_sim), mseDistance)
-                @test prob.summary_statistic isa Function
-                @test prob.summary_statistic(mid)["x"] ≈ mean(sim_vals)
+                # The QoI is preserved, not collapsed into a closure -- which is what keeps a
+                # QoI-backed problem restorable on resume. A single QoI reports its value directly.
+                @test prob.summary_statistic isa QoI
+                @test ModelManager._evaluateSummary(prob.summary_statistic, mid) ≈ mean(sim_vals)
 
                 # The sink: the QoI itself is the post_processor.
                 m2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1069.0])];
@@ -4018,7 +4169,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 # Duplicate names are refused rather than silently collapsing a column.
                 @test_throws ArgumentError ModelManager._asPostProcessor(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
-                @test_throws ArgumentError ModelManager._asSummaryStatistic(
+                @test_throws ArgumentError ModelManager._validateSummaryStatistic(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
             end
 
@@ -4074,8 +4225,8 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                       mean([_qoi_sim(Simulation(i)) for i in sids])
 
                 # And through a real consumer, to show nothing about the seam needs changing.
-                ss = ModelManager._asSummaryStatistic(readback)
-                @test ss(mid)["stored_x"] ≈ mean([_qoi_sim(Simulation(i)) for i in sids])
+                @test ModelManager._evaluateSummary(readback, mid) ≈
+                      mean([_qoi_sim(Simulation(i)) for i in sids])
             end
 
             @testset "stored=:prefer/:require and verifyStoredValues" begin
@@ -4807,7 +4958,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
                 dv1  = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
                 dv2  = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
                 # Trivial output function: no real simulator output needed.
-                gs_fn = (_sim_id::Int) -> 1.0
+                gs_fn = (_sim::Simulation) -> 1.0
 
                 samp = run(MOAT(3), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
@@ -4839,7 +4990,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @testset "GSA — Sobol" begin
                 dv1  = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
                 dv2  = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
-                gs_fn = (_sim_id::Int) -> 1.0
+                gs_fn = (_sim::Simulation) -> 1.0
 
                 samp = run(Sobolʼ(4), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
@@ -4853,7 +5004,7 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @testset "GSA — RBD" begin
                 dv1  = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
                 dv2  = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
-                gs_fn = (_sim_id::Int) -> 1.0
+                gs_fn = (_sim::Simulation) -> 1.0
 
                 samp = run(RBD(4), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
