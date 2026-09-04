@@ -4560,6 +4560,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 calculateGSA!(gsa, [QoI("spread_out", _qoi_sim)])
                 @test "spread_out" in ModelManager.gsaLabels(gsa)
                 @test ModelManager._hasGSAResults(gsa, QoI("spread_ou", _qoi_sim)) == false
+
+                # The single-measurement method files results too. It used to be covered for free,
+                # because the vector method delegated to it; now that the vector method stages and
+                # stores its own results (so a rejected call leaves `results` untouched), this is a
+                # separate exported entry point and needs its own exercise.
+                calculateGSA!(gsa, QoI("solo", _qoi_sim))
+                @test "solo" in ModelManager.gsaLabels(gsa)
+                @test gsa.results["solo"] isa GlobalSensitivity.MorrisResult
+                # It spreads, skips and recomputes on the same terms as the vector method.
+                solo_calls = Ref(0)
+                solo_spread = QoI("duo", s -> (solo_calls[] += 1; _qoi_sim(s));
+                                  reduce=per_sim -> Dict("a" => mean(per_sim), "b" => maximum(per_sim)))
+                calculateGSA!(gsa, solo_spread)
+                @test ["duo.a", "duo.b"] ⊆ ModelManager.gsaLabels(gsa)
+                once = solo_calls[]
+                calculateGSA!(gsa, solo_spread)
+                @test solo_calls[] == once                               # skipped
+                calculateGSA!(gsa, solo_spread; recompute=true)
+                @test solo_calls[] > once
             end
 
             @testset "run_kwargs is one channel with the loose splat" begin
