@@ -348,6 +348,16 @@ function _validateSummaryStatistic(qs::AbstractVector{QoI})
     return collect(qs)
 end
 
+#! TRANSITIONAL -- remove in v0.10. This whole apparatus exists only to warn people migrating from the
+#! pre-0.9 contract, where a bare `summary_statistic` was called once per *monad* and aggregated its
+#! own replicates. Once 0.9 is behind us there is nothing to disambiguate and a bare function is simply
+#! a per-simulation measurement, so delete: `_declaresSimulation` (used by nothing else),
+#! `_WARNED_SUMMARIES`, and the `if !_declaresSimulation(...)` block below -- leaving
+#! `_validateSummaryStatistic(f::Function) = _asQoI(f)`. In the tests, that also retires the
+#! "_declaresSimulation survives every method signature shape" and "the migration warning is per
+#! function, not per session" testsets, and the `_sim_where` / `_sim_varargs` / `_sim_unbounded` /
+#! `_sim_zeroarg` helpers they use. Tracked in CLAUDE.md's to-do list.
+#!
 #! Suppression is keyed on the FUNCTION, not on the log site. `maxlog=1` counts callsite hits, so a
 #! script building several problems in one session warned about the first and went silent for the
 #! rest -- exactly the case the warning exists for.

@@ -310,6 +310,20 @@ Deliberate decisions whose symptoms would otherwise look like bugs. Check here b
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
+
+- **Remove the `summary_statistic` migration warning in v0.10.** Added in 0.9 (PR #46), when a
+  measurement function's contract changed from "called once per *monad*, aggregates its own
+  replicates" to "called once per *simulation*, replicates combined by `reduce`". The two cannot be
+  told apart automatically — an untyped argument is `::Any`, so `hasmethod` answers `true` for every
+  candidate type — so a bare function whose argument is not declared `::Simulation` is accepted with a
+  warning. That warning is only meaningful while people still have pre-0.9 code; afterwards it fires
+  on perfectly ordinary lambdas (`sim -> measure(sim)`) and is pure noise. Delete
+  `_declaresSimulation` (nothing else uses it), `_WARNED_SUMMARIES`, and the warning block in
+  `_validateSummaryStatistic` (`src/qoi.jl`), leaving
+  `_validateSummaryStatistic(f::Function) = _asQoI(f)`. Also retire the two testsets that cover them
+  and the `_sim_where` / `_sim_varargs` / `_sim_unbounded` / `_sim_zeroarg` helpers. Note the
+  suppression set is deliberately unlocked and grows for the session — acceptable for a temporary
+  migration aid, and another reason not to keep it past 0.9.
 - Merge `DiscreteVariation` into `DistributedVariation`, with a discrete variation becoming the special case
   carrying a `DiscreteNonParametric` distribution over its value vector. Today the two are separate types with
   parallel machinery: `LatentVariation` has one branch per kind, calibration has `DVSource`/`CVSource` alongside
