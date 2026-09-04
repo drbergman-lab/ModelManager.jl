@@ -6,8 +6,8 @@ CurrentModule = ModelManager
 
 Once you have a [trial](@ref trial_hierarchy), [`run`](@ref) executes it. The runner is
 generic: it prepares the trial, figures out which simulations are still pending, dispatches
-them in parallel, and writes results back to the database. The simulator backend only
-provides the per-simulation launch via [`runSimulation`](@ref).
+them in parallel, runs each one (locally or as a SLURM job), and writes results back to the
+database. The simulator backend only supplies the command via [`simulationCommand`](@ref).
 
 ## The two-phase run
 
@@ -17,10 +17,11 @@ provides the per-simulation launch via [`runSimulation`](@ref).
    the whole trial. It calls the backend's [`setupSampling`](@ref) once per unique
    input-folder group and [`setupMonad`](@ref) for each monad.
 2. **Execution** — the runner collects a [`SimulationSpec`](@ref) for every simulation that has
-   not yet completed, and launches each one through the backend's [`runSimulation`](@ref)
-   inside its own task.
+   not yet completed and launches each one inside its own task, asking the backend for the
+   command via [`simulationCommand`](@ref) and handling the rest itself: output folder,
+   `output.log`/`output.err`, working directory, and local-versus-SLURM dispatch.
 
-Because preparation is separated from execution, the backend's `runSimulation` can assume the
+Because preparation is separated from execution, the backend's `simulationCommand` can assume the
 monad is fully prepared and receives everything it needs in the `SimulationSpec` — no keyword
 arguments are threaded through.
 

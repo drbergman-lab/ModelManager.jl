@@ -39,11 +39,45 @@ These options are applied to every job the runner submits for the current sessio
 
 ## How jobs are launched
 
-When HPC mode is active, the runner wraps each simulation command for `sbatch` submission
-(`prepareHPCCommand` and `prepCmdForWrap` in the runner) instead of
+When HPC mode is active, the runner submits each simulation's command to `sbatch` instead of
 spawning a local process. From your script's perspective nothing changes — you still call
 [`run`](@ref) on a trial; the runner decides per-simulation whether to execute locally or
 submit a job.
+
+Each job still writes its own `output.log` and `output.err` into that simulation's output folder,
+and `setNumberOfParallelSims` still bounds how many jobs sit in the queue at once.
+
+## How completion is detected
+
+Jobs are submitted with `--parsable` rather than `--wait`. Each job's script records its exit code
+in a sentinel file whose name was chosen before submission, and the worker that submitted it waits
+for that one file — a `stat` a second. `squeue` is consulted only as a reaper, for jobs killed by
+the scheduler (out of memory, time limit, node failure) or cancelled before they started, which
+never get the chance to write anything — and only through one answer shared by every waiting
+worker, so the scheduler sees one query per interval however many jobs are in flight.
+
+This matters on a shared cluster. `sbatch --wait` is a poll, not a callback: each waiting `sbatch`
+queries the controller on a 2-to-32-second cycle, so one waiter per simulation put load on
+slurmctld proportional to your parallelism — and worst for short simulations, because every waiter
+restarts that cycle at two seconds.
+
+Tune it with [`setHPCCompletionOptions`](@ref):
+
+```julia
+setHPCCompletionOptions(
+    done_dir = "/scratch/\$(ENV["USER"])/mm_done",  # sentinels only — not your data/
+    poll_interval = 1.0,     # seconds between a worker's checks for its own sentinel
+    reap_interval = 300.0,   # how long one squeue answer is shared before it is refreshed
+    grace_period  = 270.0,   # how long a vanished job may take to produce its sentinel
+)
+```
+
+The one setting worth knowing about is `done_dir`. NFS caches directory attributes for 30–60
+seconds by default, which delays how quickly a sentinel written on a compute node becomes visible
+to your driver. Lustre and GPFS have no such delay. If your project lives on NFS and you want
+faster turnaround, point `done_dir` at a faster filesystem — **only the sentinel directory needs to
+move; your `data/` can stay where it is.** Sentinels live for seconds and are consumed and deleted,
+so a purge policy on scratch cannot harm them.
 
 ## Filesystem safety on shared clusters
 

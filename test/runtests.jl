@@ -133,6 +133,11 @@ ModelManager.postSimulationCleanup(::TestSimulator, sp::ModelManager.SimulationP
     push!(_post_order_log, "cleanup:$(sp.simulation.id)"); nothing
 end
 
+# What the default runSimulation is handed when a test invokes it on TestSimulator. Ref{Any} so a
+# test can also hand it a pipeline and assert the rejection.
+const _test_sim_cmd = Ref{Any}(`true`)
+ModelManager.simulationCommand(::TestSimulator, ::ModelManager.SimulationSpec) = _test_sim_cmd[]
+
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
@@ -6259,6 +6264,414 @@ _test_throwing_ss(mid)     = error("summary statistic boom")
             @test haskey(tags(sim), "mm:created")
         end
         ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
+    end
+
+
+    # ============================================================================
+    # SLURM completion detection (replaces `sbatch --wait` polling)
+    #
+    # No SLURM here, so `sbatch` and `squeue` are shell scripts on PATH, driven by
+    # files in their directory: the id the next `sbatch` hands out, the listing
+    # `squeue` prints, and flag files that make either fail or hang.  Every test
+    # goes through the real process path -- spawn, argv, parse, exit status,
+    # timeout -- which is the point of shimming PATH rather than hooking Julia.
+    # ============================================================================
+    @testset "SLURM completion detection" begin
+        MM = ModelManager
+        shim = mktempdir()
+        write(joinpath(shim, "sbatch"), """
+            #!/bin/sh
+            echo "\$@" >> "$shim/sbatch.log"
+            [ -e "$shim/sbatch.fail" ] && exit 1
+            while ! mkdir "$shim/sbatch.lock" 2>/dev/null; do sleep 0.01; done
+            id=\$(cat "$shim/sbatch.next_id")
+            echo \$((id + 1)) > "$shim/sbatch.next_id"
+            rmdir "$shim/sbatch.lock"
+            echo "\$id"
+            """)
+        write(joinpath(shim, "squeue"), """
+            #!/bin/sh
+            echo "\$@ STATES=\$SQUEUE_STATES PART=\$SQUEUE_PARTITION" >> "$shim/squeue.log"
+            [ -e "$shim/squeue.fail" ] && exit 1
+            [ -e "$shim/squeue.sleep" ] && sleep 5
+            cat "$shim/squeue.out"
+            """)
+        chmod(joinpath(shim, "sbatch"), 0o755)
+        chmod(joinpath(shim, "squeue"), 0o755)
+
+        _next_job!(id) = write(joinpath(shim, "sbatch.next_id"), string(id))
+        _queue!(ids...) = write(joinpath(shim, "squeue.out"), join(string.(ids), "\n") * "\n")
+        _calls(log) = isfile(joinpath(shim, log)) ? count(!isempty, readlines(joinpath(shim, log))) : 0
+        _last(log) = last(readlines(joinpath(shim, log)))
+        function _reset_hpc!()
+            MM._queue_snapshot[] = MM._QueueSnapshot(0, nothing)
+            MM._last_stray_sweep[] = 0
+            for f in ("sbatch.fail", "squeue.fail", "squeue.sleep", "sbatch.log", "squeue.log")
+                rm(joinpath(shim, f); force=true)
+            end
+            _next_job!(1)
+            _queue!()
+        end
+
+        # SQUEUE_STATES / SQUEUE_PARTITION are set so the tests can prove they are stripped
+        # before squeue sees them: left in place, either would silently hide live jobs.
+        withenv("PATH" => shim * ":" * ENV["PATH"], "USER" => "tester",
+                "SQUEUE_STATES" => "R", "SQUEUE_PARTITION" => "gpu") do
+        mktempdir() do project_dir
+            _make_test_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+
+            done_dir = MM._hpcDoneDir()
+            # Fast cadences. grace 0 means the reaper fails a job as soon as a SECOND snapshot
+            # (taken after the first absence) still lacks it -- so roughly two reap intervals.
+            setHPCCompletionOptions(poll_interval=0.02, reap_interval=0.05, grace_period=0.0)
+            sim = Simulation(InputFolders(config="default"))
+
+            # The test plays the job. The sentinel path is baked into the `--wrap` text sbatch
+            # received, so read it back from the shim's log rather than guessing. Waiting for the
+            # submission to appear there is also what makes publishing race-free: a real job cannot
+            # write its sentinel before sbatch has returned either -- and on a cold JIT the worker's
+            # first submission takes well over any fixed sleep.
+            function _sentinel_of(nth::Int)
+                log = joinpath(shim, "sbatch.log")
+                timedwait(() -> isfile(log) && count(!isempty, readlines(log)) >= nth, 10.0) === :ok ||
+                    error("submission $(nth) never reached sbatch")
+                argv = filter(!isempty, readlines(log))[nth]
+                m = match(r"mv \"([^\"]+)\.tmp\" \"\1\"", argv)
+                isnothing(m) && error("no sentinel path in sbatch argv: $(argv)")
+                return String(m.captures[1])
+            end
+            function _publish(exit_code::Int; nth::Int=1)
+                path = _sentinel_of(nth)
+                write(path * ".tmp", string(exit_code))
+                mv(path * ".tmp", path; force=true)
+                return path
+            end
+
+            @testset "sentinel carries the outcome: zero succeeds, nonzero fails" begin
+                for (job_id, ec) in [(9001, 0), (9002, 1), (9003, 137)]
+                    _reset_hpc!()
+                    _next_job!(job_id)
+                    _queue!(job_id)                              # still queued: only the file resolves it
+                    t = @async MM._runHPCSimulation(`true`, sim.id)
+                    sleep(0.2)
+                    @test !istaskdone(t)
+                    path = _publish(ec)
+                    @test fetch(t) == ec                              # the code itself; the caller decides
+                    @test !isfile(path)                               # consumed
+                    @test occursin("--parsable", _last("sbatch.log"))
+                    @test !occursin("--wait", _last("sbatch.log"))
+                end
+            end
+
+            @testset "a failed squeue query resolves nothing" begin
+                # The catastrophic case: if a failed query read as an empty queue, every waiting
+                # job would be declared dead at once.
+                _reset_hpc!()
+                _next_job!(9101)
+                touch(joinpath(shim, "squeue.fail"))
+                tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:3]
+                sleep(0.5)
+                @test _calls("squeue.log") > 1                  # the reaper kept trying
+                @test all(!istaskdone(t) for t in tasks)        # and concluded nothing
+                for n in 1:3
+                    _publish(0; nth=n)
+                end
+                @test all(fetch(t) == 0 for t in tasks)
+            end
+
+            @testset "a job gone from the queue with no sentinel is failed, but only on a second snapshot" begin
+                _reset_hpc!()
+                _next_job!(9200)                                 # queue stays empty
+                @test MM._runHPCSimulation(`true`, sim.id) === nothing   # reaped: no exit code exists
+                @test _calls("squeue.log") >= 2                  # one wrong answer cannot fail a job
+            end
+
+            @testset "a grace period longer than the reap interval still fails a dead job" begin
+                # The grace clock is worker-local and starts on FIRST absence. Re-based on each
+                # refreshed snapshot, grace > reap_interval would reset it forever.
+                _reset_hpc!()
+                setHPCCompletionOptions(reap_interval=0.03, grace_period=0.15)
+                _next_job!(9201)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                @test timedwait(() -> istaskdone(t), 5.0) === :ok
+                @test fetch(t) === nothing
+                setHPCCompletionOptions(reap_interval=0.05, grace_period=0.0)
+            end
+
+            @testset "a snapshot taken before submission cannot fail the job" begin
+                _reset_hpc!()
+                setHPCCompletionOptions(reap_interval=3600.0)     # this snapshot is never refreshed
+                MM._queue_snapshot[] = MM._QueueSnapshot(time_ns(), Set{Int}())   # empty, pre-dates the job
+                sleep(0.01)
+                _next_job!(9250)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                sleep(0.2)
+                @test !istaskdone(t)                            # the empty snapshot said nothing about it
+                @test _calls("squeue.log") == 0                 # and was fresh enough not to be refreshed
+                _publish(0)
+                @test fetch(t) == 0
+                setHPCCompletionOptions(reap_interval=0.05)
+            end
+
+            @testset "a late sentinel wins over the reaper" begin
+                _reset_hpc!()
+                setHPCCompletionOptions(grace_period=3600.0)
+                _next_job!(9300)                                 # queue empty: already gone
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                sleep(0.2)
+                @test !istaskdone(t)                            # grace is holding it open
+                _publish(0)
+                @test fetch(t) == 0
+                setHPCCompletionOptions(grace_period=0.0)
+            end
+
+            @testset "squeue is queried once per interval regardless of how many jobs wait" begin
+                _reset_hpc!()
+                setHPCCompletionOptions(reap_interval=0.1, grace_period=3600.0)
+                _next_job!(9400)
+                _queue!(9400:9419...)
+                tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:20]
+                sleep(0.6)                                       # ~6 intervals; per-job polling would be hundreds
+                @test 3 <= _calls("squeue.log") <= 9
+                for n in 1:20
+                    _publish(0; nth=n)
+                end
+                @test all(fetch(t) == 0 for t in tasks)
+                setHPCCompletionOptions(reap_interval=0.05, grace_period=0.0)
+            end
+
+            @testset "a rejected submission fails the simulation instead of hanging" begin
+                _reset_hpc!()
+                touch(joinpath(shim, "sbatch.fail"))
+                @test MM._runHPCSimulation(`true`, sim.id) === nothing
+            end
+
+            @testset "a leftover sentinel for the same simulation cannot be read as the new result" begin
+                # Sentinel names carry a per-submission timestamp, so a file left by an earlier
+                # submission of this simulation (or a recycled SLURM job id) is simply a different
+                # name. It is neither consumed nor deleted here; the age-gated sweep gets it later.
+                _reset_hpc!()
+                stale = joinpath(done_dir, "$(sim.id).deadbeef")
+                write(stale, "1")                                # says "failed"
+                _next_job!(9500)
+                _queue!(9500)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                sleep(0.2)
+                @test !istaskdone(t)                            # the leftover did not resolve it
+                path = _publish(0)
+                @test path != stale
+                @test fetch(t) == 0
+                @test isfile(stale)                             # untouched
+                rm(stale; force=true)
+            end
+
+            @testset "an unreadable sentinel directory neither fails nor kills the worker" begin
+                # isfile only swallows ENOENT; EACCES/ESTALE/EIO would otherwise escape the worker
+                # and abort the whole run.
+                _reset_hpc!()
+                _next_job!(9600)
+                _queue!(9600)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                sleep(0.1)
+                chmod(done_dir, 0o000)
+                blocked = try
+                    isfile(joinpath(done_dir, "9600")); false
+                catch
+                    true
+                end
+                sleep(0.15)
+                chmod(done_dir, 0o700)
+                if blocked
+                    @test !istaskdone(t)                        # still waiting, did not throw
+                else
+                    @test_skip "directory permissions do not block stat here (root?)"
+                end
+                _publish(0)
+                @test fetch(t) == 0
+            end
+
+            @testset "an undeletable sentinel still resolves the job" begin
+                _reset_hpc!()
+                setHPCCompletionOptions(poll_interval=0.5)        # a wide window to publish+lock inside
+                _next_job!(9700)
+                _queue!(9700)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                sleep(0.1)
+                path = _publish(0)
+                chmod(done_dir, 0o500)                            # readable, not writable: unlink fails
+                result = fetch(t)
+                chmod(done_dir, 0o700)
+                @test result == 0                                 # resolved despite cleanup failing
+                rm(path; force=true)
+                setHPCCompletionOptions(poll_interval=0.02)
+            end
+
+            @testset "stale strays are swept once per reap interval; fresh ones are left alone" begin
+                _reset_hpc!()
+                setHPCCompletionOptions(reap_interval=3600.0)
+                old_tmp = joinpath(done_dir, ".9999.tmp")
+                old_sentinel = joinpath(done_dir, "9998")
+                fresh_tmp = joinpath(done_dir, ".9997.tmp")
+                for f in (old_tmp, old_sentinel, fresh_tmp)
+                    write(f, "0")
+                end
+                run(`touch -t 202001010000 $(old_tmp) $(old_sentinel)`)
+                MM._sweepStraysIfDue(done_dir)                    # due: _last_stray_sweep is 0
+                @test !isfile(old_tmp)
+                @test !isfile(old_sentinel)
+                @test isfile(fresh_tmp)                           # a live job may still be about to mv this
+                write(old_tmp, "0")
+                run(`touch -t 202001010000 $(old_tmp)`)
+                MM._sweepStraysIfDue(done_dir)                    # not due again this interval
+                @test isfile(old_tmp)
+                rm(old_tmp; force=true)
+                rm(fresh_tmp; force=true)
+                setHPCCompletionOptions(reap_interval=0.05)
+            end
+
+            @testset "squeue: filters stripped, array ids parsed, failure is nothing, hang is bounded" begin
+                _reset_hpc!()
+                _queue!(111, "222_3", "")
+                @test MM._squeueUserJobs() == Set([111, 222])
+                argv = _last("squeue.log")
+                @test occursin("-u tester", argv) && occursin("-t all", argv)
+                @test endswith(argv, "STATES= PART=")            # SQUEUE_* cleared before squeue ran
+                touch(joinpath(shim, "squeue.fail"))
+                @test MM._squeueUserJobs() === nothing          # nonzero exit is a failed query, not an empty queue
+                rm(joinpath(shim, "squeue.fail"))
+                touch(joinpath(shim, "squeue.sleep"))
+                MM._SQUEUE_TIMEOUT_S[] = 0.2
+                t0 = time()
+                @test MM._squeueUserJobs() === nothing          # a hang is bounded and counts as failed
+                @test time() - t0 < 5.0
+                MM._SQUEUE_TIMEOUT_S[] = 60.0
+                rm(joinpath(shim, "squeue.sleep"))
+            end
+
+            @testset "job id parsing survives site wrappers, refuses ambiguity" begin
+                @test MM._parseJobID("12345\n") == 12345
+                @test MM._parseJobID("12345;cluster\n") == 12345
+                @test MM._parseJobID("Quota: 80% used\n12345;cluster\n") == 12345      # banner before
+                @test MM._parseJobID("12345\nThank you for using the cluster\n") == 12345 # banner after
+                @test MM._parseJobID("Submitted batch job 777\n") == 777                 # wrapper dropped --parsable
+                @test MM._parseJobID("") === nothing
+                @test MM._parseJobID("nonsense\n") === nothing
+                @test MM._parseJobID("111\n222\n") === nothing                          # two ids: refuse, do not guess
+                # End to end: a wrapper that prints a banner line first must not orphan the job.
+                _reset_hpc!()
+                banner_sbatch = joinpath(shim, "sbatch")
+                original = read(banner_sbatch, String)
+                write(banner_sbatch, replace(original, "echo \"\$id\"" => "echo 'NOTICE: scratch purge Friday'; echo \"\$id\""))
+                _next_job!(9750)
+                _queue!(9750)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                sleep(0.2)
+                @test !istaskdone(t)                                # submitted and waiting, not "failed"
+                _publish(0)
+                @test fetch(t) == 0
+                write(banner_sbatch, original)
+            end
+
+            @testset "_prepareHPCSubmitCommand: --parsable, no --wait, per-simulation logs, chdir" begin
+                sentinel = joinpath(done_dir, "flagtest")
+                flags = collect(MM._prepareHPCSubmitCommand(`echo hello`, sim.id, sentinel).exec)
+                @test flags[1] == "sbatch"
+                @test "--parsable" in flags
+                @test !("--wait" in flags)
+                sim_folder = MM.trialFolder(Simulation, sim.id)
+                @test "--output=$(joinpath(sim_folder, "output.log"))" in flags
+                @test "--error=$(joinpath(sim_folder, "output.err"))" in flags
+                @test "--chdir=$(MM.simulatorDir(TestSimulator()))" in flags
+                wrap = only(filter(f -> startswith(f, "--wrap="), flags))
+                @test occursin("trap ", wrap)
+                @test occursin(sentinel, wrap)
+                @test endswith(wrap, "echo hello")
+                # A Cmd carrying its own dir is honoured, the same as the local path does.
+                flags2 = collect(MM._prepareHPCSubmitCommand(Cmd(`echo hi`; dir="/tmp"), sim.id, sentinel).exec)
+                @test "--chdir=/tmp" in flags2
+            end
+
+            @testset "the generated trap really records exit codes under /bin/sh" begin
+                for ec in (0, 4)
+                    sentinel = joinpath(done_dir, "trap$(ec)")
+                    cmd = MM._prepareHPCSubmitCommand(`sh -c "exit $(ec)"`, sim.id, sentinel)
+                    wrap = only(filter(f -> startswith(f, "--wrap="), collect(cmd.exec)))[length("--wrap=")+1:end]
+                    script = joinpath(mktempdir(), "job.sh")
+                    write(script, "#!/bin/sh\n$(wrap)\n")
+                    p = run(ignorestatus(`sh $(script)`))                   # no SLURM_JOB_ID needed any more
+                    @test p.exitcode == ec                                  # SLURM still sees the real status
+                    @test strip(read(sentinel, String)) == string(ec)
+                    @test !isfile(sentinel * ".tmp")                        # staged name did not leak
+                    rm(sentinel; force=true)
+                end
+            end
+
+            @testset "sbatch options cannot claim reserved flags" begin
+                for reserved in MM._RESERVED_SBATCH_KEYS
+                    setJobOptions(Dict(reserved => "x"))
+                    @test_throws AssertionError MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "x"))
+                    delete!(mm_globals().sbatch_options, reserved)
+                end
+            end
+
+            @testset "default runSimulation" begin
+                # TestSimulator overrides runSimulation, so reach the default explicitly.
+                spec = MM.SimulationSpec(sim, Monad(sim).id)
+                default(s) = invoke(MM.runSimulation, Tuple{AbstractSimulator,MM.SimulationSpec}, TestSimulator(), s)
+                folder = MM.trialFolder(Simulation, sim.id)
+                log_of(f) = strip(read(joinpath(folder, f), String))
+                useHPC(false)
+
+                _test_sim_cmd[] = `sh -c "echo out; echo err >&2"`
+                sp = default(spec)
+                @test sp.success && !isnothing(sp.process)
+                @test log_of("output.log") == "out"                 # per-simulation logs, wired here
+                @test log_of("output.err") == "err"
+
+                _test_sim_cmd[] = `sh -c "exit 3"`
+                @test !default(spec).success
+
+                _test_sim_cmd[] = `sh -c "kill -9 \$\$"`             # signal-killed: exitcode is 0, success is not
+                @test !default(spec).success
+
+                _test_sim_cmd[] = `definitely-not-a-command-mm-test`  # cannot start: failed, not thrown
+                sp = default(spec)
+                @test !sp.success && isnothing(sp.process)
+
+                _test_sim_cmd[] = `sh -c pwd`                          # runs in simulatorDir by default
+                default(spec)
+                @test realpath(log_of("output.log")) == realpath(MM.simulatorDir(TestSimulator()))
+                other = realpath(mktempdir())
+                _test_sim_cmd[] = Cmd(`sh -c pwd`; dir=other)           # ... or the Cmd's own dir
+                default(spec)
+                @test realpath(log_of("output.log")) == other
+
+                _test_sim_cmd[] = setenv(`true`, "A" => "1")           # env on the Cmd is rejected
+                @test_throws ArgumentError default(spec)
+                _test_sim_cmd[] = pipeline(`true`; stdout=devnull)     # so is a pipeline
+                @test_throws ArgumentError default(spec)
+
+                # With run_on_hpc set, the same default submits and waits instead.
+                useHPC(true)
+                _reset_hpc!()
+                _next_job!(9900)
+                _queue!(9900)
+                _test_sim_cmd[] = `true`
+                t = @async default(spec)
+                sleep(0.2)
+                @test _calls("sbatch.log") == 1
+                _publish(0)
+                sp = fetch(t)
+                @test sp.success && isnothing(sp.process)
+                useHPC(false)
+                _test_sim_cmd[] = `true`
+            end
+
+            _reset_hpc!()
+        end  # mktempdir
+        end  # withenv
     end
 
 end

@@ -18,7 +18,7 @@ export centralDB, dataDir, isInitialized, projectLocations, inputsDict
 export withTransaction
 export initializeModelManager
 export setNumberOfParallelSims
-export isRunningOnHPC, useHPC, setJobOptions, rm_hpc_safe
+export isRunningOnHPC, useHPC, setJobOptions, setHPCCompletionOptions, rm_hpc_safe
 export ProjectLocations, parseProjectInputsConfigurationFile
 export locationIDName, locationVariationIDName, locationTableName, locationFolder
 export locationVariationsTableName, locationVariationsFolder, locationVariationsDBName
@@ -73,6 +73,7 @@ include("globals.jl")
 include("classes.jl")
 include("recorder.jl")
 include("database.jl")
+include("hpc_completion.jl")
 include("runner.jl")
 include("deletion.jl")
 include("xml_utilities.jl")

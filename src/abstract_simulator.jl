@@ -3,9 +3,9 @@
 
 Abstract supertype for simulator backends.
 
-Concrete subtypes are responsible for preparing and executing a single simulation
-via the [`runSimulation`](@ref) dispatch, and for providing simulator-specific
-metadata (version schema, display info, etc.).
+Concrete subtypes supply the command that runs a single simulation via
+[`simulationCommand`](@ref) — ModelManager executes it, locally or as a SLURM job — and provide
+simulator-specific metadata (version schema, display info, etc.).
 
 This is the primary extension point for using the ModelManager infrastructure with
 any simulator. To support a new simulator:
@@ -13,7 +13,7 @@ any simulator. To support a new simulator:
 2. Implement the required interface methods listed below
 
 # Required interface methods
-- [`runSimulation`](@ref)`(::MySimulator, spec::SimulationSpec)::SimulationProcess`
+- [`simulationCommand`](@ref)`(::MySimulator, spec::SimulationSpec)::Cmd`
 - [`simulatorDir`](@ref)`(::MySimulator)::String`
 - [`simulatorVersionSchema`](@ref)`(::MySimulator)::String`
 - [`simulatorVersionIDName`](@ref)`(::MySimulator)::String`
@@ -23,6 +23,9 @@ any simulator. To support a new simulator:
 - [`simulatorInfo`](@ref)`(::MySimulator)::String`
 - [`setupMonad`](@ref)`(::MySimulator, M::AbstractMonad; kwargs...)::Bool`
 - [`setupSampling`](@ref)`(::MySimulator, S::AbstractSampling; kwargs...)::Bool`
+
+[`runSimulation`](@ref) has a default that runs the command from `simulationCommand` locally or as
+a SLURM job; override it only for a simulator that is not an external process.
 
 Note: `variationLocation` is **not** part of the ModelManager interface.  The calling
 framework (e.g. PhysiCellModelManager) is responsible for resolving variation targets
@@ -37,20 +40,28 @@ abstract type AbstractSimulator end
 ########################################################
 
 """
-    runSimulation(::AbstractSimulator, spec::SimulationSpec) -> SimulationProcess
+    simulationCommand(::AbstractSimulator, spec::SimulationSpec) -> Cmd
 
-Launch the simulation described by `spec` on the active simulator and return a
-[`SimulationProcess`](@ref) describing the outcome.
+Return the command that runs the simulation described by `spec`: the one thing about launching a
+simulation that only the backend knows.
 
-This is the simulator-dispatched workhorse called by [`run`](@ref) inside each `@task`.
-Each simulator package implements its own method dispatching on `AbstractSimulator`.
-Setup (compilation, varied input folders) is always performed by
-`prepareTrialHierarchy` before this function is called, so implementations
-can assume the monad is fully prepared. No kwargs are accepted — all per-simulation
-configuration is encoded in `spec`.
+Everything else -- running it locally or submitting it to SLURM, the working directory, where
+`output.log` and `output.err` go, waiting for it, and reporting the outcome -- is done by
+ModelManager's default [`runSimulation`](@ref), the same way for every backend. Setup
+(compilation, varied input folders) has already run via `prepareTrialHierarchy`, so the monad's
+inputs are in place.
+
+Return a bare `Cmd`. Set its `dir` if the command must run somewhere other than
+[`simulatorDir`](@ref); do not attach an environment or wrap it in a `pipeline` -- see
+[`runSimulation`](@ref) for why both are rejected.
+
+```julia
+ModelManager.simulationCommand(::MySimulator, spec::SimulationSpec) =
+    `./my_sim \$(pathToOutputFolder(spec.simulation.id))`
+```
 """
-function runSimulation(sim::AbstractSimulator, args...)
-    error("$(nameof(typeof(sim))) must implement: runSimulation(::$(nameof(typeof(sim))), spec::SimulationSpec)")
+function simulationCommand(sim::AbstractSimulator, args...)
+    error("$(nameof(typeof(sim))) must implement: simulationCommand(::$(nameof(typeof(sim))), spec::SimulationSpec)::Cmd")
 end
 
 """
@@ -312,7 +323,7 @@ function clearSimulatorArtifacts(sim::AbstractSimulator) end
 #! Documenter's `Private = false` include them. See CLAUDE.md, "Docstring cross-references".
 #! `postInitDisplay` and `centralDBFileName` are absent because they are already exported —
 #! Julia errors on declaring an exported name public.
-@compat public runSimulation, simulatorDir, simulatorVersionSchema, simulatorVersionIDName,
+@compat public runSimulation, simulationCommand, simulatorDir, simulatorVersionSchema, simulatorVersionIDName,
                simulatorVersionTableName, resolveSimulatorVersionID, currentSimulatorVersionID,
                simulatorInfo, setupMonad, setupSampling,
                dbVersionTableName, upgradeMilestones, upgradeToMilestone,

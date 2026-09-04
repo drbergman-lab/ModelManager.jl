@@ -5,6 +5,211 @@
 
 ---
 
+## Session: replace `sbatch --wait` polling (2026-09-03) — ships in v0.9.0
+
+### Trigger
+"Could launching a campaign on SLURM result in repeated `squeue`/`sinfo` calls?" ModelManager
+never shells out to either. But `--wait`, hardcoded in `prepareHPCCommand`, is not a callback —
+it is a poll. `_job_wait` in SLURM's `src/sbatch/sbatch.c` sleeps and calls `slurm_load_job`
+(`REQUEST_JOB_INFO_SINGLE`) on a `sleep_time = 2` → `*= 4` → `MAX_WAIT_SLEEP_TIME 32` backoff,
+with no flag or env var to change it. One waiter per in-flight simulation, so load scaled with
+`max_number_of_parallel_simulations` — and because each waiter restarts its backoff at 2s, a slot
+churning *short* simulations never reaches the 32s plateau. ~100 slots on short sims is order
+50 RPC/s against a single-threaded-ish controller.
+
+### Design path, including two wrong turns
+The wrong turns are recorded because each was plausible and each cost a round trip.
+
+1. **Poll `squeue` from one watcher instead of N waiters.** Correct but incomplete: it makes the
+   poll interval a throughput tax that grows as simulations get shorter — the same regime where
+   `--wait` was worst.
+2. **Wrong turn #1: "sentinel files don't work."** Conflated the *file* with the *watch*.
+   inotify (and so Julia's `FileWatching`) is a local-kernel mechanism with no hook into the
+   NFS/Lustre/GPFS protocol, so it never sees a file written by another node. That is a fact
+   about *event delivery*, not about visibility — `readdir` obviously works. Stating it as
+   "sentinel files are dead on a cluster" sent the design toward a network callback for no reason.
+3. **Wrong turn #2: TCP callback from the job.** Rejected on the user's objection, which was
+   right. Not because of the listening port: because there is no POSIX-guaranteed way for a job
+   to *send* — `nc`, `curl`, `python3`, bash `/dev/tcp` are each merely likely, and a fallback
+   chain is a symptom of the channel having no standard. Also: compute nodes cannot always route
+   back, and batch semantics deliberately sever submitter from job (it may start hours later,
+   after the driver is gone). SLURM's own push path is `srun`, which holds a live connection and
+   an allocation; `sbatch --wait` polls precisely because it has neither.
+4. **Landed: sentinel file + one `readdir`, scheduler as reaper only.** The reframe that settles
+   it — the problem was never "polling," it was *what* was polled. slurmctld is a scarce,
+   contended, monitored bottleneck; the parallel filesystem is built for metadata traffic and the
+   simulations are already using it. One `readdir` covers every tracked job.
+
+### Validation against prior art
+This is Nextflow's grid-executor shape, which was checked rather than assumed:
+`GridTaskHandler.readExitStatus()` reads a `.exitcode` file, consults a batched queue status when
+it is missing (`queueStatInterval`, default **1 min**), and after `exitReadTimeout` (default
+**270 s**) records `Integer.MAX_VALUE` for a job that vanished without writing. Grid `pollInterval`
+is **5 s**; `queueSize` is **100** — a hundred concurrent grid jobs and no `--wait` anywhere.
+
+Two things that comparison changed:
+- **The grace period was far too aggressive.** The draft said "absent for two ticks ⇒ failed."
+  Nextflow's 270 s is a production-tuned estimate of how late a shared filesystem can be. Adopted
+  as the default; the cost of being wrong is asymmetric (waiting too long delays one result,
+  giving up early reports a successful simulation as failed).
+- **Nextflow's empty-file case is not needed here.** It checks file *size* because `echo > file`
+  publishes the name before the content. Staging through a temp name and `mv`-ing into place makes
+  the rename atomic, so a listed sentinel always has its content.
+
+### Decisions
+- **`squeue -u`, not `-j <list>`.** `-u` maps to `slurm_load_job_user` (`REQUEST_JOB_USER_INFO`),
+  server-side filtered, one RPC regardless of tracked count. squeue's multi-ID `-j` path takes
+  `params.job_list`, and the source does not clearly show server-side filtering rather than a full
+  `REQUEST_JOB_INFO` dump — which is the thing being avoided. Unrelated jobs are filtered against
+  our own registry.
+- **A failed query resolves nothing.** `_squeueUserJobs` returns `nothing`, never an empty set.
+  Conflating them would fail every tracked simulation the first time slurmctld is slow. This is
+  the one silent-and-catastrophic failure mode in the design, so it is the first test.
+- **`trap ... EXIT` only, no `TERM`.** A scheduler kill writes no sentinel, and that already
+  resolves correctly through the reaper. Trapping signals makes detection faster, not more
+  correct, at the cost of shell that must be right under every `sh`. Verified the generated text
+  under both macOS `sh` and `dash` (the strict Debian `/bin/sh`): exit codes propagate and the
+  script's own status is preserved, so SLURM still marks the job FAILED.
+- **Nothing keyed off "the user opted into HPC".** At the time this was written v0.8.3 had
+  `run_on_hpc = false` with no auto-detection, while main's #27 auto-detects — so an assumption
+  that HPC mode means a deliberate `useHPC()` call would have merged cleanly and then been wrong
+  for every cluster user. The second pass removed the watcher this originally applied to, but the
+  rule survives it: completion machinery keys off a job existing, never off a mode flag.
+- **`prepareHPCCommand` now blocks, and ModelManager does the waiting.** Three options, in the
+  order they were tried:
+  1. *Change it to return a non-blocking `sbatch --parsable`.* **Catastrophic.** A simulator
+     package runs the returned `Cmd` itself and reads its exit status, so it would see 0 at
+     submission and record every simulation Completed the instant it was queued — silently, on a
+     version any `ModelManager = "0.8"` compat bound picks up automatically.
+  2. *Leave it byte-identical, deprecate it, add `runHPCSimulation` alongside.* Safe, but inert:
+     the fix does nothing until PCMM is changed and released, so a ModelManager patch on its own
+     helps nobody.
+  3. **Landed: ModelManager submits and waits, and returns a trivial `Cmd` carrying the job's exit
+     code.** Every existing caller works untouched — it still blocks (inside this function rather
+     than inside its own `run`), still reads the job's status off the process it runs — and the
+     per-simulation slurmctld poller is gone. One ModelManager release fixes it; no PCMM release
+     required.
+
+  This is also the right home for the waiting. A simulator package blocking on the scheduler was
+  an accident of where the `Cmd` happened to be executed, not a deliberate split: ModelManager owns
+  the runner and the concurrency limit, so it should own the wait. The cost is that a function
+  named `prepare…` blocks for the length of a simulation, which is a lie the docstring states
+  outright and which is paid back in v0.9.0, where the major bump forces every simulator package
+  to change its compat entry anyway and `prepareHPCCommand` is removed in favour of
+  `runHPCSimulation`.
+
+  **Residual risk, unverified:** if PCMM reads anything off `SimulationProcess.process` beyond
+  `exitcode` — logging `p.cmd`, say, or piping sbatch's "Submitted batch job N" line somewhere —
+  it now sees the trivial replay command instead. ModelManager itself only ever reads `success`.
+  A look at PCMM's `simulator_interface.jl` around line 40 settles it; out of scope for this repo.
+- **`done_dir` configurable, defaulting inside `data/`.** Only the sentinel directory needs to be
+  on a fast filesystem; `data/` stays put. Rejected the earlier suggestion of moving `data/` to
+  scratch — scratch is purge-swept, which is unacceptable for project data. Sentinels live for
+  seconds, so a purge policy cannot reach them.
+
+### Second pass (v0.9.0): the maintainer asked for simpler, and dropped the compat requirement
+
+The worry, verbatim: "I still worry this is over-engineered and we're missing a simpler solution."
+With backward compatibility no longer required, a four-angle design panel (minimise shared state /
+shrink the interface / delete everything not load-bearing / first principles) was run, each
+proposal then attacked by two refuters (correctness against R1-R10; is it *actually* simpler for a
+cold reader). **All four converged on the same shape**, and all eight judges agreed it is simpler by
+concept count (~20 things a reader must hold → ~10), while being honest that the *line* count barely
+moves once the required docstrings are written.
+
+**Landed: no central watcher.** Each worker already blocks for the length of its own simulation, so
+it does its own waiting — `isfile` on one known path, once a second. Gone with the watcher: the
+registry `Dict`, the `Channel` per job, the vanished `Dict`, the lazy start/stop lifecycle and its
+race, the "one bad sweep fails every job" blast radius, and the `_HPC_NO_EXIT_CODE` / `_asShellExitCode`
+/ `sh -c "exit N"` machinery that existed only for the compat hack. The reaper survives as one
+TTL-cached `squeue` snapshot behind a `trylock`, still one RPC per `reap_interval` regardless of N.
+
+**Landed: ModelManager runs the command.** `simulationCommand(sim, spec)::Cmd` is the required
+hook; `runSimulation` is a default that owns output folder, `output.log`/`output.err`, working
+directory and local-vs-SLURM dispatch, overridable for in-process simulators. `prepareHPCCommand`
+and `runHPCSimulation` are deleted; `hpcDoneDir` is internal. Public API shrinks net.
+
+**Holes the refuters found that would have shipped**, each verified by probe before fixing:
+- `isfile`/`read` throwing on EACCES/ESTALE/EIO would escape the worker and abort the run — both now
+  inside the `try`.
+- A worker whose `read` failed persistently `continue`d past the reaper: silent hang. Reaper now
+  runs every tick regardless.
+- A snapshot taken *before* submission cannot contain the job; with `reap_interval > grace_period`
+  a naive check would fail every fresh job. Snapshots stamp the query's *start*; workers skip
+  snapshots with `taken_at <= submitted_at`. Monotonic `time_ns()`, because NTP can step `time()`.
+- One proposal re-based the grace clock on each refreshed snapshot: with `grace > reap + poll` a
+  killed job hangs forever. The clock is worker-local, set at first absence, cleared on reappearance.
+- `squeue`'s default state filter omits SUSPENDED; a preempted job looked dead. `-t all`.
+- `SQUEUE_STATES`/`SQUEUE_PARTITION` in a user's profile silently filter the answer. Cleared.
+- `process_exited` does not join the stdout copy task; parsing before `wait(p)` could read a
+  truncated listing as a complete one and reap live jobs.
+- A hung `squeue` pinned the refresh; bounded with a timeout. Then: `wait(p)` after `kill(p)` blocks
+  on the pipe for as long as a grandchild (a site wrapper's real `squeue`) holds it — kill and leave.
+- Julia reports `exitcode == 0` for a signal-killed child; the local path uses `success(p)`.
+- `Cmd.env` *replaces* the environment while `sbatch --export` *extends* it; a backend that set env
+  on its `Cmd` would get opposite semantics locally and on the cluster. Rejected with an error.
+- `prepareTrialHierarchy` creates monad folders but not simulation folders; the default
+  `runSimulation` `mkpath`s before redirecting.
+
+**The maintainer's three questions, and what they changed:**
+- *Sweep every hour is long?* Frequency is tidiness only (nothing lists the directory on the hot
+  path); the age gate is the safety property. Sweep on `reap_interval`; constant deleted.
+- *Return the exit code, not a Bool?* Yes. `_waitForHPCJob`/`_runHPCSimulation` return
+  `Union{Nothing,Int}`; the default `runSimulation` is the one place that collapses to
+  `SimulationProcess.success`. If `SimulationProcess` later carries an exit code — the local path
+  already preserves one via `Process`, the HPC path drops it — nothing here changes.
+- *More robust job-ID parsing?* Real hole: a site wrapper printing a banner before the ID made
+  `first(split(...))` fail, MM reported "submission failed", **and the job ran anyway, unobserved**.
+  Now: line-anchored match, exactly one required, classic `Submitted batch job N` accepted, raw
+  output in the error.
+
+**Test seams removed.** The two production `Ref` hooks are gone; tests put file-driven `sbatch` and
+`squeue` scripts on `PATH`, so every test exercises the real spawn/argv/parse/timeout path.
+
+**The hang that took an afternoon.** The rebuilt suite hung in its first test. Cause: the test
+published its sentinel after a fixed `sleep(0.2)`, but on a cold JIT the worker's first
+`_runHPCSimulation` takes longer than that to *reach* `sbatch`, so the post-submission "discard any
+stale sentinel by this name" `rm` ate the freshly published file, and the worker waited forever on
+a job `squeue` said was alive. Every hand-rolled repro passed because it had warmed the JIT first.
+The test race exposed a real fragility: "sbatch has only just returned, the job cannot have run
+yet" is *almost* always true. Fix that removes the premise: **the sentinel is named before
+submission**, `<sim_id>.<time_ns hex>`, baked into the wrap. Unique per submission, so nothing
+stale can share its name, no `rm`, no race — and the trap no longer needs `\$SLURM_JOB_ID` at all.
+The test helper now reads the sentinel path back out of the shim's recorded `sbatch` argv, which
+also forces publish-after-submit.
+
+### Known limits
+- NFS caches directory attributes (`acdirmin`/`acdirmax`, 30 s/60 s), so a sentinel written on a
+  compute node can take up to a minute to appear in a `readdir` on an NFS mount. Lustre/GPFS have
+  coherent locking and no such delay. This is latency, bounded, and costs the scheduler nothing —
+  and `done_dir` exists to move off the slow mount.
+- The sentinel becoming visible does not prove the simulation's *output* is. Close-to-open
+  consistency covers opening a known path; a `readdir` of the output folder is still
+  attribute-cached. A `post_processor` that enumerates output files on a laggy mount may need a
+  bounded retry. Not addressed here; noted because splitting `done_dir` onto another filesystem
+  widens the gap.
+- `readdir` is a blocking syscall on Julia's default single-threaded scheduler, so a very slow
+  mount stalls the watcher. Only latency — the workers are already blocked waiting on it.
+
+### Release: v0.9.0, and why not the v0.8.4 patch this started as
+The work began as a hotfix branched from v0.8.3, on the theory that cluster users needed it before
+0.9.0 shipped. Two findings killed that plan:
+
+1. **v0.8.3 barely has the bug.** It does not auto-detect `run_on_hpc` — that is #27, unreleased —
+   so at v0.8.3 only users who explicitly called `useHPC()` reach the `sbatch --wait` path. **0.9.0
+   is the release that turns HPC mode on for everyone with `sbatch` on `PATH`**, so 0.9.0 is where
+   the exposure actually appears and where the fix has to be regardless.
+2. **Dropping backward compatibility made it a better fix.** Once a PCMM release was on the table
+   anyway, `runSimulation` could become a default over `simulationCommand` and the
+   blocking-`prepareHPCCommand` hack could be deleted outright.
+
+So the branch was rebased onto main and ships as v0.9.0. A consequence worth remembering: v0.8.4
+was planned but never tagged, so `src/hpc.jl` and `PRD.md` were corrected to say v0.9.0 is the
+first release with `run_on_hpc` auto-detection. Nothing in the shipped source mentions v0.8.4.
+
+Downstream, PhysiCellModelManager must implement `simulationCommand` and drop its `runSimulation`
+override. It should take a **minor** bump (0.4.0), not a patch: a patch is pulled in automatically
+by anyone pinning `"0.3"`, which would change cluster behaviour under a running campaign.
 ## Session: mid-session package update silently skipped migrations (2026-08-17)
 
 ### The bug

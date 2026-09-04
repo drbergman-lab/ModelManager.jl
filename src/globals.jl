@@ -25,6 +25,8 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
   through the staging path of [`rm_hpc_safe`](@ref). [`initializeModelManager`](@ref) sets it
   from [`isRunningOnHPC`](@ref) on every call; override afterwards with [`useHPC`](@ref).
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
+- `hpc_completion::HPCCompletionOptions`: How the runner detects that a submitted SLURM job has
+  finished. See [`setHPCCompletionOptions`](@ref).
 - `max_number_of_parallel_simulations::Int`: Concurrency limit.
 - `diagnostics_task::Union{Nothing,Task}`: The background `Task` running
   `databaseDiagnostics`, set by [`initializeModelManager`](@ref).
@@ -59,6 +61,7 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
 
     run_on_hpc::Bool = false
     sbatch_options::Dict{String,Any} = defaultJobOptions()
+    hpc_completion::HPCCompletionOptions = HPCCompletionOptions()
 
     max_number_of_parallel_simulations::Int = 1
 
