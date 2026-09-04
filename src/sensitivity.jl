@@ -212,6 +212,7 @@ end
     _hasGSAResults(gsa_sampling, q) → Bool
 
 Whether `gsa_sampling` already holds results for `q`, decided from `q`'s name before evaluating it.
+Exact rather than heuristic, because a [`QoI`](@ref) name cannot contain the `.` separator.
 """
 _hasGSAResults(gsa_sampling::GSASampling, q::QoI) =
     any(k -> k == q.name || startswith(k, q.name * "."), keys(gsa_sampling.results))
@@ -643,6 +644,20 @@ function _gsaComponentValue(q::QoI, label::AbstractString, monad_id::Integer, v)
 end
 
 """
+    _gsaDuplicateLabelMessage(component_keys, labels) → String
+
+The body of the error raised when two of a QoI's keys produce one label.
+"""
+function _gsaDuplicateLabelMessage(component_keys, labels)
+    dups = unique(l for l in labels if count(==(l), labels) > 1)
+    culprits = [k for (k, l) in zip(component_keys, labels) if l in dups]
+    return "keys $(join(repr.(culprits), ", ")) all produce the label " *
+           "$(join(repr.(dups), ", ")). Distinct keys that collide once written into a label are " *
+           "not allowed — each label is its own sensitivity analysis, so one would silently " *
+           "replace the other. `1` and \"1\" are the usual way this happens."
+end
+
+"""
     evaluateFunctionOnSampling(gsa_sampling, f) → Vector{Pair{String,Matrix{Float64}}}
 
 Evaluate `f` on every monad in the sampling and return one labelled matrix per quantity it measures.
@@ -685,6 +700,14 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     end
 
     labels = isnothing(component_keys) ? [q.name] : ["$(q.name).$(k)" for k in component_keys]
+    #! Checked HERE, where the keys are still in hand, because afterwards only the labels survive.
+    #! Two distinct keys can land on one label -- `1` and `"1"`, the same collision the sink guards
+    #! against -- and neither downstream path handles it: `calculateGSA!`'s cross-QoI check reports
+    #! "comes from both QoI \"q\" and QoI \"q\". Rename one of them", advice that cannot work,
+    #! while the single-measurement method has no such check and simply lets one analysis overwrite
+    #! the other.
+    allunique(labels) || throw(ArgumentError(
+        "QoI \"$(q.name)\": " * _gsaDuplicateLabelMessage(component_keys, labels)))
     out = Pair{String,Matrix{Float64}}[]
     for (i, label) in enumerate(labels)
         vals = zeros(Float64, size(monad_id_df))

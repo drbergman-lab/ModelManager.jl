@@ -4494,6 +4494,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test err isa ArgumentError
                 @test occursin("same keys", err.msg)
 
+                # Two keys of ONE QoI that collide once written into a label are refused where the
+                # keys are still in hand, not downstream. Both downstream paths mishandle it: the
+                # cross-QoI check would say "comes from both QoI \"…\" and QoI \"…\"" naming the
+                # same QoI twice, and the single-measurement method has no check at all and would
+                # let one analysis silently overwrite the other.
+                collide = QoI("collide", _qoi_sim;
+                              reduce=per_sim -> Dict{Any,Any}(1 => 1.0, "1" => 2.0))
+                err = try; calculateGSA!(gsa, [collide]); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("all produce the label", err.msg)
+                @test occursin("collide", err.msg)
+                # ...and through the single-measurement method too, which is the silent path.
+                err = try; calculateGSA!(gsa, collide); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("all produce the label", err.msg)
+                @test !any(startswith("collide"), ModelManager.gsaLabels(gsa))
+
                 # Two QoIs producing one label is refused, and nothing is filed when it is.
                 dup = [QoI("dup", _qoi_sim), QoI("dup", _qoi_sim; reduce=maximum)]
                 err = try; calculateGSA!(gsa, dup); nothing; catch e; e; end
