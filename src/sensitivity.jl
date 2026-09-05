@@ -234,14 +234,18 @@ end
 #! claim the label `counts.x`: caught within one `calculateGSA!` call by the collision check, but
 #! across calls it would silently skip one of them -- in one ordering the whole spreading QoI, so
 #! `counts.y` would never be computed. See the constructor in `src/qoi.jl`.
+#! An auto-derived anonymous name says nothing about identity -- two closures from one factory share
+#! it -- so a QoI carrying one is always re-evaluated, and its result replaces whatever sat under
+#! the label. Only a name the user chose (or a top-level function's own) can mean "already done".
 """
     _hasGSAResults(gsa_sampling, q) → Bool
 
 Whether `gsa_sampling` already holds results for `q`, decided from `q`'s name before evaluating it.
-Exact rather than heuristic, because a [`QoI`](@ref) name cannot contain the `.` separator.
+Exact rather than heuristic, because a [`QoI`](@ref) name cannot contain the `.` separator, and
+never claimed for an auto-named closure, whose derived name identifies nothing.
 """
 _hasGSAResults(gsa_sampling::GSASampling, q::QoI) =
-    any(k -> _isQoILabelOf(k, q.name), keys(gsa_sampling.results))
+    !_isAutoNamedAnonymous(q) && any(k -> _isQoILabelOf(k, q.name), keys(gsa_sampling.results))
 
 """
     _gsaLabelsOf(gsa_sampling, name) → Vector{String}

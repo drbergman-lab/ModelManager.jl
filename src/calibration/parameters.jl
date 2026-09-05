@@ -284,11 +284,29 @@ _StrippedLVSource(src::LVSource) = _StrippedLVSource(src.lv)
 """
     _isAnonymousFunction(f::Function) → Bool
 
-Return `true` if `f` is an anonymous function or compiler-generated closure
-(i.e. `nameof(f)` starts with `#`). Named functions defined with
-`function foo(...) end` or `foo(...) = ...` return `false`.
+Whether `f` cannot be restored by name in a fresh Julia session -- which is what JLD2 needs to bring
+a saved `CalibrationProblem` back. `false` for a function defined at the top level of a module and
+for a callable struct (JLD2 stores those as a type plus fields); `true` for a lambda *and* for a
+named function defined inside another function, a `let` or a `@testset`, because those are closure
+types whose names exist only in the session that compiled them.
+
+The previous test, `nameof(f)` starting with `#`, passed exactly that second kind: `nameof` of an
+`f(s) = k` defined inside `make(k)` is `:f`, while its type is `#f#make##0`, which no other session
+can name. A manifest saved with one looked complete and then failed to load with a raw JLD2
+reconstruction error -- and since the manifest is read before `problem=` is consulted, the
+documented rescue failed the same way.
 """
-_isAnonymousFunction(f::Function) = startswith(string(nameof(f)), "#")
+function _isAnonymousFunction(f::Function)
+    type_name = string(nameof(typeof(f)))
+    #! A callable struct: its type has an ordinary name, and JLD2 restores it like any struct.
+    startswith(type_name, "#") || return false
+    #! A top-level function's singleton type is named exactly `#<name>`; a closure's carries its
+    #! enclosing scope (`#f#make##0`) and a lambda's is numeric (`#12#13`).
+    type_name == "#" * string(nameof(f)) || return true
+    #! Same shape as a top-level function, so check that the name really resolves to `f` there.
+    m = parentmodule(f)
+    return !(isdefined(m, nameof(f)) && getfield(m, nameof(f)) === f)
+end
 
 #! A `QoI` is only as restorable as the two functions inside it, so it is anonymous if either is. Both
 #! are checked: a named `compute` with an anonymous `reduce` would round-trip as a QoI that silently

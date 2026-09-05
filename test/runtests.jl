@@ -167,6 +167,16 @@ _sim_unbounded(s::S) where {S}              = 1.0   # `S` is `Any`: carries no i
 _sim_zeroarg()                              = 1.0
 _sim_two(s::Simulation)    = 2.0
 _sim_vec(s::Simulation)    = [1.0]
+# Shapes `_isAnonymousFunction` must tell apart. A factory's inner named function is a closure type
+# (`#f#make##0`) that only this session can name, whether or not it captures anything; a callable
+# struct is an ordinary type JLD2 restores; a top-level name may use any alphabet.
+_make_closure(k) = (f(s) = k; f)
+_make_closure_nocapture() = (g(s) = 1.0; g)
+struct _Functor <: Function; k::Int; end
+(f::_Functor)(s) = f.k
+μstar_top(s) = 1.0
+# A closure that counts its calls, for the GSA "never skipped" test.
+_make_counting(calls::Ref{Int}) = (c(s) = (calls[] += 1; 1.0); c)
 # A single QoI reports its value directly; a vector reports a Dict keyed by name. That is what keeps
 # the scalar and vector `observed_data` shapes usable.
 _test_named_ss             = [QoI("x", _sim_one)]
@@ -181,6 +191,9 @@ _test_nonzero_ss           = [QoI("x", _sim_two)]
 # Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
 # values differ; _qoi_monad sees the whole monad at once.
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
+# A String-valued and a keyed compute, for the stored-value read-back tests.
+_qoi_label(s::Simulation) = "sim_$(s.id)"
+_qoi_pair(s::Simulation)  = (; a = _qoi_sim(s), b = 2 * _qoi_sim(s))
 # A bare function in `functions=`: it now receives a `Simulation`, exactly like a QoI's `compute`.
 # Untyped on purpose -- that is how users write them, and it is the case dispatch cannot sniff.
 _qoi_by_id(sim)           = getParameterValue(sim, :config, XMLPath(["data", "x"]))
@@ -1835,13 +1848,26 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
     ################## Problem persistence: anonymous function detection ##################
 
-    @testset "_isAnonymousFunction" begin
+    @testset "_isAnonymousFunction means 'not restorable by name'" begin
         @test  ModelManager._isAnonymousFunction(x -> x^2)
         @test  ModelManager._isAnonymousFunction((x, y) -> x + y)
+        # A named function defined inside a scope -- this @testset included -- is a closure type
+        # that only this session can name, so it is exactly as unrestorable as a lambda. The old
+        # `nameof`-prefix test called it restorable, and a manifest saved with one failed to load in
+        # a fresh session with a raw JLD2 reconstruction error.
         named_fn(x) = x^2
-        @test !ModelManager._isAnonymousFunction(named_fn)
+        @test  ModelManager._isAnonymousFunction(named_fn)
+        @test  ModelManager._isAnonymousFunction(_make_closure(1))
+        @test  ModelManager._isAnonymousFunction(_make_closure_nocapture())
+        # Top-level functions and callable structs restore by name.
         @test !ModelManager._isAnonymousFunction(identity)
         @test !ModelManager._isAnonymousFunction(mseDistance)
+        @test !ModelManager._isAnonymousFunction(_sim_one)
+        @test !ModelManager._isAnonymousFunction(μstar_top)
+        @test !ModelManager._isAnonymousFunction(_Functor(3))
+        # ...and so does a QoI built from them, while one built from a closure does not.
+        @test !ModelManager._isAnonymousFunction(QoI("k", _Functor(3)))
+        @test  ModelManager._isAnonymousFunction(QoI("k", _make_closure(3)))
     end
 
     @testset "_StrippedLVSource construction" begin
@@ -1959,8 +1985,19 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             loaded2 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path2)
             @test !ModelManager._isCompleteManifest(loaded2)
             @test isnothing(loaded2.summary_statistic)
+
+            # A closure-backed QoI -- a named inner function, the shape the old check let through --
+            # is stripped like a lambda, so no manifest is written that a fresh session cannot read.
+            prob_closure = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                              QoI("x", _make_closure(1.0)), _test_named_dist, 1, var_id)
+            @test isnothing(ModelManager._ProblemManifest(prob_closure).summary_statistic)
+            # ...while a callable struct is kept: JLD2 restores it as a type plus fields.
+            prob_functor = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                              QoI("x", _Functor(1)), _test_named_dist, 1, var_id)
+            @test ModelManager._isCompleteManifest(ModelManager._ProblemManifest(prob_functor))
         end
     end
+
 
     @testset "_validateStructuralMatch" begin
         xp  = XMLPath(["overall", "max_time"])
@@ -4080,7 +4117,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test seen[end] === Simulation          # GSA: a Simulation, not a bare Int
 
                 empty!(seen)
-                ModelManager._asPostProcessor(rec)(Simulation(sid))
+                # Named, so the sink accepts it: `rec` is defined inside this testset and is therefore
+                # a closure, whose derived name the sink refuses to store under.
+                ModelManager._asPostProcessor(QoI("rec", rec))(Simulation(sid))
                 @test seen[end] === Simulation          # sink: a Simulation, not a SimulationProcess
 
                 # A QoI's compute already received a Simulation, so the two now agree exactly.
@@ -4091,6 +4130,18 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # And a bare function's name is regularised so it can be a column / Dict key.
                 @test ModelManager._qoiNameFromFunction(_sim_one) == "_sim_one"
                 @test occursin(r"^anon_[0-9_]+$", ModelManager._qoiNameFromFunction(s -> 1.0))
+                # A closure's name comes from its type, as an `anon_…` form: `make("a")` and
+                # `make("b")` both answer `nameof` with `:f`, so the bare name identifies nothing --
+                # and the same factory's closures still share the derived name, which is why such a
+                # name is never used to skip work or to store under.
+                @test startswith(ModelManager._qoiNameFromFunction(_make_closure(1)), "anon")
+                @test ModelManager._qoiNameFromFunction(_make_closure(1)) ==
+                      ModelManager._qoiNameFromFunction(_make_closure(2))
+                @test ModelManager._isAutoNamedAnonymous(ModelManager._asQoI(_make_closure(1)))
+                @test !ModelManager._isAutoNamedAnonymous(QoI("chosen", _make_closure(1)))
+                @test !ModelManager._isAutoNamedAnonymous(ModelManager._asQoI(_sim_one))
+                # A real name is kept whatever alphabet it uses, rather than mangled to `anon_star`.
+                @test ModelManager._qoiNameFromFunction(μstar_top) == "μstar_top"
             end
 
             @testset "_declaresSimulation survives every method signature shape" begin
@@ -4345,6 +4396,52 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 none = verifyStoredValues(QoI("no_such_column", _qoi_sim), t)
                 @test none.n_missing == length(sids)
                 @test none.n_agreed == 0
+
+                # The read side mirrors the write side. A String comes back as text rather than
+                # crashing in a Float64 conversion, and a keyed value -- which the sink spread into
+                # `<name>.<key>` columns -- is reassembled into a Dict with String keys.
+                t2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1451.0, 1457.0])];
+                                 n_replicates=2, use_previous=false)
+                run(t2; post_processor=[QoI("stored_label", _qoi_label), QoI("stored_pair", _qoi_pair)])
+                waitForDiagnostics()
+                sid2 = first(simulationIDs(t2))
+                @test ModelManager._storedValue("stored_label", sid2) == _qoi_label(Simulation(sid2))
+                pair = _qoi_pair(Simulation(sid2))
+                @test ModelManager._storedValue("stored_pair", sid2) == Dict("a" => pair.a, "b" => pair.b)
+                # :require finds the spread value; before, it reported "no stored value".
+                @test ModelManager._computeOn(QoI("stored_pair", s -> error("compute must not run"); stored=:require), sid2) ==
+                      Dict("a" => pair.a, "b" => pair.b)
+                # verifyStoredValues compares text with isequal and keyed values key by key.
+                @test verifyStoredValues(QoI("stored_label", _qoi_label), t2).n_mismatched == 0
+                repk = verifyStoredValues(QoI("stored_pair", _qoi_pair), t2)
+                @test repk.n_mismatched == 0
+                @test repk.n_agreed + repk.n_unverifiable == length(simulationIDs(t2))
+                badk = verifyStoredValues(QoI("stored_pair", s -> (; a = 1e9, b = 1e9)), t2)
+                if badk.n_unverifiable < length(simulationIDs(t2))
+                    @test badk.n_mismatched > 0
+                    @test badk.mismatches[1].stored isa Dict
+                end
+                # A compute that cannot see the output any more is unverifiable, not a mismatch.
+                gone = verifyStoredValues(QoI("stored_pair", s -> missing), t2)
+                @test gone.n_mismatched == 0
+                @test gone.n_unverifiable == length(simulationIDs(t2))
+            end
+
+            @testset "_loadProblem: an unreadable problem.jld2 names the way out" begin
+                # Whatever JLD2 cannot reconstruct -- a closure only the saving session could name is
+                # the realistic case -- must not surface as a raw MethodError from inside JLD2, and
+                # must not block the documented `problem=` rescue, which used to fail identically
+                # because the file was read before the supplied problem was consulted.
+                cal = ModelManager.createCalibration("ABCSMC"; description="unreadable manifest")
+                folder = ModelManager.calibrationFolder(cal)
+                mkpath(folder)
+                write(joinpath(folder, "problem.jld2"), "not a JLD2 file")
+                err = try; ModelManager._loadProblem(cal); nothing; catch e; e; end
+                @test err isa ErrorException
+                @test occursin("could not be read back", err.msg)
+                @test occursin("problem=my_problem", err.msg)
+                # With a problem in hand the caller is warned and gets `nothing` back to use it.
+                @test (@test_logs (:warn, r"could not be read back") ModelManager._loadProblem(cal; required=false)) === nothing
             end
 
             @testset "sensitivity on a discrepancy-to-data QoI" begin
@@ -4430,6 +4527,22 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # second `run`, because each run draws a fresh LHS design — comparing across two
                 # designs would compare two different questions.
                 calculateGSA!(gsa, [QoI("x", s -> _pair(s)["x"]), QoI("y", s -> _pair(s)["y"])])
+
+                # An auto-named closure is never "already evaluated": two closures from one factory
+                # share the derived name, so the name proves nothing about what sits under the label.
+                calls = Ref(0)
+                counting = _make_counting(calls)
+                calculateGSA!(gsa, [counting]); n_first = calls[]
+                @test n_first > 0
+                calculateGSA!(gsa, [counting])
+                @test calls[] == 2n_first                       # re-evaluated, not skipped
+                @test !ModelManager._hasGSAResults(gsa, ModelManager._asQoI(counting))
+                # Give it a name and the skip applies again.
+                calculateGSA!(gsa, [QoI("counted", counting)]); n_named = calls[]
+                calculateGSA!(gsa, [QoI("counted", counting)])
+                @test calls[] == n_named
+                # Leave `results` as the assertions below expect it.
+                filter!(p -> !(p.first == "counted" || startswith(p.first, "anon")), gsa.results)
                 @test ModelManager.gsaLabels(gsa) == ["counts.x", "counts.y", "x", "y"]
                 @test vec(gsa.results["counts.x"].means_star) ≈ vec(gsa.results["x"].means_star)
                 @test vec(gsa.results["counts.y"].means_star) ≈ vec(gsa.results["y"].means_star)

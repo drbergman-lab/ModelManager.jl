@@ -100,6 +100,52 @@ and the sink never calls `reduce` at all. A `#!` comment says so, so the next re
 
 ---
 
+## Session: restorable means "JLD2 can name it"; stored values read back as written (2026-09-05) — ships in v0.10.0
+
+### Trigger
+An architecture review of the QoI seam, adversarially verified: four medium bugs, all in what the
+seam *promised* rather than in the reduction it performs.
+
+### Closures passed as restorable
+`_isAnonymousFunction` tested `startswith(string(nameof(f)), "#")`. A named function defined inside
+another function -- `f(s) = k` inside `make(k)`, exactly the shape `_saveProblem`'s own tip
+recommended -- answers `nameof` with `:f`, so it passed, the manifest was saved "complete", and a
+fresh session failed to load it with a raw JLD2 `ReconstructedMutable` MethodError. Worse, because
+`resumeCalibration` read the manifest *before* consulting `problem=`, the documented rescue failed
+the same way. Verified by the reviewer in a two-process probe on 1.12.7.
+
+Decision: the predicate now asks the question that matters -- can a fresh session restore this by
+name? A callable struct's type has an ordinary name (JLD2 stores it as type plus fields): restorable.
+A type named `#<name>` exactly, resolving to `f` in its parent module: a top-level function,
+restorable. Anything else (`#f#make##0`, `#12#13`): not. `_loadProblem` takes `required=`, so with
+a `problem=` in hand an unreadable file is a warning and the supplied problem is used unvalidated;
+without one it is an error naming both ways out. Rejected: validating the supplied problem against
+`parameters.toml` instead of the manifest -- more machinery than the case warrants today.
+
+The same predicate now drives `_qoiNameFromFunction`: a closure's name comes from its type and is an
+`anon_…` form. Two closures from one factory still share it (same type, different captures), so the
+name is treated as saying nothing: the sink refuses to store under it (as before) and
+`calculateGSA!`'s name-based skip ignores it (`_isAutoNamedAnonymous`). Before, `run(...;
+functions=[countOf("tumor")])` followed by `calculateGSA!(gsa, [countOf("immune")])` was skipped and
+the tumor indices sat under the shared label `f`. A real name is kept in any alphabet; `μstar` used to
+become `anon_star` and collide with `σstar`.
+
+### `stored=` could not see what the sink wrote
+`_storedValue` looked for a column literally named after the QoI and coerced it to `Float64`. A
+`String` value crashed in the conversion; a keyed QoI -- whose columns the sink writes as
+`<name>.<key>` -- was reported as never stored, so `:prefer` recomputed from pruned output and
+`:require` threw with the row right there in `postProcessingTable`. `verifyStoredValues` had the
+same `Float64` coercion on both sides.
+
+Decision: read back the way the sink wrote. A bare column returns the value as held; otherwise every
+`<name>.<key>` column is reassembled into a `Dict{String,Any}`, with `String` keys because that is
+all a column name can carry (documented: a NamedTuple-keyed compute reads back string-keyed).
+`verifyStoredValues` compares numbers with `isapprox`, keyed values key by key with the fresh keys
+stringified, everything else with `isequal`, and counts a `missing`/`nothing` fresh value as
+unverifiable rather than as a mismatch.
+
+---
+
 ## Session: GSA spreads a keyed measurement (2026-09-04) — ships in v0.9.1
 
 ### Trigger
