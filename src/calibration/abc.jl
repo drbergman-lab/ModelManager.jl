@@ -762,29 +762,47 @@ function _saveProblem(calibration::Calibration, problem::CalibrationProblem)
 
         Anonymous fields detected: $(join(anon, ", "))
 
-        Tip: define functions with `function name(...) end` (or top-level named functions)
-        instead of anonymous lambdas to enable fully automatic resume.
+        Tip: define these functions at the top level of a file or module, `function name(...) end`,
+        rather than as lambdas or inside another function -- a closure has no name another session
+        can restore, however it was written.
         """
     end
     jldsave(path; manifest=manifest)
 end
 
 """
-    _loadProblem(calibration::Calibration) → _ProblemManifest
+    _loadProblem(calibration::Calibration; required::Bool=true) → Union{Nothing,_ProblemManifest}
 
-Load `problem.jld2` and return a `_ProblemManifest`.
+Load `problem.jld2` and return a `_ProblemManifest`. A file that exists but cannot be reconstructed
+-- what a closure that only the saving session could name looks like from a fresh one -- is an error
+naming the two ways out when `required`, and a warning plus `nothing` when the caller has a
+`problem=` to fall back on.
 """
-function _loadProblem(calibration::Calibration)
+function _loadProblem(calibration::Calibration; required::Bool=true)
     path = joinpath(calibrationFolder(calibration), "problem.jld2")
     isfile(path) || error(
         "Cannot resume: $path not found. " *
         "The problem.jld2 file is written automatically by runABC/runCalibration.")
-    return jldopen(path) do f
-        haskey(f, "manifest") || error(
-            "Unrecognized problem.jld2 format in $path. " *
-            "Re-run with the original problem to regenerate.")
-        f["manifest"]::_ProblemManifest
+    manifest = try
+        jldopen(path) do f
+            haskey(f, "manifest") || return :unrecognized
+            f["manifest"]::_ProblemManifest
+        end
+    catch e
+        msg = "The saved problem in $path could not be read back: $(sprint(showerror, e))\n" *
+              "This is what a `summary_statistic`, `distance` or `LatentVariation` map that is a " *
+              "closure -- a lambda, or a named function defined inside another function -- looks like " *
+              "from a fresh session. Either `include` the file that defines those functions before " *
+              "resuming, or pass the original problem: " *
+              "`resumeCalibration(Calibration($(calibration.id)); problem=my_problem)`."
+        required && error(msg)
+        @warn msg * "\nUsing the supplied `problem=` without checking it against the saved one."
+        return nothing
     end
+    manifest === :unrecognized && error(
+        "Unrecognized problem.jld2 format in $path. " *
+        "Re-run with the original problem to regenerate.")
+    return manifest
 end
 
 """
@@ -1123,6 +1141,10 @@ function _resolveResumeProblem(manifest::_ProblemManifest, provided::Calibration
     return provided
 end
 
+#! The manifest could not be read back and the caller supplied a problem: use it. `_loadProblem`
+#! has already warned that it goes unvalidated.
+_resolveResumeProblem(::Nothing, provided::CalibrationProblem, ::Calibration) = provided
+
 ################## Resume — public API ##################
 
 """
@@ -1220,7 +1242,7 @@ function resumeCalibration(calibration::Calibration,
                            kwargs...)
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
-    manifest = _loadProblem(calibration)
+    manifest = _loadProblem(calibration; required=isnothing(problem))
     active_problem = _resolveResumeProblem(manifest, problem, calibration)
 
     m = if isnothing(method)
