@@ -4577,10 +4577,21 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test "shrink.c" in ModelManager.gsaLabels(gsa)
                 @test !any(l -> l in ("shrink.a", "shrink.b"), ModelManager.gsaLabels(gsa))
 
+                # ...but replacing is scoped to the QoIs NAMED, never a prune of the rest. `spr`
+                # and `again` were not in either `shrink` call and keep their labels.
+                @test ["spr.a", "again"] ⊆ ModelManager.gsaLabels(gsa)
+
                 # Adding a quantity evaluates only the new one.
                 calculateGSA!(gsa, [spr, QoI("fresh", _qoi_sim)])
                 @test spread_calls[] == 2 * after_first                  # spr untouched again
                 @test "fresh" in ModelManager.gsaLabels(gsa)
+
+                # And a later `recompute` of one measurement leaves every other one alone. Pruning
+                # what a call does not name would make `calculateGSA!(gsa, [q2])` delete q1, which
+                # is the add-a-quantity workflow the skip exists for; an unnamed QoI's indices are
+                # not stale either, having come from this same sampling.
+                calculateGSA!(gsa, [QoI("fresh", _qoi_sim; reduce=maximum)]; recompute=true)
+                @test ["fresh", "spr.a", "again", "shrink.c"] ⊆ ModelManager.gsaLabels(gsa)
 
                 # The name-based skip is exact, not a loose prefix match: "spr" must not be
                 # considered already-evaluated because of an unrelated name that starts with it.

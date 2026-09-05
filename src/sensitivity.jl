@@ -148,6 +148,12 @@ A measurement whose results are already present is **skipped**, so adding a quan
 costs only the new one: `run(method, spec; functions=[q1])` followed by
 `calculateGSA!(gsa, [q1, q2])` reads each simulation's output for `q2` alone.
 
+Results **accumulate**. A measurement absent from `functions` keeps whatever it produced earlier —
+that is what makes adding a quantity cheap, and its indices are not stale, having been computed from
+this same sampling. What `recompute` replaces is the labels of the measurements you *do* name, so a
+reducer that drops or renames a key leaves nothing behind; it never prunes ones you do not name.
+`empty!(gsa_sampling.results)` is how you start over.
+
 # Keywords
 - `recompute`: evaluate even where results already exist, *replacing* every label that measurement
   owns rather than merging into them — so a reducer that drops or renames a key leaves nothing stale
@@ -239,13 +245,17 @@ _hasGSAResults(gsa_sampling::GSASampling, q::QoI) =
 
 """
     _isGSALabelOf(label, name) → Bool
-    _gsaLabelsOf(gsa_sampling, name) → Vector{String}
 
-Whether `label` is one a QoI called `name` produces, and the labels in `gsa_sampling` that are.
+Whether `label` is one that a QoI called `name` produces — its name, or its name and a key.
 """
 _isGSALabelOf(label::AbstractString, name::AbstractString) =
     label == name || startswith(label, name * ".")
 
+"""
+    _gsaLabelsOf(gsa_sampling, name) → Vector{String}
+
+Every label in `gsa_sampling.results` that a QoI called `name` produced.
+"""
 _gsaLabelsOf(gsa_sampling::GSASampling, name::AbstractString) =
     filter(k -> _isGSALabelOf(k, name), collect(keys(gsa_sampling.results)))
 
