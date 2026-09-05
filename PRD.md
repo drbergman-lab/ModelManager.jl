@@ -215,14 +215,18 @@ target location's file type.
 - A snapshot taken before submission cannot fail the job, and is not refreshed while fresh.
 - A sentinel arriving after the job left the queue, within grace, decides the outcome.
 - With 20 jobs waiting, `squeue` is called once per interval, not once per job.
-- A rejected submission fails the simulation rather than blocking.
+- A submission `sbatch` refuses is not a simulation failure: no job ran. A refusal whose message looks transient (QOS/submit limit, controller not answering) is retried with backoff (2 s doubling to 60 s) for up to `submit_retry_period` (default 900 s), with one warning per session; any other refusal, or a transient one that outlasts the period, throws `_SubmissionRefused`. `run` reports it as the `:submission` stage naming the simulation, puts that simulation back to `Not Started`, and fails fast; nothing is erased from any monad.
+- `run`'s completion loop closes the task queue however it exits (normally, fail-fast, or interrupt), so no further simulation starts and worker tasks end instead of blocking on the channel for the rest of the session; every simulation no worker picked up is returned from `Queued` to `Not Started`. Jobs already submitted keep running and are recorded by their workers.
+- `defaultJobOptions()` sets only `job-name`; `setJobOptions` refuses the keys ModelManager renders itself (`wrap`, `output`, `error`, `wait`, `parsable`, `chdir`) with an `ArgumentError`.
 - A leftover sentinel for the same simulation is neither consumed nor deleted, and does not affect the result.
 - An unreadable sentinel directory neither fails nor kills the worker; an undeletable sentinel still resolves the job.
 - Stale strays are swept, fresh ones left alone, at most once per interval.
 - `squeue` argv contains `-t all`; `SQUEUE_*` variables are absent from its environment; a nonzero exit is `nothing`; a hang returns `nothing` within the timeout rather than blocking on the pipe.
 - `sbatch` output with a banner line before or after the ID, or in the classic `Submitted batch job N` form, parses; two IDs or none is refused.
 - The generated `--wrap` text, run under `/bin/sh`, records the true exit code at the given path and preserves the script's own status, for paths containing spaces, `$`, backticks, quotes and shell metacharacters.
-- `hpc.out` holds the submitted job's ID; a rejected submission puts the scheduler's message in `hpc.err`.
+- `hpc.out` holds the submitted job's ID; a refused submission puts the scheduler's message in `hpc.err`, throws `_SubmissionRefused` (after exhausting retries when the message looked transient), and leaves the simulation at `Not Started` with its monad intact; `run` names the submission stage in its error. A transient refusal that clears is retried until it succeeds, against the same sentinel.
+- After `run` ends by fail-fast, no simulation is left at `Queued` or `Running`; those never started are `Not Started`.
+- `setJobOptions` refuses reserved keys; `defaultJobOptions()` has exactly one key, `job-name`.
 - `simulationCommand` returning `nothing` fails that one simulation and lets the trial continue; a `Cmd` with an environment or a `pipeline` raises `ArgumentError`.
 - A backend that throws on launch leaves no simulation at `"Running"`.
 - The default `runSimulation` writes `output.log`/`output.err` into the simulation folder, runs in `simulatorDir` or the `Cmd`'s `dir`, records a signal-killed or unstartable process as failed rather than throwing, rejects a `Cmd` with an environment or a `pipeline`, and routes to SLURM when `run_on_hpc` is set.

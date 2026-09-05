@@ -116,7 +116,14 @@ const _fail_sim_predicate = Ref{Union{Nothing,Function}}(nothing)
 # "a throwing runSimulation still records the simulation" testset.
 const _throw_in_run = Ref(false)
 
-function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.SimulationSpec)
+# When set, TestSimulator's override steps aside and the *default* runSimulation runs -- the one
+# that consults `simulationCommand`, `run_on_hpc` and the sbatch shim -- so `run()` can be driven
+# end to end through the SLURM path.
+const _use_default_run = Ref(false)
+
+function ModelManager.runSimulation(sim::TestSimulator, spec::ModelManager.SimulationSpec)
+    _use_default_run[] && return invoke(ModelManager.runSimulation,
+                                        Tuple{AbstractSimulator,ModelManager.SimulationSpec}, sim, spec)
     # No-op: immediately report success without launching any process.
     _throw_in_run[] && error("backend blew up launching simulation $(spec.simulation.id)")
     should_fail = !isnothing(_fail_sim_predicate[]) && _fail_sim_predicate[](spec)
@@ -6731,20 +6738,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             RUNNING = ModelManager.statusCodeID("Running")
             QUEUED  = ModelManager.statusCodeID("Queued")
 
+            NOT_STARTED = ModelManager.statusCodeID("Not Started")
+
             # IDs captured up front: failing every simulation empties the monad, which deletes it.
             monad = Monad(InputFolders(config="default"); n_replicates=3)
             ids = simulationIDs(monad)
             _throw_in_run[] = true
             try
                 @test_throws Exception run(monad; quiet=true)
-                # `run` throws from its completion loop the moment it sees the first error, while
-                # the worker tasks are still draining the queue. Wait for them *before* clearing the
-                # flag, or the stragglers run successfully and the end state is not what was tested.
+                # `run` throws from its completion loop the moment it sees the first error. Its
+                # `finally` closes the queue, so a simulation no worker has picked up yet goes back
+                # to "Not Started"; one a worker already holds is run (and here, fails). Which of
+                # the later two each is depends on scheduling, so both outcomes are accepted --
+                # what must never remain is a row at "Queued" or "Running".
                 @test timedwait(() -> all(statusOf(id) ∉ (RUNNING, QUEUED) for id in ids), 20.0) === :ok
             finally
                 _throw_in_run[] = false
             end
-            @test all(statusOf(id) == FAILED for id in ids)   # every one recorded, none stranded
+            @test any(statusOf(id) == FAILED for id in ids)              # the one that threw was recorded
+            @test all(statusOf(id) ∈ (FAILED, NOT_STARTED) for id in ids)  # none stranded
         end
     end
 
@@ -6764,6 +6776,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             #!/bin/sh
             echo "\$@" >> "$shim/sbatch.log"
             [ -e "$shim/sbatch.fail" ] && { echo "boom: bad partition" >&2; exit 1; }
+            if [ -e "$shim/sbatch.transient" ]; then
+              n=\$(cat "$shim/sbatch.transient")
+              if [ "\$n" -gt 0 ]; then
+                echo \$((n - 1)) > "$shim/sbatch.transient"
+                echo "sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)" >&2
+                exit 1
+              fi
+            fi
             while ! mkdir "$shim/sbatch.lock" 2>/dev/null; do sleep 0.01; done
             id=\$(cat "$shim/sbatch.next_id")
             echo \$((id + 1)) > "$shim/sbatch.next_id"
@@ -6787,7 +6807,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         function _reset_hpc!()
             MM._queue_snapshot[] = MM._QueueSnapshot(0, nothing)
             MM._last_stray_sweep[] = 0
-            for f in ("sbatch.fail", "squeue.fail", "squeue.sleep", "sbatch.log", "squeue.log")
+            MM._SUBMIT_BACKOFF_BASE_S[] = 2.0
+            for f in ("sbatch.fail", "sbatch.transient", "squeue.fail", "squeue.sleep", "sbatch.log", "squeue.log")
                 rm(joinpath(shim, f); force=true)
             end
             _next_job!(1)
@@ -6933,12 +6954,78 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 setHPCCompletionOptions(reap_interval=0.05, grace_period=0.0)
             end
 
-            @testset "a rejected submission fails the simulation instead of hanging" begin
+            @testset "a refused submission stops the run and leaves the simulations pending" begin
+                # A refusal is not a result: no job ran. It used to be recorded as a failed
+                # simulation, which erased the simulation from its monad -- and since a refused
+                # worker returns at once and takes the next spec, a submit limit smaller than the
+                # parallelism shredded a whole campaign in seconds. Now it throws, `run` fails fast
+                # naming the submission stage, and every simulation is left pending.
                 _reset_hpc!()
                 touch(joinpath(shim, "sbatch.fail"))
-                @test MM._runHPCSimulation(`true`, sim.id) === nothing
-                # The rejection reason is on disk, not only in the log.
+                @test_throws MM._SubmissionRefused MM._runHPCSimulation(`true`, sim.id)
+                # The rejection reason is on disk, not only in the error.
                 @test occursin("boom", read(joinpath(MM.trialFolder(Simulation, sim.id), "hpc.err"), String))
+                # "bad partition" is not a message that clears up on its own: one attempt, no retry.
+                @test _calls("sbatch.log") == 1
+
+                _status(id) = MM.queryToDataFrame(
+                    MM.constructSelectQuery("simulations", "WHERE simulation_id=$(id)";
+                                            selection="status_code_id"); is_row=true)[1, :status_code_id]
+                NOT_STARTED = MM.statusCodeID("Not Started")
+                @test mm_globals().run_on_hpc                     # the shim on PATH made init detect SLURM
+                monad = Monad(InputFolders(config="default"); n_replicates=3)
+                ids = simulationIDs(monad)
+                _use_default_run[] = true                         # TestSimulator normally bypasses sbatch
+                err = try
+                    run(monad; quiet=true)
+                    nothing
+                catch e
+                    e
+                finally
+                    _use_default_run[] = false
+                end
+                @test err isa MM._SimulationStageError
+                @test occursin("SLURM submission", sprint(showerror, err))
+                @test occursin("boom", sprint(showerror, err))
+                # Workers may still be draining the queue when `run` throws; wait for them.
+                @test timedwait(() -> all(_status(id) == NOT_STARTED for id in ids), 20.0) === :ok
+                # Nothing was recorded as failed, so nothing was erased from the monad.
+                @test sort(constituentIDs(Monad, monad.id)) == sort(ids)
+                rm(joinpath(shim, "sbatch.fail"))
+            end
+
+            @testset "a transient refusal is retried until it clears" begin
+                # The QOS submit-limit message is what a user sees when parallelism exceeds
+                # MaxSubmitJobs; it clears as earlier jobs finish, so the worker waits rather than
+                # giving up. The sentinel path is chosen once, before the first attempt, so the
+                # eventual job writes where the worker is already waiting.
+                _reset_hpc!()
+                MM._SUBMIT_BACKOFF_BASE_S[] = 0.01
+                write(joinpath(shim, "sbatch.transient"), "3")   # refuse three times, then accept
+                _next_job!(9301)
+                _queue!(9301)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                @test timedwait(() -> _calls("sbatch.log") >= 4, 10.0) === :ok
+                @test !istaskdone(t)
+                _publish(0; nth=4)
+                @test fetch(t) == 0
+                @test _calls("sbatch.log") == 4
+            end
+
+            @testset "a transient refusal that outlasts submit_retry_period is a refusal" begin
+                _reset_hpc!()
+                MM._SUBMIT_BACKOFF_BASE_S[] = 0.01
+                setHPCCompletionOptions(submit_retry_period=0.2)
+                write(joinpath(shim, "sbatch.transient"), "1000")
+                @test_throws MM._SubmissionRefused MM._runHPCSimulation(`true`, sim.id)
+                @test _calls("sbatch.log") > 1                    # it did retry before giving up
+                setHPCCompletionOptions(submit_retry_period=900.0)
+            end
+
+            @testset "the shipped job options request nothing but a name" begin
+                # No memory or time request: those are the site's to choose until the user says
+                # otherwise, and a too-small default is a silent kill plus minutes of reaper latency.
+                @test collect(keys(MM.defaultJobOptions())) == ["job-name"]
             end
 
             @testset "the submission's own streams are kept as hpc.out / hpc.err" begin
@@ -7170,8 +7257,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             @testset "sbatch options cannot claim reserved flags" begin
                 for reserved in MM._RESERVED_SBATCH_KEYS
-                    setJobOptions(Dict(reserved => "x"))
-                    @test_throws AssertionError MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "x"))
+                    # Refused when set, so the mistake surfaces before any job is built...
+                    @test_throws ArgumentError setJobOptions(Dict(reserved => "x"))
+                    @test !haskey(mm_globals().sbatch_options, reserved)
+                    # ...and again when rendered, for a value written into the Dict by hand.
+                    mm_globals().sbatch_options[reserved] = "x"
+                    @test_throws ArgumentError MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "x"))
                     delete!(mm_globals().sbatch_options, reserved)
                 end
             end
