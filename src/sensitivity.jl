@@ -691,7 +691,15 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     #! over a hole is wrong rather than approximate, so this refuses instead.
     reference_id = first(monad_ids)
     component_keys = _gsaComponentKeys(q, reduced[reference_id], reference_id)
+    #! Walked in DESIGN order, so the monad an error names is the first mismatch someone scanning
+    #! their design would reach -- iterating `reduced` instead would name whichever monad hashing
+    #! happens to visit first, which is reproducible but not meaningful. Each DISTINCT monad is
+    #! checked once, because a design can place the same monad in many cells: RBD's matrix is one set
+    #! of variations permuted per column, so every column repeats them all.
+    checked = Set{Int}()
     for monad_id in monad_ids
+        monad_id in checked && continue
+        push!(checked, monad_id)
         _gsaComponentKeys(q, reduced[monad_id], monad_id) == component_keys || throw(ArgumentError(
             "QoI \"$(q.name)\": every monad must reduce to the same keys, since each key becomes " *
             "its own sensitivity analysis and needs a value from every monad in the design. Monad " *
