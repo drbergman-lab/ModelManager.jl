@@ -158,7 +158,7 @@ function QoI(name::AbstractString, compute::Function;
              reduce::Function=mean, stored::Symbol=:never)
     stored in _QOI_STORED_MODES || throw(ArgumentError(
         "QoI `stored` must be one of $(_QOI_STORED_MODES); got :$(stored)."))
-    occursin('.', name) && throw(ArgumentError(
+    occursin(_QOI_LABEL_SEPARATOR, name) && throw(ArgumentError(
         "QoI names cannot contain a `.`; got \"$(name)\". The dot separates a quantity from its " *
         "components — a `Dict`-valued measurement is labelled \"$(name)\" plus `.` plus each key — " *
         "so a name carrying one would be indistinguishable from another QoI's component. Use `_`."))
@@ -285,6 +285,98 @@ function _reduceOverMonad(x, monad_id::Integer)
         "Monad $(monad_id) lists $(length(sim_ids)) simulations but only $(length(sims)) are in the " *
         "database, so QoI \"$(q.name)\" cannot be evaluated on it."))
     return q.reduce([_computeOn(q, sim) for sim in sims])
+end
+
+
+#! The separator between a quantity and its components lives in ONE place, because four sites have to
+#! agree on it: the `QoI` constructor refuses it inside a name, the sink writes it into a column name,
+#! sensitivity analysis writes it into a label, and `_isQoILabelOf` reads it back out. Spelling it in
+#! four string literals is how they drift apart.
+const _QOI_LABEL_SEPARATOR = "."
+
+"""
+    _qoiLabel(name, key) → String
+
+The name one component of a keyed measurement is stored under: `"<name>.<key>"`. The sink uses it for
+a column, sensitivity analysis for a label.
+"""
+_qoiLabel(name::AbstractString, key) = string(name, _QOI_LABEL_SEPARATOR, key)
+
+"""
+    _isQoILabelOf(label, name) → Bool
+
+Whether `label` is one that a QoI called `name` produces — its name, or its name and a key.
+"""
+_isQoILabelOf(label::AbstractString, name::AbstractString) =
+    label == name || startswith(label, name * _QOI_LABEL_SEPARATOR)
+
+#! Moved here from `src/sensitivity.jl`: this is about what a MEASUREMENT names, not about
+#! sensitivity. The error messages still speak of sensitivity analysis because it is the only
+#! consumer that requires a `Real` per component -- calibration passes whatever `reduce` returns
+#! straight to its `distance`, and the sink never calls `reduce` at all.
+
+#! A `Real` reduce is one quantity; a `Dict`/`NamedTuple` one is several, and `nothing` here is the
+#! marker for the scalar case -- it distinguishes "no components" from "components, and here they
+#! are", which an empty vector would not.
+#!
+#! `Dict` keys are sorted so two runs of the same script produce the same order; a `NamedTuple` keeps
+#! its declaration order, which the user chose. Keys are compared UNSTRINGIFIED across monads, so a
+#! QoI that returns `(a=…, b=…)` for one monad and `Dict("a"=>…, "b"=>…)` for another is caught --
+#! both would stringify to the same labels and hide a reducer that is not doing one thing.
+"""
+    _qoiComponentKeys(q, value, monad_id) → keys or nothing
+
+The keys `value` contributes as separate sensitivity analyses, or `nothing` when it is a single
+`Real`. Throws when `value` is neither.
+"""
+_qoiComponentKeys(::QoI, ::Real, ::Integer) = nothing
+_qoiComponentKeys(::QoI, v::NamedTuple, ::Integer) = collect(keys(v))
+_qoiComponentKeys(::QoI, v::AbstractDict, ::Integer) = sort(collect(keys(v)); by=string)
+
+#! The `Vector` case is called out because it is the one a reader will reach for, and because the
+#! obvious accommodation -- spreading by index into `q_1`, `q_2` -- is not safe. Two monads' vectors
+#! can only be checked for equal LENGTH, and equal length is not alignment: series sampled at
+#! different times, or one run that stopped early, produce same-length vectors whose entries mean
+#! different things, and the indices would come out confident and wrong. A `Dict` cannot: its keys
+#! are the alignment, supplied by the person who knows what they mean.
+function _qoiComponentKeys(q::QoI, v, monad_id::Integer)
+    advice = v isa AbstractArray ?
+        "A `Vector` is not spread by index: only its length can be checked against the other " *
+        "monads', and equal length is not equal meaning — two series sampled at different times " *
+        "have the same length and different contents. Return a `Dict` whose keys name the " *
+        "components, or reduce to the single number you want the indices for." :
+        "Reduce to a single number, or to a `Dict` naming each component."
+    throw(ArgumentError(
+        "QoI \"$(q.name)\": each monad must reduce to a `Real`, or to a `Dict`/`NamedTuple` of " *
+        "them — one sensitivity analysis per key, labelled \"$(q.name).<key>\". Monad " *
+        "$(monad_id) reduced to a $(typeof(v)). " * advice))
+end
+
+#! Checked per label rather than only per container, because a `Dict` passing the key check can still
+#! hold something that is not a number. Without this the failure is a bare `convert` MethodError with
+#! no mention of the QoI, which is the error this whole path exists to avoid.
+"""
+    _qoiComponentValue(q, label, monad_id, v) → Float64
+"""
+function _qoiComponentValue(q::QoI, label::AbstractString, monad_id::Integer, v)
+    v isa Real || throw(ArgumentError(
+        "QoI \"$(q.name)\": \"$(label)\" must be a `Real` on every monad, since it becomes a " *
+        "sensitivity index. Monad $(monad_id) gave a $(typeof(v))."))
+    return Float64(v)
+end
+
+"""
+    _qoiDuplicateLabelMessage(component_keys, labels) → String
+
+The body of the error raised when two of a QoI's keys produce one label.
+"""
+function _qoiDuplicateLabelMessage(component_keys, labels)
+    dups = unique(l for l in labels if count(==(l), labels) > 1)
+    culprits = [k for (k, l) in zip(component_keys, labels) if l in dups]
+    return "keys $(join(repr.(culprits), ", ")) all produce the label " *
+           "$(join(repr.(dups), ", ")). Distinct keys that collide once written into a label are " *
+           "not allowed — each label is its own sensitivity analysis, so one would silently " *
+           "replace the other. `1` and \"1\" are one way to get here."
 end
 
 #! One contract, and one internal representation. A user may hand any consumer a bare `Function`; it
@@ -509,7 +601,7 @@ function _asPostProcessor(qs::AbstractVector{QoI})
                 #! Namespaced by the QoI's name, matching how sensitivity analysis labels the same
                 #! spread. Two QoIs measuring "tumor" no longer land in one column.
                 for (k, vv) in pairs(v)
-                    push!(entries, "$(q.name).$(k)" => vv)
+                    push!(entries, _qoiLabel(q.name, k) => vv)
                 end
             else
                 push!(entries, q.name => v)

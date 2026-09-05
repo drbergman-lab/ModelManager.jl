@@ -5,6 +5,48 @@
 
 ---
 
+## Session: QoI evaluation moves into qoi.jl (2026-09-05) — ships in v0.9.1
+
+### Trigger
+Reviewing PR #49: "why is sensitivity.jl owning the code for computing QoIs?" It is a fair question
+about placement, but the substance turned out to be a divergence, not an aesthetic.
+
+### The two implementations had drifted
+`qoi.jl`'s `_reduceOverMonad` and an inline loop in `evaluateFunctionOnSampling` did the same job —
+compute a QoI over a monad's simulations and reduce the replicates — and only one of them was right:
+
+- `_reduceOverMonad` batch-loads through `simulationsFromIDs`, with a `#!` comment naming the N+1
+  pattern it deliberately avoids, and guards both an empty monad and a constituent list that
+  disagrees with the database.
+- GSA's copy called `_computeOn(q, simulation_id)` once per ID — that same N+1 pattern, one
+  `Simulation(sid)` round trip each — and carried neither guard, so an empty monad reached
+  `q.reduce([])` and an inconsistent one went unnoticed.
+
+GSA now calls `_reduceOverMonad`, gaining the batch query and both guards. Checked before switching
+that this is not a trade: `stored=:prefer` already queries per simulation inside `_storedValue`
+regardless of which path is taken, so the batch version is better or equal in every case rather than
+only in the `stored=:never` default.
+
+### One separator, not four string literals
+`"<name>.<key>"` was written out in `_asPostProcessor` and in `evaluateFunctionOnSampling`, and the
+`"."` was hardcoded a third time in `_isGSALabelOf` and a fourth in the `QoI` constructor's refusal.
+Four sites that must agree, none of which said so. Now `_QOI_LABEL_SEPARATOR`, `_qoiLabel` and
+`_isQoILabelOf` in `qoi.jl`, with a test that ties the constructor's refusal to the label helper:
+whatever `_qoiLabel` builds is exactly what a name may not look like.
+
+### Moved, and what stayed
+`_gsaComponentKeys`, `_gsaComponentValue` and `_gsaDuplicateLabelMessage` became `_qoiComponentKeys`,
+`_qoiComponentValue` and `_qoiDuplicateLabelMessage` in `qoi.jl` — they describe what a *measurement*
+names, not anything about sensitivity. `_gsaLabelsOf` stayed in `sensitivity.jl`, because it is about
+a `GSASampling`'s stored results rather than about a QoI.
+
+Their error messages still name sensitivity analysis, and that is deliberate: it is the only consumer
+requiring a `Real` per component, since calibration hands whatever `reduce` returns to its `distance`
+and the sink never calls `reduce` at all. A `#!` comment says so, so the next reader does not
+"correct" it into something vaguer.
+
+---
+
 ## Session: GSA spreads a keyed measurement (2026-09-04) — ships in v0.9.1
 
 ### Trigger

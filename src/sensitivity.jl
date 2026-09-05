@@ -241,15 +241,7 @@ Whether `gsa_sampling` already holds results for `q`, decided from `q`'s name be
 Exact rather than heuristic, because a [`QoI`](@ref) name cannot contain the `.` separator.
 """
 _hasGSAResults(gsa_sampling::GSASampling, q::QoI) =
-    any(k -> _isGSALabelOf(k, q.name), keys(gsa_sampling.results))
-
-"""
-    _isGSALabelOf(label, name) → Bool
-
-Whether `label` is one that a QoI called `name` produces — its name, or its name and a key.
-"""
-_isGSALabelOf(label::AbstractString, name::AbstractString) =
-    label == name || startswith(label, name * ".")
+    any(k -> _isQoILabelOf(k, q.name), keys(gsa_sampling.results))
 
 """
     _gsaLabelsOf(gsa_sampling, name) → Vector{String}
@@ -257,7 +249,7 @@ _isGSALabelOf(label::AbstractString, name::AbstractString) =
 Every label in `gsa_sampling.results` that a QoI called `name` produced.
 """
 _gsaLabelsOf(gsa_sampling::GSASampling, name::AbstractString) =
-    filter(k -> _isGSALabelOf(k, name), collect(keys(gsa_sampling.results)))
+    filter(k -> _isQoILabelOf(k, name), collect(keys(gsa_sampling.results)))
 
 #! Computes without storing. Split out so the vector method above can see every label a call will
 #! produce before it commits any of them.
@@ -635,70 +627,6 @@ function recordSensitivityScheme(gsa_sampling::GSASampling)
     return CSV.write(path_to_csv, getMonadIDDataFrame(gsa_sampling); header=true)
 end
 
-#! A `Real` reduce is one quantity; a `Dict`/`NamedTuple` one is several, and `nothing` here is the
-#! marker for the scalar case -- it distinguishes "no components" from "components, and here they
-#! are", which an empty vector would not.
-#!
-#! `Dict` keys are sorted so two runs of the same script produce the same order; a `NamedTuple` keeps
-#! its declaration order, which the user chose. Keys are compared UNSTRINGIFIED across monads, so a
-#! QoI that returns `(a=…, b=…)` for one monad and `Dict("a"=>…, "b"=>…)` for another is caught --
-#! both would stringify to the same labels and hide a reducer that is not doing one thing.
-"""
-    _gsaComponentKeys(q, value, monad_id) → keys or nothing
-
-The keys `value` contributes as separate sensitivity analyses, or `nothing` when it is a single
-`Real`. Throws when `value` is neither.
-"""
-_gsaComponentKeys(::QoI, ::Real, ::Integer) = nothing
-_gsaComponentKeys(::QoI, v::NamedTuple, ::Integer) = collect(keys(v))
-_gsaComponentKeys(::QoI, v::AbstractDict, ::Integer) = sort(collect(keys(v)); by=string)
-
-#! The `Vector` case is called out because it is the one a reader will reach for, and because the
-#! obvious accommodation -- spreading by index into `q_1`, `q_2` -- is not safe. Two monads' vectors
-#! can only be checked for equal LENGTH, and equal length is not alignment: series sampled at
-#! different times, or one run that stopped early, produce same-length vectors whose entries mean
-#! different things, and the indices would come out confident and wrong. A `Dict` cannot: its keys
-#! are the alignment, supplied by the person who knows what they mean.
-function _gsaComponentKeys(q::QoI, v, monad_id::Integer)
-    advice = v isa AbstractArray ?
-        "A `Vector` is not spread by index: only its length can be checked against the other " *
-        "monads', and equal length is not equal meaning — two series sampled at different times " *
-        "have the same length and different contents. Return a `Dict` whose keys name the " *
-        "components, or reduce to the single number you want the indices for." :
-        "Reduce to a single number, or to a `Dict` naming each component."
-    throw(ArgumentError(
-        "QoI \"$(q.name)\": each monad must reduce to a `Real`, or to a `Dict`/`NamedTuple` of " *
-        "them — one sensitivity analysis per key, labelled \"$(q.name).<key>\". Monad " *
-        "$(monad_id) reduced to a $(typeof(v)). " * advice))
-end
-
-#! Checked per label rather than only per container, because a `Dict` passing the key check can still
-#! hold something that is not a number. Without this the failure is a bare `convert` MethodError with
-#! no mention of the QoI, which is the error this whole path exists to avoid.
-"""
-    _gsaComponentValue(q, label, monad_id, v) → Float64
-"""
-function _gsaComponentValue(q::QoI, label::AbstractString, monad_id::Integer, v)
-    v isa Real || throw(ArgumentError(
-        "QoI \"$(q.name)\": \"$(label)\" must be a `Real` on every monad, since it becomes a " *
-        "sensitivity index. Monad $(monad_id) gave a $(typeof(v))."))
-    return Float64(v)
-end
-
-"""
-    _gsaDuplicateLabelMessage(component_keys, labels) → String
-
-The body of the error raised when two of a QoI's keys produce one label.
-"""
-function _gsaDuplicateLabelMessage(component_keys, labels)
-    dups = unique(l for l in labels if count(==(l), labels) > 1)
-    culprits = [k for (k, l) in zip(component_keys, labels) if l in dups]
-    return "keys $(join(repr.(culprits), ", ")) all produce the label " *
-           "$(join(repr.(dups), ", ")). Distinct keys that collide once written into a label are " *
-           "not allowed — each label is its own sensitivity analysis, so one would silently " *
-           "replace the other. `1` and \"1\" are one way to get here."
-end
-
 """
     evaluateFunctionOnSampling(gsa_sampling, f) → Vector{Pair{String,Matrix{Float64}}}
 
@@ -717,14 +645,19 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     monad_id_df = getMonadIDDataFrame(gsa_sampling)
     monad_ids = monad_id_df |> Matrix
 
-    #! One reduction per DISTINCT monad, as before: the design repeats monads, and `compute` may be
-    #! expensive. What changed is that the cache holds the raw reduced value rather than a `Float64`,
-    #! because its shape is what decides how many analyses this QoI yields.
+    #! One reduction per DISTINCT monad: a design repeats monads (every RBD column holds the same
+    #! set), and `compute` may be expensive. The cache holds the RAW reduced value, because its shape
+    #! is what decides how many analyses this QoI yields.
+    #!
+    #! The reduction itself is `_reduceOverMonad`, the same function calibration uses, rather than a
+    #! second copy here. The copy had drifted: it built one `Simulation` per ID -- the N+1 pattern
+    #! `simulationsFromIDs` exists to avoid, and which `_reduceOverMonad` already avoided for
+    #! calibration -- and it carried neither of that function's guards, so an empty monad reached
+    #! `q.reduce([])` and a monad whose constituent list disagreed with the database went unnoticed.
     reduced = Dict{Int,Any}()
     for monad_id in monad_ids
         haskey(reduced, monad_id) && continue
-        simulation_ids = constituentIDs(Monad, monad_id)
-        reduced[monad_id] = q.reduce([_computeOn(q, simulation_id) for simulation_id in simulation_ids])
+        reduced[monad_id] = _reduceOverMonad(q, monad_id)
     end
 
     #! Every monad is checked, not just the first. A key set that differs anywhere leaves a hole in
@@ -732,7 +665,7 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     #! `mseDistance`, which treats an absent key as zero and warns once. A sensitivity index computed
     #! over a hole is wrong rather than approximate, so this refuses instead.
     reference_id = first(monad_ids)
-    component_keys = _gsaComponentKeys(q, reduced[reference_id], reference_id)
+    component_keys = _qoiComponentKeys(q, reduced[reference_id], reference_id)
     #! Walked in DESIGN order, so the monad an error names is the first mismatch someone scanning
     #! their design would reach -- iterating `reduced` instead would name whichever monad hashing
     #! happens to visit first, which is reproducible but not meaningful. Each DISTINCT monad is
@@ -742,11 +675,11 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     for monad_id in monad_ids
         monad_id in checked && continue
         push!(checked, monad_id)
-        _gsaComponentKeys(q, reduced[monad_id], monad_id) == component_keys || throw(ArgumentError(
+        _qoiComponentKeys(q, reduced[monad_id], monad_id) == component_keys || throw(ArgumentError(
             "QoI \"$(q.name)\": every monad must reduce to the same keys, since each key becomes " *
             "its own sensitivity analysis and needs a value from every monad in the design. Monad " *
             "$(reference_id) gave $(repr(component_keys)) but monad $(monad_id) gave " *
-            "$(repr(_gsaComponentKeys(q, reduced[monad_id], monad_id)))."))
+            "$(repr(_qoiComponentKeys(q, reduced[monad_id], monad_id)))."))
     end
 
     #! An empty `Dict`/`NamedTuple` is not "no components" -- it is a reducer that named nothing, and
@@ -757,7 +690,7 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
         "QoI \"$(q.name)\": its `reduce` returned an empty $(typeof(reduced[reference_id])), so it " *
         "names no quantities and there is nothing to analyse. Return a `Real`, or a " *
         "`Dict`/`NamedTuple` with at least one key."))
-    labels = isnothing(component_keys) ? [q.name] : ["$(q.name).$(k)" for k in component_keys]
+    labels = isnothing(component_keys) ? [q.name] : [_qoiLabel(q.name, k) for k in component_keys]
     #! Checked HERE, where the keys are still in hand, because afterwards only the labels survive.
     #! Two distinct keys can land on one label -- `1` and `"1"`, the same collision the sink guards
     #! against -- and neither downstream path handles it: `calculateGSA!`'s cross-QoI check reports
@@ -765,13 +698,13 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     #! while the single-measurement method has no such check and simply lets one analysis overwrite
     #! the other.
     allunique(labels) || throw(ArgumentError(
-        "QoI \"$(q.name)\": " * _gsaDuplicateLabelMessage(component_keys, labels)))
+        "QoI \"$(q.name)\": " * _qoiDuplicateLabelMessage(component_keys, labels)))
     out = Pair{String,Matrix{Float64}}[]
     for (i, label) in enumerate(labels)
         vals = zeros(Float64, size(monad_id_df))
         for (ind, monad_id) in enumerate(monad_ids)
             v = reduced[monad_id]
-            vals[ind] = _gsaComponentValue(q, label, monad_id,
+            vals[ind] = _qoiComponentValue(q, label, monad_id,
                                            isnothing(component_keys) ? v : v[component_keys[i]])
         end
         push!(out, label => vals)
