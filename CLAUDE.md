@@ -310,6 +310,28 @@ Deliberate decisions whose symptoms would otherwise look like bugs. Check here b
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
+- **Move QoI evaluation out of `src/sensitivity.jl` into `src/qoi.jl`.** Sensitivity analysis owns
+  machinery that is about measuring a QoI, not about sensitivity: `_gsaComponentKeys`,
+  `_gsaComponentValue`, `_gsaDuplicateLabelMessage`, the `"<name>.<key>"` label construction, and the
+  per-monad reduce loop inside `evaluateFunctionOnSampling`. The payoff is not tidiness — **the same
+  operation is already implemented twice, and the two have diverged.** `_reduceOverMonad` (qoi.jl)
+  does the calibration side and batch-loads through `simulationsFromIDs`, with a `#!` comment naming
+  the N+1 pattern it is deliberately avoiding, plus guards for an empty monad and for a constituent
+  list that disagrees with the database. GSA's loop calls `_computeOn(q, simulation_id)` once per ID
+  — exactly that N+1 pattern — and has neither guard, so an empty monad reaches `q.reduce([])`
+  instead of the named error. Merging gives GSA the batch query and both guards for free.
+
+  A third duplication rides along: the `"$(q.name).$(k)"` label format is written out in
+  `_asPostProcessor` (qoi.jl) and in `evaluateFunctionOnSampling` (sensitivity.jl), and the `"."`
+  separator is hardcoded a third time in `_isGSALabelOf`. One helper and one constant should own it,
+  in the file that also owns the constructor rule refusing `.` in a QoI name.
+
+  **They are not identical, so this is a factoring job rather than a delete.** GSA caches one
+  reduction per *distinct* monad because a design repeats monads (RBD especially); calibration has no
+  such need. GSA also needs the raw reduced value, since its *shape* decides how many labels the QoI
+  yields, while calibration hands it straight to `distance`. So the shared piece is "reduce one monad
+  to its value", with the caching staying at the GSA call site. The `_gsa*` prefixes go once they
+  move. Surfaced reviewing PR #49.
 - **Give a simulator a supported way to set environment variables.** `runSimulation`'s default
   rejects a `Cmd` carrying an environment, because Julia's `Cmd.env` *replaces* the environment
   (a child asking for one variable loses `PATH`, `HOME`, `LD_LIBRARY_PATH` and module state) while
