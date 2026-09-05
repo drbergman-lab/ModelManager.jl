@@ -11,14 +11,18 @@ measurement written once and passed to any of them.
 
 # Arguments
 - `name`: identifies the quantity. It is the sink's column name and the key under which
-  [`CalibrationProblem`](@ref) reports the value to its `distance`.
+  [`CalibrationProblem`](@ref) reports the value to its `distance`. It may not contain a `.`, which
+  is reserved as the separator between a quantity and its components (see below).
 - `compute`: called with one [`Simulation`](@ref). It may return anything `reduce` understands — a
   scalar, a vector, a `Dict` — **except** when the QoI is used as a `post_processor`, where `reduce`
   is never called and `compute`'s own return value is what gets stored.
 
 # Keywords
-- `reduce`: combines one parameter set's replicate values into a single value, `mean` by default.
-  It receives the vector of everything `compute` returned for that set.
+- `reduce`: collapses one parameter set's *replicates*, `mean` by default. It receives the vector of
+  everything `compute` returned for that set — one entry per replicate — and returns that set's
+  value. It is not `Base.reduce`, and the result need not be a scalar: what it reduces is the
+  replicate dimension, so returning a `Dict` of `name => value` is a reduction over replicates that
+  keeps several quantities, and every consumer here understands one.
 
 # What each consumer needs back
 Neither `compute` nor `reduce` is constrained by `QoI` itself; the requirement comes from where the QoI
@@ -26,7 +30,7 @@ is used, and it does not fall on the same function in each case:
 
 | consumer | what must be a usable value | what it must be |
 |---|---|---|
-| `run(::GSAMethod, ...; functions=)` | `reduce`'s return | a `Real` (the sensitivity indices need `Float64`) |
+| `run(::GSAMethod, ...; functions=)` | `reduce`'s return | a `Real`, or a `Dict`/`NamedTuple` of them |
 | [`CalibrationProblem`](@ref)'s `summary_statistic` | `reduce`'s return | anything the problem's `distance` accepts |
 | `run(...; post_processor=)` | **`compute`'s return** | a scalar `Bool`, `Integer`, `Real` or `AbstractString` |
 
@@ -35,6 +39,20 @@ value and nothing to combine, so `reduce` is never called and the freedom to ret
 apply. Write richer per-simulation output to the simulation's own folder instead. Returning something a
 consumer cannot use is that consumer's error to raise, and the sink's names the QoI and the offending
 type.
+
+# A `Dict` becomes several quantities, not one
+Two consumers spread a keyed value rather than demanding one number, and both name the pieces the
+same way — `"<qoi name>.<key>"` — so one measurement names its parts identically wherever it is used:
+
+- **Sensitivity analysis** runs one analysis per key, labelled `"<qoi name>.<key>"` — so
+  `QoI("counts", …)` reducing to `Dict("tumor" => …, "immune" => …)` gives `counts.tumor` and
+  `counts.immune`. Every monad must reduce to the *same* keys; one that does not is refused, because a
+  sensitivity index computed over a missing value is wrong rather than approximate. A `Vector` is not
+  spread by index: only its length could be checked against the other monads', and equal length is not
+  equal meaning.
+- **The sink** names its columns the same way: `"<qoi name>.<key>"`. Because those names are
+  persisted, an *anonymous* `compute` is refused outright when it spreads — its derived `anon_9`
+  would prefix every column and vary between sessions. Name the QoI, or pass a named function.
 
 Because `reduce` sees every replicate's value, a measurement that needs the replicates *jointly*
 rather than as summarised numbers is expressed by having `compute` return the raw material — a time
@@ -107,6 +125,12 @@ QoI("slope", timeSeries; reduce=series -> fitSlope(reduce(vcat, series)))
 run(MOAT(), spec; functions=[tumor])
 CalibrationProblem(spec, observed, tumor, mseDistance)
 run(trial; post_processor=tumor)
+
+# Several quantities from one measurement, named the same way in both places: GSA spreads
+# `reduce`'s keys into `counts.tumor` / `counts.immune`, and the sink spreads `compute`'s keys
+# into columns `counts.tumor` / `counts.immune`.
+counts = QoI("counts", finalPopulationCount;
+             reduce = per_sim -> Dict(k => mean(getindex.(per_sim, k)) for k in ("tumor", "immune")))
 ```
 """
 struct QoI
@@ -118,10 +142,26 @@ end
 
 const _QOI_STORED_MODES = (:never, :prefer, :require)
 
+#! The separator is reserved so that a label can be read backwards. Every name a spread quantity
+#! produces is `"<qoi name>.<key>"`, and sensitivity analysis decides whether a QoI has already been
+#! evaluated by testing exactly that shape against its name -- before reading any output, which is
+#! what makes the check a saving rather than a late no-op. Allow a `.` inside a name and the shape is
+#! ambiguous: `QoI("counts.x", …)` alongside a `QoI("counts", …)` that spreads to `x` gives two
+#! different QoIs a claim on the label `counts.x`. Within one call that collides and is refused, but
+#! across calls it silently skips -- either the second QoI (leaving the first's value under its
+#! label) or, worse, the whole spreading QoI, so a legitimate `counts.y` is never computed.
+#!
+#! Refused at construction rather than inferred later because provenance cannot be recovered from a
+#! label once it exists. `_qoiNameFromFunction` already regularises to `[A-Za-z_][A-Za-z0-9_]*`, so
+#! nothing ModelManager derives can trip this -- only a name a user chose.
 function QoI(name::AbstractString, compute::Function;
              reduce::Function=mean, stored::Symbol=:never)
     stored in _QOI_STORED_MODES || throw(ArgumentError(
         "QoI `stored` must be one of $(_QOI_STORED_MODES); got :$(stored)."))
+    occursin('.', name) && throw(ArgumentError(
+        "QoI names cannot contain a `.`; got \"$(name)\". The dot separates a quantity from its " *
+        "components — a `Dict`-valued measurement is labelled \"$(name)\" plus `.` plus each key — " *
+        "so a name carrying one would be indistinguishable from another QoI's component. Use `_`."))
     return QoI(String(name), compute, reduce, stored)
 end
 
@@ -412,10 +452,15 @@ _evaluateSummary(qs::AbstractVector{QoI}, monad_id::Integer) =
 #! No reducer here, and none possible: the hook fires once per simulation, so there is exactly one
 #! value and nothing to combine. A QoI's `reduce` is simply unused by the sink.
 #!
-#! A `compute` returning a `NamedTuple` or a `Dict` contributes its own entries as columns rather than
-#! nesting under the QoI's name. That is what lets a wrapped bare function keep producing several
-#! columns -- the sink has always accepted a multi-field return and spread it -- and what lets a QoI
-#! discover its column set from the simulation's own output at run time.
+#! A `compute` returning a `NamedTuple` or a `Dict` contributes one column per key, named
+#! `"<qoi name>.<key>"` -- the same rule sensitivity analysis uses for a spread `reduce`, so one
+#! measurement names its parts the same way wherever it is consumed. This is what lets a QoI discover
+#! its column set from the simulation's own output at run time, and it is why two QoIs that both
+#! measure "tumor" no longer collide in a single column.
+#!
+#! It also means an anonymous `compute` can no longer write columns at all, since its derived name
+#! would prefix every one of them. That capability was deliberately given up: namespacing is worth
+#! more than the convenience of an unnamed lambda, and naming the QoI is a one-word fix.
 """
     _asPostProcessor(x) → Function
 
@@ -431,37 +476,42 @@ function _asPostProcessor(qs::AbstractVector{QoI})
         "QoI names must be unique within one post-processor; got $(names)."))
     return function (sim::Simulation)
         #! Ordered pairs, not a `Dict`: round-tripping through one scrambled a `NamedTuple`'s field
-        #! order, so the sink added its columns in hash order. Keys are also left unstringified --
-        #! the sink rejects distinct keys that collide once stringified (`1` and `"1"`), and
-        #! converting early would collapse them before that check ever ran.
+        #! order, so the sink added its columns in hash order. Distinct keys that collide once
+        #! stringified (`1` and `"1"`) still reach the sink as two separate entries, so its
+        #! `allunique` check still sees and rejects them.
         entries = Pair{Any,Any}[]
         for q in qs
             v = _computeOn(q, sim)
             #! `nothing`/`missing` records nothing for this simulation -- how a post-processor skips
             #! one whose output it could not read.
             (isnothing(v) || ismissing(v)) && continue
-            if v isa NamedTuple || v isa AbstractDict
+            spreads = v isa NamedTuple || v isa AbstractDict
+            #! A gensym must never become a persistent database column, and since EVERY column a QoI
+            #! writes is now named after it, that applies to a spread return as much as a scalar one:
+            #! the regularised `anon_9` varies between sessions, so the same script would write a
+            #! second, half-empty set of columns next time.
+            #!
+            #! One narrowing. Only values the sink would actually store: a return it rejects anyway
+            #! (a bare `Vector`, say) keeps flowing to its own error, which is raised outside the
+            #! per-simulation stage and so stays an `ArgumentError` at the call site. And only a name
+            #! that was AUTO-DERIVED -- `QoI("counts", sim -> …)` has an anonymous `compute` but a
+            #! perfectly good name, and must not be refused.
+            (spreads || v isa Union{Bool,Integer,Real,AbstractString}) &&
+                _isAnonymousFunction(q.compute) &&
+                q.name == _qoiNameFromFunction(q.compute) && throw(ArgumentError(
+                "post_processor: an anonymous function has no stable name, and every sink column is " *
+                "named after the QoI that wrote it — this $(typeof(v)) would be stored as " *
+                (spreads ? "\"<name>.<key>\" per key" : "\"<name>\"") * ". The derived name " *
+                "varies between sessions, so the same script would write a second, half-empty set " *
+                "of columns next time. Name it — `QoI(\"my_quantity\", f)` — or pass a named " *
+                "function."))
+            if spreads
+                #! Namespaced by the QoI's name, matching how sensitivity analysis labels the same
+                #! spread. Two QoIs measuring "tumor" no longer land in one column.
                 for (k, vv) in pairs(v)
-                    push!(entries, k => vv)
+                    push!(entries, "$(q.name).$(k)" => vv)
                 end
             else
-                #! A gensym must never become a persistent database column. An anonymous function
-                #! returning a scalar has no name to store it under, and the regularised `anon_9`
-                #! varies between sessions -- the same script would write a second, half-empty column
-                #! next time. Returning a NamedTuple/Dict is unaffected: those names come from the
-                #! user, and the branch above never consults the QoI's name.
-                #! Two narrowings. Only values the sink would actually store: a return it rejects
-                #! anyway (a Vector, say) keeps flowing to its own error, which is raised outside the
-                #! per-simulation stage and so stays an `ArgumentError` at the call site. And only a
-                #! name that was AUTO-DERIVED from an anonymous function -- `QoI("counts", sim -> …)`
-                #! has an anonymous `compute` but a perfectly good name, and must not be refused.
-                v isa Union{Bool,Integer,Real,AbstractString} &&
-                    _isAnonymousFunction(q.compute) &&
-                    q.name == _qoiNameFromFunction(q.compute) && throw(ArgumentError(
-                    "post_processor: an anonymous function returned a $(typeof(v)), which has to be " *
-                    "stored under a column name, and an anonymous function has none. Either name it " *
-                    "-- `QoI(\"my_quantity\", f)` -- or return a NamedTuple/Dict whose keys are the " *
-                    "column names."))
                 push!(entries, q.name => v)
             end
         end

@@ -17,13 +17,46 @@ run(method, inputs, variations; functions = [f1, f2, ...])
 - `inputs` — the base [`InputFolders`](@ref) (or a reference monad).
 - `variations` — the parameters to analyze, as [`DistributedVariation`](@ref)s (or
   [`CoVariation`](@ref)s), so each can be sampled across its range.
-- `functions` — output functions of the form `simulation -> Real`, or [`QoI`](@ref)s. Each defines
-  one scalar output whose sensitivity to the inputs is computed. Each is called once per
-  *simulation* with a [`Simulation`](@ref), and the values are combined over a monad's replicates
-  by `mean` — pass a `QoI` to choose a different reduction.
+- `functions` — output functions of the form `simulation -> Real`, or [`QoI`](@ref)s. Each is called
+  once per *simulation* with a [`Simulation`](@ref), and the values are combined over a monad's
+  replicates by `mean` — pass a `QoI` to choose a different reduction.
 
 `run` builds the appropriate sampling design, runs the simulations, evaluates your output
 functions, and returns a [`GSASampling`](@ref) result holding the sensitivity indices.
+
+## One measurement, several quantities
+
+An entry of `functions` need not define a single output. If a `QoI`'s `reduce` returns a `Dict` or
+`NamedTuple` instead of a number, each key becomes its own sensitivity analysis, labelled
+`"<qoi name>.<key>"`:
+
+```julia
+counts = QoI("counts", finalPopulationCount;
+             reduce = per_sim -> Dict(k => mean(getindex.(per_sim, k)) for k in ("tumor", "immune")))
+
+gsa = run(MOAT(15), inputs, dists; functions=[counts])
+ModelManager.gsaLabels(gsa)     # ["counts.immune", "counts.tumor"]
+gsa.results["counts.tumor"]
+```
+
+This is what lets the same measurement feed all three consumers: a `Dict`-valued quantity already
+worked as a [`CalibrationProblem`](@ref)'s `summary_statistic` and as a `post_processor`, and no
+longer has to be rewritten once per key to ask a sensitivity question about it.
+
+Two constraints follow from what a sensitivity index needs:
+
+- **Every monad must produce the same keys.** Each key's indices are computed over a value from every
+  monad in the design, so a monad missing one leaves a hole — and unlike [`mseDistance`](@ref), which
+  treats an absent key as zero, there is no fill that makes the answer merely approximate rather than
+  wrong. A mismatch is refused, naming both key sets.
+- **A `Vector` is not spread by index.** Only its length could be checked against the other monads',
+  and equal length is not equal meaning: two series sampled at different times have the same length
+  and different contents. Return a `Dict` whose keys name the components — you know what they mean,
+  and the framework does not.
+
+A QoI's `name` may not contain a `.`, since that is the separator: reserving it is what lets a label
+be read back to the QoI that produced it, and so what lets [`calculateGSA!`](@ref) decide from a name
+alone whether that measurement has already been evaluated.
 
 ## MOAT — Morris screening
 
@@ -69,10 +102,17 @@ gsa = run(RBD(128; num_harmonics=10), inputs, dists; functions=[final_count])
 The returned [`GSASampling`](@ref) carries the underlying [`Sampling`](@ref) and the computed
 indices. Helpers include:
 
-- [`calculateGSA!`](@ref) — (re)compute indices for a set of output functions.
+- [`gsaLabels`](@ref) — the labels of the analyses computed, sorted. Each indexes `gsa.results`.
+- [`calculateGSA!`](@ref) — compute indices for a set of output functions, filing them under their
+  labels. A measurement already evaluated is skipped, so adding a quantity later costs only the new
+  one. Pass `recompute=true` when the measurement itself has changed — nothing can detect that, since
+  redefining a function's body in place leaves it indistinguishable from the one already evaluated.
 - [`getMonadIDDataFrame`](@ref) — the monad-ID design matrix used.
 - [`simulationIDs`](@ref) — the simulations that were run.
 - [`methodString`](@ref) — a label for the method/design.
+
+Indices themselves live in `gsa.results`, a `Dict` keyed by those labels — one entry per quantity,
+which is one per `functions` entry unless a `QoI` spread into several.
 
 Because GSA is built on the same [space-filling designs](@ref space_filling) and the
 same [runner](@ref running_simulations), its simulations are deduplicated and reused like any

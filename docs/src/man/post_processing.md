@@ -26,7 +26,7 @@ Because your callback runs *before* cleanup, it always sees the intact (but proc
 folder:
 
 ```julia
-run(sampling; post_processor = sim -> (; final_count = countCells(simulationID(sim))))
+run(sampling; post_processor = QoI("counts", sim -> (; final_count = countCells(simulationID(sim)))))
 ```
 
 ## The callback signature
@@ -52,6 +52,18 @@ The return value decides storage:
   simulation's row. Anything else (including a non-scalar value such as a vector) raises an
   `ArgumentError`.
 
+!!! note "Every column is named `<qoi name>.<key>`"
+    A returned key does not become a bare column: it is prefixed with the name of the [`QoI`](@ref)
+    that produced it, so `QoI("counts", …)` returning `(; tumor = 3)` writes `counts.tumor`. That is
+    what lets two measurements both report a `tumor` without landing in one column, and it matches
+    how [sensitivity analysis](@ref sensitivity_analysis) labels the same spread.
+
+    **A bare anonymous function therefore cannot write to the sink.** Its name is derived from a
+    gensym (`anon_9`) that changes between sessions, so the same script would write a fresh,
+    half-empty set of columns on every run. Wrap it — `QoI("counts", sim -> …)` — or pass a named
+    function, whose name is stable. A callback returning `nothing` is unaffected, since it stores
+    nothing to name.
+
 ### Storing nothing (side effects only)
 
 If you only want side effects — writing your own output file, deleting data, logging — return
@@ -71,21 +83,26 @@ end)
 The most concise form. Each field becomes a sink column:
 
 ```julia
-run(sampling; post_processor = sp -> (; final_count = countCells(simulationID(sp)),
-                                        mean_speed  = meanCellSpeed(simulationID(sp))))
+run(sampling; post_processor = QoI("cells", sp -> (; final_count = countCells(simulationID(sp)),
+                                                     mean_speed  = meanCellSpeed(simulationID(sp)))))
 ```
+
+giving columns `cells.final_count` and `cells.mean_speed`.
 
 ### Storing a Dict
 
-Useful when column names are computed or come from data. Keys are used as column names:
+Useful when the names are computed or come from data. Keys become the second half of each column
+name:
 
 ```julia
-run(sampling; post_processor = function (sp)
+run(sampling; post_processor = QoI("viability", function (sp)
     cells = loadCells(simulationID(sp))          # a loader from your simulator package
     return Dict("n_alive" => countAlive(cells),
                 "n_dead"  => countDead(cells))
-end)
+end))
 ```
+
+giving columns `viability.n_alive` and `viability.n_dead`.
 
 (`countCells`, `meanCellSpeed`, `loadCells`, … are stand-ins for whatever loaders your
 simulator package provides — see its documentation.)

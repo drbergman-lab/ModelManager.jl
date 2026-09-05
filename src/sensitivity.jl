@@ -27,7 +27,7 @@ abstract type GSASampling end
 #! `methodString` are the accessors the manual tells them to call on the result.
 #! See CLAUDE.md, "Docstring cross-references".
 @compat public GSASampling, GSAMethod, MOATSampling, SobolSampling, RBDSampling,
-               getMonadIDDataFrame, methodString
+               getMonadIDDataFrame, methodString, gsaLabels
 
 """
     getMonadIDDataFrame(gsa_sampling::GSASampling)
@@ -65,6 +65,19 @@ function methodString(gsa_sampling::GSASampling)
     method = split(method, ".")[end]
     return endswith(method, "sampling") ? method[1:end-8] : method
 end
+
+#! Sorted, because a `Dict`'s iteration order is unspecified and these labels drive plot series and
+#! `show` output — both of which should be identical between two runs of the same script.
+"""
+    gsaLabels(gsa_sampling::GSASampling)
+
+The labels of the sensitivity analyses computed on `gsa_sampling`, sorted.
+
+One label is not one `functions=` entry. A [`QoI`](@ref) whose `reduce` returns a `Dict` or
+`NamedTuple` yields one analysis per key, labelled `"<qoi name>.<key>"`; a `Real` yields one
+labelled with the QoI's name. Each label indexes `gsa_sampling.results`.
+"""
+gsaLabels(gsa_sampling::GSASampling) = sort(collect(keys(gsa_sampling.results)))
 
 """
     run(method::GSAMethod, inputs::InputFolders, avs; functions, kwargs...)
@@ -125,16 +138,136 @@ function sensitivityResults!(gsa_sampling::GSASampling, functions::AbstractVecto
 end
 
 """
-    calculateGSA!(gsa_sampling, functions)
+    calculateGSA!(gsa_sampling, functions; recompute=false)
+    calculateGSA!(gsa_sampling, f; recompute=false)
 
-Calculate sensitivity indices for each function in `functions`.
+Calculate sensitivity indices for `functions` (or for the single measurement `f`) and file them in
+`gsa_sampling.results` under their labels — see [`gsaLabels`](@ref).
+
+A measurement whose results are already present is **skipped**, so adding a quantity to an analysis
+costs only the new one: `run(method, spec; functions=[q1])` followed by
+`calculateGSA!(gsa, [q1, q2])` reads each simulation's output for `q2` alone.
+
+Results **accumulate**. A measurement absent from `functions` keeps whatever it produced earlier —
+that is what makes adding a quantity cheap, and its indices are not stale, having been computed from
+this same sampling. What `recompute` replaces is the labels of the measurements you *do* name, so a
+reducer that drops or renames a key leaves nothing behind; it never prunes ones you do not name.
+`empty!(gsa_sampling.results)` is how you start over.
+
+# Keywords
+- `recompute`: evaluate even where results already exist, *replacing* every label that measurement
+  owns rather than merging into them — so a reducer that drops or renames a key leaves nothing stale
+  behind. Needed when the measurement itself has changed, because nothing can detect that — redefining a function's body in place leaves
+  it indistinguishable from the one already evaluated, the same reason a [`QoI`](@ref)'s `stored`
+  defaults to `:never`.
+
+# Errors
+Two entries of `functions` that produce the same label — most easily two [`QoI`](@ref)s with the same
+`name` — are refused, since one would silently replace the other. Nothing is filed when this happens;
+the whole call is rejected before any result is stored.
 """
-function calculateGSA!(gsa_sampling::GSASampling, functions::AbstractVector)
+function calculateGSA!(gsa_sampling::GSASampling, functions::AbstractVector; recompute::Bool=false)
+    #! Collision is checked on the FLATTENED labels rather than on the QoI names, because a QoI that
+    #! spreads contributes labels its name alone does not reveal. And everything is computed before
+    #! anything is stored, so a rejected call leaves `results` exactly as it found it rather than
+    #! half-written.
+    #!
+    #! Scoped to this call on purpose. Checking against `results` as a whole would make a second
+    #! `calculateGSA!` for the same quantity an error, and refreshing a result is the documented
+    #! reason this function is public.
+    labelled = Pair{String,Any}[]
+    sources = Dict{String,String}()
+    evaluated = String[]
     for f in functions
-        calculateGSA!(gsa_sampling, f)
+        q = _asQoI(f)
+        recompute || !_hasGSAResults(gsa_sampling, q) || continue
+        push!(evaluated, q.name)
+        for (label, result) in _gsaResults(gsa_sampling, q)
+            haskey(sources, label) && throw(ArgumentError(
+                "Sensitivity labels must be unique within one `calculateGSA!` call, but " *
+                "\"$(label)\" comes from both QoI \"$(sources[label])\" and QoI \"$(q.name)\". " *
+                "Rename one of them."))
+            sources[label] = q.name
+            push!(labelled, label => result)
+        end
+    end
+    _replaceGSAResults!(gsa_sampling, evaluated, labelled)
+    return
+end
+
+function calculateGSA!(gsa_sampling::GSASampling, f::Union{Function,QoI}; recompute::Bool=false)
+    q = _asQoI(f)
+    recompute || !_hasGSAResults(gsa_sampling, q) || return
+    _replaceGSAResults!(gsa_sampling, [q.name], _gsaResults(gsa_sampling, q))
+    return
+end
+
+#! A re-evaluated QoI REPLACES its labels; it does not merge into them. Storing only what the new
+#! evaluation produced would leave a label the previous reducer made and this one no longer does --
+#! holding a number from a measurement that no longer exists, reported by `gsaLabels` as current and
+#! drawn as a series. That is precisely the case `recompute` is for, so it is the case that must not
+#! silently keep stale results.
+"""
+    _replaceGSAResults!(gsa_sampling, names, labelled)
+
+File `labelled` in `gsa_sampling.results`, first dropping every label already belonging to one of
+`names`.
+"""
+function _replaceGSAResults!(gsa_sampling::GSASampling, names, labelled)
+    for name in names, label in _gsaLabelsOf(gsa_sampling, name)
+        delete!(gsa_sampling.results, label)
+    end
+    for (label, result) in labelled
+        gsa_sampling.results[label] = result
     end
     return
 end
+
+#! Decided from the NAME, not from the labels, and that is the whole point: a spreading QoI's labels
+#! come from `reduce`'s return and are unknown until it has run on a monad, so a check that needed
+#! them would have to do the expensive work first and save nothing. Every label a QoI produces is
+#! either its name or its name followed by `.` and a key, so the name alone answers the question
+#! before any output is read.
+#!
+#! The inference is EXACT, not a heuristic, and only because `QoI` refuses a name containing a `.`.
+#! Without that, `QoI("counts.x", …)` and a `QoI("counts", …)` spreading to key `"x"` would both
+#! claim the label `counts.x`: caught within one `calculateGSA!` call by the collision check, but
+#! across calls it would silently skip one of them -- in one ordering the whole spreading QoI, so
+#! `counts.y` would never be computed. See the constructor in `src/qoi.jl`.
+"""
+    _hasGSAResults(gsa_sampling, q) → Bool
+
+Whether `gsa_sampling` already holds results for `q`, decided from `q`'s name before evaluating it.
+Exact rather than heuristic, because a [`QoI`](@ref) name cannot contain the `.` separator.
+"""
+_hasGSAResults(gsa_sampling::GSASampling, q::QoI) =
+    any(k -> _isGSALabelOf(k, q.name), keys(gsa_sampling.results))
+
+"""
+    _isGSALabelOf(label, name) → Bool
+
+Whether `label` is one that a QoI called `name` produces — its name, or its name and a key.
+"""
+_isGSALabelOf(label::AbstractString, name::AbstractString) =
+    label == name || startswith(label, name * ".")
+
+"""
+    _gsaLabelsOf(gsa_sampling, name) → Vector{String}
+
+Every label in `gsa_sampling.results` that a QoI called `name` produced.
+"""
+_gsaLabelsOf(gsa_sampling::GSASampling, name::AbstractString) =
+    filter(k -> _isGSALabelOf(k, name), collect(keys(gsa_sampling.results)))
+
+#! Computes without storing. Split out so the vector method above can see every label a call will
+#! produce before it commits any of them.
+"""
+    _gsaResults(gsa_sampling, f) → Vector{Pair{String,result}}
+
+The sensitivity indices `f` yields on `gsa_sampling`, one labelled entry per quantity it measures.
+Stores nothing.
+"""
+function _gsaResults end
 
 ############# Morris One-At-A-Time (MOAT) #############
 
@@ -168,18 +301,18 @@ Result of a [`MOAT`](@ref) sensitivity analysis.
 struct MOATSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{Union{Function,QoI},GlobalSensitivity.MorrisResult}
+    results::Dict{String,GlobalSensitivity.MorrisResult}
 end
 
-MOATSampling(sampling::Sampling, monad_ids_df::DataFrame) = MOATSampling(sampling, monad_ids_df, Dict{Union{Function,QoI},GlobalSensitivity.MorrisResult}())
+MOATSampling(sampling::Sampling, monad_ids_df::DataFrame) = MOATSampling(sampling, monad_ids_df, Dict{String,GlobalSensitivity.MorrisResult}())
 
 function Base.show(io::IO, moat_sampling::MOATSampling)
     println(io, "MOAT sampling")
     println(io, "-------------")
     println(io, moat_sampling.sampling)
-    println(io, "Sensitivity functions calculated:")
-    for f in keys(moat_sampling.results)
-        println(io, "  $f")
+    println(io, "Sensitivity quantities calculated:")
+    for label in gsaLabels(moat_sampling)
+        println(io, "  $label")
     end
 end
 
@@ -253,17 +386,16 @@ function perturbVariation(pv::ParsedVariations, inputs::InputFolders, reference_
     return perturbed_variation_ids
 end
 
-function calculateGSA!(moat_sampling::MOATSampling, f::Union{Function,QoI})
-    if f in keys(moat_sampling.results)
-        return
+function _gsaResults(moat_sampling::MOATSampling, f::Union{Function,QoI})
+    out = Pair{String,GlobalSensitivity.MorrisResult}[]
+    for (label, vals) in evaluateFunctionOnSampling(moat_sampling, f)
+        effects = 2 * (vals[:,2:end] .- vals[:,1])
+        means = mean(effects, dims=1)
+        means_star = mean(abs.(effects), dims=1)
+        variances = var(effects, dims=1)
+        push!(out, label => GlobalSensitivity.MorrisResult(means, means_star, variances, effects))
     end
-    vals = evaluateFunctionOnSampling(moat_sampling, f)
-    effects = 2 * (vals[:,2:end] .- vals[:,1])
-    means = mean(effects, dims=1)
-    means_star = mean(abs.(effects), dims=1)
-    variances = var(effects, dims=1)
-    moat_sampling.results[f] = GlobalSensitivity.MorrisResult(means, means_star, variances, effects)
-    return
+    return out
 end
 
 ############# Sobolʼ Indices #############
@@ -310,12 +442,12 @@ Result of a [`Sobolʼ`](@ref) sensitivity analysis.
 struct SobolSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{Union{Function,QoI},GlobalSensitivity.SobolResult}
+    results::Dict{String,GlobalSensitivity.SobolResult}
     sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}
 end
 
 SobolSampling(sampling::Sampling, monad_ids_df::DataFrame; sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}=(first_order=:Jansen1999, total_order=:Jansen1999)) =
-    SobolSampling(sampling, monad_ids_df, Dict{Union{Function,QoI},GlobalSensitivity.SobolResult}(), sobol_index_methods)
+    SobolSampling(sampling, monad_ids_df, Dict{String,GlobalSensitivity.SobolResult}(), sobol_index_methods)
 
 function Base.show(io::IO, sobol_sampling::SobolSampling)
     println(io, "Sobol sampling")
@@ -324,9 +456,9 @@ function Base.show(io::IO, sobol_sampling::SobolSampling)
     println(io, "Sobol index methods:")
     println(io, "  First order: $(sobol_sampling.sobol_index_methods.first_order)")
     println(io, "  Total order: $(sobol_sampling.sobol_index_methods.total_order)")
-    println(io, "Sensitivity functions calculated:")
-    for f in keys(sobol_sampling.results)
-        println(io, "  $f")
+    println(io, "Sensitivity quantities calculated:")
+    for label in gsaLabels(sobol_sampling)
+        println(io, "  $label")
     end
 end
 
@@ -361,11 +493,15 @@ function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::Parse
     return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods)
 end
 
-function calculateGSA!(sobol_sampling::SobolSampling, f::Union{Function,QoI})
-    if f in keys(sobol_sampling.results)
-        return
+function _gsaResults(sobol_sampling::SobolSampling, f::Union{Function,QoI})
+    out = Pair{String,GlobalSensitivity.SobolResult}[]
+    for (label, vals) in evaluateFunctionOnSampling(sobol_sampling, f)
+        push!(out, label => _sobolResult(sobol_sampling, vals))
     end
-    vals = evaluateFunctionOnSampling(sobol_sampling, f)
+    return out
+end
+
+function _sobolResult(sobol_sampling::SobolSampling, vals::Matrix{Float64})
     d = size(vals, 2) - 2
     A_values = @view vals[:, 1]
     B_values = @view vals[:, 2]
@@ -394,8 +530,7 @@ function calculateGSA!(sobol_sampling::SobolSampling, f::Union{Function,QoI})
     end
     first_order_indices = first_order_variances ./ total_variance
     total_order_indices = total_order_variances ./ total_variance
-    sobol_sampling.results[f] = GlobalSensitivity.SobolResult(first_order_indices, nothing, nothing, nothing, total_order_indices, nothing)
-    return
+    return GlobalSensitivity.SobolResult(first_order_indices, nothing, nothing, nothing, total_order_indices, nothing)
 end
 
 ############# Random Balance Design (RBD) #############
@@ -431,13 +566,13 @@ Result of an [`RBD`](@ref) sensitivity analysis.
 struct RBDSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{Union{Function,QoI},Vector{<:Real}}
+    results::Dict{String,Vector{<:Real}}
     num_harmonics::Int
     num_cycles::Union{Int,Rational}
 end
 
 RBDSampling(sampling::Sampling, monad_ids_df::DataFrame, num_cycles; num_harmonics::Int=6) =
-    RBDSampling(sampling, monad_ids_df, Dict{Union{Function,QoI},Vector{<:Real}}(), num_harmonics, num_cycles)
+    RBDSampling(sampling, monad_ids_df, Dict{String,Vector{<:Real}}(), num_harmonics, num_cycles)
 
 function Base.show(io::IO, rbd_sampling::RBDSampling)
     println(io, "RBD sampling")
@@ -445,9 +580,9 @@ function Base.show(io::IO, rbd_sampling::RBDSampling)
     println(io, rbd_sampling.sampling)
     println(io, "Number of harmonics: $(rbd_sampling.num_harmonics)")
     println(io, "Number of cycles (1/2 or 1): $(rbd_sampling.num_cycles)")
-    println(io, "GSA functions:")
-    for f in keys(rbd_sampling.results)
-        println(io, "  $f")
+    println(io, "Sensitivity quantities calculated:")
+    for label in gsaLabels(rbd_sampling)
+        println(io, "  $label")
     end
 end
 
@@ -472,20 +607,19 @@ function runSensitivitySampling(method::RBD, inputs::InputFolders, pv::ParsedVar
     return RBDSampling(sampling, monad_ids_df, method.rbd_variation.num_cycles; num_harmonics=method.num_harmonics)
 end
 
-function calculateGSA!(rbd_sampling::RBDSampling, f::Union{Function,QoI})
-    if f in keys(rbd_sampling.results)
-        return
+function _gsaResults(rbd_sampling::RBDSampling, f::Union{Function,QoI})
+    out = Pair{String,Vector{<:Real}}[]
+    for (label, vals) in evaluateFunctionOnSampling(rbd_sampling, f)
+        if rbd_sampling.num_cycles == 1 // 2
+            vals = vcat(vals, vals[end-1:-1:2, :])
+        end
+        ys = fft(vals, 1) .|> abs2
+        ys ./= size(vals, 1)
+        V = sum(ys[2:end, :], dims=1)
+        Vi = 2 * sum(ys[2:(min(size(ys, 1), rbd_sampling.num_harmonics + 1)), :], dims=1)
+        push!(out, label => ((Vi ./ V) |> vec))
     end
-    vals = evaluateFunctionOnSampling(rbd_sampling, f)
-    if rbd_sampling.num_cycles == 1 // 2
-        vals = vcat(vals, vals[end-1:-1:2, :])
-    end
-    ys = fft(vals, 1) .|> abs2
-    ys ./= size(vals, 1)
-    V = sum(ys[2:end, :], dims=1)
-    Vi = 2 * sum(ys[2:(min(size(ys, 1), rbd_sampling.num_harmonics + 1)), :], dims=1)
-    rbd_sampling.results[f] = (Vi ./ V) |> vec
-    return
+    return out
 end
 
 ############# Generic Helper Functions #############
@@ -501,30 +635,148 @@ function recordSensitivityScheme(gsa_sampling::GSASampling)
     return CSV.write(path_to_csv, getMonadIDDataFrame(gsa_sampling); header=true)
 end
 
+#! A `Real` reduce is one quantity; a `Dict`/`NamedTuple` one is several, and `nothing` here is the
+#! marker for the scalar case -- it distinguishes "no components" from "components, and here they
+#! are", which an empty vector would not.
+#!
+#! `Dict` keys are sorted so two runs of the same script produce the same order; a `NamedTuple` keeps
+#! its declaration order, which the user chose. Keys are compared UNSTRINGIFIED across monads, so a
+#! QoI that returns `(a=…, b=…)` for one monad and `Dict("a"=>…, "b"=>…)` for another is caught --
+#! both would stringify to the same labels and hide a reducer that is not doing one thing.
 """
-    evaluateFunctionOnSampling(gsa_sampling, f)
+    _gsaComponentKeys(q, value, monad_id) → keys or nothing
 
-Evaluate `f` (a function of `simulation_id`) on each monad in the sampling, averaging replicates.
+The keys `value` contributes as separate sensitivity analyses, or `nothing` when it is a single
+`Real`. Throws when `value` is neither.
+"""
+_gsaComponentKeys(::QoI, ::Real, ::Integer) = nothing
+_gsaComponentKeys(::QoI, v::NamedTuple, ::Integer) = collect(keys(v))
+_gsaComponentKeys(::QoI, v::AbstractDict, ::Integer) = sort(collect(keys(v)); by=string)
+
+#! The `Vector` case is called out because it is the one a reader will reach for, and because the
+#! obvious accommodation -- spreading by index into `q_1`, `q_2` -- is not safe. Two monads' vectors
+#! can only be checked for equal LENGTH, and equal length is not alignment: series sampled at
+#! different times, or one run that stopped early, produce same-length vectors whose entries mean
+#! different things, and the indices would come out confident and wrong. A `Dict` cannot: its keys
+#! are the alignment, supplied by the person who knows what they mean.
+function _gsaComponentKeys(q::QoI, v, monad_id::Integer)
+    advice = v isa AbstractArray ?
+        "A `Vector` is not spread by index: only its length can be checked against the other " *
+        "monads', and equal length is not equal meaning — two series sampled at different times " *
+        "have the same length and different contents. Return a `Dict` whose keys name the " *
+        "components, or reduce to the single number you want the indices for." :
+        "Reduce to a single number, or to a `Dict` naming each component."
+    throw(ArgumentError(
+        "QoI \"$(q.name)\": each monad must reduce to a `Real`, or to a `Dict`/`NamedTuple` of " *
+        "them — one sensitivity analysis per key, labelled \"$(q.name).<key>\". Monad " *
+        "$(monad_id) reduced to a $(typeof(v)). " * advice))
+end
+
+#! Checked per label rather than only per container, because a `Dict` passing the key check can still
+#! hold something that is not a number. Without this the failure is a bare `convert` MethodError with
+#! no mention of the QoI, which is the error this whole path exists to avoid.
+"""
+    _gsaComponentValue(q, label, monad_id, v) → Float64
+"""
+function _gsaComponentValue(q::QoI, label::AbstractString, monad_id::Integer, v)
+    v isa Real || throw(ArgumentError(
+        "QoI \"$(q.name)\": \"$(label)\" must be a `Real` on every monad, since it becomes a " *
+        "sensitivity index. Monad $(monad_id) gave a $(typeof(v))."))
+    return Float64(v)
+end
+
+"""
+    _gsaDuplicateLabelMessage(component_keys, labels) → String
+
+The body of the error raised when two of a QoI's keys produce one label.
+"""
+function _gsaDuplicateLabelMessage(component_keys, labels)
+    dups = unique(l for l in labels if count(==(l), labels) > 1)
+    culprits = [k for (k, l) in zip(component_keys, labels) if l in dups]
+    return "keys $(join(repr.(culprits), ", ")) all produce the label " *
+           "$(join(repr.(dups), ", ")). Distinct keys that collide once written into a label are " *
+           "not allowed — each label is its own sensitivity analysis, so one would silently " *
+           "replace the other. `1` and \"1\" are one way to get here."
+end
+
+"""
+    evaluateFunctionOnSampling(gsa_sampling, f) → Vector{Pair{String,Matrix{Float64}}}
+
+Evaluate `f` on every monad in the sampling and return one labelled matrix per quantity it measures.
+
+Each matrix is shaped like [`getMonadIDDataFrame`](@ref)`(gsa_sampling)` — one entry per cell of the
+method's design, holding that monad's reduced value — which is the layout each method's index
+arithmetic reads. A [`QoI`](@ref) whose `reduce` returns a `Real` gives one such matrix; one that
+returns a `Dict` or `NamedTuple` gives one per key.
 """
 function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function,QoI})
     #! A bare `Function` is wrapped into a `QoI` here, so the rest of this works on one object with
     #! one contract: `compute` gets a `Simulation`, `reduce` combines the replicates (`mean` for a
-    #! wrapped function, which is what this always did). `Float64` stays because the sensitivity
-    #! indices downstream require it: a reducer returning something else fails here, at the QoI,
-    #! rather than deep inside GlobalSensitivity.
+    #! wrapped function, which is what this always did).
     q = _asQoI(f)
     monad_id_df = getMonadIDDataFrame(gsa_sampling)
-    value_dict = Dict{Int,Float64}()
-    vals = zeros(Float64, size(monad_id_df))
-    for (ind, monad_id) in enumerate(monad_id_df |> Matrix)
-        if !haskey(value_dict, monad_id)
-            simulation_ids = constituentIDs(Monad, monad_id)
-            sim_values = [_computeOn(q, simulation_id) for simulation_id in simulation_ids]
-            value_dict[monad_id] = q.reduce(sim_values)
-        end
-        vals[ind] = value_dict[monad_id]
+    monad_ids = monad_id_df |> Matrix
+
+    #! One reduction per DISTINCT monad, as before: the design repeats monads, and `compute` may be
+    #! expensive. What changed is that the cache holds the raw reduced value rather than a `Float64`,
+    #! because its shape is what decides how many analyses this QoI yields.
+    reduced = Dict{Int,Any}()
+    for monad_id in monad_ids
+        haskey(reduced, monad_id) && continue
+        simulation_ids = constituentIDs(Monad, monad_id)
+        reduced[monad_id] = q.reduce([_computeOn(q, simulation_id) for simulation_id in simulation_ids])
     end
-    return vals
+
+    #! Every monad is checked, not just the first. A key set that differs anywhere leaves a hole in
+    #! that key's design matrix, and there is no defensible value to fill it with -- unlike
+    #! `mseDistance`, which treats an absent key as zero and warns once. A sensitivity index computed
+    #! over a hole is wrong rather than approximate, so this refuses instead.
+    reference_id = first(monad_ids)
+    component_keys = _gsaComponentKeys(q, reduced[reference_id], reference_id)
+    #! Walked in DESIGN order, so the monad an error names is the first mismatch someone scanning
+    #! their design would reach -- iterating `reduced` instead would name whichever monad hashing
+    #! happens to visit first, which is reproducible but not meaningful. Each DISTINCT monad is
+    #! checked once, because a design can place the same monad in many cells: RBD's matrix is one set
+    #! of variations permuted per column, so every column repeats them all.
+    checked = Set{Int}()
+    for monad_id in monad_ids
+        monad_id in checked && continue
+        push!(checked, monad_id)
+        _gsaComponentKeys(q, reduced[monad_id], monad_id) == component_keys || throw(ArgumentError(
+            "QoI \"$(q.name)\": every monad must reduce to the same keys, since each key becomes " *
+            "its own sensitivity analysis and needs a value from every monad in the design. Monad " *
+            "$(reference_id) gave $(repr(component_keys)) but monad $(monad_id) gave " *
+            "$(repr(_gsaComponentKeys(q, reduced[monad_id], monad_id)))."))
+    end
+
+    #! An empty `Dict`/`NamedTuple` is not "no components" -- it is a reducer that named nothing, and
+    #! silently storing no result for a QoI the user explicitly asked for is the kind of quiet
+    #! nothing this path exists to avoid. It would also never be marked evaluated, so every later
+    #! call would re-read every simulation's output to store nothing again.
+    isnothing(component_keys) || !isempty(component_keys) || throw(ArgumentError(
+        "QoI \"$(q.name)\": its `reduce` returned an empty $(typeof(reduced[reference_id])), so it " *
+        "names no quantities and there is nothing to analyse. Return a `Real`, or a " *
+        "`Dict`/`NamedTuple` with at least one key."))
+    labels = isnothing(component_keys) ? [q.name] : ["$(q.name).$(k)" for k in component_keys]
+    #! Checked HERE, where the keys are still in hand, because afterwards only the labels survive.
+    #! Two distinct keys can land on one label -- `1` and `"1"`, the same collision the sink guards
+    #! against -- and neither downstream path handles it: `calculateGSA!`'s cross-QoI check reports
+    #! "comes from both QoI \"q\" and QoI \"q\". Rename one of them", advice that cannot work,
+    #! while the single-measurement method has no such check and simply lets one analysis overwrite
+    #! the other.
+    allunique(labels) || throw(ArgumentError(
+        "QoI \"$(q.name)\": " * _gsaDuplicateLabelMessage(component_keys, labels)))
+    out = Pair{String,Matrix{Float64}}[]
+    for (i, label) in enumerate(labels)
+        vals = zeros(Float64, size(monad_id_df))
+        for (ind, monad_id) in enumerate(monad_ids)
+            v = reduced[monad_id]
+            vals[ind] = _gsaComponentValue(q, label, monad_id,
+                                           isnothing(component_keys) ? v : v[component_keys[i]])
+        end
+        push!(out, label => vals)
+    end
+    return out
 end
 
 """

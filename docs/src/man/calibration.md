@@ -60,9 +60,11 @@ Two functions you supply:
   once per *simulation* with a [`Simulation`](@ref), and its replicates are combined by that QoI's
   `reduce` (`mean` by default — pass `reduce=` for anything else, and note it receives every
   replicate's value, so a step that must happen *after* averaging goes there). A single QoI reports
-  its value directly; a vector reports a `Dict` keyed by QoI name. A bare function is refused: it
-  used to be called once per *monad* and aggregate however it liked, and the two cannot be told
-  apart automatically.
+  its value directly; a vector reports a `Dict` keyed by QoI name. A bare function is accepted, but
+  **warned about unless it declares `(s::Simulation)`**: such a function used to be called once per
+  *monad* and aggregate however it liked, the two cannot be told apart automatically, and
+  reinterpreting an old one per-simulation returns a different number without raising. Annotating it
+  silences the warning; passing a `QoI` also lets you choose the reduction.
 - **`distance`** — `(simulated, observed) -> Float64`. The built-in [`mseDistance`](@ref)
   handles `Dict`, `Vector`, and scalar inputs; supply your own for anything else.
 

@@ -1376,8 +1376,8 @@ a given simulation appear as `missing`. Returns an empty table if no post-proces
 
 # Examples
 ```julia
-out = run(sampling; post_processor = sp -> (; final_count = countCells(simulationID(sp))))
-postProcessingTable(sampling)
+out = run(sampling; post_processor = QoI("cells", sp -> (; final_count = countCells(simulationID(sp)))))
+postProcessingTable(sampling)      # column: cells.final_count
 ```
 """
 function postProcessingTable(T::AbstractArray{<:AbstractTrial})
