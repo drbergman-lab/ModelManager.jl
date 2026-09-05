@@ -149,8 +149,9 @@ costs only the new one: `run(method, spec; functions=[q1])` followed by
 `calculateGSA!(gsa, [q1, q2])` reads each simulation's output for `q2` alone.
 
 # Keywords
-- `recompute`: evaluate and overwrite even where results already exist. Needed when the measurement
-  itself has changed, because nothing can detect that — redefining a function's body in place leaves
+- `recompute`: evaluate even where results already exist, *replacing* every label that measurement
+  owns rather than merging into them — so a reducer that drops or renames a key leaves nothing stale
+  behind. Needed when the measurement itself has changed, because nothing can detect that — redefining a function's body in place leaves
   it indistinguishable from the one already evaluated, the same reason a [`QoI`](@ref)'s `stored`
   defaults to `:never`.
 
@@ -170,9 +171,11 @@ function calculateGSA!(gsa_sampling::GSASampling, functions::AbstractVector; rec
     #! reason this function is public.
     labelled = Pair{String,Any}[]
     sources = Dict{String,String}()
+    evaluated = String[]
     for f in functions
         q = _asQoI(f)
         recompute || !_hasGSAResults(gsa_sampling, q) || continue
+        push!(evaluated, q.name)
         for (label, result) in _gsaResults(gsa_sampling, q)
             haskey(sources, label) && throw(ArgumentError(
                 "Sensitivity labels must be unique within one `calculateGSA!` call, but " *
@@ -182,16 +185,33 @@ function calculateGSA!(gsa_sampling::GSASampling, functions::AbstractVector; rec
             push!(labelled, label => result)
         end
     end
-    for (label, result) in labelled
-        gsa_sampling.results[label] = result
-    end
+    _replaceGSAResults!(gsa_sampling, evaluated, labelled)
     return
 end
 
 function calculateGSA!(gsa_sampling::GSASampling, f::Union{Function,QoI}; recompute::Bool=false)
     q = _asQoI(f)
     recompute || !_hasGSAResults(gsa_sampling, q) || return
-    for (label, result) in _gsaResults(gsa_sampling, q)
+    _replaceGSAResults!(gsa_sampling, [q.name], _gsaResults(gsa_sampling, q))
+    return
+end
+
+#! A re-evaluated QoI REPLACES its labels; it does not merge into them. Storing only what the new
+#! evaluation produced would leave a label the previous reducer made and this one no longer does --
+#! holding a number from a measurement that no longer exists, reported by `gsaLabels` as current and
+#! drawn as a series. That is precisely the case `recompute` is for, so it is the case that must not
+#! silently keep stale results.
+"""
+    _replaceGSAResults!(gsa_sampling, names, labelled)
+
+File `labelled` in `gsa_sampling.results`, first dropping every label already belonging to one of
+`names`.
+"""
+function _replaceGSAResults!(gsa_sampling::GSASampling, names, labelled)
+    for name in names, label in _gsaLabelsOf(gsa_sampling, name)
+        delete!(gsa_sampling.results, label)
+    end
+    for (label, result) in labelled
         gsa_sampling.results[label] = result
     end
     return
@@ -215,7 +235,19 @@ Whether `gsa_sampling` already holds results for `q`, decided from `q`'s name be
 Exact rather than heuristic, because a [`QoI`](@ref) name cannot contain the `.` separator.
 """
 _hasGSAResults(gsa_sampling::GSASampling, q::QoI) =
-    any(k -> k == q.name || startswith(k, q.name * "."), keys(gsa_sampling.results))
+    any(k -> _isGSALabelOf(k, q.name), keys(gsa_sampling.results))
+
+"""
+    _isGSALabelOf(label, name) → Bool
+    _gsaLabelsOf(gsa_sampling, name) → Vector{String}
+
+Whether `label` is one a QoI called `name` produces, and the labels in `gsa_sampling` that are.
+"""
+_isGSALabelOf(label::AbstractString, name::AbstractString) =
+    label == name || startswith(label, name * ".")
+
+_gsaLabelsOf(gsa_sampling::GSASampling, name::AbstractString) =
+    filter(k -> _isGSALabelOf(k, name), collect(keys(gsa_sampling.results)))
 
 #! Computes without storing. Split out so the vector method above can see every label a call will
 #! produce before it commits any of them.
@@ -707,6 +739,14 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
             "$(repr(_gsaComponentKeys(q, reduced[monad_id], monad_id)))."))
     end
 
+    #! An empty `Dict`/`NamedTuple` is not "no components" -- it is a reducer that named nothing, and
+    #! silently storing no result for a QoI the user explicitly asked for is the kind of quiet
+    #! nothing this path exists to avoid. It would also never be marked evaluated, so every later
+    #! call would re-read every simulation's output to store nothing again.
+    isnothing(component_keys) || !isempty(component_keys) || throw(ArgumentError(
+        "QoI \"$(q.name)\": its `reduce` returned an empty $(typeof(reduced[reference_id])), so it " *
+        "names no quantities and there is nothing to analyse. Return a `Real`, or a " *
+        "`Dict`/`NamedTuple` with at least one key."))
     labels = isnothing(component_keys) ? [q.name] : ["$(q.name).$(k)" for k in component_keys]
     #! Checked HERE, where the keys are still in hand, because afterwards only the labels survive.
     #! Two distinct keys can land on one label -- `1` and `"1"`, the same collision the sink guards

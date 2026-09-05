@@ -119,6 +119,39 @@ name or its name plus `.` and a key, `_hasGSAResults` answers with a prefix test
 original reason: nothing can detect that a measurement changed, the same impossibility documented
 around `stored=:never`.
 
+### Late catch: `recompute=true` was leaving stale labels
+Found in the final pre-merge pass, and it was the one real correctness bug in the branch. The store
+loop wrote only the labels the *new* evaluation produced. A QoI whose reducer drops or renames a key
+therefore kept the old label, holding a number from a measurement that no longer existed — reported
+by `gsaLabels` as current and drawn as a plot series. Measured before fixing: a `"counts"` QoI
+spreading to `{x, y}`, re-evaluated with `recompute=true` under a reducer yielding only `x`, left
+`counts.y = 20.0` from the previous reducer beside a fresh `counts.x = 99.0`.
+
+The docstring said `recompute` "evaluate and overwrite", which a reader takes as replacement, and the
+whole point of the keyword is that the measurement changed — so this was silent staleness in exactly
+the path built to avoid it. `_replaceGSAResults!` now drops every label a re-evaluated QoI owns
+before filing the new ones, using the same `_isGSALabelOf` predicate `_hasGSAResults` uses.
+
+Also from that pass: an empty `Dict`/`NamedTuple` from `reduce` named no quantities, stored nothing,
+raised nothing, and never counted as evaluated — so every later call re-read every simulation's
+output to store nothing again. Now refused.
+
+### Late catch: rendered API docs the sink change invalidated
+Three doc sites outside the diff documented the pre-change sink and were missed until the final pass:
+
+- `postProcessingTable`'s only example was a bare anonymous `post_processor` returning a
+  `NamedTuple` — the exact shape now refused, so the sole rendered example for an exported function
+  would have thrown when copied.
+- `run(::AbstractTrial)`'s `post_processor` documentation — the canonical reference both
+  `postProcessingTable` and the manual point at — described bare-key columns and said nothing about
+  either breaking change.
+- README's post-processing bullet still described the pre-0.9 `f(simulation_process)` contract,
+  listing `wasSuccessful` and `monadID` accessors that the sink no longer has.
+
+The lesson worth keeping: changing a behaviour means grepping for every place that *describes* it,
+not only the places that *implement* it. The docs build passes either way, because a wrong example
+still renders.
+
 ### Decision: a QoI name may not contain a `.`
 Found by probing the skip rather than by reading it, and it is the price of inferring provenance from
 a name. `_hasGSAResults` tests `k == q.name || startswith(k, q.name * ".")`. If a name may itself

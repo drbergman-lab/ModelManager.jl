@@ -4494,6 +4494,15 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test err isa ArgumentError
                 @test occursin("same keys", err.msg)
 
+                # A reducer that names no quantities is refused rather than silently storing
+                # nothing: it would also never count as evaluated, so every later call would re-read
+                # every simulation's output to store nothing again.
+                empty_q = QoI("empty", _qoi_sim; reduce=per_sim -> Dict{String,Float64}())
+                err = try; calculateGSA!(gsa, [empty_q]); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("names no quantities", err.msg)
+                @test isempty(ModelManager._gsaLabelsOf(gsa, "empty"))
+
                 # Two keys of ONE QoI that collide once written into a label are refused where the
                 # keys are still in hand, not downstream. Both downstream paths mishandle it: the
                 # cross-QoI check would say "comes from both QoI \"…\" and QoI \"…\"" naming the
@@ -4547,6 +4556,26 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test spread_calls[] == after_first                      # no output re-read
                 calculateGSA!(gsa, [spr]; recompute=true)
                 @test spread_calls[] > after_first
+
+                # `recompute` REPLACES a measurement's labels rather than merging into them. A
+                # reducer that drops a key would otherwise leave the old label behind holding a
+                # number from a measurement that no longer exists — reported by `gsaLabels` as
+                # current and drawn as a series — which is exactly the case `recompute` is for.
+                calculateGSA!(gsa, [QoI("shrink", _qoi_sim;
+                                        reduce=per_sim -> Dict("a" => mean(per_sim),
+                                                               "b" => maximum(per_sim)))])
+                @test ["shrink.a", "shrink.b"] ⊆ ModelManager.gsaLabels(gsa)
+                calculateGSA!(gsa, [QoI("shrink", _qoi_sim;
+                                        reduce=per_sim -> Dict("a" => mean(per_sim)))];
+                              recompute=true)
+                @test "shrink.a" in ModelManager.gsaLabels(gsa)
+                @test !("shrink.b" in ModelManager.gsaLabels(gsa))   # dropped, not left stale
+                # ...and through the single-measurement method too.
+                calculateGSA!(gsa, QoI("shrink", _qoi_sim;
+                                       reduce=per_sim -> Dict("c" => mean(per_sim)));
+                              recompute=true)
+                @test "shrink.c" in ModelManager.gsaLabels(gsa)
+                @test !any(l -> l in ("shrink.a", "shrink.b"), ModelManager.gsaLabels(gsa))
 
                 # Adding a quantity evaluates only the new one.
                 calculateGSA!(gsa, [spr, QoI("fresh", _qoi_sim)])

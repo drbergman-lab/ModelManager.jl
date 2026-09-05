@@ -41,8 +41,8 @@ consumer cannot use is that consumer's error to raise, and the sink's names the 
 type.
 
 # A `Dict` becomes several quantities, not one
-Two consumers spread a keyed value rather than demanding one number, and they name the pieces
-differently on purpose:
+Two consumers spread a keyed value rather than demanding one number, and both name the pieces the
+same way — `"<qoi name>.<key>"` — so one measurement names its parts identically wherever it is used:
 
 - **Sensitivity analysis** runs one analysis per key, labelled `"<qoi name>.<key>"` — so
   `QoI("counts", …)` reducing to `Dict("tumor" => …, "immune" => …)` gives `counts.tumor` and
@@ -500,10 +500,11 @@ function _asPostProcessor(qs::AbstractVector{QoI})
                 _isAnonymousFunction(q.compute) &&
                 q.name == _qoiNameFromFunction(q.compute) && throw(ArgumentError(
                 "post_processor: an anonymous function has no stable name, and every sink column is " *
-                "named after the QoI that wrote it — a $(typeof(v)) return is stored as " *
-                "\"<name>.<key>\". The derived name varies between sessions, so the same script " *
-                "would write a second, half-empty set of columns next time. Name it — " *
-                "`QoI(\"my_quantity\", f)` — or pass a named function."))
+                "named after the QoI that wrote it — this $(typeof(v)) would be stored as " *
+                (spreads ? "\"<name>.<key>\" per key" : "\"<name>\"") * ". The derived name " *
+                "varies between sessions, so the same script would write a second, half-empty set " *
+                "of columns next time. Name it — `QoI(\"my_quantity\", f)` — or pass a named " *
+                "function."))
             if spreads
                 #! Namespaced by the QoI's name, matching how sensitivity analysis labels the same
                 #! spread. Two QoIs measuring "tumor" no longer land in one column.
