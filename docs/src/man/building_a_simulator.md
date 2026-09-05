@@ -82,14 +82,15 @@ Dispatch each on your concrete type.
 ### Running a simulation
 
 ```julia
-ModelManager.simulationCommand(sim::MySimulator, spec::SimulationSpec)::Cmd
+ModelManager.simulationCommand(sim::MySimulator, spec::SimulationSpec)::Union{Nothing,Cmd}
 ```
 
 The one thing about launching a simulation that only you know: which command runs it. Setup has
 already happened (see below), so everything you need is in the [`SimulationSpec`](@ref). Return a
 bare `Cmd` — set its `dir` if it must run somewhere other than [`simulatorDir`](@ref), but do not
 attach an environment or wrap it in a `pipeline`; both are rejected, for reasons the
-[`runSimulation`](@ref) docstring explains.
+[`runSimulation`](@ref) docstring explains. Return `nothing` when no command can be built: that
+fails the one simulation without aborting the rest of the trial.
 
 Everything else is done for you by the default [`runSimulation`](@ref): it creates the simulation's
 output folder, sends stdout and stderr to `output.log` and `output.err` there, runs the command in

@@ -1562,7 +1562,8 @@ function _saveGeneration(dir::String, gen::GenerationResult, max_nr_populations:
     meta = Dict{String,Any}(
         #! Two distinct quantities, and only the first used to be recorded: `max_epsilon_accepted`
         #! is the worst distance actually accepted, while `epsilon_threshold` is the cutoff the
-        #! generation was run against. They coincide only when `epsilon_quantile == 1.0`.
+        #! generation was run against. They never coincide: the constructor requires
+        #! `epsilon_quantile < 1`.
         "t"                    => gen.t,
         "max_epsilon_accepted" => gen.max_epsilon_accepted,
         "n_evaluations"        => gen.n_evaluations,

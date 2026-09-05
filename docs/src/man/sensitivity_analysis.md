@@ -39,9 +39,8 @@ ModelManager.gsaLabels(gsa)     # ["counts.immune", "counts.tumor"]
 gsa.results["counts.tumor"]
 ```
 
-This is what lets the same measurement feed all three consumers: a `Dict`-valued quantity already
-worked as a [`CalibrationProblem`](@ref)'s `summary_statistic` and as a `post_processor`, and no
-longer has to be rewritten once per key to ask a sensitivity question about it.
+The same `Dict`-valued quantity serves unchanged as a [`CalibrationProblem`](@ref)'s
+`summary_statistic` and as a `post_processor`, so one measurement feeds all three consumers.
 
 Two constraints follow from what a sensitivity index needs:
 
@@ -57,6 +56,22 @@ Two constraints follow from what a sensitivity index needs:
 A QoI's `name` may not contain a `.`, since that is the separator: reserving it is what lets a label
 be read back to the QoI that produced it, and so what lets [`calculateGSA!`](@ref) decide from a name
 alone whether that measurement has already been evaluated.
+
+## One study, two analyses
+
+The model-and-parameters half of a study — the inputs, the variations, the baseline and the
+replicate count — can be built once as a [`StudySpec`](@ref) and handed to either analysis:
+
+```julia
+spec = StudySpec(inputs, dists; n_replicates=3)
+
+gsa     = run(MOAT(15), spec; functions=[counts])
+problem = CalibrationProblem(spec, observed, counts, mseDistance)
+```
+
+`spec` keeps your own variations and reports, per parameter, whether sensitivity analysis and
+[calibration](@ref calibration_man) can use it when displayed. A keyword passed to `run` (such as
+`n_replicates=`) takes precedence over the spec's value.
 
 ## MOAT — Morris screening
 

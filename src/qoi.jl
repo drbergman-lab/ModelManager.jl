@@ -14,8 +14,9 @@ measurement written once and passed to any of them.
   [`CalibrationProblem`](@ref) reports the value to its `distance`. It may not contain a `.`, which
   is reserved as the separator between a quantity and its components (see below).
 - `compute`: called with one [`Simulation`](@ref). It may return anything `reduce` understands — a
-  scalar, a vector, a `Dict` — **except** when the QoI is used as a `post_processor`, where `reduce`
-  is never called and `compute`'s own return value is what gets stored.
+  scalar, a vector, a `Dict`. When the QoI is used as a `post_processor`, `reduce` is never called and
+  `compute`'s own return value is what gets stored, so there it must be a scalar or a keyed collection
+  of scalars (see the table below).
 
 # Keywords
 - `reduce`: collapses one parameter set's *replicates*, `mean` by default. It receives the vector of
@@ -32,7 +33,7 @@ is used, and it does not fall on the same function in each case:
 |---|---|---|
 | `run(::GSAMethod, ...; functions=)` | `reduce`'s return | a `Real`, or a `Dict`/`NamedTuple` of them |
 | [`CalibrationProblem`](@ref)'s `summary_statistic` | `reduce`'s return | anything the problem's `distance` accepts |
-| `run(...; post_processor=)` | **`compute`'s return** | a scalar `Bool`, `Integer`, `Real` or `AbstractString` |
+| `run(...; post_processor=)` | **`compute`'s return** | a scalar (`Bool`, `Integer`, `Real` or `AbstractString`), or a `NamedTuple`/`Dict` of scalars (spread to `<name>.<key>`) |
 
 The sink is the exception, and the reason is that it fires once per simulation: there is exactly one
 value and nothing to combine, so `reduce` is never called and the freedom to return a vector does not
@@ -51,8 +52,9 @@ same way — `"<qoi name>.<key>"` — so one measurement names its parts identic
   spread by index: only its length could be checked against the other monads', and equal length is not
   equal meaning.
 - **The sink** names its columns the same way: `"<qoi name>.<key>"`. Because those names are
-  persisted, an *anonymous* `compute` is refused outright when it spreads — its derived `anon_9`
-  would prefix every column and vary between sessions. Name the QoI, or pass a named function.
+  persisted, a bare anonymous function — a `QoI` whose name had to be derived from its `compute` — is
+  refused whenever it stores anything: its derived `anon_9` would name every column and vary between
+  sessions. Name the QoI, or pass a named function.
 
 Because `reduce` sees every replicate's value, a measurement that needs the replicates *jointly*
 rather than as summarised numbers is expressed by having `compute` return the raw material — a time

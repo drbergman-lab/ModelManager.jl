@@ -699,8 +699,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
         DataFrame(Dict(name => [p[name] for p in rejected_coords] for name in param_names))
     #! `epsilon` is the threshold this generation was run against; record it, because it cannot be
     #! recovered from the result. The previous generation's `max_epsilon_accepted` is not it: the
-    #! threshold is `quantile(prev.distances, epsilon_quantile)`, which equals the previous maximum
-    #! only when `epsilon_quantile == 1.0`.
+    #! threshold is `quantile(prev.distances, epsilon_quantile)`, and the constructor requires
+    #! `epsilon_quantile < 1`, so the two never coincide.
     return _buildGenerationResult(t, accepted, weights, n_evaluations, n_accepted_total,
                                   param_names; rejected_proposals=rejected_df,
                                   epsilon_threshold=epsilon,
