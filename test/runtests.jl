@@ -4287,6 +4287,15 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test !occursin('.', ModelManager._asQoI(s -> 1.0).name)
                 @test !occursin('.', ModelManager._asQoI(_qoi_by_id).name)
 
+                # The separator has one definition, and the four sites that depend on it agree.
+                # Tying the constructor's refusal to the label helper is the point: whatever
+                # `_qoiLabel` builds is exactly what a name may not look like.
+                @test ModelManager._qoiLabel("counts", "tumor") == "counts.tumor"
+                @test ModelManager._isQoILabelOf("counts.tumor", "counts")
+                @test ModelManager._isQoILabelOf("counts", "counts")
+                @test !ModelManager._isQoILabelOf("countsX", "counts")     # not a loose prefix
+                @test_throws ArgumentError QoI(ModelManager._qoiLabel("a", "b"), _qoi_sim)
+
                 # :require before anything is stored names the fix rather than failing obscurely.
                 sid_probe = 1
                 @test_throws ArgumentError ModelManager._computeOn(
