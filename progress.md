@@ -5,6 +5,64 @@
 
 ---
 
+## Session: `deleteCalibration(delete_subs=true)` keeps monads other runs use (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #58, from the second review pass: `deleteSampling(delete_subs=true)` walks every other
+sampling and protects the monads they list, while `deleteCalibration(delete_subs=true)` handed its
+whole evaluated set to `deleteMonad(...; delete_supers=true)` with no cross-reference check. The
+`SimulationBank` is keyed on inputs and simulator version, not on the calibration, so two runs on
+one problem *routinely* share monads — deleting run 1 shrank `Sampling(result2)` and
+`simulationIDs(result2)` under run 2, and `delete_supers=true` rewrote any user sampling that
+happened to share a parameterization.
+
+### Decisions
+- **Protect shared monads (option 1 of the issue).** `delete_subs=true`
+  now means "the monads only this run used". The alternative on offer was to keep the cascade and
+  document it; the sibling function's semantics won, and the docstring's existing "may predate it
+  and outlive it" already implied monads are not the run's property.
+- **The run's own batch samplings are excluded from the guard, by tag.** A naive mirror of
+  `deleteSampling` protects *everything*, because each generation's batch sampling lists the monads
+  that generation evaluated. `_batchSamplingIDs` reads the `mm:calibration` tag `_buildEvaluateBatch`
+  already stamps on each batch. Nothing else can make the distinction: the generation records name
+  monads, never samplings, so a batch and a user sampling over the same monads are otherwise
+  indistinguishable.
+- **Other calibrations are guarded through `calibrationMonadIDs`, the raw on-disk record**, rather
+  than `monadIDs(Calibration(id))`. It is a superset — it names monads already deleted — and every
+  extra ID it carries is one that cannot be in the deletion list anyway, so the survival filter
+  would only cost a query.
+- **The default stays `delete_subs=false`.** Opting in is the only way simulation data should
+  disappear; the maintainer considered flipping it now that the cascade is narrow and rejected it.
+- **`delete_supers` stays `true`, against the issue's plan.** The plan said to drop it to `false`
+  "matching `deleteSampling`", but `deleteSampling` has already removed its own rows before it
+  cascades; `deleteCalibration` leaves the batch samplings in the table, and with `false` they kept
+  constituent lists naming deleted monads -- `Sampling(id)` threw on them, and so did any
+  `findTrials(Sampling; ...)` whose match included one. After the guard the upward walk can reach
+  only those batches, so it does exactly the right cleanup: rewrite each to its surviving monads,
+  remove it once empty. A `Trial` built over a batch is rewritten the same way, as for any sampling.
+
+### Rejected
+- **`findTrials(Sampling; tags=...)` for the batch lookup.** It materializes `Sampling` objects
+  (each reading its constituent CSV) and throws above `MAX_MATERIALIZED_TRIALS`, which would turn a
+  long run into a deletion failure. `_idsMatchingDirect` answers the same question in IDs.
+- **`delete_supers=false`, as the issue's plan said.** See Decisions: it leaves batch rows that
+  cannot be materialised.
+
+### Traps
+- **Everything is read before anything is deleted.** The generation records live inside the folder
+  `rm_hpc_safe` removes, and the `mm:calibration` tags that identify the batch samplings are one
+  obvious extension away from being deleted alongside the calibration's own tag rows (#60).
+- **A green suite did not catch the stale batch rows.** The first cut passed `delete_supers=false`
+  and every test passed, because nothing constructed a batch `Sampling` after a deletion. The
+  regression test now materialises each surviving batch of the deleted run.
+- **A test here proves nothing unless the two runs really do share.** The fixture asserts both
+  `!isempty(shared)` and `!isempty(only1)` before deleting. Sharing is arranged rather than hoped
+  for: generation 1 is a fresh `SobolSeq`, so the smaller run proposes a prefix of the larger run's
+  points, and `cdf_grid_k=4` is above `k_min` for both population sizes so the two snap to the same
+  grid instead of to grids of different resolutions.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger

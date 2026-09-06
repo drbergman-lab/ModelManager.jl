@@ -3774,6 +3774,81 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test isempty(calibrationsTable([cal4.id, cal5.id]))
             end
 
+            @testset "deleteCalibration(delete_subs=true) keeps monads others use" begin
+                # Two runs on one problem, in a parameter range no other testset touches so the
+                # monads here belong to these runs alone. Generation 1 is a Sobol sequence snapped
+                # to the CDF grid, so the smaller run proposes a prefix of the larger run's points
+                # and picks its monads up out of the bank; the larger run's remaining points are
+                # its own. cdf_grid_k=4 is above k_min for both population sizes, so both snap to
+                # the same grid rather than to grids of different resolutions.
+                dv       = DistributedVariation(:config, xp_x, Uniform(212.0, 214.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_named_ss, mseDistance)
+
+                cal1 = runCalibration(ABCSMC(population_size=6, max_nr_populations=1,
+                                             minimum_epsilon=0.0, cdf_grid_k=4),
+                                      prob; description="shared monads 1").calibration
+                waitForDiagnostics()
+                cal2 = runCalibration(ABCSMC(population_size=3, max_nr_populations=1,
+                                             minimum_epsilon=0.0, cdf_grid_k=4),
+                                      prob; description="shared monads 2").calibration
+                waitForDiagnostics()
+
+                mids1  = monadIDs(cal1)
+                mids2  = monadIDs(cal2)
+                shared = intersect(mids1, mids2)
+                only1  = setdiff(mids1, mids2)
+                # Without both of these the deletion below would prove nothing.
+                @test !isempty(shared)
+                @test !isempty(only1)
+
+                # A sampling built by hand over one of run 1's own monads — the second monad keeps
+                # its constituent set distinct from any batch sampling, which would otherwise be
+                # found rather than inserted.
+                protected  = first(only1)
+                guard = createTrial(inputs, [DiscreteVariation(:config, xp_x,
+                                                               [getParameterValue(Monad(protected), :config, xp_x),
+                                                                215.0])])
+                @test guard isa Sampling
+                @test protected in monadIDs(guard)
+                batches1 = ModelManager._batchSamplingIDs([cal1.id])
+                @test !(guard.id in batches1)
+                @test !isempty(batches1)
+
+                doomed = setdiff(only1, [protected])
+                @test !isempty(doomed)
+                doomed_sims = reduce(vcat, (constituentIDs(Monad, id) for id in doomed))
+                @test !isempty(doomed_sims)
+
+                deleteCalibration(cal1; delete_subs=true)
+                @test isempty(calibrationsTable([cal1.id]))
+                # Everything run 2 evaluated survives, so its views are unchanged.
+                @test all(id -> id in monadIDs(), shared)
+                @test monadIDs(cal2) == mids2
+                # As does the monad the hand-built sampling holds.
+                @test protected in monadIDs()
+                # What only run 1 used is gone, simulations and all.
+                @test !any(id -> id in monadIDs(), doomed)
+                @test !any(id -> id in simulationIDs(), doomed_sims)
+                # Run 1's batches were the only supers of the deleted monads. Each is rewritten to
+                # its surviving monads -- so it can still be materialised -- or removed once empty;
+                # generation 1's single batch keeps the shared and protected monads here.
+                surviving_batches = filter(collect(batches1)) do sid
+                    !isempty(queryToDataFrame(constructSelectQuery("samplings", "WHERE sampling_id=$sid;")))
+                end
+                @test !isempty(surviving_batches)
+                for sid in surviving_batches
+                    @test Set(constituentIDs(Sampling, sid)) == Set(setdiff(mids1, doomed))
+                    @test Sampling(sid) isa Sampling
+                end
+
+                # The default still deletes nothing but bookkeeping, even now that run 2 is the
+                # only consumer of its monads.
+                deleteCalibration(cal2)
+                @test isempty(calibrationsTable([cal2.id]))
+                @test all(id -> id in monadIDs(), mids2)
+            end
+
             @testset "runCalibration progress levels" begin
                 dv       = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 observed = Dict{String,Any}("x" => 1.0)
