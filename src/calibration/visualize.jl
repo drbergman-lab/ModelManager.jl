@@ -279,8 +279,7 @@ end
         indices = _completeGenerationIndices(gen_dir)
         isempty(indices) && error("No CDF generation files for Calibration($(cal.id)).")
         t = generation === :final ? last(indices) : Int(generation)
-        t in indices || throw(ArgumentError(
-            "Generation $t not found for Calibration($(cal.id)). Available: $(indices)."))
+        t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, cal.id, t, indices)))
         cdf_path = _generationArtifact(gen_dir, t, :cdfs)
         isnothing(cdf_path) && error(
             "Generation $t of Calibration($(cal.id)) has no CDF file.")

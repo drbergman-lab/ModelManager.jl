@@ -145,6 +145,19 @@ _completeGenerationIndices(gen_dir::AbstractString) =
     filter(t -> !isnothing(_generationArtifact(gen_dir, t, :metadata)), _generationIndices(gen_dir))
 
 """
+    _generationUnavailable(gen_dir, calibration_id, t, complete) → String
+
+The message for asking about generation `t` when it is not among `complete`: it says whether the
+generation is still being written (or was interrupted) or does not exist at all, since "not found"
+for a folder the user can see on disk reads as corruption.
+"""
+function _generationUnavailable(gen_dir::AbstractString, calibration_id::Int, t::Int, complete::AbstractVector{Int})
+    t in _generationIndices(gen_dir) && return "Generation $t of Calibration($(calibration_id)) is " *
+        "incomplete -- still running, or interrupted before it finished writing. Complete generations: $(complete)."
+    return "Generation $t not found for Calibration($(calibration_id)). Available: $(complete)."
+end
+
+"""
     _generationArtifact(gen_dir, t, role) → String or nothing
 
 Resolve generation `t`'s `role` artifact for **reading**: the folder layout first, then the historical
