@@ -671,6 +671,11 @@ end
 
 _sourceToCalibrationParameter(src::DVSource) = CalibrationParameter(src, LatentVariation(src.dv))
 _sourceToCalibrationParameter(src::CVSource) = CalibrationParameter(src, LatentVariation(src.cv))
+#! Mirrors `_toCalibrationParameter` for the same variation, so the reconstructed `LatentVariation`
+#! is the same `DiscreteUniform` over value indices the original run used. Without these, a manifest
+#! holding a discrete source reports itself complete and then dies in `_manifestToProblem`.
+_sourceToCalibrationParameter(src::DiscreteSource) = CalibrationParameter(src, LatentVariation(src.dv))
+_sourceToCalibrationParameter(src::DiscreteCoSource) = CalibrationParameter(src, LatentVariation(src.cv))
 _sourceToCalibrationParameter(src::LVSource) = CalibrationParameter(src, src.lv)
 function _sourceToCalibrationParameter(src::_StrippedLVSource)
     error("Cannot reconstruct CalibrationProblem from _StrippedLVSource " *
@@ -934,6 +939,39 @@ function _validateStructuralMatch(cp::CalibrationParameter, src, i::Int)
                 "Parameter $i (CVSource) variation $k distribution mismatch.")
             v1.flip == v2.flip || error(
                 "Parameter $i (CVSource) variation $k flip mismatch.")
+        end
+
+    elseif src isa DiscreteSource
+        cp.source isa DiscreteSource || error(
+            "Parameter $i type mismatch: saved DiscreteSource, re-supplied $(typeof(cp.source)).")
+        dv_new, dv_saved = cp.source.dv, src.dv
+        dv_new.location == dv_saved.location || error(
+            "Parameter $i (DiscreteSource) location mismatch: " *
+            "saved :$(dv_saved.location), re-supplied :$(dv_new.location).")
+        columnName(dv_new.target) == columnName(dv_saved.target) || error(
+            "Parameter $i (DiscreteSource) target mismatch: " *
+            "saved \"$(columnName(dv_saved.target))\", re-supplied \"$(columnName(dv_new.target))\".")
+        #! The levels themselves, in order: a particle coordinate is a CDF over value *indices*, so a
+        #! reordered or resized list silently re-points every saved coordinate at a different level.
+        dv_new.values == dv_saved.values || error(
+            "Parameter $i (DiscreteSource) values mismatch: " *
+            "saved $(dv_saved.values), re-supplied $(dv_new.values). A saved particle coordinate " *
+            "indexes this list, so it cannot be reordered or resized on resume.")
+
+    elseif src isa DiscreteCoSource
+        cp.source isa DiscreteCoSource || error(
+            "Parameter $i type mismatch: saved DiscreteCoSource, re-supplied $(typeof(cp.source)).")
+        cv_new, cv_saved = cp.source.cv, src.cv
+        length(cv_new.variations) == length(cv_saved.variations) || error(
+            "Parameter $i (DiscreteCoSource) length mismatch.")
+        for (k, (v1, v2)) in enumerate(zip(cv_new.variations, cv_saved.variations))
+            v1.location == v2.location || error(
+                "Parameter $i (DiscreteCoSource) variation $k location mismatch.")
+            columnName(v1.target) == columnName(v2.target) || error(
+                "Parameter $i (DiscreteCoSource) variation $k target mismatch.")
+            v1.values == v2.values || error(
+                "Parameter $i (DiscreteCoSource) variation $k values mismatch: " *
+                "saved $(v2.values), re-supplied $(v1.values).")
         end
 
     elseif src isa _StrippedLVSource

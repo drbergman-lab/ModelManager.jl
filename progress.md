@@ -5,6 +5,53 @@
 
 ---
 
+## Session: two discrete-parameter defects from the calibration review (2026-09-06)
+
+An adversarial review of the calibration PRs (#33-#40), the part of the 0.9 range that had had no
+review. Twenty-five findings survived verification; these are the two highest that had a mechanical
+fix. The rest are ModelManager issues #61 (snapping bias, needs a decision) and #62 (triage).
+
+### Resume was dead for any discrete calibration, both routes
+#38 gave discrete parameters their own source types and let the default passthrough store them in
+`_ProblemManifest`, but neither resume path learned to read one back. `_sourceToCalibrationParameter`
+had methods for four source types and not these, so the automatic route reported the manifest
+*complete* and then died in `_manifestToProblem`; `_validateStructuralMatch` fell through to
+"Unexpected saved source type", so `problem=` died too. The second is the sharper failure: that
+branch keys off the **saved** source type, so nothing a user re-supplies can steer around it.
+
+- **Decision: reconstruct through the same constructor `_toCalibrationParameter` uses**, so the
+  rebuilt `LatentVariation` is the same `DiscreteUniform` over value indices the original run had.
+  Anything else risks a coordinate meaning a different level after resume.
+- **Decision: the structural check compares `values` element-wise** and drops the `flip` comparison
+  the DV/CV branches make, since `DiscreteVariation` has no such field. A saved coordinate *indexes*
+  the level list, so a reordered or resized list silently re-points every particle — the error says
+  so rather than just reporting a mismatch.
+- **Trap:** the test that looked like coverage asserted only `loaded.sources[1] isa DiscreteSource`
+  while its comment claimed "so a discrete run can resume". A comment is not an assertion; the
+  testset now actually resumes, by both routes, and checks that mismatched levels are refused.
+
+### A discrete co-variation's inverse map checked only the first target
+The `DistributedVariation` co-variation twenty lines below recovers `u` from the first target and
+then verifies the rest agree, returning `NaN` when they do not; `_bankCdfCoords` turns that into
+"not reusable". The discrete one never looked past `tv[1]`, so the `SimulationBank` would admit a
+database row whose remaining co-varied columns are paired with the wrong index — or are not levels
+at all — at the first column's coordinate. With `cdf_grid_k` set, `_lookupAndSnap` can then serve
+that monad to a particle whose reported parameters say otherwise: the distance comes from one
+parameter pair and `particles.csv` reports another.
+
+- **Decision: mirror the continuous guard exactly**, `NaN` for "off the curve", rather than throwing.
+  `_bankCdfCoords` already has both escape hatches (a `try` around the maps for the first target's
+  throw, and an `isnan` check); using the one that already exists keeps the two co-variation kinds
+  reading the same way.
+- **Rejected: a tolerance comparison.** The continuous branch needs one because it round-trips
+  through `quantile`; a discrete level is copied verbatim from the user's list, so `==` is right and
+  a tolerance would admit a neighbouring level for closely spaced values.
+- **Not fixed here:** Phase 2 of the bank tests a discrete column against `minimum`/`maximum` of its
+  levels rather than `insupport`, so an off-level value inside the range still clears that stage.
+  The inverse-map guard now catches it; tightening Phase 2 as well is in issue #62.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger

@@ -3282,9 +3282,31 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test all(v -> 0.5 <= v <= 3.0, mpost[!, ccol])        # still continuous
 
                 # The problem manifest round-trips a discrete source, so a discrete run can resume.
+                # The manifest assertions alone used to carry that claim without testing it: both
+                # resume routes died on a discrete source, `_manifestToProblem` with a MethodError
+                # and `_validateStructuralMatch` with "Unexpected saved source type", and neither is
+                # something a user can steer around -- the failing branch keys off the *saved* type.
                 loaded = ModelManager._loadProblem(dres.calibration)
                 @test loaded isa ModelManager._ProblemManifest
                 @test loaded.sources[1] isa ModelManager.DiscreteSource
+                # ...so resume it, both ways. No `problem=`: reconstruction from the manifest.
+                dres2 = resumeCalibration(dres.calibration; max_nr_populations=3)
+                waitForDiagnostics()
+                @test dres2 isa ABCResult
+                @test length(dres2.generations) >= length(dres.generations)
+                dpost2, _ = posterior(dres2)
+                @test all(v -> v in [0.5, 1.5, 2.5], dpost2[!, col])
+                # ...and with `problem=`, the route a lambda summary statistic makes mandatory:
+                # this one goes through `_validateStructuralMatch`.
+                @test resumeCalibration(dres.calibration; problem=dprob, max_nr_populations=4) isa ABCResult
+                waitForDiagnostics()
+                # A re-supplied problem whose levels differ is refused rather than silently accepted:
+                # a saved coordinate indexes the level list, so a different list re-points every one.
+                shifted = CalibrationProblem(inputs, [DiscreteVariation(:config, xp_x, [0.5, 1.5, 9.5])],
+                                             observed, _test_named_ss, mseDistance)
+                err = try; resumeCalibration(dres.calibration; problem=shifted); nothing; catch e; e; end
+                @test err isa ErrorException
+                @test occursin("values mismatch", err.msg)
 
                 # A CoVariation of discrete variations: one latent coordinate driving two targets
                 # in lockstep. Runs the DiscreteCoSource methods -- the TOML entry, the bank's
@@ -3307,6 +3329,32 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     @test findfirst(==(r[xcol]), [0.5, 1.5, 2.5]) ==
                           findfirst(==(r[ycol]), [1.0, 2.0, 3.0])
                 end
+
+                # The co-variation resumes too, through the DiscreteCoSource branches.
+                @test resumeCalibration(cvres.calibration; max_nr_populations=3) isa ABCResult
+                waitForDiagnostics()
+                @test resumeCalibration(cvres.calibration; problem=cvprob, max_nr_populations=4) isa ABCResult
+                waitForDiagnostics()
+
+                # A co-variation's inverse map checks every target, not just the first. Without the
+                # joint check the bank would admit a database row whose second column is paired with
+                # the wrong index -- or is not a level at all -- at the first column's coordinate,
+                # and `_lookupAndSnap` could then serve that monad to a particle whose reported
+                # parameters say otherwise. `NaN` is how an inverse map says "off the curve", and
+                # `_bankCdfCoords` turns it into "not reusable".
+                cv_lv = ModelManager.LatentVariation(cv)
+                inv = only(cv_lv.inverse_maps)
+                @test inv([1.5, 2.0]) == 2                      # on the curve: level 2 of both
+                @test isnan(inv([1.5, 3.0]))                    # wrong index on the second target
+                @test isnan(inv([1.5, 1.7]))                    # not a level of the second target
+                xcolname, ycolname = columnName(xp_x), columnName(xp_y)
+                @test ModelManager._bankCdfCoords(cv_lv, Dict(xcolname => 1.5, ycolname => 2.0)) ≈ [2/3]
+                @test isnothing(ModelManager._bankCdfCoords(cv_lv, Dict(xcolname => 1.5, ycolname => 3.0)))
+                @test isnothing(ModelManager._bankCdfCoords(cv_lv, Dict(xcolname => 1.5, ycolname => 1.7)))
+                # The continuous twin already behaved this way; the discrete one now matches it.
+                cont_cv = CoVariation(DistributedVariation(:config, xp_x, Uniform(0.0, 1.0)),
+                                      DistributedVariation(:config, xp_y, Uniform(0.0, 1.0)))
+                @test isnan(only(ModelManager.LatentVariation(cont_cv).inverse_maps)([0.25, 0.75]))
 
                 # The co-source round-trips, and its parameters.toml records the levels of both
                 # targets rather than the internal DiscreteUniform.
