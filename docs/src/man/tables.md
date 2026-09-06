@@ -45,8 +45,8 @@ Both functions share these keywords:
 A practical order of operations: print the table once with the defaults, read the column
 names off it, then pass the ones you care about to `sort_by`.
 
-The full keyword reference lives on [`simulationsTableFromQuery`](@ref) and
-[`monadsTableFromQuery`](@ref). Those two are also the raw-SQL escape hatch — hand them a
+The full keyword reference lives on [`ModelManager.simulationsTableFromQuery`](@ref) and
+[`ModelManager.monadsTableFromQuery`](@ref). Those two are also the raw-SQL escape hatch — hand them a
 query string and they apply the same column expansion and shaping to its result.
 
 ## Printing and exporting

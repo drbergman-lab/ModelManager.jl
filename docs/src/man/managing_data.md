@@ -60,7 +60,7 @@ deleteSimulationsByStatus(["Failed"])           # prompts before deleting
 deleteSimulationsByStatus(["Failed"]; user_check=false)
 ```
 
-The status values are those from [`recognizedStatusCodes`](@ref).
+The status values are those from [`ModelManager.recognizedStatusCodes`](@ref).
 
 ## Resetting a project
 
@@ -75,7 +75,7 @@ resetDatabase(; force_reset=true)     # skip the prompt (scripts/CI)
 
 This is destructive and irreversible — every simulation, monad, sampling, and trial is
 deleted, and the post-processing sink (`data/outputs/postprocessing.db`) is removed. Use it
-deliberately. [`resetFolder`](@ref) resets a single input folder's variation state without
+deliberately. [`ModelManager.resetFolder`](@ref) resets a single input folder's variation state without
 touching the rest of the project.
 
 ## Safe removal on shared filesystems

@@ -13,7 +13,7 @@ export getInstalledVersion, getDBPackageVersion, resolvePackageVersion
 export queryToDataFrame, stmtToDataFrame, constructSelectQuery, tableIDName
 export tableExists, tableColumns
 export locationVariationsDatabase
-export ModelManagerGlobals, mm_globals_ref, mm_globals, assertInitialized
+export ModelManagerGlobals, mm_globals, assertInitialized
 export centralDB, dataDir, isInitialized, projectLocations, inputsDict
 export withTransaction
 export initializeModelManager
