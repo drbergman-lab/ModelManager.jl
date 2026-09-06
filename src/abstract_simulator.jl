@@ -196,16 +196,22 @@ end
 ############   Database upgrade interface   ############
 ########################################################
 
+#! The default is derived rather than asked for: the same package identity `getInstalledVersion`
+#! and `_loadedPackageVersion` already resolve from the module defining the simulator type. A
+#! backend that names the table after its own package therefore implements nothing, and one that
+#! inherited a legacy table name overrides.
 """
     dbVersionTableName(sim::AbstractSimulator)::String
 
 Return the name of the SQLite table used to persist the package version in the
-project database (e.g. `"pcmm_version"`). The generic upgrade machinery reads and
-writes this table to track which version a given database was last migrated to.
+project database. The generic upgrade machinery reads and writes this table to track which
+version a given database was last migrated to.
+
+Defaults to the lowercased name of the package defining `typeof(sim)`, with `_version`
+appended — `"physicellmodelmanager_version"` for a `PhysiCellSimulator`. Override it only to
+keep a name the database already uses.
 """
-function dbVersionTableName(sim::AbstractSimulator)
-    error("$(nameof(typeof(sim))) must implement: dbVersionTableName(::$(nameof(typeof(sim))))::String")
-end
+dbVersionTableName(sim::AbstractSimulator) = lowercase(string(nameof(_packageModule(sim)))) * "_version"
 
 """
     upgradeMilestones(sim::AbstractSimulator)::Vector{VersionNumber}
@@ -213,11 +219,15 @@ end
 Return a **sorted** vector of milestone `VersionNumber`s that have associated
 database schema changes. [`upgradeToMilestone`](@ref) is called for each milestone
 between the current database version and the target package version.
-"""
-function upgradeMilestones(sim::AbstractSimulator)
-    error("$(nameof(typeof(sim))) must implement: upgradeMilestones(::$(nameof(typeof(sim))))::Vector{VersionNumber}")
-end
 
+Defaults to empty: a backend whose schema has never changed shape declares no milestones and
+implements neither this nor `upgradeToMilestone`.
+"""
+upgradeMilestones(::AbstractSimulator) = VersionNumber[]
+
+#! Reachable only from a backend that declared milestones in `upgradeMilestones` — with the empty
+#! default, `upgradePackage` has nothing to cross and never calls this. So the error names that
+#! inconsistency rather than reporting an unimplemented required method.
 """
     upgradeToMilestone(sim::AbstractSimulator, version::VersionNumber, auto_upgrade::Bool)::Bool
 
@@ -230,9 +240,12 @@ Implementations are responsible for:
 2. Making all necessary DDL/DML changes to the database.
 3. **Not** updating the version table — `upgradePackage` does that after a
    successful return.
+
+The default throws. It is reached only once [`upgradeMilestones`](@ref) returns a non-empty
+vector, so a backend that declares milestones must implement it.
 """
 function upgradeToMilestone(sim::AbstractSimulator, args...)
-    error("$(nameof(typeof(sim))) must implement: upgradeToMilestone(::$(nameof(typeof(sim))), version::VersionNumber, auto_upgrade::Bool)::Bool")
+    error("$(nameof(typeof(sim))) declares milestones in upgradeMilestones but does not implement: upgradeToMilestone(::$(nameof(typeof(sim))), version::VersionNumber, auto_upgrade::Bool)::Bool")
 end
 
 ########################################################

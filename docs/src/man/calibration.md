@@ -140,7 +140,7 @@ what you can control.
 
 Calibration can evaluate thousands of particles, many close together in parameter space.
 Setting `cdf_grid_k` on the method snaps proposals onto a dyadic grid in CDF space and reuses
-previously evaluated monads within a small box (the [`SimulationBank`](@ref)), avoiding
+previously evaluated monads within a small box (the [`ModelManager.SimulationBank`](@ref)), avoiding
 redundant simulations. The grid refines each generation, so early generations are cheap and
 later ones precise. See the [`ABCSMC`](@ref) docstring for the exact semantics.
 

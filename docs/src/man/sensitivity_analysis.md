@@ -102,14 +102,14 @@ gsa = run(RBD(128; num_harmonics=10), inputs, dists; functions=[final_count])
 The returned [`GSASampling`](@ref) carries the underlying [`Sampling`](@ref) and the computed
 indices. Helpers include:
 
-- [`gsaLabels`](@ref) — the labels of the analyses computed, sorted. Each indexes `gsa.results`.
+- [`ModelManager.gsaLabels`](@ref) — the labels of the analyses computed, sorted. Each indexes `gsa.results`.
 - [`calculateGSA!`](@ref) — compute indices for a set of output functions, filing them under their
   labels. A measurement already evaluated is skipped, so adding a quantity later costs only the new
   one. Pass `recompute=true` when the measurement itself has changed — nothing can detect that, since
   redefining a function's body in place leaves it indistinguishable from the one already evaluated.
-- [`getMonadIDDataFrame`](@ref) — the monad-ID design matrix used.
+- [`ModelManager.getMonadIDDataFrame`](@ref) — the monad-ID design matrix used.
 - [`simulationIDs`](@ref) — the simulations that were run.
-- [`methodString`](@ref) — a label for the method/design.
+- [`ModelManager.methodString`](@ref) — a label for the method/design.
 
 Indices themselves live in `gsa.results`, a `Dict` keyed by those labels — one entry per quantity,
 which is one per `functions` entry unless a `QoI` spread into several.

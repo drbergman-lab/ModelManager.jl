@@ -26,11 +26,11 @@ ModelManager calls your methods at the right moments during a run:
   runner                ──▶  simulationCommand(sim, spec) the command that runs one simulation
   prepareTrialHierarchy ──▶  setupSampling / setupMonad   prepare before running
   database + versioning ──▶  simulatorVersion* methods    schema + version tracking
-  migration framework   ──▶  upgrade* methods             schema migrations
+  migration framework   ──▶  upgrade* methods             schema migrations (optional)
 
 You call ModelManager once, at load time, to wire everything up:
 
-  __init__ (sets mm_globals_ref) ──▶  initializeModelManager
+  __init__ (registerSimulator!) ──▶  initializeModelManager
 ```
 
 You supply a concrete type and a handful of methods; ModelManager calls them at the right
@@ -49,17 +49,23 @@ mutable struct MySimulator <: AbstractSimulator
 end
 ```
 
-## 2. Register globals in `__init__`
+## 2. Register your simulator in `__init__`
 
 ModelManager keeps all per-project state in a [`ModelManagerGlobals`](@ref) accessed through
-[`mm_globals`](@ref). Your package creates the instance and stores it in
-[`mm_globals_ref`](@ref) when it loads:
+[`mm_globals`](@ref). One call when your package loads creates it:
 
 ```julia
 function __init__()
-    ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = MySimulator("/path", v"0.1.0"))
+    ModelManager.registerSimulator!(MySimulator("/path", v"0.1.0"))
 end
 ```
+
+[`registerSimulator!`](@ref) takes whatever the globals need — currently
+`max_number_of_parallel_simulations`, which users change afterwards with
+[`setNumberOfParallelSims`](@ref). It is idempotent for your own backend, so reloading the
+package does not wipe an open project, and it warns rather than silently taking over if another
+backend is already registered: **one process serves one backend.** The `Ref` behind it,
+[`mm_globals_ref`](@ref), is public but is not the registration API.
 
 ## 3. Provide an initialization entry point
 
@@ -124,21 +130,6 @@ ModelManager.currentSimulatorVersionID(sim::MySimulator)::Int
 These let ModelManager build the database schema (one version table and one version-FK column
 per simulator) and stamp every simulation with the simulator version that produced it.
 
-### Database migration interface
-
-To support schema upgrades as your package evolves:
-
-```julia
-ModelManager.dbVersionTableName(sim::MySimulator)::String          # e.g. "my_version"
-ModelManager.upgradeMilestones(sim::MySimulator)::Vector{VersionNumber}
-ModelManager.upgradeToMilestone(sim::MySimulator, version, auto_upgrade)::Bool
-```
-
-See [Database upgrades](@ref database_upgrades) for how these are orchestrated by [`upgradePackage`](@ref).
-
-Migrations target the version of your package loaded in the session, read from the package
-defining your simulator type.
-
 ## 5. Override optional hooks as needed
 
 These have working defaults; override only when your simulator needs them.
@@ -153,6 +144,32 @@ These have working defaults; override only when your simulator needs them.
 | [`getInputFolderDescription`](@ref) | `""` | read folder metadata for the DB |
 | [`clearSimulatorArtifacts`](@ref) | no-op | remove compiled artifacts on database reset |
 | [`simulationThreads`](@ref) | `nothing` | how many threads a simulation starts, so SLURM jobs request that many CPUs; implement it when the simulator sets its own thread count |
+| [`postVariationXMLProcessing`](@ref) | no-op | post-process a variation file after ModelManager writes it |
+
+### Database migrations
+
+A backend that has never changed its schema implements none of these:
+
+| Method | Default | Override to… |
+| --- | --- | --- |
+| [`dbVersionTableName`](@ref) | `"<your package, lowercased>_version"` | keep a table name a shipped database already uses |
+| [`upgradeMilestones`](@ref) | `VersionNumber[]` | declare the releases whose schema changed |
+| [`upgradeToMilestone`](@ref) | throws | apply one declared milestone; required once `upgradeMilestones` is non-empty |
+
+See [Database upgrades](@ref database_upgrades) for how these are orchestrated by
+[`upgradePackage`](@ref). Migrations target the version of your package loaded in the session,
+read from the package defining your simulator type — the same package identity that gives
+`dbVersionTableName` its default.
+
+## 6. Reach for ModelManager's own helpers
+
+Two your backend will want rather than reimplement:
+
+- [`variationFilePath`](@ref)`(location, M)` — the path [`createXMLFile`](@ref) writes a monad's
+  variation file to. Ask for it instead of rebuilding the `<location>_variation_<id>.xml`
+  convention; the path is computed from the monad, so it is available before the file exists.
+- [`quietRun`](@ref)`(cmd)` — run a command with stdout and stderr sent to `devnull`, for probing
+  that a simulator executable is present without printing its output.
 
 ## Boundary rules
 
