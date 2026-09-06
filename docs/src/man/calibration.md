@@ -291,13 +291,15 @@ all of these — the views describe what the run actually produced.
 
 ```julia
 deleteCalibration(result)                           # bookkeeping only
-deleteCalibration(3; delete_subs = true)            # and every monad it evaluated
+deleteCalibration(3; delete_subs = true)            # and the monads no one else uses
 ```
 
 The monads are kept by default because they are not the run's private property: the simulation
 bank reuses monads across runs, and a monad the calibration snapped onto may have been created by
-ordinary exploration long beforehand. Note that deleting a run discards its posterior — the
-generation CSVs, the serialized problem, and the method settings all live in the folder.
+ordinary exploration long beforehand. For the same reason `delete_subs = true` deletes only the
+monads nothing else points at — see [Managing data](@ref managing_data). Note that deleting a run
+discards its posterior — the generation CSVs, the serialized problem, and the method settings all
+live in the folder.
 
 ## [Visualizing calibration results](@id abc_plots)
 

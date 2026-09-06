@@ -593,6 +593,60 @@ end
 
 ################## Deletion ##################
 
+#! The tag is the only route to these. The generation records say which *monads* a run evaluated,
+#! never which samplings it created, so nothing else can tell a batch of this run apart from a
+#! sampling a user built over the same monads — which is the whole distinction the guard rests on.
+"""
+    _batchSamplingIDs(calibration_ids) → Set{Int}
+
+Sampling IDs of the per-generation batches these calibration runs created, read from the
+`mm:calibration` tag each batch carries.
+"""
+function _batchSamplingIDs(calibration_ids::AbstractVector{<:Integer})
+    ids = Set{Int}()
+    for calibration_id in calibration_ids
+        union!(ids, _idsMatchingDirect(_tagClass(Sampling), "mm:calibration" => string(calibration_id)))
+    end
+    return ids
+end
+
+#! `deleteSampling`'s guard, with the one correction that makes it apply here: a calibration's own
+#! batch samplings list every monad it evaluated, so treating them as other consumers would protect
+#! all of them and `delete_subs=true` would delete nothing.
+"""
+    _unsharedCalibrationMonadIDs(calibration_ids) → Vector{Int}
+
+The surviving monads these calibration runs evaluated that no other consumer references.
+
+A monad is dropped from the result — and so kept — when it belongs to any sampling other than these
+runs' own per-generation batches, or when another calibration's generation record lists it.
+"""
+function _unsharedCalibrationMonadIDs(calibration_ids::AbstractVector{<:Integer})
+    monad_ids = unique!(reduce(vcat, (monadIDs(Calibration(id)) for id in calibration_ids); init=Int[]))
+    isempty(monad_ids) && return monad_ids
+
+    own_sampling_ids = _batchSamplingIDs(calibration_ids)
+    sampling_ids = constructSelectQuery("samplings"; selection="sampling_id") |> queryToDataFrame |> x -> x.sampling_id
+    for sampling_id in sampling_ids
+        sampling_id in own_sampling_ids && continue
+        in_use = constituentIDs(Sampling, sampling_id)
+        filter!(id -> !(id in in_use), monad_ids)
+        isempty(monad_ids) && return monad_ids
+    end
+
+    #! The raw record rather than `monadIDs(Calibration(id))`: it is a superset (it names monads
+    #! already deleted), and every extra ID it carries is one no longer in `monad_ids` anyway.
+    other_calibration_ids = setdiff(
+        constructSelectQuery("calibrations"; selection="calibration_id") |> queryToDataFrame |> x -> x.calibration_id,
+        calibration_ids)
+    for calibration_id in other_calibration_ids
+        in_use = calibrationMonadIDs(Calibration(calibration_id))
+        filter!(id -> !(id in in_use), monad_ids)
+        isempty(monad_ids) && return monad_ids
+    end
+    return monad_ids
+end
+
 """
     deleteCalibration(target; delete_subs=false)
 
@@ -603,7 +657,12 @@ the [`ABCResult`](@ref) [`runABC`](@ref) returns.
 
 `delete_subs` defaults to `false`, unlike the trial-level deleters — a run's monads are shared,
 through the [`SimulationBank`](@ref) and `use_previous`, so they may predate it and outlive it.
-Pass `true` to remove them and their simulations too.
+
+Pass `true` to delete the monads **only these runs used**, and their simulations. A monad another
+calibration's generation record lists, or one belonging to any sampling other than these runs' own
+per-generation batches, is kept. Those batches are the only samplings a deleted monad can still
+belong to, so each is rewritten to its surviving monads and removed once empty; no other sampling
+is touched.
 
 Note that the folder holds the generation CSVs, the serialized problem and the method settings, so
 deleting a run discards its posterior: [`posterior`](@ref) and [`resumeABC`](@ref) stop working
@@ -612,7 +671,7 @@ for it.
 # Examples
 ```julia
 deleteCalibration(result)                  # bookkeeping only
-deleteCalibration(3; delete_subs = true)   # and every monad it evaluated
+deleteCalibration(3; delete_subs = true)   # and the monads no one else uses
 ```
 """
 function deleteCalibration(calibration_ids::AbstractVector{<:Integer}; delete_subs::Bool=false)
@@ -620,9 +679,9 @@ function deleteCalibration(calibration_ids::AbstractVector{<:Integer}; delete_su
     ids = Int.(calibration_ids)
     isempty(ids) && return nothing
     #! Collected before anything is removed: the per-generation CSVs inside the folder are the only
-    #! record of which monads a calibration evaluated.
-    monad_ids_to_delete = delete_subs ?
-        unique!(reduce(vcat, (monadIDs(Calibration(id)) for id in ids); init=Int[])) : Int[]
+    #! record of which monads a calibration evaluated, and the `mm:calibration` tags naming its
+    #! batch samplings have to be read while the deletion below can still be extended to them.
+    monad_ids_to_delete = delete_subs ? _unsharedCalibrationMonadIDs(ids) : Int[]
 
     DBInterface.execute(centralDB(),
         "DELETE FROM calibrations WHERE calibration_id IN ($(join(ids, ",")));")
@@ -631,6 +690,10 @@ function deleteCalibration(calibration_ids::AbstractVector{<:Integer}; delete_su
         rm_hpc_safe(calibrationFolder(id); force=true, recursive=true)
     end
 
+    #! After the guard, the only samplings still holding one of these monads are the deleted runs'
+    #! own batches, so the upward cascade can reach nothing but them: it rewrites each to its
+    #! surviving monads and removes the ones left empty. `false` here would leave rows whose
+    #! constituents no longer exist, and `Sampling(id)` on such a row throws.
     isempty(monad_ids_to_delete) ||
         deleteMonad(monad_ids_to_delete; delete_subs=true, delete_supers=true)
     return nothing
