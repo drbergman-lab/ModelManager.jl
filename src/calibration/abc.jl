@@ -887,13 +887,16 @@ if no generations have been written yet.
 """
 function _findLastGenerationCSVs(calibration::Calibration)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
-    indices = _generationIndices(gen_dir)
-    isempty(indices) && return nothing
-    t = last(indices)
-    cdf_path     = _generationArtifact(gen_dir, t, :cdfs)
-    display_path = _generationArtifact(gen_dir, t, :particles)
-    (isnothing(cdf_path) || isnothing(display_path)) && return nothing
-    return cdf_path, display_path
+    #! Walk back to the newest generation that has both artifacts rather than testing only the last
+    #! index. A resume targets an interrupted run, whose trailing folder is exactly the incomplete
+    #! one -- so returning `nothing` there silently skipped the particle-consistency and LVSource-map
+    #! checks on the runs that most need them.
+    for t in Iterators.reverse(_generationIndices(gen_dir))
+        cdf_path     = _generationArtifact(gen_dir, t, :cdfs)
+        display_path = _generationArtifact(gen_dir, t, :particles)
+        isnothing(cdf_path) || isnothing(display_path) || return cdf_path, display_path
+    end
+    return nothing
 end
 
 """
@@ -1241,7 +1244,7 @@ function resumeCalibration(calibration::Calibration,
     #! that quietly falls back to the quantile rule. A schedule sized for the *remaining* generations
     #! instead of the whole run therefore runs out early without erroring.
     if !isnothing(m.epsilon_schedule)
-        n_done    = length(_generationIndices(joinpath(calibrationFolder(calibration), "generations")))
+        n_done    = length(_completeGenerationIndices(joinpath(calibrationFolder(calibration), "generations")))
         last_cov  = length(m.epsilon_schedule) + 1
         first_new = n_done + 1
         if last_cov < m.max_nr_populations

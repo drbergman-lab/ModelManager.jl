@@ -124,6 +124,26 @@ function _flatGenerationArtifact(gen_dir::AbstractString, t::Int, role::Symbol)
     return _findGenerationFile(gen_dir, t, "_" * _GENERATION_ARTIFACTS[role])
 end
 
+#! The permissive scan above answers "what is on disk"; this answers "what can be read as a finished
+#! generation", and the two differ for the whole time a generation is running. `_buildEvaluateBatch`
+#! writes the monad record before launching any simulation, which `mkpath`s `generations/<t>/`, while
+#! the artifacts that define the generation are written only by `_saveGeneration` at the end. So an
+#! interrupted or still-running calibration has a trailing folder holding just `monads.csv`, and a
+#! reader that takes `last(indices)` sees one generation too many -- `posterior(cal)` then errors
+#! instead of returning the last finished generation. That is a regression from the flat layout,
+#! where the enumeration matched particle files and an in-flight generation was simply invisible.
+#!
+#! `metadata.toml` is the commit marker rather than `particles.csv`: `_saveGeneration` writes the
+#! CSVs first and the TOML last, so the TOML's presence is the only artifact that implies the rest.
+"""
+    _completeGenerationIndices(gen_dir) → Vector{Int}
+
+Every generation under `gen_dir` that finished writing, ascending. Use this for anything that
+presents a run to the user; use `_generationIndices` when you want every folder on disk.
+"""
+_completeGenerationIndices(gen_dir::AbstractString) =
+    filter(t -> !isnothing(_generationArtifact(gen_dir, t, :metadata)), _generationIndices(gen_dir))
+
 """
     _generationArtifact(gen_dir, t, role) → String or nothing
 
@@ -548,7 +568,7 @@ end
 #! is none. Guarded throughout: this feeds `show`, which must never throw.
 function _generationSummary(calibration::Calibration)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
-    indices = _generationIndices(gen_dir)
+    indices = _completeGenerationIndices(gen_dir)
     isempty(indices) && return (0, nothing)
     last_meta = _generationArtifact(gen_dir, last(indices), :metadata)
     isnothing(last_meta) && return (length(indices), nothing)

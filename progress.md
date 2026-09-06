@@ -5,6 +5,45 @@
 
 ---
 
+## Session: an in-flight generation folder is not a completed generation (2026-09-06)
+
+From the adversarial review of the calibration PRs (#33-#40); the last of that review's four
+high-severity findings with a mechanical fix.
+
+### What happened
+`_buildEvaluateBatch` writes a generation's monad record before launching any simulation, and that
+write `mkpath`s `generations/<t>/`. The artifacts that define the generation are written only by
+`_saveGeneration` at the end. So for the whole duration of generation t -- and permanently, if the
+run is interrupted -- the folder exists holding only `monads.csv`, and `_generationIndices`, which
+counts any all-digit subdirectory, reports one generation too many. `posterior(cal)` resolved
+`:final` to it and died "has no particle file"; all four disk-based plot styles failed the same way;
+`show` over-counted and dropped the final epsilon. A regression from #39: the flat layout enumerated
+particle files, so an in-flight generation was invisible.
+
+### Decisions
+- **Two enumerations, named for the question each answers.** `_generationIndices` keeps its
+  permissive scan, which migration and the monad-ID reader depend on; `_completeGenerationIndices`
+  is what anything presenting a run to a user calls. Rejected: making the single function strict,
+  which would break `_migrateGenerationLayout!` (it must see the folder it is migrating) and
+  `calibrationMonadIDs` (an interrupted generation's monads are real and were simulated).
+- **`metadata.toml` is the commit marker, not `particles.csv`.** `_saveGeneration` writes the CSVs
+  first and the TOML last, so the TOML is the only artifact whose presence implies the rest. A
+  `particles.csv` test would accept a generation whose write died between the two -- covered by a
+  test.
+- **`_findLastGenerationCSVs` walks backwards** to the newest generation holding both artifacts,
+  rather than testing only the last index and returning `nothing`. Same root cause, opposite
+  symptom: it silently skipped the particle-consistency and LVSource-map validations on exactly the
+  interrupted runs a resume targets.
+- The `epsilon_schedule` coverage warning counts finished generations too, so its "generations
+  N-M" range is no longer shifted by one on an interrupted run.
+
+### Not fixed here
+`posterior` still says "has no particle file" if a *named* generation is incomplete, rather than
+"generation N is incomplete". And a run that stopped on `max_evaluations` crashes on resume for an
+unrelated reason (ModelManager issue #62).
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger
