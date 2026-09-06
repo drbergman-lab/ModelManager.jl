@@ -49,10 +49,9 @@ problem = CalibrationProblem(
 )
 ```
 
-The parameters can be any mix of [`DistributedVariation`](@ref),
-[`CoVariation`](@ref){[`DistributedVariation`](@ref)}, or
-[`LatentVariation`](@ref){<:Distribution} — they are converted to the internal
-[`CalibrationParameter`](@ref) representation automatically.
+The parameters can be any mix of [`DistributedVariation`](@ref), [`DiscreteVariation`](@ref),
+[`CoVariation`](@ref)s of either, or [`LatentVariation`](@ref){<:Distribution} — they are
+converted to the internal [`CalibrationParameter`](@ref) representation automatically.
 
 Two functions you supply:
 
@@ -61,15 +60,30 @@ Two functions you supply:
   `reduce` (`mean` by default — pass `reduce=` for anything else, and note it receives every
   replicate's value, so a step that must happen *after* averaging goes there). A single QoI reports
   its value directly; a vector reports a `Dict` keyed by QoI name. A bare function is accepted, but
-  **warned about unless it declares `(s::Simulation)`**: such a function used to be called once per
-  *monad* and aggregate however it liked, the two cannot be told apart automatically, and
-  reinterpreting an old one per-simulation returns a different number without raising. Annotating it
+  **warned about unless it declares `(s::Simulation)`**, since the declared argument type is the only
+  signal that it was written to be called per simulation rather than per monad. Annotating it
   silences the warning; passing a `QoI` also lets you choose the reduction.
 - **`distance`** — `(simulated, observed) -> Float64`. The built-in [`mseDistance`](@ref)
   handles `Dict`, `Vector`, and scalar inputs; supply your own for anything else.
 
 Set `n_replicates > 1` in the problem to average out stochastic noise per particle (at N×
 the compute cost).
+
+### One study, two analyses
+
+If the same model and parameters also feed a [sensitivity analysis](@ref sensitivity_analysis),
+build the shared half once as a [`StudySpec`](@ref) and construct the problem from it:
+
+```julia
+spec    = StudySpec(ref, [DistributedVariation(:config, xml_path, Uniform(1e-7, 1e-4))]; n_replicates=3)
+tumor   = QoI("tumor", measureTumor)
+
+problem = CalibrationProblem(spec, observed, tumor, mseDistance)
+gsa     = run(MOAT(15), spec; functions=[tumor])
+```
+
+The spec keeps your own variations; displaying it reports, per parameter, whether sensitivity
+analysis and calibration can use it.
 
 ## Choosing the method
 
@@ -204,10 +218,8 @@ The folder name is the generation number, zero-padded to fit `max_nr_populations
 that cap the existing folders are re-padded to match, so the directory stays in order; lowering it
 narrows them again, but never below the width the generations already on disk require.
 
-Calibrations written by an earlier version stored the same artifacts as flat files
-(`generation_01.csv`, `generation_01_monads.csv`, and a `generation_cdfs/` subdirectory). Those are
-read as they are — nothing needs converting before you can plot or inspect a run — and are moved into
-the folder layout the first time the run is resumed.
+Legacy flat generation files written by earlier versions are still read as they are, and are moved
+into this layout the first time the run is resumed.
 
 ## Finding your runs again
 
@@ -406,7 +418,8 @@ the likeliest reason otherwise-correct code trips.
 | ``Calibration failed while evaluating monad N: `summary_statistic` or `distance` raised`` | Your function threw on a monad that has output. | The original exception and backtrace follow the message. |
 | ``distance returned a T, but a `Real` is required`` | `distance` returned a `Dict`, `missing`, `nothing`, … | Return a real number. If you are guarding against missing output yourself, you no longer need to — see the table above. |
 | `simulation(s) X … have no row in the simulations table` | A monad's constituent record and the database disagree. | Run `ModelManager.databaseDiagnostics()`. This indicates corrupted bookkeeping, not a failed simulation. |
-| `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used anonymous functions, which JLD2 cannot serialize. | Pass the original problem: `resumeCalibration(cal; problem=my_problem)`. Define `summary_statistic`/`distance` as named functions to avoid it next time. |
+| `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used lambdas or closures — a named function defined *inside* another function counts — which JLD2 cannot restore by name. | Pass the original problem: `resumeCalibration(cal; problem=my_problem)`. Define `summary_statistic`/`distance` at the top level of a file or module to avoid it next time. |
+| `The saved problem in … could not be read back` | The file holds a closure this session cannot name (saved by a version that did not detect it). | `include` the file that defines your functions before resuming, or pass `problem=`, which is then used without being checked against the saved one. |
 
 ### The run isn't converging
 

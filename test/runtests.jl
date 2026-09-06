@@ -116,7 +116,14 @@ const _fail_sim_predicate = Ref{Union{Nothing,Function}}(nothing)
 # "a throwing runSimulation still records the simulation" testset.
 const _throw_in_run = Ref(false)
 
-function ModelManager.runSimulation(::TestSimulator, spec::ModelManager.SimulationSpec)
+# When set, TestSimulator's override steps aside and the *default* runSimulation runs -- the one
+# that consults `simulationCommand`, `run_on_hpc` and the sbatch shim -- so `run()` can be driven
+# end to end through the SLURM path.
+const _use_default_run = Ref(false)
+
+function ModelManager.runSimulation(sim::TestSimulator, spec::ModelManager.SimulationSpec)
+    _use_default_run[] && return invoke(ModelManager.runSimulation,
+                                        Tuple{AbstractSimulator,ModelManager.SimulationSpec}, sim, spec)
     # No-op: immediately report success without launching any process.
     _throw_in_run[] && error("backend blew up launching simulation $(spec.simulation.id)")
     should_fail = !isnothing(_fail_sim_predicate[]) && _fail_sim_predicate[](spec)
@@ -144,6 +151,11 @@ end
 const _test_sim_cmd = Ref{Any}(`true`)
 ModelManager.simulationCommand(::TestSimulator, ::ModelManager.SimulationSpec) = _test_sim_cmd[]
 
+# What `simulationThreads` answers for TestSimulator: `nothing` (the interface default) unless a test
+# sets it, so the default `cpus-per-task` can be shown both absent and present.
+const _test_threads = Ref{Union{Nothing,Int}}(nothing)
+ModelManager.simulationThreads(::TestSimulator, ::Simulation) = _test_threads[]
+
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
@@ -160,6 +172,16 @@ _sim_unbounded(s::S) where {S}              = 1.0   # `S` is `Any`: carries no i
 _sim_zeroarg()                              = 1.0
 _sim_two(s::Simulation)    = 2.0
 _sim_vec(s::Simulation)    = [1.0]
+# Shapes `_isAnonymousFunction` must tell apart. A factory's inner named function is a closure type
+# (`#f#make##0`) that only this session can name, whether or not it captures anything; a callable
+# struct is an ordinary type JLD2 restores; a top-level name may use any alphabet.
+_make_closure(k) = (f(s) = k; f)
+_make_closure_nocapture() = (g(s) = 1.0; g)
+struct _Functor <: Function; k::Int; end
+(f::_Functor)(s) = f.k
+μstar_top(s) = 1.0
+# A closure that counts its calls, for the GSA "never skipped" test.
+_make_counting(calls::Ref{Int}) = (c(s) = (calls[] += 1; 1.0); c)
 # A single QoI reports its value directly; a vector reports a Dict keyed by name. That is what keeps
 # the scalar and vector `observed_data` shapes usable.
 _test_named_ss             = [QoI("x", _sim_one)]
@@ -174,6 +196,9 @@ _test_nonzero_ss           = [QoI("x", _sim_two)]
 # Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
 # values differ; _qoi_monad sees the whole monad at once.
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
+# A String-valued and a keyed compute, for the stored-value read-back tests.
+_qoi_label(s::Simulation) = "sim_$(s.id)"
+_qoi_pair(s::Simulation)  = (; a = _qoi_sim(s), b = 2 * _qoi_sim(s))
 # A bare function in `functions=`: it now receives a `Simulation`, exactly like a QoI's `compute`.
 # Untyped on purpose -- that is how users write them, and it is the case dispatch cannot sniff.
 _qoi_by_id(sim)           = getParameterValue(sim, :config, XMLPath(["data", "x"]))
@@ -1828,13 +1853,26 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
     ################## Problem persistence: anonymous function detection ##################
 
-    @testset "_isAnonymousFunction" begin
+    @testset "_isAnonymousFunction means 'not restorable by name'" begin
         @test  ModelManager._isAnonymousFunction(x -> x^2)
         @test  ModelManager._isAnonymousFunction((x, y) -> x + y)
+        # A named function defined inside a scope -- this @testset included -- is a closure type
+        # that only this session can name, so it is exactly as unrestorable as a lambda. The old
+        # `nameof`-prefix test called it restorable, and a manifest saved with one failed to load in
+        # a fresh session with a raw JLD2 reconstruction error.
         named_fn(x) = x^2
-        @test !ModelManager._isAnonymousFunction(named_fn)
+        @test  ModelManager._isAnonymousFunction(named_fn)
+        @test  ModelManager._isAnonymousFunction(_make_closure(1))
+        @test  ModelManager._isAnonymousFunction(_make_closure_nocapture())
+        # Top-level functions and callable structs restore by name.
         @test !ModelManager._isAnonymousFunction(identity)
         @test !ModelManager._isAnonymousFunction(mseDistance)
+        @test !ModelManager._isAnonymousFunction(_sim_one)
+        @test !ModelManager._isAnonymousFunction(μstar_top)
+        @test !ModelManager._isAnonymousFunction(_Functor(3))
+        # ...and so does a QoI built from them, while one built from a closure does not.
+        @test !ModelManager._isAnonymousFunction(QoI("k", _Functor(3)))
+        @test  ModelManager._isAnonymousFunction(QoI("k", _make_closure(3)))
     end
 
     @testset "_StrippedLVSource construction" begin
@@ -1952,8 +1990,19 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             loaded2 = jldopen(f -> f["manifest"]::ModelManager._ProblemManifest, path2)
             @test !ModelManager._isCompleteManifest(loaded2)
             @test isnothing(loaded2.summary_statistic)
+
+            # A closure-backed QoI -- a named inner function, the shape the old check let through --
+            # is stripped like a lambda, so no manifest is written that a fresh session cannot read.
+            prob_closure = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                              QoI("x", _make_closure(1.0)), _test_named_dist, 1, var_id)
+            @test isnothing(ModelManager._ProblemManifest(prob_closure).summary_statistic)
+            # ...while a callable struct is kept: JLD2 restores it as a type plus fields.
+            prob_functor = CalibrationProblem(inputs, CalibrationParameter[cp_dv], obs,
+                                              QoI("x", _Functor(1)), _test_named_dist, 1, var_id)
+            @test ModelManager._isCompleteManifest(ModelManager._ProblemManifest(prob_functor))
         end
     end
+
 
     @testset "_validateStructuralMatch" begin
         xp  = XMLPath(["overall", "max_time"])
@@ -4073,7 +4122,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test seen[end] === Simulation          # GSA: a Simulation, not a bare Int
 
                 empty!(seen)
-                ModelManager._asPostProcessor(rec)(Simulation(sid))
+                # Named, so the sink accepts it: `rec` is defined inside this testset and is therefore
+                # a closure, whose derived name the sink refuses to store under.
+                ModelManager._asPostProcessor(QoI("rec", rec))(Simulation(sid))
                 @test seen[end] === Simulation          # sink: a Simulation, not a SimulationProcess
 
                 # A QoI's compute already received a Simulation, so the two now agree exactly.
@@ -4084,6 +4135,18 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # And a bare function's name is regularised so it can be a column / Dict key.
                 @test ModelManager._qoiNameFromFunction(_sim_one) == "_sim_one"
                 @test occursin(r"^anon_[0-9_]+$", ModelManager._qoiNameFromFunction(s -> 1.0))
+                # A closure's name comes from its type, as an `anon_…` form: `make("a")` and
+                # `make("b")` both answer `nameof` with `:f`, so the bare name identifies nothing --
+                # and the same factory's closures still share the derived name, which is why such a
+                # name is never used to skip work or to store under.
+                @test startswith(ModelManager._qoiNameFromFunction(_make_closure(1)), "anon")
+                @test ModelManager._qoiNameFromFunction(_make_closure(1)) ==
+                      ModelManager._qoiNameFromFunction(_make_closure(2))
+                @test ModelManager._isAutoNamedAnonymous(ModelManager._asQoI(_make_closure(1)))
+                @test !ModelManager._isAutoNamedAnonymous(QoI("chosen", _make_closure(1)))
+                @test !ModelManager._isAutoNamedAnonymous(ModelManager._asQoI(_sim_one))
+                # A real name is kept whatever alphabet it uses, rather than mangled to `anon_star`.
+                @test ModelManager._qoiNameFromFunction(μstar_top) == "μstar_top"
             end
 
             @testset "_declaresSimulation survives every method signature shape" begin
@@ -4338,6 +4401,52 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 none = verifyStoredValues(QoI("no_such_column", _qoi_sim), t)
                 @test none.n_missing == length(sids)
                 @test none.n_agreed == 0
+
+                # The read side mirrors the write side. A String comes back as text rather than
+                # crashing in a Float64 conversion, and a keyed value -- which the sink spread into
+                # `<name>.<key>` columns -- is reassembled into a Dict with String keys.
+                t2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1451.0, 1457.0])];
+                                 n_replicates=2, use_previous=false)
+                run(t2; post_processor=[QoI("stored_label", _qoi_label), QoI("stored_pair", _qoi_pair)])
+                waitForDiagnostics()
+                sid2 = first(simulationIDs(t2))
+                @test ModelManager._storedValue("stored_label", sid2) == _qoi_label(Simulation(sid2))
+                pair = _qoi_pair(Simulation(sid2))
+                @test ModelManager._storedValue("stored_pair", sid2) == Dict("a" => pair.a, "b" => pair.b)
+                # :require finds the spread value; before, it reported "no stored value".
+                @test ModelManager._computeOn(QoI("stored_pair", s -> error("compute must not run"); stored=:require), sid2) ==
+                      Dict("a" => pair.a, "b" => pair.b)
+                # verifyStoredValues compares text with isequal and keyed values key by key.
+                @test verifyStoredValues(QoI("stored_label", _qoi_label), t2).n_mismatched == 0
+                repk = verifyStoredValues(QoI("stored_pair", _qoi_pair), t2)
+                @test repk.n_mismatched == 0
+                @test repk.n_agreed + repk.n_unverifiable == length(simulationIDs(t2))
+                badk = verifyStoredValues(QoI("stored_pair", s -> (; a = 1e9, b = 1e9)), t2)
+                if badk.n_unverifiable < length(simulationIDs(t2))
+                    @test badk.n_mismatched > 0
+                    @test badk.mismatches[1].stored isa Dict
+                end
+                # A compute that cannot see the output any more is unverifiable, not a mismatch.
+                gone = verifyStoredValues(QoI("stored_pair", s -> missing), t2)
+                @test gone.n_mismatched == 0
+                @test gone.n_unverifiable == length(simulationIDs(t2))
+            end
+
+            @testset "_loadProblem: an unreadable problem.jld2 names the way out" begin
+                # Whatever JLD2 cannot reconstruct -- a closure only the saving session could name is
+                # the realistic case -- must not surface as a raw MethodError from inside JLD2, and
+                # must not block the documented `problem=` rescue, which used to fail identically
+                # because the file was read before the supplied problem was consulted.
+                cal = ModelManager.createCalibration("ABCSMC"; description="unreadable manifest")
+                folder = ModelManager.calibrationFolder(cal)
+                mkpath(folder)
+                write(joinpath(folder, "problem.jld2"), "not a JLD2 file")
+                err = try; ModelManager._loadProblem(cal); nothing; catch e; e; end
+                @test err isa ErrorException
+                @test occursin("could not be read back", err.msg)
+                @test occursin("problem=my_problem", err.msg)
+                # With a problem in hand the caller is warned and gets `nothing` back to use it.
+                @test (@test_logs (:warn, r"could not be read back") ModelManager._loadProblem(cal; required=false)) === nothing
             end
 
             @testset "sensitivity on a discrepancy-to-data QoI" begin
@@ -4423,6 +4532,22 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # second `run`, because each run draws a fresh LHS design — comparing across two
                 # designs would compare two different questions.
                 calculateGSA!(gsa, [QoI("x", s -> _pair(s)["x"]), QoI("y", s -> _pair(s)["y"])])
+
+                # An auto-named closure is never "already evaluated": two closures from one factory
+                # share the derived name, so the name proves nothing about what sits under the label.
+                calls = Ref(0)
+                counting = _make_counting(calls)
+                calculateGSA!(gsa, [counting]); n_first = calls[]
+                @test n_first > 0
+                calculateGSA!(gsa, [counting])
+                @test calls[] == 2n_first                       # re-evaluated, not skipped
+                @test !ModelManager._hasGSAResults(gsa, ModelManager._asQoI(counting))
+                # Give it a name and the skip applies again.
+                calculateGSA!(gsa, [QoI("counted", counting)]); n_named = calls[]
+                calculateGSA!(gsa, [QoI("counted", counting)])
+                @test calls[] == n_named
+                # Leave `results` as the assertions below expect it.
+                filter!(p -> !(p.first == "counted" || startswith(p.first, "anon")), gsa.results)
                 @test ModelManager.gsaLabels(gsa) == ["counts.x", "counts.y", "x", "y"]
                 @test vec(gsa.results["counts.x"].means_star) ≈ vec(gsa.results["x"].means_star)
                 @test vec(gsa.results["counts.y"].means_star) ≈ vec(gsa.results["y"].means_star)
@@ -6731,20 +6856,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             RUNNING = ModelManager.statusCodeID("Running")
             QUEUED  = ModelManager.statusCodeID("Queued")
 
+            NOT_STARTED = ModelManager.statusCodeID("Not Started")
+
             # IDs captured up front: failing every simulation empties the monad, which deletes it.
             monad = Monad(InputFolders(config="default"); n_replicates=3)
             ids = simulationIDs(monad)
             _throw_in_run[] = true
             try
                 @test_throws Exception run(monad; quiet=true)
-                # `run` throws from its completion loop the moment it sees the first error, while
-                # the worker tasks are still draining the queue. Wait for them *before* clearing the
-                # flag, or the stragglers run successfully and the end state is not what was tested.
+                # `run` throws from its completion loop the moment it sees the first error. Its
+                # `finally` closes the queue, so a simulation no worker has picked up yet goes back
+                # to "Not Started"; one a worker already holds is run (and here, fails). Which of
+                # the later two each is depends on scheduling, so both outcomes are accepted --
+                # what must never remain is a row at "Queued" or "Running".
                 @test timedwait(() -> all(statusOf(id) ∉ (RUNNING, QUEUED) for id in ids), 20.0) === :ok
             finally
                 _throw_in_run[] = false
             end
-            @test all(statusOf(id) == FAILED for id in ids)   # every one recorded, none stranded
+            @test any(statusOf(id) == FAILED for id in ids)              # the one that threw was recorded
+            @test all(statusOf(id) ∈ (FAILED, NOT_STARTED) for id in ids)  # none stranded
         end
     end
 
@@ -6764,6 +6894,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             #!/bin/sh
             echo "\$@" >> "$shim/sbatch.log"
             [ -e "$shim/sbatch.fail" ] && { echo "boom: bad partition" >&2; exit 1; }
+            if [ -e "$shim/sbatch.transient" ]; then
+              n=\$(cat "$shim/sbatch.transient")
+              if [ "\$n" -gt 0 ]; then
+                echo \$((n - 1)) > "$shim/sbatch.transient"
+                echo "sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)" >&2
+                exit 1
+              fi
+            fi
             while ! mkdir "$shim/sbatch.lock" 2>/dev/null; do sleep 0.01; done
             id=\$(cat "$shim/sbatch.next_id")
             echo \$((id + 1)) > "$shim/sbatch.next_id"
@@ -6787,7 +6925,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         function _reset_hpc!()
             MM._queue_snapshot[] = MM._QueueSnapshot(0, nothing)
             MM._last_stray_sweep[] = 0
-            for f in ("sbatch.fail", "squeue.fail", "squeue.sleep", "sbatch.log", "squeue.log")
+            MM._SUBMIT_BACKOFF_BASE_S[] = 2.0
+            for f in ("sbatch.fail", "sbatch.transient", "squeue.fail", "squeue.sleep", "sbatch.log", "squeue.log")
                 rm(joinpath(shim, f); force=true)
             end
             _next_job!(1)
@@ -6859,7 +6998,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _reset_hpc!()
                 _next_job!(9101)
                 touch(joinpath(shim, "squeue.fail"))
-                tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:3]
+                # Real simulations: the HPC path now carries the `Simulation` (job options are
+                # functions of it), so a bare integer that names no row is no longer a usable label.
+                sims3 = [Simulation(InputFolders(config="default")) for _ in 1:3]
+                tasks = [@async MM._runHPCSimulation(`true`, s.id) for s in sims3]
                 @test timedwait(() -> _calls("squeue.log") >= 2, 15.0) === :ok   # the reaper kept trying
                 @test all(!istaskdone(t) for t in tasks)        # and concluded nothing from failures
                 for n in 1:3
@@ -6919,7 +7061,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 setHPCCompletionOptions(reap_interval=0.1, grace_period=3600.0)
                 _next_job!(9400)
                 _queue!(9400:9419...)
-                tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:20]
+                sims20 = [Simulation(InputFolders(config="default")) for _ in 1:20]
+                tasks = [@async MM._runHPCSimulation(`true`, s.id) for s in sims20]
                 # Wait for the reaper to have refreshed a few times, rather than sleeping a fixed
                 # span and asserting a rate -- the rate depends on machine load, and the invariant
                 # under test does not. Over this window 20 workers poll ~dozens of times each; if
@@ -6933,12 +7076,101 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 setHPCCompletionOptions(reap_interval=0.05, grace_period=0.0)
             end
 
-            @testset "a rejected submission fails the simulation instead of hanging" begin
+            @testset "a refused submission stops the run and leaves the simulations pending" begin
+                # A refusal is not a result: no job ran. It used to be recorded as a failed
+                # simulation, which erased the simulation from its monad -- and since a refused
+                # worker returns at once and takes the next spec, a submit limit smaller than the
+                # parallelism shredded a whole campaign in seconds. Now it throws, `run` fails fast
+                # naming the submission stage, and every simulation is left pending.
                 _reset_hpc!()
                 touch(joinpath(shim, "sbatch.fail"))
-                @test MM._runHPCSimulation(`true`, sim.id) === nothing
-                # The rejection reason is on disk, not only in the log.
+                @test_throws MM._SubmissionRefused MM._runHPCSimulation(`true`, sim.id)
+                # The rejection reason is on disk, not only in the error.
                 @test occursin("boom", read(joinpath(MM.trialFolder(Simulation, sim.id), "hpc.err"), String))
+                # "bad partition" is not a message that clears up on its own: one attempt, no retry.
+                @test _calls("sbatch.log") == 1
+
+                _status(id) = MM.queryToDataFrame(
+                    MM.constructSelectQuery("simulations", "WHERE simulation_id=$(id)";
+                                            selection="status_code_id"); is_row=true)[1, :status_code_id]
+                NOT_STARTED = MM.statusCodeID("Not Started")
+                @test mm_globals().run_on_hpc                     # the shim on PATH made init detect SLURM
+                monad = Monad(InputFolders(config="default"); n_replicates=3)
+                ids = simulationIDs(monad)
+                _use_default_run[] = true                         # TestSimulator normally bypasses sbatch
+                try
+                    err = try
+                        run(monad; quiet=true)
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa MM._SimulationStageError
+                    @test occursin("SLURM submission", sprint(showerror, err))
+                    @test occursin("boom", sprint(showerror, err))
+                    # `run` throws on the first refusal while the worker is still draining the queue.
+                    # Wait for it to finish BEFORE switching the backend override back, or the
+                    # stragglers run through TestSimulator's no-op and complete instead.
+                    @test timedwait(() -> all(_status(id) == NOT_STARTED for id in ids), 20.0) === :ok
+                finally
+                    _use_default_run[] = false
+                end
+                # Nothing was recorded as failed, so nothing was erased from the monad.
+                @test sort(constituentIDs(Monad, monad.id)) == sort(ids)
+                rm(joinpath(shim, "sbatch.fail"))
+            end
+
+            @testset "a transient refusal is retried until it clears" begin
+                # The QOS submit-limit message is what a user sees when parallelism exceeds
+                # MaxSubmitJobs; it clears as earlier jobs finish, so the worker waits rather than
+                # giving up. The sentinel path is chosen once, before the first attempt, so the
+                # eventual job writes where the worker is already waiting.
+                _reset_hpc!()
+                MM._SUBMIT_BACKOFF_BASE_S[] = 0.01
+                write(joinpath(shim, "sbatch.transient"), "3")   # refuse three times, then accept
+                _next_job!(9301)
+                _queue!(9301)
+                t = @async MM._runHPCSimulation(`true`, sim.id)
+                @test timedwait(() -> _calls("sbatch.log") >= 4, 10.0) === :ok
+                @test !istaskdone(t)
+                _publish(0; nth=4)
+                @test fetch(t) == 0
+                @test _calls("sbatch.log") == 4
+            end
+
+            @testset "a transient refusal that outlasts submit_retry_period is a refusal" begin
+                _reset_hpc!()
+                MM._SUBMIT_BACKOFF_BASE_S[] = 0.01
+                setHPCCompletionOptions(submit_retry_period=0.2)
+                write(joinpath(shim, "sbatch.transient"), "1000")
+                @test_throws MM._SubmissionRefused MM._runHPCSimulation(`true`, sim.id)
+                @test _calls("sbatch.log") > 1                    # it did retry before giving up
+                setHPCCompletionOptions(submit_retry_period=900.0)
+            end
+
+            @testset "the shipped job options: a name, and the backend's CPU count" begin
+                # No memory or time request: those are the site's to choose until the user says
+                # otherwise, and a too-small default is a silent kill plus minutes of reaper latency.
+                @test Set(keys(MM.defaultJobOptions())) == Set(["job-name", "cpus-per-task"])
+                flags(cmd) = collect(MM._prepareHPCSubmitCommand(cmd, sim.id, joinpath(done_dir, "s")).exec)
+                # TestSimulator leaves `simulationThreads` at its default, so no CPU count is
+                # requested and the site's default applies; the job name is still there.
+                @test "--job-name=S$(sim.id)" in flags(`echo hi`)
+                @test !any(startswith("--cpus-per-task="), flags(`echo hi`))
+                # A backend that reports a thread count gets it requested, per simulation.
+                _test_threads[] = 6
+                @test "--cpus-per-task=6" in flags(`echo hi`)
+                _test_threads[] = nothing
+                # A Function-valued option receives the Simulation about to be submitted, and
+                # `nothing` from it omits the flag for that simulation.
+                setJobOptions(Dict("comment" => s -> "sim$(s.id)", "qos" => s -> nothing))
+                @test "--comment=sim$(sim.id)" in flags(`echo hi`)
+                @test !any(startswith("--qos="), flags(`echo hi`))
+                delete!(mm_globals().sbatch_options, "comment")
+                delete!(mm_globals().sbatch_options, "qos")
+                # Keys name sbatch flags, so they are Strings; anything else is refused up front.
+                @test_throws ArgumentError setJobOptions(Dict(:time => "01:00:00"))
+                @test !haskey(mm_globals().sbatch_options, "time")
             end
 
             @testset "the submission's own streams are kept as hpc.out / hpc.err" begin
@@ -7170,8 +7402,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             @testset "sbatch options cannot claim reserved flags" begin
                 for reserved in MM._RESERVED_SBATCH_KEYS
-                    setJobOptions(Dict(reserved => "x"))
-                    @test_throws AssertionError MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "x"))
+                    # Refused when set, so the mistake surfaces before any job is built...
+                    @test_throws ArgumentError setJobOptions(Dict(reserved => "x"))
+                    @test !haskey(mm_globals().sbatch_options, reserved)
+                    # ...and again when rendered, for a value written into the Dict by hand.
+                    mm_globals().sbatch_options[reserved] = "x"
+                    @test_throws ArgumentError MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "x"))
                     delete!(mm_globals().sbatch_options, reserved)
                 end
             end

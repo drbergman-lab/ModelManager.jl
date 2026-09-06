@@ -24,18 +24,40 @@ useHPC(false)   # force local execution even on a cluster login node
 
 ## Job options
 
-SLURM job parameters are held in a `Dict` of `sbatch` options. [`defaultJobOptions`](@ref)
-provides sensible defaults; [`setJobOptions`](@ref) merges your overrides in:
+SLURM job parameters are held in a `Dict` of `sbatch` options. [`defaultJobOptions`](@ref) sets
+two: a job name, `S<simulation id>`, and `cpus-per-task` from the backend's `simulationThreads`
+when it implements that hook (PhysiCellModelManager does, from the config's `omp_num_threads`).
+Time, memory and partition are the site's defaults until you say otherwise with
+[`setJobOptions`](@ref):
 
 ```julia
 setJobOptions(Dict(
-    "time"      => "02:00:00",
-    "mem"       => "8G",
-    "partition" => "compute",
+    "time"          => "02:00:00",
+    "mem"           => "8G",
+    "cpus-per-task" => 6,
+    "partition"     => "compute",
 ))
 ```
 
-These options are applied to every job the runner submits for the current session.
+Set `time` and `mem` explicitly. A job the scheduler kills for exceeding either writes no exit
+code, so it is only noticed by the reaper described below -- several minutes later, per job. If
+your backend does not implement `simulationThreads`, set `cpus-per-task` yourself to the thread
+count the simulator actually uses: SLURM allocates one CPU by default, and a simulator that starts
+more threads than that runs them all on one core. A value may be a function of the `Simulation`
+about to be submitted, so an option can follow a varied parameter; returning `nothing` omits the
+flag for that simulation:
+
+```julia
+setJobOptions(Dict("comment" => simulation -> "monad \$(only(monadIDs(simulation)))"))
+```
+
+These options are applied to every job the runner submits for the current session. The flags
+ModelManager renders itself (`wrap`, `output`, `error`, `wait`, `parsable`, `chdir`) cannot be set.
+
+`setNumberOfParallelSims` bounds how many jobs are in the queue at once, and its default is 1 --
+one job at a time, however large the cluster. Raise it, but not above your per-user submit limit
+(`sacctmgr show qos format=name,maxsubmitjobsperuser`): a submission the scheduler refuses for that
+reason is retried for a while, then stops the run.
 
 ## How jobs are launched
 
@@ -46,6 +68,41 @@ submit a job.
 
 Each job still writes its own `output.log` and `output.err` into that simulation's output folder,
 and `setNumberOfParallelSims` still bounds how many jobs sit in the queue at once.
+
+### When `sbatch` refuses a job
+
+A refused submission is not a failed simulation: no job ran, so nothing is known about the
+simulation, and it is left pending rather than recorded as failed. What happens next depends on
+the refusal:
+
+- A message that clears up on its own -- a per-user submit limit while earlier jobs drain, a
+  controller that is not answering -- is retried with backoff for up to `submit_retry_period`
+  (default 15 minutes; see [`setHPCCompletionOptions`](@ref)). A warning says so the first time.
+- Anything else (a wrong partition, an invalid option, no `sbatch` on this machine), or a
+  transient refusal that outlasts the period, stops the run immediately with the scheduler's own
+  message. Every simulation not yet submitted is back at `Not Started`, so fixing the problem and
+  calling `run` again continues where it stopped. Jobs that were already submitted keep running
+  and are recorded as they finish, as long as the Julia session stays alive.
+
+### Interrupting a run
+
+Ctrl-C stops `run` from submitting anything further and returns the not-yet-submitted simulations
+to `Not Started`. Jobs already in the queue are *not* cancelled: they run to completion and, if the
+Julia session is still alive, their outcomes are recorded. To abandon them, `scancel` them
+yourself -- each simulation's folder holds its job ID in `hpc.out`, and the default job name is
+`S<simulation id>`, so `scancel --name=S123` also works.
+
+### Keeping the driver alive
+
+The Julia process that called `run` is what waits for the jobs and records their outcomes; if it
+dies, the jobs still finish but nothing writes their results to the database, and the simulations
+they belonged to stay at `Running`. Run long campaigns from a session that survives your login
+shell -- `tmux`, `screen`, `nohup julia script.jl &`, or a batch job whose time limit covers the
+whole campaign (submitting jobs from inside a job is allowed on most clusters). If a driver does
+die, its simulations can be found with `simulationsTable` filtered on status, and reset with
+`deleteSimulationsByStatus("Running")` once their jobs have finished or been cancelled -- check
+`sacct --name=S<id>` first, since a job still running will otherwise write into a folder whose
+simulation ID has been reused.
 
 ## How completion is detected
 
@@ -61,6 +118,10 @@ queries the controller on a 2-to-32-second cycle, so one waiter per simulation p
 slurmctld proportional to your parallelism — and worst for short simulations, because every waiter
 restarts that cycle at two seconds.
 
+A job the scheduler kills therefore takes a while to be noticed: up to one `reap_interval` for
+the queue snapshot to refresh, plus the `grace_period`, plus a second snapshot -- five to ten
+minutes with the defaults. Each such job is reported with its job ID so `sacct -j` can say why.
+
 Tune it with [`setHPCCompletionOptions`](@ref):
 
 ```julia
@@ -69,6 +130,7 @@ setHPCCompletionOptions(
     poll_interval = 1.0,     # seconds between a worker's checks for its own sentinel
     reap_interval = 300.0,   # how long one squeue answer is shared before it is refreshed
     grace_period  = 270.0,   # how long a vanished job may take to produce its sentinel
+    submit_retry_period = 900.0,  # how long a transiently refused submission is retried
 )
 ```
 
@@ -76,8 +138,17 @@ The one setting worth knowing about is `done_dir`. NFS caches directory attribut
 seconds by default, which delays how quickly a sentinel written on a compute node becomes visible
 to your driver. Lustre and GPFS have no such delay. If your project lives on NFS and you want
 faster turnaround, point `done_dir` at a faster filesystem — **only the sentinel directory needs to
-move; your `data/` can stay where it is.** Sentinels live for seconds and are consumed and deleted,
-so a purge policy on scratch cannot harm them.
+move; your `data/` can stay where it is.** It must be mounted at the same path on every compute
+node: a job that cannot write its sentinel there looks exactly like a job the scheduler killed.
+Sentinels live for seconds and are consumed and deleted, so a purge policy on scratch cannot harm
+them.
+
+### Finding a job again
+
+Each simulation's folder holds the `sbatch` client's own output in `hpc.out` (the job ID) and
+`hpc.err` (a refusal message, if any), beside the `output.log`/`output.err` the job itself wrote.
+With the default job name, `sacct --name=S<simulation id>` finds the scheduler's record without
+opening either file.
 
 ## Filesystem safety on shared clusters
 

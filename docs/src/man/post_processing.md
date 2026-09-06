@@ -43,14 +43,17 @@ provide loaders keyed by `simulationID`.
 
 The return value decides storage:
 
-- `nothing` → nothing is stored (pure side effects — compute, write files, or clean up however
-  you like).
-- a `NamedTuple` or `AbstractDict` of `name => scalar` (where each value is a `Real`, `Bool`, or
-  `String`) → one row (keyed by `simulation_id`) is upserted into the project's post-processing
-  sink at `data/outputs/postprocessing.db`. Columns are added on demand, so a quantity not
-  computed for a given simulation reads back as `missing`; re-running overwrites that
-  simulation's row. Anything else (including a non-scalar value such as a vector) raises an
-  `ArgumentError`.
+- `nothing` (or `missing`) → nothing is stored (pure side effects — compute, write files, or clean
+  up however you like).
+- a scalar (`Real`, `Bool`, or `String`) → stored under the QoI's own name: one row (keyed by
+  `simulation_id`) is upserted into the project's post-processing sink at
+  `data/outputs/postprocessing.db`.
+- a `NamedTuple` or `AbstractDict` of `name => scalar` → the same row, with one column per key
+  named `<qoi name>.<key>` (see below).
+
+Columns are added on demand, so a quantity not computed for a given simulation reads back as
+`missing`; re-running overwrites that simulation's row. Anything else (including a non-scalar
+value such as a vector) raises an `ArgumentError`.
 
 !!! note "Every column is named `<qoi name>.<key>`"
     A returned key does not become a bare column: it is prefixed with the name of the [`QoI`](@ref)
@@ -131,6 +134,22 @@ Quantities and [tags](@ref tagging) are both keyed by
 ids = findSimulationIDs(tags = ("project" => "immune-escape",), status = "Completed")
 innerjoin(simulationsTable(ids; tags = true), postProcessingTable(ids), on = :SimID)
 ```
+
+## Reading stored values later
+
+A [`QoI`](@ref) can read the value the sink stored instead of recomputing it — useful once a
+backend's cleanup has removed the output it was computed from:
+
+```julia
+tumor = QoI("tumor", measureTumor; stored=:prefer)    # stored value if present, else compute
+tumor = QoI("tumor", measureTumor; stored=:require)   # stored value, or an error
+```
+
+The default is `stored=:never`, because nothing records which `compute` produced a stored value.
+A value is read back as it was written: a `String` or `Bool` comes back as stored, and a keyed
+QoI is reassembled from its `<name>.<key>` columns into a `Dict` with `String` keys.
+[`verifyStoredValues`](@ref) recomputes wherever a simulation's output still exists and reports
+agreements, mismatches, and how many values could not be checked.
 
 ## Lifecycle and error handling
 

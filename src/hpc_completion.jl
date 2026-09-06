@@ -251,10 +251,13 @@ function _waitForHPCJob(job_id::Int, sentinel::String, submitted_at::UInt64)
         end
         gone_since = something(gone_since, time_ns())
         if snap.taken_at > gone_since && _elapsedSeconds(gone_since) >= opts.grace_period
+            #! One line per reaped job, deliberately uncapped: the job ID is the only handle on
+            #! the scheduler's own record of what happened, and a campaign whose jobs are all
+            #! being killed should say so for every one of them.
             @warn "SLURM job $(job_id) left the queue without recording an exit code; treating the \
                    simulation as failed. This is what a job killed by the scheduler (out of memory, \
                    time limit, node failure) or cancelled while pending looks like — check its \
-                   output.err and `sacct -j $(job_id)`." maxlog=10
+                   output.err and `sacct -j $(job_id)`."
             return nothing
         end
     end
@@ -316,35 +319,97 @@ function _recordSubmissionOutput(simulation_id::Int, stdout_text::AbstractString
 end
 
 """
-    _submitHPCJob(cmd::Cmd, simulation_id::Int) → Union{Nothing,Int}
+    _SubmissionRefused <: Exception
 
-Run the prepared `sbatch` command and return the job ID, or `nothing` if submission failed.
+`sbatch` would not take the job: it could not be invoked, it exited non-zero, or its output held no
+job ID. Thrown by `_submitHPCJob` once its retry policy is exhausted; `run` turns it into a
+fail-fast error naming the simulation.
+
+A refusal is not a simulation failure. The job never existed, so nothing is known about the
+simulation -- what is wrong is the environment: a per-user submit limit, a controller that is not
+answering, a mistyped partition, no `sbatch` on this machine. Recording it as `Failed` would erase
+the simulation from its monad, and since a refused worker returns at once and takes the next spec,
+a persistent refusal would shred a whole campaign in seconds. Instead the simulation goes back to
+`Not Started` and the run stops.
 """
-function _submitHPCJob(cmd::Cmd, simulation_id::Int)
+struct _SubmissionRefused <: Exception
+    simulation_id::Int
+    message::String
+end
+
+Base.showerror(io::IO, e::_SubmissionRefused) =
+    print(io, "sbatch refused the job for simulation $(e.simulation_id): $(e.message)")
+
+#! Refusals that clear up on their own: a submit limit while earlier jobs drain, a controller too
+#! busy to answer. Matched on sbatch's own wording, because every refusal exits 1. Anything not
+#! matched is treated as permanent and fails fast -- a wrong partition or option does not fix
+#! itself, and retrying it would only delay the message. The QOS wording is shared between a submit
+#! *count* limit (transient) and a size or time limit (permanent); retrying the latter for
+#! `submit_retry_period` is the price of not failing the former.
+const _TRANSIENT_REFUSAL_PATTERNS = (
+    r"QOS"i, r"MaxSubmitJob"i, r"job submit limit"i, r"AssocMax"i,
+    r"Socket timed out"i, r"Unable to contact"i, r"connect failure"i,
+    r"Resource temporarily unavailable"i, r"Zero Bytes were transmitted"i, r"try again"i,
+)
+_isTransientRefusal(message::AbstractString) = any(p -> occursin(p, message), _TRANSIENT_REFUSAL_PATTERNS)
+
+#! Retry cadence: doubles from the base to the cap. `Ref`s only so the tests can shrink them; the
+#! user-facing knob is the total, `HPCCompletionOptions.submit_retry_period`.
+const _SUBMIT_BACKOFF_BASE_S = Ref(2.0)
+const _SUBMIT_BACKOFF_MAX_S = Ref(60.0)
+
+"""
+    _trySubmit(cmd::Cmd, simulation_id::Int) → Union{Int,String}
+
+Run the prepared `sbatch` command once. Return the job ID, or the refusal as a message. The
+client's own streams are written to `hpc.out`/`hpc.err` either way.
+"""
+function _trySubmit(cmd::Cmd, simulation_id::Int)
     out = IOBuffer()
     err = IOBuffer()
     p = try
         run(pipeline(ignorestatus(cmd); stdout=out, stderr=err))
     catch e
-        @error "Failed to invoke sbatch for simulation $(simulation_id)." exception=(e, catch_backtrace())
-        _recordSubmissionOutput(simulation_id, "", "sbatch could not be invoked: $(e)")
-        return nothing
+        message = "sbatch could not be invoked: $(sprint(showerror, e))"
+        _recordSubmissionOutput(simulation_id, "", message)
+        return message
     end
-    #! Drained once: an IOBuffer cannot be read twice, and both the log line and the file need it.
+    #! Drained once: an IOBuffer cannot be read twice, and both the message and the file need it.
     stdout_text = String(take!(out))
     stderr_text = String(take!(err))
     _recordSubmissionOutput(simulation_id, stdout_text, stderr_text)
-    if !success(p)
-        @error "sbatch rejected the job for simulation $(simulation_id) (exit $(p.exitcode)): $(strip(stderr_text))"
-        return nothing
-    end
+    success(p) || return "sbatch exited $(p.exitcode): $(strip(stderr_text))"
     job_id = _parseJobID(stdout_text)
-    #! Getting this wrong is worse than a failed submission: the job runs, and nothing waits for it.
-    #! So the raw output goes in the message -- a site wrapper with an unexpected format is then a
-    #! one-line diagnosis instead of an orphaned job.
-    isnothing(job_id) && @error "Could not find exactly one job ID in sbatch's output for simulation \
-                                 $(simulation_id). Output was:\n$(stdout_text)"
+    #! Getting this wrong is worse than a refusal: the job runs, and nothing waits for it. So the
+    #! raw output goes in the message -- a site wrapper with an unexpected format is then a one-line
+    #! diagnosis instead of an orphaned job.
+    isnothing(job_id) && return "could not find exactly one job ID in sbatch's output. Output was:\n$(stdout_text)"
     return job_id
+end
+
+"""
+    _submitHPCJob(cmd::Cmd, simulation_id::Int) → Int
+
+Run the prepared `sbatch` command and return the job ID. A refusal whose message looks transient is
+retried with backoff for up to `HPCCompletionOptions.submit_retry_period`; any other refusal, or a
+transient one that outlasts that period, throws `_SubmissionRefused`.
+"""
+function _submitHPCJob(cmd::Cmd, simulation_id::Int)
+    period = mm_globals().hpc_completion.submit_retry_period
+    started = time_ns()
+    attempt = 0
+    while true
+        attempt += 1
+        outcome = _trySubmit(cmd, simulation_id)
+        outcome isa Int && return outcome
+        (_isTransientRefusal(outcome) && _elapsedSeconds(started) < period) ||
+            throw(_SubmissionRefused(simulation_id, outcome))
+        attempt == 1 && @warn "sbatch refused the job for simulation $(simulation_id) with a message \
+                               that usually clears up on its own; retrying for up to \
+                               $(round(Int, period)) s. If this is a per-user submit limit, set \
+                               `setNumberOfParallelSims` to at most that limit.\n$(outcome)" maxlog=1
+        sleep(min(_SUBMIT_BACKOFF_BASE_S[] * 2.0^(attempt - 1), _SUBMIT_BACKOFF_MAX_S[]))
+    end
 end
 
 """
@@ -366,16 +431,20 @@ function _parseJobID(stdout_text::AbstractString)
 end
 
 """
-    _runHPCSimulation(cmd::Cmd, simulation_id::Int) → Union{Nothing,Int}
+    _runHPCSimulation(cmd::Cmd, simulation::Simulation) → Union{Nothing,Int}
 
 Submit `cmd` as a SLURM job, block until it finishes, and return its exit code -- or `nothing` if
-it never produced one, because `sbatch` refused it or the scheduler lost it before it could write.
-The caller decides what a nonzero code means; this only reports it.
+it never produced one because the scheduler lost it before it could write. A submission `sbatch`
+refuses throws `_SubmissionRefused` instead: no job ran, so there is no outcome to report. The
+caller decides what a nonzero code means; this only reports it.
 
 Blocking the calling worker is what preserves the throttle: `max_number_of_parallel_simulations`
 bounds how many jobs sit in the queue exactly as it did under `sbatch --wait`.
 """
-function _runHPCSimulation(cmd::Cmd, simulation_id::Int)
+_runHPCSimulation(cmd::Cmd, simulation_id::Int) = _runHPCSimulation(cmd, Simulation(simulation_id))
+
+function _runHPCSimulation(cmd::Cmd, simulation::Simulation)
+    simulation_id = simulation.id
     done_dir = _hpcDoneDir()
     _sweepStraysIfDue(done_dir)
     #! The sentinel's name is chosen here, before submission, and baked into the job script. It has
@@ -389,7 +458,6 @@ function _runHPCSimulation(cmd::Cmd, simulation_id::Int)
     #! fast job's real sentinel.) The job ID is used only for the reaper's liveness check, where a
     #! recycled ID can at worst delay a reap, never produce a wrong result.
     sentinel = joinpath(done_dir, "$(simulation_id).$(string(time_ns(); base=16))")
-    job_id = _submitHPCJob(_prepareHPCSubmitCommand(cmd, simulation_id, sentinel), simulation_id)
-    isnothing(job_id) && return nothing
+    job_id = _submitHPCJob(_prepareHPCSubmitCommand(cmd, simulation, sentinel), simulation_id)
     return _waitForHPCJob(job_id, sentinel, time_ns())
 end
