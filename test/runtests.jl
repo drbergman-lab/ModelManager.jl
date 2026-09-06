@@ -1639,6 +1639,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             ["x", "y"]
         )
         param_names = ["x", "y"]
+        priors = [Uniform(0, 1), Uniform(0, 1)]
         k_eff  = 2     # grid = {0.25, 0.5, 0.75}
         radius = 0.1
 
@@ -1646,19 +1647,19 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
         # Bank hit: monad 99 at (0.52, 0.48) is within radius 0.1 of original (0.49, 0.51)
         eff, mid = ModelManager._lookupAndSnap(
-            Dict("x" => 0.49, "y" => 0.51), param_names, k_eff, radius, bank, mid_gen)
+            Dict("x" => 0.49, "y" => 0.51), param_names, priors, k_eff, radius, bank, mid_gen)
         @test mid == 99
         @test eff["x"] ≈ 0.52   # bank monad's actual CDF coords
         @test eff["y"] ≈ 0.48
 
         # Bank hit again with same proposal — bank reuse is always allowed (duplicates OK)
         eff2, mid2 = ModelManager._lookupAndSnap(
-            Dict("x" => 0.49, "y" => 0.51), param_names, k_eff, radius, bank, mid_gen)
+            Dict("x" => 0.49, "y" => 0.51), param_names, priors, k_eff, radius, bank, mid_gen)
         @test mid2 == 99   # same bank monad returned again
 
         # No bank hit → snap coords returned, mid is nothing (resolved later by evaluate_batch)
         eff3, mid3 = ModelManager._lookupAndSnap(
-            Dict("x" => 0.26, "y" => 0.74), param_names, k_eff, radius, bank, mid_gen)
+            Dict("x" => 0.26, "y" => 0.74), param_names, priors, k_eff, radius, bank, mid_gen)
         @test eff3["x"] ≈ 0.25   # snapped (no bank hit at (0.26, 0.74))
         @test eff3["y"] ≈ 0.75
         @test isnothing(mid3)
@@ -1666,14 +1667,35 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         # mid_gen hit: after registering mid 200, same proposal reuses it
         push!(mid_gen, ([0.25, 0.75], 200))
         eff4, mid4 = ModelManager._lookupAndSnap(
-            Dict("x" => 0.26, "y" => 0.74), param_names, k_eff, radius, bank, mid_gen)
+            Dict("x" => 0.26, "y" => 0.74), param_names, priors, k_eff, radius, bank, mid_gen)
         @test mid4 == 200   # mid_gen candidate found
 
         # No bank or mid_gen hit → returns nothing for mid
         eff5, mid5 = ModelManager._lookupAndSnap(
-            Dict("x" => 0.01, "y" => 0.99), param_names, k_eff, radius, bank, mid_gen)
+            Dict("x" => 0.01, "y" => 0.99), param_names, priors, k_eff, radius, bank, mid_gen)
         @test eff5 isa Dict{String,Float64}
         @test isnothing(mid5)
+
+        # A discrete prior exempts its coordinate from the snap; the continuous one still snaps.
+        discrete_priors = [DiscreteUniform(1, 10), Uniform(0, 1)]
+        empty_bank = ModelManager.SimulationBank(Int[], Matrix{Float64}(undef, 2, 0), param_names)
+        eff6, mid6 = ModelManager._lookupAndSnap(
+            Dict("x" => 0.26, "y" => 0.74), param_names, discrete_priors, k_eff, radius,
+            empty_bank, Tuple{Vector{Float64},Int}[])
+        @test eff6["x"] ≈ 0.26   # untouched
+        @test eff6["y"] ≈ 0.75   # snapped
+        @test isnothing(mid6)
+    end
+
+    @testset "_snapToCDFGrid with a prior" begin
+        # Continuous prior: identical to the two-argument form.
+        @test ModelManager._snapToCDFGrid(0.13, 3, Uniform(0, 1)) ≈ 0.125
+        @test ModelManager._snapToCDFGrid(0.13, 3, Normal()) ≈ 0.125
+
+        # Discrete prior: returned untouched at every resolution.
+        for k in 1:6
+            @test ModelManager._snapToCDFGrid(0.13, k, DiscreteUniform(1, 10)) == 0.13
+        end
     end
 
     @testset "ABCSMC cdf_grid_k field and validation" begin
@@ -4959,6 +4981,47 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     j = round(Int, u * n)
                     @test j ∈ 1:(n-1)
                     @test isapprox(u, j / n; atol=1e-10)
+                end
+            end
+
+            @testset "a discrete coordinate keeps every level under CDF-grid snapping" begin
+                # A 10-level discrete parameter in 3 dimensions with population_size=100:
+                # k_min = ceil(log2(100^(1/3) + 1)) = 3, so generation 1 snaps onto {j/8 : j=1..7}.
+                # Seven grid points cannot cover ten levels, and the grid is spaced evenly over
+                # [0,1] rather than over the level bins, so snapping this coordinate left levels
+                # 1, 6 and 10 unreachable and skewed the prior over the rest. Generation 1 has
+                # no reweighting step to undo that, so every level must survive the proposal.
+                Random.seed!(11)
+                dv = DiscreteVariation(:config, xp_x, collect(31.0:40.0))
+                discrete_prior = LatentVariation(dv).latent_parameters[1]
+                @test discrete_prior == DiscreteUniform(1, 10)
+
+                snap_id_map = Dict{NTuple{3,Float64}, Int}()
+                id_counter  = Ref(0)
+                get_monad_id_fn = function(params)
+                    key = (params["level"], params["y"], params["z"])
+                    if !haskey(snap_id_map, key)
+                        id_counter[] += 1
+                        snap_id_map[key] = id_counter[]
+                    end
+                    return snap_id_map[key]
+                end
+                evaluate_batch = (t, proposals) -> [(rand(), isnothing(mid) ? get_monad_id_fn(cdfs) : mid)
+                                                     for (cdfs, mid) in proposals]
+
+                method = ABCSMC(population_size=100, max_nr_populations=1,
+                                minimum_epsilon=0.0, cdf_grid_k=3)
+                gens = ModelManager._runABCSMC(method, ["level", "y", "z"],
+                                               [discrete_prior, Uniform(0, 1), Uniform(0, 1)],
+                                               evaluate_batch, g -> nothing)
+
+                levels = [quantile(discrete_prior, u) for u in gens[1].particles[!, :level]]
+                @test Set(levels) == Set(1:10)
+
+                # The continuous coordinates are still snapped to the generation-1 grid.
+                n = 2^ModelManager._effectiveK(3, 1)
+                for name in [:y, :z], u in gens[1].particles[!, name]
+                    @test isapprox(u, round(Int, u * n) / n; atol=1e-10)
                 end
             end
 
