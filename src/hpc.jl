@@ -1,3 +1,5 @@
+using Dates
+
 """
     shellCommandExists(cmd::Union{String,Cmd})
 
@@ -21,7 +23,14 @@ isRunningOnHPC() = shellCommandExists(`sbatch`)
 """
     useHPC([use::Bool=true])
 
-Set the global `run_on_hpc` flag to `use`.
+Set the global `run_on_hpc` flag to `use`, and keep it set across later calls to
+[`initializeModelManager`](@ref).
+
+The pinning is what makes the call worth writing in a script. `initializeModelManager` seeds
+`run_on_hpc` from the SLURM probe every time it runs, and a downstream package's `__init__` may
+initialize a project before your script has said anything; without the pin, re-initializing would
+silently undo `useHPC(false)` on a machine that happens to have `sbatch` installed. The pin lasts
+for the session and applies to every project opened in it.
 
 # Examples
 ```julia
@@ -45,6 +54,8 @@ function useHPC(use::Bool=true)
         """ maxlog=1
     end
     mm_globals().run_on_hpc = use
+    mm_globals().run_on_hpc_overridden = true
+    return use
 end
 
 """
@@ -90,10 +101,6 @@ without writing anything, through one answer shared by every waiting worker.
   60 s. A refusal that does not look transient (a wrong partition, an invalid option, no
   `sbatch` at all) is not retried. Either way, giving up stops the run and puts the simulation
   back to `Not Started`; it is never recorded as failed, because no job ever ran.
-- `done_dir::String`: Where sentinels are written. Empty means `<dataDir()>/.hpc_done`. Point it
-  at a faster filesystem when the project lives on an NFS mount: NFS caches directory attributes
-  for `acdirmin`/`acdirmax` (30s/60s by default), which delays how quickly a sentinel written on a
-  compute node becomes visible here. Only this directory needs to move; `data/` stays where it is.
 - `poll_interval::Float64`: Seconds between each waiting worker's check for its own sentinel — one
   `stat` per in-flight job per interval. This is the completion path.
 - `reap_interval::Float64`: How long one `squeue` answer is shared by every waiting worker before
@@ -105,7 +112,6 @@ without writing anything, through one answer shared by every waiting worker.
 """
 @with_kw mutable struct HPCCompletionOptions
     submit_retry_period::Float64 = 900.0
-    done_dir::String = ""
     poll_interval::Float64 = 1.0
     reap_interval::Float64 = 300.0
     grace_period::Float64 = 270.0
@@ -116,11 +122,8 @@ end
 
 Set any of the [`HPCCompletionOptions`](@ref) fields on the active globals.
 
-The default worth knowing about is `done_dir`: on a project whose `data/` lives on an NFS mount,
-pointing it at a faster filesystem cuts completion latency without moving the project itself.
-
 ```julia
-setHPCCompletionOptions(done_dir="/scratch/\$(ENV["USER"])/mm_done")
+setHPCCompletionOptions(grace_period=600.0)   # a filesystem slower than the 270 s default assumes
 ```
 """
 function setHPCCompletionOptions(; kwargs...)
@@ -160,6 +163,120 @@ function setJobOptions(options::Dict)
             "reserved keys are $(join(_RESERVED_SBATCH_KEYS, ", "))."))
         mm_globals().sbatch_options[String(key)] = value
     end
+end
+
+"""
+    _driverJobDir() → String
+
+A fresh, timestamped directory under `data/outputs/drivers/` for one driver submission, holding
+the generated batch script, the job's own streams, and the `sbatch` client's. A second submission
+inside the same second gets a `-2`, `-3`, … suffix rather than overwriting the first one's logs.
+"""
+function _driverJobDir()
+    root = joinpath(dataDir(), "outputs", "drivers")
+    stamp = Dates.format(now(), "yyyymmdd-HHMMSS")
+    dir = joinpath(root, stamp)
+    n = 1
+    while ispath(dir)
+        n += 1
+        dir = joinpath(root, "$(stamp)-$(n)")
+    end
+    mkpath(dir)
+    return dir
+end
+
+"""
+    _driverJobFlags(options) → Vector{String}
+
+Render a `submitDriver` keyword splat as `--key=value` flags, defaulting `job-name` to
+`mm-driver`. An underscore in a keyword becomes a hyphen, since `cpus_per_task=4` is writable and
+`var"cpus-per-task"=4` is not.
+"""
+function _driverJobFlags(options)
+    opts = Dict{String,Any}("job-name" => "mm-driver")
+    for (key, value) in options
+        flag = replace(String(key), "_" => "-")
+        flag in _RESERVED_SBATCH_KEYS && throw(ArgumentError(
+            "The sbatch option `$(flag)` is set by ModelManager itself and cannot be overridden; " *
+            "reserved keys are $(join(_RESERVED_SBATCH_KEYS, ", "))."))
+        #! No `Function` values here, unlike `setJobOptions`: there is no `Simulation` to call one
+        #! with. The driver is one job, so a literal is the only thing that could be meant.
+        value isa Union{AbstractString,Number} || throw(ArgumentError(
+            "The sbatch option `$(flag)` for submitDriver must be a String or a number; got " *
+            "$(repr(value))::$(typeof(value))."))
+        opts[flag] = value
+    end
+    #! Sorted so the submitted command line is reproducible between sessions.
+    return ["--$(k)=$(opts[k])" for k in sort(collect(keys(opts)))]
+end
+
+"""
+    submitDriver(script; project=Base.active_project(), options...) → Int
+
+Submit `script` itself as a SLURM job, so the Julia process that drives a campaign runs on a
+compute node under the scheduler's clock instead of in an SSH session that a dropped connection
+would kill. Returns the job ID, and prints the `squeue`/`sacct` lines that follow it.
+
+The job's body is `julia --project=<project> <script>`, resolved from the `PATH` the job inherits
+(SLURM exports the submitting environment by default), so submit from a shell where `julia` runs.
+Each `options` keyword becomes an `sbatch` flag, with underscores turned into hyphens
+(`cpus_per_task=4` → `--cpus-per-task=4`); values must be strings or numbers, and the flags
+ModelManager renders itself are refused. `job-name` defaults to `mm-driver`. The generated batch
+script and the job's `output.log`/`output.err` are kept under
+`data/outputs/drivers/<timestamp>/`.
+
+**The driver's own `--time` has to cover the entire campaign** — not just the compute, but the
+queue wait of every simulation job it will submit, since it sits blocked until the last one
+finishes. A driver killed at its time limit strands exactly the rows this helper exists to
+protect; `databaseDiagnostics` can recover them afterwards, but the campaign still stops.
+
+Inside the driver job, HPC detection stays on and each simulation is still submitted as its own
+job. That is the intended design — it hands scheduling to SLURM — so the driver itself needs only
+one core and a small memory request, whatever the simulations need.
+
+```julia
+submitDriver("run_campaign.jl"; time="48:00:00", mem="4G", partition="long")
+```
+"""
+function submitDriver(script::AbstractString; project=Base.active_project(), options...)
+    assertInitialized()
+    isfile(script) || throw(ArgumentError("submitDriver: no script at `$(script)`."))
+    dir = _driverJobDir()
+    body = "julia --project=$(_shQuote(string(project))) $(_shQuote(abspath(script)))"
+    job_script = joinpath(dir, "driver.sh")
+    #! `exec` so the job's exit status is Julia's own, with no shell frame in between for SLURM to
+    #! report instead. sbatch requires the leading shebang.
+    write(job_script, "#!/bin/sh\nexec $(body)\n")
+    chmod(job_script, 0o755)
+
+    flags = ["--parsable",
+             "--output=$(joinpath(dir, "output.log"))",
+             "--error=$(joinpath(dir, "output.err"))"]
+    append!(flags, _driverJobFlags(options))
+    out, err = IOBuffer(), IOBuffer()
+    p = try
+        run(pipeline(ignorestatus(`sbatch $flags $job_script`); stdout=out, stderr=err))
+    catch e
+        throw(SubmissionRefused(nothing, "sbatch could not be invoked: $(sprint(showerror, e))"))
+    end
+    stdout_text, stderr_text = String(take!(out)), String(take!(err))
+    #! The same pair the per-simulation path writes, for the same reason: with `--parsable` this is
+    #! the only place the job ID lands on disk.
+    write(joinpath(dir, "hpc.out"), stdout_text)
+    write(joinpath(dir, "hpc.err"), stderr_text)
+    success(p) || throw(SubmissionRefused(nothing, "sbatch exited $(p.exitcode): $(strip(stderr_text))"))
+    job_id = _parseJobID(stdout_text)
+    isnothing(job_id) && throw(SubmissionRefused(nothing,
+        "could not find exactly one job ID in sbatch's output. Output was:\n$(stdout_text)"))
+
+    println("""
+    Submitted driver job $(job_id): $(body)
+        while it waits or runs:  squeue -j $(job_id)
+        once it has finished:    sacct -j $(job_id)
+        its output:              $(joinpath(dir, "output.log"))
+    """)
+    flush(stdout)
+    return job_id
 end
 
 #! Public despite not being exported: the manual documents it as the starting point users
