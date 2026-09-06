@@ -24,9 +24,11 @@ useHPC(false)   # force local execution even on a cluster login node
 
 ## Job options
 
-SLURM job parameters are held in a `Dict` of `sbatch` options. The only default
-([`defaultJobOptions`](@ref)) is a job name, `S<simulation id>`; time, memory, CPUs and partition
-are the site's defaults until you say otherwise with [`setJobOptions`](@ref):
+SLURM job parameters are held in a `Dict` of `sbatch` options. [`defaultJobOptions`](@ref) sets
+two: a job name, `S<simulation id>`, and `cpus-per-task` from the backend's `simulationThreads`
+when it implements that hook (PhysiCellModelManager does, from the config's `omp_num_threads`).
+Time, memory and partition are the site's defaults until you say otherwise with
+[`setJobOptions`](@ref):
 
 ```julia
 setJobOptions(Dict(
@@ -38,14 +40,15 @@ setJobOptions(Dict(
 ```
 
 Set `time` and `mem` explicitly. A job the scheduler kills for exceeding either writes no exit
-code, so it is only noticed by the reaper described below -- several minutes later, per job.
-Set `cpus-per-task` to the thread count your simulator actually uses: SLURM allocates one CPU by
-default, and a simulator that starts more threads than that (PhysiCell reads its thread count from
-its own configuration, not from SLURM) runs them all on one core. A value may be a function of
-the simulation ID, so an option can follow a varied parameter:
+code, so it is only noticed by the reaper described below -- several minutes later, per job. If
+your backend does not implement `simulationThreads`, set `cpus-per-task` yourself to the thread
+count the simulator actually uses: SLURM allocates one CPU by default, and a simulator that starts
+more threads than that runs them all on one core. A value may be a function of the `Simulation`
+about to be submitted, so an option can follow a varied parameter; returning `nothing` omits the
+flag for that simulation:
 
 ```julia
-setJobOptions(Dict("cpus-per-task" => sim_id -> threadsFor(sim_id)))
+setJobOptions(Dict("comment" => simulation -> "monad \$(only(monadIDs(simulation)))"))
 ```
 
 These options are applied to every job the runner submits for the current session. The flags

@@ -50,17 +50,21 @@ end
 """
     defaultJobOptions()
 
-Return a `Dict` with default SLURM options.
+Return a `Dict` with default SLURM options. Two keys, both resolved per simulation:
 
-The only default is `"job-name"`, set to `simulation_id -> "S\$(simulation_id)"`, so a job can be
-found again with `sacct --name=S<id>`. Everything else -- `time`, `mem`, `cpus-per-task`,
-`partition` -- is left to the site's defaults until [`setJobOptions`](@ref) says otherwise: a
-memory or time default chosen here would be wrong for most simulators, and a job that exceeds it
-is killed silently and takes minutes to be declared failed.
+- `"job-name"`: `S<simulation id>`, so a job can be found again with `sacct --name=S<id>`.
+- `"cpus-per-task"`: whatever the backend's [`simulationThreads`](@ref) reports for the
+  simulation; `nothing` (the default for a backend that does not implement it) omits the flag.
+
+Everything else -- `time`, `mem`, `partition` -- is left to the site's defaults until
+[`setJobOptions`](@ref) says otherwise: a memory or time default chosen here would be wrong for
+most simulators, and a job that exceeds it is killed silently and takes minutes to be declared
+failed.
 """
 function defaultJobOptions()
     return Dict{String,Any}(
-        "job-name" => simulation_id -> "S$(simulation_id)",
+        "job-name" => simulation -> "S$(simulation.id)",
+        "cpus-per-task" => simulation -> simulationThreads(mm_globals().simulator, simulation),
     )
 end
 
@@ -133,24 +137,28 @@ end
 
 Merge `options` into the global `sbatch_options` dictionary.
 
-Each key–value pair becomes a `--key=value` flag appended to the `sbatch`
-command when running simulations on an HPC. Values that are `Function`s are
-called with the simulation ID at runtime, so an option can depend on the simulation:
+Each key–value pair becomes a `--key=value` flag appended to the `sbatch` command when running
+simulations on an HPC. A value that is a `Function` is called with the [`Simulation`](@ref) about
+to be submitted, so an option can follow a varied parameter; returning `nothing` omits the flag
+for that simulation:
 
 ```julia
 setJobOptions(Dict("time" => "02:00:00", "mem" => "8G",
-                   "cpus-per-task" => sim_id -> threadsFor(sim_id)))
+                   "comment" => simulation -> "monad \$(only(monadIDs(simulation)))"))
 ```
 
-The keys ModelManager renders itself (`wrap`, `output`, `error`, `wait`, `parsable`, `chdir`)
-are refused with an `ArgumentError`.
+Keys must be `String`s. The keys ModelManager renders itself (`wrap`, `output`, `error`, `wait`,
+`parsable`, `chdir`) are refused with an `ArgumentError`.
 """
 function setJobOptions(options::Dict)
     for (key, value) in options
+        key isa AbstractString || throw(ArgumentError(
+            "sbatch option keys must be Strings naming the flag (\"time\", \"mem\", …); got " *
+            "$(repr(key))::$(typeof(key))."))
         key in _RESERVED_SBATCH_KEYS && throw(ArgumentError(
             "The sbatch option `$(key)` is set by ModelManager itself and cannot be overridden; " *
             "reserved keys are $(join(_RESERVED_SBATCH_KEYS, ", "))."))
-        mm_globals().sbatch_options[key] = value
+        mm_globals().sbatch_options[String(key)] = value
     end
 end
 
