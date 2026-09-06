@@ -3726,6 +3726,36 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
                 cal = runCalibration(method, prob; description="deleteme").calibration
                 waitForDiagnostics()
+
+                # End to end: an in-flight generation folder must not become `:final`. Plant the
+                # state an interrupted run leaves -- the next generation's monad record written,
+                # nothing else -- and check the readers still answer from the last finished one.
+                let gen_dir = joinpath(ModelManager.calibrationFolder(cal), "generations"),
+                    done = ModelManager._completeGenerationIndices(gen_dir),
+                    inflight = joinpath(gen_dir, lpad(last(done) + 1, 2, '0'))
+                    mkpath(inflight)
+                    write(joinpath(inflight, "monads.csv"), "1\n")
+                    try
+                        @test ModelManager._completeGenerationIndices(gen_dir) == done
+                        df_p, w_p = posterior(cal)          # was: "has no particle file"
+                        @test length(w_p) > 0
+                        @test sum(w_p) ≈ 1.0 atol=1e-6
+                        @test df_p == first(posterior(cal; generation=last(done)))
+                        # `show` counts finished generations, so it does not over-report either.
+                        @test occursin("Generations: $(length(done))", sprint(show, cal))
+                        # Asking for the in-flight generation by number says what it is, rather than
+                        # "not found" for a folder the user can see on disk.
+                        err = try; posterior(cal; generation=last(done) + 1); nothing; catch e; e; end
+                        @test err isa ArgumentError
+                        @test occursin("incomplete", err.msg)
+                        err2 = try; posterior(cal; generation=last(done) + 7); nothing; catch e; e; end
+                        @test err2 isa ArgumentError
+                        @test occursin("not found", err2.msg)
+                    finally
+                        rm(inflight; recursive=true, force=true)
+                    end
+                end
+
                 tag!(cal, "project" => "doomed")
                 monad_ids = monadIDs(cal)
                 sim_ids = simulationIDs(cal)
@@ -5882,6 +5912,44 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         # Fresh databases get the provenance column from the schema; existing ones from
         # `ensureProvenanceColumns`.
         @test occursin("provenance_id", ModelManager.calibrationsSchema())
+    end
+
+    @testset "an in-flight generation is not a completed one" begin
+        # `_buildEvaluateBatch` writes a generation's monad record before launching any simulation,
+        # which creates `generations/<t>/`. So for the whole time generation t is running -- and
+        # forever, if the run is interrupted -- that folder exists holding only `monads.csv`. Every
+        # reader that takes `last(indices)` then sees one generation too many: `posterior(cal)`
+        # resolves `:final` to it and dies "has no particle file" instead of returning the last
+        # finished generation, and the disk-based plot styles fail the same way. The flat layout did
+        # not have this: it enumerated particle files, so an in-flight generation was invisible.
+        mktempdir() do dir
+            for t in 1:3
+                d = joinpath(dir, lpad(t, 2, '0'))
+                mkpath(d)
+                for f in ("particles.csv", "cdfs.csv", "monads.csv", "proposals.csv")
+                    write(joinpath(d, f), "1\n")
+                end
+                write(joinpath(d, "metadata.toml"), "max_epsilon_accepted = 1.0\n")
+            end
+            # Generation 4 has started: its monad record is on disk, nothing else is.
+            mkpath(joinpath(dir, "04"))
+            write(joinpath(dir, "04", "monads.csv"), "1\n")
+
+            # The permissive scan still reports it -- callers that want every folder on disk
+            # (migration, the monad-ID reader) depend on that.
+            @test ModelManager._generationIndices(dir) == [1, 2, 3, 4]
+            # ...but it is not a generation anyone can read back.
+            @test ModelManager._completeGenerationIndices(dir) == [1, 2, 3]
+
+            # `metadata.toml` is the marker, not `particles.csv`: a write that died between the two
+            # would leave particles present and the generation still unreadable as a whole.
+            d5 = joinpath(dir, "05")
+            mkpath(d5)
+            write(joinpath(d5, "particles.csv"), "1\n")
+            write(joinpath(d5, "cdfs.csv"), "1\n")
+            @test ModelManager._generationIndices(dir) == [1, 2, 3, 4, 5]
+            @test ModelManager._completeGenerationIndices(dir) == [1, 2, 3]
+        end
     end
 
     @testset "generation files are ordered numerically, not lexicographically" begin

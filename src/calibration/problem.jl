@@ -364,13 +364,14 @@ function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:fina
     #! Addressed by generation index, not by position in a sorted file list. The old form sorted names
     #! lexicographically and then used the list position as `t`, which is only correct while every name
     #! has the same width and no generation is missing.
-    indices = _generationIndices(gen_dir)
+    #! Complete generations only: a folder for a generation still running (or interrupted) holds
+    #! just its monad record, so `:final` would resolve to it and then fail for want of particles.
+    indices = _completeGenerationIndices(gen_dir)
     isempty(indices) && error(
         "No completed generations found for Calibration($(calibration.id)).")
 
     t = generation === :final ? last(indices) : Int(generation)
-    t in indices || throw(ArgumentError(
-        "Generation $t not found for Calibration($(calibration.id)). Available: $(indices)."))
+    t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, calibration.id, t, indices)))
 
     csv_path = _generationArtifact(gen_dir, t, :particles)
     isnothing(csv_path) && error(
