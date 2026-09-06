@@ -5,6 +5,67 @@
 
 ---
 
+## Session: a discrete coordinate is not snapped to the CDF grid (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #61, from the adversarial review of the calibration PRs. `_snapToCDFGrid` snapped every
+proposal coordinate to `{j/2^k_eff}` with no knowledge of what the coordinate meant. A discrete
+parameter is a `DiscreteUniform(1, L)` over value indices, and the dyadic grid is spread evenly
+over [0, 1] rather than over the `L` level bins, so the levels received unequal numbers of grid
+points -- and when `2^k_eff < L`, some received none. Measured for `L = 10` at `k_eff = 3`
+(which `k_min = ceil(log2(N^(1/d) + 1))` produces for `population_size=100` in three dimensions,
+so it is the *default* resolution rather than a contrived one): generation 1 reaches levels
+2-5 and 7-9 and never proposes 1, 6 or 10. Generation 1 weights every accepted particle equally
+and sets the next generation's epsilon from that population, so nothing downstream corrects it.
+
+### Decisions
+- **Do not snap a coordinate whose latent prior is discrete** (option 1 of the three in the
+  issue). `_snapToCDFGrid` gains a three-argument method taking that coordinate's prior and
+  dispatching on `DiscreteDistribution`; `_lookupAndSnap` takes `priors` -- already threaded into
+  both generation runners and previously ignored -- and applies it per coordinate. Snapping buys
+  a discrete coordinate nothing to begin with: the quantile already collapses each level's whole
+  CDF bin to one target value, and what actually prevents a repeat simulation is `use_previous=true`
+  in `_createMonadForParams`, where two proposals in the same level produce the same
+  `variation_id`, hit the `INSERT OR IGNORE` on `monads`, and resolve to the same monad with
+  `num_sims_to_add = 0`.
+- **Dispatch on the prior rather than a precomputed mask.** `_snapToCDFGrid(u, k_eff, ::DiscreteDistribution)`
+  reads as the rule it is, and puts the decision next to the arithmetic it is about. A `Vector{Bool}`
+  computed in the runners would have been another parallel array to keep aligned with `param_names`.
+- **Bank lookup is untouched, and needed to be.** `_lookupAndSnap` tests the box against `raw_cdf`,
+  the *unsnapped* proposal, in every dimension -- it always did, before and after this change -- so
+  the discrete axis's bank behaviour is bit-identical. The only second-order effect is on
+  `mid_gen_additions`, which now stores a discrete coordinate's raw value instead of its snapped
+  one, so two same-level proposals within a generation match each other less often; that costs one
+  extra `evaluate_batch` entry and no extra simulation, because the monad is the same one.
+
+### Rejected
+- **Snapping a discrete coordinate to its own level's midpoint `(2i-1)/(2L)`** (issue option 2).
+  It preserves the prior too, and would keep a canonical value per level, but the canonical value
+  only matters for `_cdfToGridKey`, which no production path calls. Paying for a second snap rule
+  to serve a helper that only the tests use is the wrong trade.
+- **Warning when `2^k_base_eff < L`** (issue option 3). A warning about a distortion we can simply
+  not create.
+- **Raising `k_base_eff`.** Explicitly ruled out in the issue and worth restating: a larger `k`
+  shrinks the relative imbalance but never removes it (`L = 3` divides no power of two, so it
+  persists at every `k`), and it inflates the number of distinct proposals in exchange for no extra
+  resolution on a parameter with `L` distinct values.
+
+### Traps
+- **`DiscreteDistribution` is not a `Distributions` name `abc_smc.jl` had in scope.** The file
+  imports selectively (`using Distributions: pdf`); it worked only because `variations.jl` does a
+  blanket `using Distributions` into the same module. Named explicitly in the import list rather
+  than left to that.
+- **The regression test needs the database** even though it is an algorithm-level test.
+  `_runFirstGeneration` calls `_updateMidGenAdditions!` after `evaluate_batch`, which queries
+  simulation statuses -- which is why the two existing snapping integration tests live inside the
+  DB-backed testset, and why this one joins them.
+- **Generation 1 is the clean place to assert this.** With an empty bank and an empty
+  `mid_gen_additions` (all `population_size` proposals are built before the single batch is
+  dispatched), no lookup can fire, so the proposals are exactly the snapped Sobol points and the
+  assertion is deterministic.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger

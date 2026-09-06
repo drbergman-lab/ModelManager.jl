@@ -148,6 +148,11 @@ Only monads with at least one simulation that is running or completed are eligib
 there is nothing to gain from snapping onto a monad whose simulations have not started, and a
 monad whose simulations all failed no longer exists.
 
+A discrete parameter is not snapped. Its levels do not line up with a dyadic grid, so snapping
+would sample some levels more often than others; it still takes part in bank reuse, and repeat
+parameterizations are collapsed when the monad is created, which is where its redundant work was
+being removed anyway.
+
 ## Results and resuming
 
 [`runABC`](@ref) returns an [`ABCResult`](@ref). Inspect the inferred posterior with

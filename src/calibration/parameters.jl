@@ -147,8 +147,11 @@ _calibrationRejection(::LatentVariation{<:Distribution}) = nothing
 #! indices, so a particle coordinate stays a CDF value in [0,1] and the quantile does the quantising —
 #! the perturbation kernels never see a target value and need no discrete counterpart. What a discrete
 #! parameter costs is resolution, not correctness: the sampler explores within-bin variation that has
-#! no effect on the simulation, which `cdf_grid_k` snapping and the `SimulationBank` already mitigate
-#! by collapsing repeated grid points.
+#! no effect on the simulation. `cdf_grid_k` snapping does not help with that and is deliberately not
+#! applied to a discrete coordinate — the dyadic grid is spread evenly over [0,1] rather than over the
+#! level bins, so snapping would skew the prior over levels and, at a coarse `k`, leave some
+#! unreachable. What does collapse the redundant work is `use_previous=true` in `_createMonadForParams`
+#! (an identical parameterization reuses the existing monad) and, across runs, the `SimulationBank`.
 _calibrationRejection(::DiscreteVariation) = nothing
 _calibrationRejection(::CoVariation{<:DiscreteVariation}) = nothing
 
