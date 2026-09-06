@@ -371,8 +371,7 @@ function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:fina
         "No completed generations found for Calibration($(calibration.id)).")
 
     t = generation === :final ? last(indices) : Int(generation)
-    t in indices || throw(ArgumentError(
-        "Generation $t not found for Calibration($(calibration.id)). Available: $(indices)."))
+    t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, calibration.id, t, indices)))
 
     csv_path = _generationArtifact(gen_dir, t, :particles)
     isnothing(csv_path) && error(

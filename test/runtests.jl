@@ -3743,6 +3743,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                         @test df_p == first(posterior(cal; generation=last(done)))
                         # `show` counts finished generations, so it does not over-report either.
                         @test occursin("Generations: $(length(done))", sprint(show, cal))
+                        # Asking for the in-flight generation by number says what it is, rather than
+                        # "not found" for a folder the user can see on disk.
+                        err = try; posterior(cal; generation=last(done) + 1); nothing; catch e; e; end
+                        @test err isa ArgumentError
+                        @test occursin("incomplete", err.msg)
+                        err2 = try; posterior(cal; generation=last(done) + 7); nothing; catch e; e; end
+                        @test err2 isa ArgumentError
+                        @test occursin("not found", err2.msg)
                     finally
                         rm(inflight; recursive=true, force=true)
                     end
