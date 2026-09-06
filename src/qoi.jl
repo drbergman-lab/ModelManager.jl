@@ -98,6 +98,9 @@ QoI("tumor", computeFromOutput; stored=:prefer)    # stored value if present, el
 QoI("tumor", computeFromOutput; stored=:require)   # stored value or an error
 ```
 
+A keyed QoI is read back from its `"<name>.<key>"` columns as a `Dict` with `String` keys, whatever
+key type `compute` used; a `String` or `Bool` value comes back as the sink holds it.
+
 It defaults off because **nothing records which `compute` produced a stored value, and no fingerprint
 can**: redefining a function's body in place leaves both `hash` and `nameof` unchanged, so a changed
 `compute` is undetectable, while two textually identical anonymous functions hash differently, so an
@@ -196,16 +199,30 @@ function _storedLookup(q::QoI, sid::Int)
 end
 
 """
-    _storedValue(name, sim_id) → Float64 or nothing
+    _storedValue(name, sim_id) → value or nothing
 
-The post-processing sink's value for `name` on `sim_id`, or `nothing` if it was never stored.
+The post-processing sink's value for `name` on `sim_id`, or `nothing` if it was never stored. A
+scalar comes back as the sink holds it: `Float64`, `Int64` or `String`, and a `Bool`, which the sink
+stores as INTEGER, as `0`/`1`. A keyed value, which the sink spread into `"<name>.<key>"` columns,
+comes back as a `Dict{String,Any}` over those keys -- with `String` keys, since that is all a column
+name can carry.
 """
 function _storedValue(name::AbstractString, sim_id::Int)
     tbl = postProcessingTable([sim_id])
     nrow(tbl) == 1 || return nothing
-    name in names(tbl) || return nothing
-    v = tbl[1, name]
-    return ismissing(v) ? nothing : Float64(v)
+    cols = names(tbl)
+    if name in cols
+        v = tbl[1, name]
+        return ismissing(v) ? nothing : v
+    end
+    #! Read back the way the sink wrote it: `_asPostProcessor` spreads a keyed compute into one
+    #! column per key, so the value is reassembled from every column this name owns.
+    prefix = name * _QOI_LABEL_SEPARATOR
+    spread = filter(c -> startswith(c, prefix), cols)
+    isempty(spread) && return nothing
+    d = Dict{String,Any}(String(chop(c; head=length(prefix), tail=0)) => tbl[1, c]
+                         for c in spread if !ismissing(tbl[1, c]))
+    return isempty(d) ? nothing : d
 end
 
 #! There is no way to check that a stored value came from *this* `compute`, and that is the whole
@@ -224,8 +241,11 @@ end
 Check a `QoI`'s stored values against freshly computed ones, for the simulations of `T`.
 
 Returns `(; n_checked, n_agreed, n_mismatched, n_unverifiable, n_missing, mismatches)`. A simulation is
-*unverifiable* when its output folder is gone, which is exactly the situation `stored` exists for — the
-value may be perfectly good, but nothing here can confirm it.
+*unverifiable* when its output folder is gone -- exactly the situation `stored` exists for — or when
+`compute` returns `missing`/`nothing` for it: the value may be perfectly good, but nothing here can
+confirm it. Numbers are compared with `isapprox` at `rtol`. A keyed value is compared key by key;
+the sink stores keys as `String`s, so a `NamedTuple`-keyed `compute` is compared against its
+stringified keys. Anything else is compared with `isequal`.
 
 Use this before trusting `stored=:prefer` or `stored=:require` on results you care about. Nothing about
 a stored value records which `compute` produced it, so recomputation is the only real check.
@@ -245,7 +265,7 @@ function verifyStoredValues(q::QoI, T::AbstractTrial; rtol::Real=1e-8,
     sids = simulationIDs(T)
     isnothing(limit) || (sids = sids[1:min(length(sids), Int(limit))])
     n_agreed = 0; n_mismatched = 0; n_unverifiable = 0; n_missing = 0
-    mismatches = NamedTuple{(:simulation_id, :stored, :recomputed),Tuple{Int,Float64,Float64}}[]
+    mismatches = NamedTuple{(:simulation_id, :stored, :recomputed),Tuple{Int,Any,Any}}[]
     for sid in sids
         v = _storedValue(q.name, Int(sid))
         if isnothing(v)
@@ -256,8 +276,12 @@ function verifyStoredValues(q::QoI, T::AbstractTrial; rtol::Real=1e-8,
             n_unverifiable += 1
             continue
         end
-        fresh = Float64(q.compute(Simulation(Int(sid))))
-        if isapprox(v, fresh; rtol=rtol)
+        fresh = q.compute(Simulation(Int(sid)))
+        if isnothing(fresh) || ismissing(fresh)
+            n_unverifiable += 1
+            continue
+        end
+        if _storedAgrees(v, fresh; rtol=rtol)
             n_agreed += 1
         else
             n_mismatched += 1
@@ -266,6 +290,22 @@ function verifyStoredValues(q::QoI, T::AbstractTrial; rtol::Real=1e-8,
     end
     return (; n_checked = length(sids), n_agreed, n_mismatched, n_unverifiable, n_missing, mismatches)
 end
+
+"""
+    _storedAgrees(stored, fresh; rtol) → Bool
+
+Whether a value read back from the sink matches a freshly computed one: `isapprox` for numbers, key
+by key for a keyed value (the sink's keys are `String`s, so the fresh keys are compared as strings),
+`isequal` for anything else.
+"""
+_storedAgrees(stored::Real, fresh::Real; rtol) = isapprox(stored, fresh; rtol=rtol)
+function _storedAgrees(stored::AbstractDict, fresh; rtol)
+    (fresh isa AbstractDict || fresh isa NamedTuple) || return false
+    fresh_by_string = Dict{String,Any}(string(k) => v for (k, v) in pairs(fresh))
+    Set(keys(fresh_by_string)) == Set(keys(stored)) || return false
+    return all(_storedAgrees(stored[k], fresh_by_string[k]; rtol=rtol) for k in keys(stored))
+end
+_storedAgrees(stored, fresh; rtol) = isequal(stored, fresh)
 
 """
     _reduceOverMonad(q, monad_id) → value
@@ -397,20 +437,32 @@ _asQoI(q::QoI) = q
 _asQoI(f::Function) = QoI(_qoiNameFromFunction(f), f)
 _asQoI(x) = throw(ArgumentError("Expected a QoI or a Function; got $(typeof(x))."))
 
-#! Anonymous functions are named `"#3"` / `"#3#4"` -- distinct per function (measured, so fine as
-#! identities) but not valid identifiers, and this name becomes a sink column name and a `Dict` key.
-#! So regularise rather than reject: `#3#4` becomes `anon_3_4`.
+#! A closure or lambda has no name another session -- or another call of the same factory -- would
+#! agree on: `make("tumor")` and `make("immune")` both answer `nameof` with `:f`. So for those the
+#! name comes from the type, which carries the enclosing scope (`#f#make##0`) or a counter
+#! (`#3#4`), regularised into an identifier: `anon_f_make_0`, `anon_3_4`. Everything derived this way
+#! starts with `anon`, which the sink refuses to store under and sensitivity analysis never uses to
+#! skip work (`_isAutoNamedAnonymous`), because it identifies nothing.
 """
     _qoiNameFromFunction(f) → String
 
-A name for a bare function, usable as a database column and a `Dict` key. Named functions keep their
-own name; anonymous ones get a regularised `anon_…` form.
+A name for a bare function, usable as a database column and a `Dict` key. A top-level named function
+keeps its own name, in any alphabet; a lambda or closure gets a regularised `anon_…` form.
 """
 function _qoiNameFromFunction(f::Function)
-    raw = string(nameof(f))
-    occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", raw) && return raw
-    return "anon" * replace(raw, r"[^A-Za-z0-9_]+" => "_")
+    raw = _isAnonymousFunction(f) ? string(nameof(typeof(f))) : string(nameof(f))
+    occursin(r"^[\p{L}_][\p{L}\p{N}_]*$", raw) && return raw
+    return "anon" * replace(raw, r"[^\p{L}\p{N}_]+" => "_")
 end
+
+"""
+    _isAutoNamedAnonymous(q::QoI) → Bool
+
+Whether `q` wraps a closure or lambda under the name ModelManager derived for it rather than one the
+user chose. Such a name identifies nothing -- two closures from one factory share it -- so the sink
+refuses to store under it and sensitivity analysis never treats it as already evaluated.
+"""
+_isAutoNamedAnonymous(q::QoI) = _isAnonymousFunction(q.compute) && q.name == _qoiNameFromFunction(q.compute)
 
 qoiName(f::Function) = string(nameof(f))
 
@@ -589,8 +641,7 @@ function _asPostProcessor(qs::AbstractVector{QoI})
             #! that was AUTO-DERIVED -- `QoI("counts", sim -> …)` has an anonymous `compute` but a
             #! perfectly good name, and must not be refused.
             (spreads || v isa Union{Bool,Integer,Real,AbstractString}) &&
-                _isAnonymousFunction(q.compute) &&
-                q.name == _qoiNameFromFunction(q.compute) && throw(ArgumentError(
+                _isAutoNamedAnonymous(q) && throw(ArgumentError(
                 "post_processor: an anonymous function has no stable name, and every sink column is " *
                 "named after the QoI that wrote it — this $(typeof(v)) would be stored as " *
                 (spreads ? "\"<name>.<key>\" per key" : "\"<name>\"") * ". The derived name " *

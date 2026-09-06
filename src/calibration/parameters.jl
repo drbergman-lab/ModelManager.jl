@@ -281,14 +281,26 @@ function _StrippedLVSource(lv::LatentVariation{<:Distribution})
 end
 _StrippedLVSource(src::LVSource) = _StrippedLVSource(src.lv)
 
+#! This is JLD2's own test -- `T <: Function && isgensym(Symbol(T))` at
+#! JLD2/src/data/writing_datatypes.jl:446, where it warns that it "only stores functions by name" --
+#! spelled out rather than called, because `JLD2.isgensym` is internal and a one-line predicate is not
+#! worth coupling to a private name; a change there then shows up as a behaviour difference, not a
+#! load error. It asks about the *type*: a top-level function's singleton type prints as
+#! `typeof(sq)`, a closure's as `var"#f#make##0"{Int64}` and a lambda's as `var"#12#13"`, both
+#! carrying a `#`, while a callable struct's type is its own ordinary name. The earlier
+#! `nameof`-prefix test asked about the function instead, and `nameof` of a closure defined as
+#! `f(s) = k` inside `make(k)` is just `:f`.
 """
     _isAnonymousFunction(f::Function) → Bool
 
-Return `true` if `f` is an anonymous function or compiler-generated closure
-(i.e. `nameof(f)` starts with `#`). Named functions defined with
-`function foo(...) end` or `foo(...) = ...` return `false`.
+Whether `f` cannot be restored by name in a fresh Julia session -- which is what JLD2 needs to bring
+a saved `CalibrationProblem` back, and the same test JLD2 itself applies before warning that it only
+stores functions by name. `false` for a function defined at the top level of a module and for a
+callable struct (JLD2 stores those as a type plus fields); `true` for a lambda *and* for a named
+function defined inside another function, a `let` or a `@testset`, because those are closure types
+whose names exist only in the session that compiled them.
 """
-_isAnonymousFunction(f::Function) = startswith(string(nameof(f)), "#")
+_isAnonymousFunction(f::Function) = occursin('#', string(typeof(f)))
 
 #! A `QoI` is only as restorable as the two functions inside it, so it is anonymous if either is. Both
 #! are checked: a named `compute` with an anonymous `reduce` would round-trip as a QoI that silently
