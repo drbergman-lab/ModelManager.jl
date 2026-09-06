@@ -31,6 +31,12 @@ end
 
 # Build a Dict mapping db column names → display names by reading parameters.toml from disk.
 # For LVSource, maps target db columns → target_display_names (latent columns not included).
+#! A discrete source writes the same two shapes as its continuous counterpart — `DiscreteSource` has
+#! `db_column`/`display_name` like `DVSource`, `DiscreteCoSource` has the plural pair like `CVSource` —
+#! so they share the branches. Without them a discrete parameter had no entry here at all, and the
+#! disk-resident `:transition` plot silently dropped its column: the mapping is applied by renaming
+#! `simulationsTable` columns, and an unrenamed one no longer matches the display names the plot
+#! selects on. Only plots built from disk were affected; the in-memory mapping covered both.
 function _buildDbToDisplayMappingFromTOML(toml_path::String)
     isfile(toml_path) || return Dict{String,String}()
     d = TOML.parsefile(toml_path)
@@ -38,9 +44,9 @@ function _buildDbToDisplayMappingFromTOML(toml_path::String)
     mapping = Dict{String,String}()
     for entry in d["parameters"]
         st = get(entry, "source_type", "")
-        if st == "DVSource"
+        if st == "DVSource" || st == "DiscreteSource"
             mapping[entry["db_column"]] = entry["display_name"]
-        elseif st == "CVSource"
+        elseif st == "CVSource" || st == "DiscreteCoSource"
             for (db_col, disp) in zip(entry["db_columns"], entry["display_names"])
                 mapping[db_col] = disp
             end
