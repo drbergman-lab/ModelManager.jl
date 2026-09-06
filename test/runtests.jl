@@ -2271,6 +2271,26 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test gens[1].weights ≈ fill(0.25, 4)       # weights renormalized to the trimmed size
     end
 
+    @testset "a generation that accepts nothing is discarded, not persisted" begin
+        Random.seed!(3)
+        saved = Int[]
+        # Generation 1's distances are ordinary; everything after is far above any threshold the
+        # quantile rule can pick, so generation 2 accepts nothing and runs until the budget stops
+        # it. That used to reach `maximum(distances)` on an empty vector and throw
+        # "reducing over an empty collection" without ever naming the budget.
+        evaluate_batch = function(t, proposals)
+            return [(t == 1 ? rand() : 1.0e6, 0) for _ in proposals]
+        end
+        method = ABCSMC(population_size=6, max_nr_populations=4, minimum_epsilon=0.0,
+                        max_evaluations=12)
+        gens = @test_logs (:warn, r"accepted no particles") match_mode=:any begin
+            ModelManager._runABCSMC(method, ["x"], [Uniform(0, 1)], evaluate_batch,
+                                     g -> push!(saved, g.t); verbosity=:none)
+        end
+        @test length(gens) == 1        # the empty generation never joins the result...
+        @test saved == [1]             # ...and is never handed to the persistence callback
+    end
+
     ################## DB-backed integration ##################
     #
     # All tests below initialise a real SQLite project in a temporary directory and
@@ -5079,6 +5099,38 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 waitForDiagnostics()
                 @test r2.method.max_nr_populations == 3
                 @test r2.method.population_size    == 6
+            end
+
+            @testset "a resume whose budget is spent stops before it writes anything" begin
+                dv    = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
+                prob  = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
+                                           _test_nonzero_ss, mseDistance)
+                saved = ABCSMC(population_size=4, max_nr_populations=1, minimum_epsilon=0.0,
+                               max_evaluations=4)
+                base  = runCalibration(saved, prob; description="spent budget")
+                cal   = base.calibration
+                waitForDiagnostics()
+
+                # Raising only the generation cap leaves the budget spent. The resume-time stopping
+                # check never passed `budget_hit`, so this ran generation 2, trimmed its batch to
+                # nothing, and died on an empty `maximum` instead of naming the budget.
+                r = @test_logs (:warn, r"max_evaluations=4 reached") match_mode=:any begin
+                    resumeCalibration(cal; problem=prob, max_nr_populations=3)
+                end
+                @test length(r.generations) == 1
+
+                # method.toml still describes the run that happened, not the resume that did not.
+                stored = TOML.parsefile(joinpath(ModelManager.calibrationFolder(cal), "method.toml"))
+                @test stored["max_nr_populations"] == 1
+                @test stored["max_evaluations"]    == 4
+
+                # Raising the budget as well is what continues the run.
+                r2 = resumeCalibration(cal; problem=prob, max_nr_populations=2,
+                                       max_evaluations=64)
+                waitForDiagnostics()
+                @test length(r2.generations) == 2
+                stored2 = TOML.parsefile(joinpath(ModelManager.calibrationFolder(cal), "method.toml"))
+                @test stored2["max_evaluations"] == 64
             end
 
             @testset "_runControlKeywords survives a second runABC method" begin

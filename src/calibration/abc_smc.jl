@@ -389,6 +389,10 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
                                            k_base_eff=k_base_eff,
                                            mid_gen_additions=mid_gen_additions,
                                            budget=budget, budget_hit=budget_hit)
+            #! The generation accepted nothing and has already explained itself. It must not be
+            #! persisted — the next generation resamples from its particles — so the run ends here
+            #! with the generations that do have particles.
+            isnothing(gen) && break
         end
 
         # Absorb this generation's new grid evaluations into the bank before the next.
@@ -605,7 +609,10 @@ multiple particles, each receiving its own weight. `mid_gen_additions` accumulat
 grid evaluations within this generation and is shared between batches (growing throughout).
 
 Budget accounting is delegated to `_updateBudget!`. When `budget_hit` is set, the
-completed portion of the generation is returned (possibly fewer than `population_size`).
+completed portion of the generation is returned (possibly fewer than `population_size`) —
+or `nothing` when that portion is empty, meaning the budget ran out before any proposal
+passed ε. A generation with no particles is not a generation: `nothing` tells the caller to
+stop with what is already on disk rather than persist one.
 """
 function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                                   priors::Vector{<:Distribution}, evaluate_batch::Function,
@@ -629,6 +636,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
     fitted = _fitKernel(method.perturbation_kernel, prev.particles, prev.weights, param_names, t;
                         k_eff=snap_active ? k_eff : nothing)
     radius      = snap_active ? _bankBoxRadius(k_eff)      : 0.0
+
+    best_distance = Inf
 
     proposal_rows = NamedTuple{(:monad_id, :distance, :accepted), Tuple{Int,Float64,Bool}}[]
     while length(accepted) < method.population_size
@@ -671,6 +680,10 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
 
         n_accepted_this_round = 0
         for (i, (distance, metadata)) in enumerate(results)
+            #! Kept for the empty-`accepted` guard below, which has to say whether the budget ran
+            #! out or ε is simply out of reach. The closest distance the generation saw is the one
+            #! number that separates those, and it is gone once the loop ends.
+            ismissing(distance) || (best_distance = min(best_distance, Float64(distance)))
             #! A `missing` distance means the monad had no successful simulation, so there is
             #! nothing to compare against ε — the particle is rejected outright.
             if !ismissing(distance) && distance <= epsilon
@@ -692,6 +705,29 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                                     acceptance_rate_est / 2 :
                                     n_accepted_this_round / length(proposals))
         budget_hit[] && break
+    end
+
+    #! Guarded here rather than papered over downstream: `max_epsilon_accepted` is `maximum` over the
+    #! accepted distances, which throws on an empty collection, and an `init=` would only trade the
+    #! error for a zero-particle generation that the *next* generation would then resample from. Every
+    #! exit from the loop above is a budget break, so this is reachable exactly when the budget ran out
+    #! before anything passed ε — the run stops with the generations already on disk.
+    if isempty(accepted)
+        detail = isfinite(best_distance) ?
+            "the closest of the $(n_evaluations) proposals it evaluated was $(best_distance), " *
+            "against ε=$(epsilon)" :
+            "not one of the $(n_evaluations) proposals it evaluated produced a distance at all — " *
+            "every monad failed, so check the generation's failure files"
+        @warn """
+        ABC-SMC generation $t accepted no particles, so it is discarded and the run stops with \
+        generation $(t - 1) as its last: max_evaluations=$(method.max_evaluations) was reached and \
+        $(detail).
+        Raise the budget to continue — `resumeCalibration(cal; max_evaluations=N)` with N above \
+        $(budget[]), which counts every evaluation the run has made rather than only new ones. If \
+        the closest distance is far above ε, it is the threshold that is out of reach and not the \
+        budget: relax `epsilon_quantile` or `minimum_epsilon` as well.
+        """
+        return nothing
     end
 
     weights = _computeWeights(accepted, param_names, prev, fitted)
