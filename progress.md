@@ -5,6 +5,35 @@
 
 ---
 
+## Session: two holes found by a second review pass (2026-09-06)
+
+### The busy timeout covered the central database only
+`_openDB`'s docstring says "Every ModelManager database open goes through this". Two did not: the
+per-folder variations database created in `insertFolder` and the connection `locationVariationsDatabase`
+hands back. Those are written by `addVariations` while a campaign runs and read by the table and
+analysis functions — precisely the two-session case the timeout was added for — so a second session
+still failed at once with "database is locked". Both go through `_openDB` now, and the test asserts
+that `SQLite.DB(` appears exactly once in `database.jl` and nowhere else in `src/`, so the docstring
+stays true by construction rather than by inspection.
+
+### A deleted calibration left tags that were re-attributed, not merely stale
+Each generation's batch sampling carries `mm:calibration => "<id>"` and `mm:generation => "<t>"`.
+`deleteTagsFor(Calibration, ids)` cannot reach them: they sit on *sampling* rows and name the run in
+their **value**, while that function is keyed on `(trial_class, trial_id)`. Because `calibration_id`
+is an `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, SQLite hands the deleted run's id to the next
+one, so `findMonads(tags = ("mm:calibration" => …))` — the route `tag!`'s own docstring recommends —
+returned the deleted run's monads alongside the new run's, while `monadIDs(result)` (which reads the
+folder) disagreed.
+
+- **Decision: clean the value-references in `deleteCalibration`** rather than add `AUTOINCREMENT`.
+  The dangling rows are wrong on their own terms; a schema change would need a migration every
+  backend implements to fix a symptom.
+- **Trap for the test:** `mm:generation` values are generation numbers, so *every* run in a project
+  has a sampling tagged `"1"`. Assert on the samplings the run under test tagged, not on a
+  project-wide query.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger

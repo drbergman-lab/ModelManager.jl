@@ -53,7 +53,7 @@ end
 - [x] Project configuration — `inputs.toml` parsing, `ProjectLocations`, location path utilities
 - [x] Trial hierarchy — `Simulation`, `Monad`, `Sampling`, `Trial`, `InputFolders`, `VariationID`
 - [x] Database schema — generic SQLite schema parameterized by simulator version table/column names
-- [x] Database utilities — `queryToDataFrame`, `constructSelectQuery`, `buildWhereClause`, etc.
+- [x] Database utilities — `queryToDataFrame`, `constructSelectQuery`, `buildWhereClause`, etc.; every open (central, sink, per-folder variations) carries a busy timeout
 - [x] Schema migrations — `up.jl` framework with `upgradePackage`, `upgradeToMilestone`; migrations target the version loaded in the session, read from the package defining the simulator type, so updating the environment mid-session defers the schema change to the next session rather than recording a version whose migration never ran
 - [x] Runner — parallel simulation execution via Julia tasks/channels; HPC SLURM support; `prepareTrialHierarchy` + `pendingSimulationSpecs` split
 - [x] Deletion — `deleteSimulations`, `deleteMonad`, `deleteSampling`, `deleteTrial`, `resetDatabase`

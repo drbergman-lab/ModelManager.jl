@@ -83,6 +83,7 @@ the "Docstring Cross-References" section of `CLAUDE.md`.
 - The `simulator` field has no default — it must be provided by the caller.
 - `mm_globals_ref = Ref{Union{Nothing,ModelManagerGlobals}}(nothing)` is the module-level storage.
 - `mm_globals()` returns the current globals, asserting it has been initialized.
+- Every SQLite database ModelManager opens — the central one, the post-processing sink, and each input folder's variations database — is opened with a five-second busy timeout, so a second session waits for a lock rather than failing at once.
 - Simulator packages call `mm_globals_ref[] = ModelManagerGlobals(simulator=MySimulator(...))` in their `__init__`.
 - Zero-arg accessor functions (`centralDB()`, `dataDir()`, `projectLocations()`, etc.) read from `mm_globals()`.
 - `initializeModelManager` seeds `run_on_hpc` from `isRunningOnHPC()` (a probe for `sbatch` on the `PATH`) on every call, placed after all early-return failure paths and before `postInitDisplay` prints it. `useHPC(use)` overrides it afterwards; a subsequent `initializeModelManager` re-detects unconditionally and discards the override.
