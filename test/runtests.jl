@@ -3727,6 +3727,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 cal = runCalibration(method, prob; description="deleteme").calibration
                 waitForDiagnostics()
                 tag!(cal, "project" => "doomed")
+                # The run tagged each generation's batch sampling with its own id and generation.
+                batch_samplings = findTrials(Sampling; tags = ("mm:calibration" => string(cal.id),))
+                @test !isempty(batch_samplings)
+                @test all(s -> hasTag(s, "mm:generation"), batch_samplings)
                 monad_ids = monadIDs(cal)
                 sim_ids = simulationIDs(cal)
                 folder = ModelManager.calibrationFolder(cal)
@@ -3737,6 +3741,16 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test isempty(tags(cal))
                 @test !isdir(folder)
                 @test isempty(findTrials(Calibration; tags=("project" => "doomed",)))
+                # ...and the batch tags go with it. Those name the run in their *value* and sit on
+                # sampling rows, so `deleteTagsFor(Calibration, …)` -- keyed on (trial_class,
+                # trial_id) -- cannot reach them. Left behind they would not merely be stale:
+                # `calibration_id` is an INTEGER PRIMARY KEY without AUTOINCREMENT, so the next run
+                # inherits the deleted id and `findMonads(tags = ("mm:calibration" => …))` -- the
+                # route `tag!`'s docstring recommends -- would return both runs' monads.
+                @test isempty(findTrials(Sampling; tags = ("mm:calibration" => string(cal.id),)))
+                #! Checked on this run's own samplings: `mm:generation` values are generation
+                #! numbers, so every other run in this project carries "1" too.
+                @test all(s -> !hasTag(s, "mm:generation"), batch_samplings)
                 # Monads are shared through the bank and `use_previous`, so they are kept.
                 @test all(id -> id in monadIDs(), monad_ids)
                 @test all(id -> id in simulationIDs(), sim_ids)
@@ -7461,4 +7475,17 @@ end
     row = first(ModelManager.DBInterface.execute(db, "PRAGMA busy_timeout;"))
     @test row[1] == 5000
     close(db)
+    # Every open goes through it, as the docstring says. The per-folder variations databases are
+    # the ones this was missing: they are written by `addVariations` while a campaign runs and read
+    # by the table and analysis functions, which is the concurrent case the timeout exists for --
+    # and they used to be constructed with a bare `SQLite.DB`, so a second session got
+    # "database is locked" immediately instead of waiting.
+    @test length(collect(eachmatch(r"SQLite\.DB\(", read(joinpath(pkgdir(ModelManager), "src", "database.jl"), String)))) == 1
+    for file in readdir(joinpath(pkgdir(ModelManager), "src"); join=true)
+        endswith(file, ".jl") || continue
+        basename(file) == "database.jl" && continue
+        #! globals.jl holds the placeholder `SQLite.DB()` a fresh `ModelManagerGlobals` carries.
+        text = replace(read(file, String), "SQLite.DB()" => "")
+        @test !occursin("SQLite.DB(", text)
+    end
 end
