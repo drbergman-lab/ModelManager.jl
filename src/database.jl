@@ -329,7 +329,7 @@ function insertFolder(location::Symbol, folder::String, description::String="")
         initializeInputFolder(sim, InputFolder(location, folder))
         return
     end
-    db_variations = joinpath(path_to_folder, locationVariationsDBName(location)) |> SQLite.DB
+    db_variations = _openDB(joinpath(path_to_folder, locationVariationsDBName(location)))
     location_variation_id_name = locationVariationIDName(location)
     table_name = locationVariationsTableName(location)
     createMMTable(table_name, "$location_variation_id_name INTEGER PRIMARY KEY, par_key BLOB UNIQUE"; db=db_variations)
@@ -411,7 +411,10 @@ function locationVariationsDatabase(location::Symbol, folder::String)
     if !isfile(path_to_db)
         return missing
     end
-    return path_to_db |> SQLite.DB
+    #! Through `_openDB`, like every other open: these per-folder databases are written by
+    #! `addVariations` while a campaign runs and read by the table and analysis functions, which is
+    #! exactly the concurrent case the busy timeout exists for.
+    return _openDB(path_to_db)
 end
 
 function locationVariationsDatabase(location::Symbol, id::Int)
