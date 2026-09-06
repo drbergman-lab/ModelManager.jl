@@ -276,7 +276,7 @@ end
         df, w = posterior(cal; generation=generation)
     else
         gen_dir = joinpath(calibrationFolder(cal), "generations")
-        indices = _generationIndices(gen_dir)
+        indices = _completeGenerationIndices(gen_dir)
         isempty(indices) && error("No CDF generation files for Calibration($(cal.id)).")
         t = generation === :final ? last(indices) : Int(generation)
         t in indices || throw(ArgumentError(
@@ -857,7 +857,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
     #! Generations are addressed by index throughout, so both layouts and any padding width behave
     #! alike, and `t` never means "position in a sorted listing".
-    indices = _generationIndices(gen_dir)
+    indices = _completeGenerationIndices(gen_dir)
     isempty(indices) && error("No completed generations for Calibration($(cal.id)).")
 
     # Helper: read generation t's display-format particles; return (param_df, weights, raw_df).
