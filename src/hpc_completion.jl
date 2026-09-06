@@ -431,7 +431,7 @@ function _parseJobID(stdout_text::AbstractString)
 end
 
 """
-    _runHPCSimulation(cmd::Cmd, simulation_id::Int) → Union{Nothing,Int}
+    _runHPCSimulation(cmd::Cmd, simulation::Simulation) → Union{Nothing,Int}
 
 Submit `cmd` as a SLURM job, block until it finishes, and return its exit code -- or `nothing` if
 it never produced one because the scheduler lost it before it could write. A submission `sbatch`
@@ -441,7 +441,10 @@ caller decides what a nonzero code means; this only reports it.
 Blocking the calling worker is what preserves the throttle: `max_number_of_parallel_simulations`
 bounds how many jobs sit in the queue exactly as it did under `sbatch --wait`.
 """
-function _runHPCSimulation(cmd::Cmd, simulation_id::Int)
+_runHPCSimulation(cmd::Cmd, simulation_id::Int) = _runHPCSimulation(cmd, Simulation(simulation_id))
+
+function _runHPCSimulation(cmd::Cmd, simulation::Simulation)
+    simulation_id = simulation.id
     done_dir = _hpcDoneDir()
     _sweepStraysIfDue(done_dir)
     #! The sentinel's name is chosen here, before submission, and baked into the job script. It has
@@ -455,6 +458,6 @@ function _runHPCSimulation(cmd::Cmd, simulation_id::Int)
     #! fast job's real sentinel.) The job ID is used only for the reaper's liveness check, where a
     #! recycled ID can at worst delay a reap, never produce a wrong result.
     sentinel = joinpath(done_dir, "$(simulation_id).$(string(time_ns(); base=16))")
-    job_id = _submitHPCJob(_prepareHPCSubmitCommand(cmd, simulation_id, sentinel), simulation_id)
+    job_id = _submitHPCJob(_prepareHPCSubmitCommand(cmd, simulation, sentinel), simulation_id)
     return _waitForHPCJob(job_id, sentinel, time_ns())
 end

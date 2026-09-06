@@ -151,6 +151,11 @@ end
 const _test_sim_cmd = Ref{Any}(`true`)
 ModelManager.simulationCommand(::TestSimulator, ::ModelManager.SimulationSpec) = _test_sim_cmd[]
 
+# What `simulationThreads` answers for TestSimulator: `nothing` (the interface default) unless a test
+# sets it, so the default `cpus-per-task` can be shown both absent and present.
+const _test_threads = Ref{Union{Nothing,Int}}(nothing)
+ModelManager.simulationThreads(::TestSimulator, ::Simulation) = _test_threads[]
+
 ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 
 # Module-level named functions for _isAnonymousFunction / _ProblemManifest tests.
@@ -6993,7 +6998,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _reset_hpc!()
                 _next_job!(9101)
                 touch(joinpath(shim, "squeue.fail"))
-                tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:3]
+                # Real simulations: the HPC path now carries the `Simulation` (job options are
+                # functions of it), so a bare integer that names no row is no longer a usable label.
+                sims3 = [Simulation(InputFolders(config="default")) for _ in 1:3]
+                tasks = [@async MM._runHPCSimulation(`true`, s.id) for s in sims3]
                 @test timedwait(() -> _calls("squeue.log") >= 2, 15.0) === :ok   # the reaper kept trying
                 @test all(!istaskdone(t) for t in tasks)        # and concluded nothing from failures
                 for n in 1:3
@@ -7053,7 +7061,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 setHPCCompletionOptions(reap_interval=0.1, grace_period=3600.0)
                 _next_job!(9400)
                 _queue!(9400:9419...)
-                tasks = [@async MM._runHPCSimulation(`true`, i) for i in 1:20]
+                sims20 = [Simulation(InputFolders(config="default")) for _ in 1:20]
+                tasks = [@async MM._runHPCSimulation(`true`, s.id) for s in sims20]
                 # Wait for the reaper to have refreshed a few times, rather than sleeping a fixed
                 # span and asserting a rate -- the rate depends on machine load, and the invariant
                 # under test does not. Over this window 20 workers poll ~dozens of times each; if
@@ -7089,19 +7098,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 monad = Monad(InputFolders(config="default"); n_replicates=3)
                 ids = simulationIDs(monad)
                 _use_default_run[] = true                         # TestSimulator normally bypasses sbatch
-                err = try
-                    run(monad; quiet=true)
-                    nothing
-                catch e
-                    e
+                try
+                    err = try
+                        run(monad; quiet=true)
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa MM._SimulationStageError
+                    @test occursin("SLURM submission", sprint(showerror, err))
+                    @test occursin("boom", sprint(showerror, err))
+                    # `run` throws on the first refusal while the worker is still draining the queue.
+                    # Wait for it to finish BEFORE switching the backend override back, or the
+                    # stragglers run through TestSimulator's no-op and complete instead.
+                    @test timedwait(() -> all(_status(id) == NOT_STARTED for id in ids), 20.0) === :ok
                 finally
                     _use_default_run[] = false
                 end
-                @test err isa MM._SimulationStageError
-                @test occursin("SLURM submission", sprint(showerror, err))
-                @test occursin("boom", sprint(showerror, err))
-                # Workers may still be draining the queue when `run` throws; wait for them.
-                @test timedwait(() -> all(_status(id) == NOT_STARTED for id in ids), 20.0) === :ok
                 # Nothing was recorded as failed, so nothing was erased from the monad.
                 @test sort(constituentIDs(Monad, monad.id)) == sort(ids)
                 rm(joinpath(shim, "sbatch.fail"))
@@ -7135,10 +7148,29 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 setHPCCompletionOptions(submit_retry_period=900.0)
             end
 
-            @testset "the shipped job options request nothing but a name" begin
+            @testset "the shipped job options: a name, and the backend's CPU count" begin
                 # No memory or time request: those are the site's to choose until the user says
                 # otherwise, and a too-small default is a silent kill plus minutes of reaper latency.
-                @test collect(keys(MM.defaultJobOptions())) == ["job-name"]
+                @test Set(keys(MM.defaultJobOptions())) == Set(["job-name", "cpus-per-task"])
+                flags(cmd) = collect(MM._prepareHPCSubmitCommand(cmd, sim.id, joinpath(done_dir, "s")).exec)
+                # TestSimulator leaves `simulationThreads` at its default, so no CPU count is
+                # requested and the site's default applies; the job name is still there.
+                @test "--job-name=S$(sim.id)" in flags(`echo hi`)
+                @test !any(startswith("--cpus-per-task="), flags(`echo hi`))
+                # A backend that reports a thread count gets it requested, per simulation.
+                _test_threads[] = 6
+                @test "--cpus-per-task=6" in flags(`echo hi`)
+                _test_threads[] = nothing
+                # A Function-valued option receives the Simulation about to be submitted, and
+                # `nothing` from it omits the flag for that simulation.
+                setJobOptions(Dict("comment" => s -> "sim$(s.id)", "qos" => s -> nothing))
+                @test "--comment=sim$(sim.id)" in flags(`echo hi`)
+                @test !any(startswith("--qos="), flags(`echo hi`))
+                delete!(mm_globals().sbatch_options, "comment")
+                delete!(mm_globals().sbatch_options, "qos")
+                # Keys name sbatch flags, so they are Strings; anything else is refused up front.
+                @test_throws ArgumentError setJobOptions(Dict(:time => "01:00:00"))
+                @test !haskey(mm_globals().sbatch_options, "time")
             end
 
             @testset "the submission's own streams are kept as hpc.out / hpc.err" begin

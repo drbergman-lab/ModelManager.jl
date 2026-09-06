@@ -46,7 +46,19 @@ seconds. The generated script template defaults `n_replicates = 1`, so every mon
   and wrong for most 3D runs; a job killed for exceeding it writes no sentinel and takes five to ten
   minutes to be declared failed. The site default is the honest default. `job-name` stays, because
   `S<id>` is the only bridge from a simulation to `sacct` besides `hpc.out`.
-- **Reserved sbatch keys are refused in `setJobOptions`**, not asserted at the first submission.
+- **Reserved sbatch keys are refused in `setJobOptions`**, not asserted at the first submission;
+  so are non-`String` keys (review).
+- **`cpus-per-task` is a default, filled by the backend.** Review asked whether the manual's
+  `sim_id -> threadsFor(sim_id)` example should be a real function, and of a `Simulation` rather
+  than an ID. Yes to both: only the backend knows its thread count, so ModelManager stubs
+  `simulationThreads(sim, simulation)` (default `nothing`, which omits the flag) and
+  `defaultJobOptions` requests it per submission; PCMM implements it from `omp_num_threads`. Every
+  `Function`-valued job option now receives the `Simulation`, matching the measurement contract.
+- **Ownership is tracked, not inferred.** Review (Copilot) found the shutdown reset used
+  `istaskstarted` as "no worker took this", which lies between a worker's dequeue and its
+  `schedule`; a retried `run` could then schedule the same simulation twice. Workers now mark a
+  `claimed` bit the instant they dequeue an index, with no yield in between, and the reset consults
+  that.
 - **The reaper's warning is uncapped.** `maxlog=10` hid the SLURM-specific cause (and the
   `sacct -j` hint) after ten kills; one line per reaped job is the right amount.
 

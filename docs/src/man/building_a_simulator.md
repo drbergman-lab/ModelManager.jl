@@ -153,6 +153,7 @@ These have working defaults; override only when your simulator needs them.
 | [`initializeInputFolder`](@ref) | no-op | compile a template into a new input folder |
 | [`getInputFolderDescription`](@ref) | `""` | read folder metadata for the DB |
 | [`clearSimulatorArtifacts`](@ref) | no-op | remove compiled artifacts on database reset |
+| [`simulationThreads`](@ref) | `nothing` | how many threads a simulation starts, so SLURM jobs request that many CPUs; implement it when the simulator sets its own thread count |
 
 ## Boundary rules
 
