@@ -656,12 +656,12 @@ function _deleteCalibrationBatchTags(ids::AbstractVector{<:Integer})
     #! The generation tag carries only a generation number, so it is identified by sitting on a
     #! sampling this run tagged -- collected before the calibration tags are removed.
     tagged = queryToDataFrame(
-        "SELECT trial_class, trial_id FROM tags " *
+        "SELECT DISTINCT trial_class, trial_id FROM tags " *
         "WHERE tag_key='mm:calibration' AND tag_value IN ($(values_sql));")
     for row in eachrow(tagged)
         DBInterface.execute(centralDB(),
-            "DELETE FROM tags WHERE tag_key='mm:generation' AND trial_class='$(row.trial_class)' " *
-            "AND trial_id=$(row.trial_id);")
+            "DELETE FROM tags WHERE tag_key='mm:generation' AND trial_class=? AND trial_id=?;",
+            (row.trial_class, row.trial_id))
     end
     DBInterface.execute(centralDB(),
         "DELETE FROM tags WHERE tag_key='mm:calibration' AND tag_value IN ($(values_sql));")
