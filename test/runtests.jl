@@ -4435,6 +4435,22 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test occursin("problem=my_problem", err.msg)
                 # With a problem in hand the caller is warned and gets `nothing` back to use it.
                 @test (@test_logs (:warn, r"could not be read back") ModelManager._loadProblem(cal; required=false)) === nothing
+
+                # The other two ways the file can fail take the same exit, so `problem=` is never
+                # blocked by a file that cannot help: a JLD2 file with no `manifest` entry (an
+                # unrecognised or older format) and no file at all (a run from before it was written).
+                jldsave(joinpath(folder, "problem.jld2"); something_else=1)
+                err = try; ModelManager._loadProblem(cal); nothing; catch e; e; end
+                @test err isa ErrorException
+                @test occursin("no `manifest` entry", err.msg)
+                @test occursin("problem=my_problem", err.msg)
+                @test (@test_logs (:warn, r"no `manifest` entry") ModelManager._loadProblem(cal; required=false)) === nothing
+                rm(joinpath(folder, "problem.jld2"))
+                err = try; ModelManager._loadProblem(cal); nothing; catch e; e; end
+                @test err isa ErrorException
+                @test occursin("not found", err.msg)
+                @test occursin("problem=my_problem", err.msg)
+                @test (@test_logs (:warn, r"not found") ModelManager._loadProblem(cal; required=false)) === nothing
             end
 
             @testset "sensitivity on a discrepancy-to-data QoI" begin

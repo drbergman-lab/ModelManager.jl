@@ -61,13 +61,17 @@ fresh session failed to load it with a raw JLD2 `ReconstructedMutable` MethodErr
 `resumeCalibration` read the manifest *before* consulting `problem=`, the documented rescue failed
 the same way. Verified by the reviewer in a two-process probe on 1.12.7.
 
-Decision: the predicate now asks the question that matters -- can a fresh session restore this by
-name? A callable struct's type has an ordinary name (JLD2 stores it as type plus fields): restorable.
-A type named `#<name>` exactly, resolving to `f` in its parent module: a top-level function,
-restorable. Anything else (`#f#make##0`, `#12#13`): not. `_loadProblem` takes `required=`, so with
-a `problem=` in hand an unreadable file is a warning and the supplied problem is used unvalidated;
-without one it is an error naming both ways out. Rejected: validating the supplied problem against
-`parameters.toml` instead of the manifest -- more machinery than the case warrants today.
+Decision: the predicate asks the question that matters -- can a fresh session restore this by
+name? -- and it is JLD2's own answer, `occursin('#', string(typeof(f)))`, the test JLD2 applies at
+`writing_datatypes.jl:446` before warning that it only stores functions by name. Review asked
+whether JLD2 had already solved this rather than us guessing; it had, and the one-liner agrees with
+the hand-rolled three-step version on every case in the test (top-level, `Base`, lambda, inner
+named, `let`-scoped, capture-free inner, callable struct). Spelled locally rather than calling
+`JLD2.isgensym`, which is internal. `_loadProblem` takes `required=`, so with a `problem=` in hand
+an unreadable file -- absent, without a `manifest` entry, or unreconstructable -- is a warning and
+the supplied problem is used unvalidated; without one it is an error naming both ways out.
+Rejected: validating the supplied problem against `parameters.toml` instead of the manifest -- more
+machinery than the case warrants today.
 
 The same predicate now drives `_qoiNameFromFunction`: a closure's name comes from its type and is an
 `anon_…` form. Two closures from one factory still share it (same type, different captures), so the

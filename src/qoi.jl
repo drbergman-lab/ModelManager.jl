@@ -202,9 +202,10 @@ end
     _storedValue(name, sim_id) → value or nothing
 
 The post-processing sink's value for `name` on `sim_id`, or `nothing` if it was never stored. A
-scalar comes back as the sink holds it (`Float64`, `Int64` or `String`); a keyed value, which the
-sink spread into `"<name>.<key>"` columns, comes back as a `Dict{String,Any}` over those keys --
-with `String` keys, since that is all a column name can carry.
+scalar comes back as the sink holds it: `Float64`, `Int64` or `String`, and a `Bool`, which the sink
+stores as INTEGER, as `0`/`1`. A keyed value, which the sink spread into `"<name>.<key>"` columns,
+comes back as a `Dict{String,Any}` over those keys -- with `String` keys, since that is all a column
+name can carry.
 """
 function _storedValue(name::AbstractString, sim_id::Int)
     tbl = postProcessingTable([sim_id])
@@ -242,8 +243,9 @@ Check a `QoI`'s stored values against freshly computed ones, for the simulations
 Returns `(; n_checked, n_agreed, n_mismatched, n_unverifiable, n_missing, mismatches)`. A simulation is
 *unverifiable* when its output folder is gone -- exactly the situation `stored` exists for — or when
 `compute` returns `missing`/`nothing` for it: the value may be perfectly good, but nothing here can
-confirm it. Numbers are compared with `isapprox(; rtol)`, a keyed value key by key (against the
-`String` keys the sink stores), anything else with `isequal`.
+confirm it. Numbers are compared with `isapprox` at `rtol`. A keyed value is compared key by key;
+the sink stores keys as `String`s, so a `NamedTuple`-keyed `compute` is compared against its
+stringified keys. Anything else is compared with `isequal`.
 
 Use this before trusting `stored=:prefer` or `stored=:require` on results you care about. Nothing about
 a stored value records which `compute` produced it, so recomputation is the only real check.

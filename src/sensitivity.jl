@@ -234,9 +234,13 @@ end
 #! claim the label `counts.x`: caught within one `calculateGSA!` call by the collision check, but
 #! across calls it would silently skip one of them -- in one ordering the whole spreading QoI, so
 #! `counts.y` would never be computed. See the constructor in `src/qoi.jl`.
-#! An auto-derived anonymous name says nothing about identity -- two closures from one factory share
-#! it -- so a QoI carrying one is always re-evaluated, and its result replaces whatever sat under
-#! the label. Only a name the user chose (or a top-level function's own) can mean "already done".
+#! A QoI whose name ModelManager derived from an anonymous `compute` is never treated as already
+#! evaluated. The derived name comes from the closure's *type*, and every closure a factory returns
+#! has the same type whatever it captured -- `make("tumor")` and `make("immune")` both become
+#! `anon_f_make_0` -- so the label proves nothing about which measurement sits under it, and skipping
+#! on it would keep the tumor indices when the user asked for immune. Such a QoI is re-evaluated and
+#! its result replaces whatever the label held. Only a name the user chose, or a top-level
+#! function's own, can mean "already done".
 """
     _hasGSAResults(gsa_sampling, q) → Bool
 

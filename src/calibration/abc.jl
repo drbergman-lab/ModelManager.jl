@@ -780,28 +780,36 @@ naming the two ways out when `required`, and a warning plus `nothing` when the c
 """
 function _loadProblem(calibration::Calibration; required::Bool=true)
     path = joinpath(calibrationFolder(calibration), "problem.jld2")
-    isfile(path) || error(
-        "Cannot resume: $path not found. " *
-        "The problem.jld2 file is written automatically by runABC/runCalibration.")
+    rescue = "`resumeCalibration(Calibration($(calibration.id)); problem=my_problem)`"
+    #! Every way the saved problem can fail to read takes the same exit -- absent, unrecognised, or
+    #! unreconstructable -- because the caller's situation is the same in all three: with a
+    #! `problem=` in hand the file is advisory and a warning will do; without one it is the only
+    #! copy and the error must name both ways out.
+    function unreadable(msg::String)
+        required && error(msg)
+        @warn msg * "\nUsing the supplied `problem=` without checking it against the saved one."
+        return nothing
+    end
+    isfile(path) || return unreadable(
+        "Cannot resume: $path not found. The problem.jld2 file is written automatically by " *
+        "runABC/runCalibration, so a run from before it existed can only be resumed by passing the " *
+        "original problem: $(rescue).")
     manifest = try
         jldopen(path) do f
             haskey(f, "manifest") || return :unrecognized
             f["manifest"]::_ProblemManifest
         end
     catch e
-        msg = "The saved problem in $path could not be read back: $(sprint(showerror, e))\n" *
-              "This is what a `summary_statistic`, `distance` or `LatentVariation` map that is a " *
-              "closure -- a lambda, or a named function defined inside another function -- looks like " *
-              "from a fresh session. Either `include` the file that defines those functions before " *
-              "resuming, or pass the original problem: " *
-              "`resumeCalibration(Calibration($(calibration.id)); problem=my_problem)`."
-        required && error(msg)
-        @warn msg * "\nUsing the supplied `problem=` without checking it against the saved one."
-        return nothing
+        return unreadable(
+            "The saved problem in $path could not be read back: $(sprint(showerror, e))\n" *
+            "This is what a `summary_statistic`, `distance` or `LatentVariation` map that is a " *
+            "closure -- a lambda, or a named function defined inside another function -- looks like " *
+            "from a fresh session. Either `include` the file that defines those functions before " *
+            "resuming, or pass the original problem: $(rescue).")
     end
-    manifest === :unrecognized && error(
-        "Unrecognized problem.jld2 format in $path. " *
-        "Re-run with the original problem to regenerate.")
+    manifest === :unrecognized && return unreadable(
+        "Unrecognized problem.jld2 format in $path: it has no `manifest` entry. Re-run with the " *
+        "original problem to regenerate it, or pass that problem to this resume: $(rescue).")
     return manifest
 end
 
