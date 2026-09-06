@@ -46,7 +46,7 @@ mutable struct MySimulator <: AbstractSimulator
 end
 
 function __init__()
-    ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = MySimulator("/path"))
+    ModelManager.registerSimulator!(MySimulator("/path"))
 end
 ```
 

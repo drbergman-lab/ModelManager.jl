@@ -5,6 +5,75 @@
 
 ---
 
+## Session: the MM/PCMM boundary — the half that needs no downstream companion (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #54, the architecture review of the ModelManager/PhysiCellModelManager split. This entry
+covers only the items the maintainer settled as needing no companion change downstream: publishing
+the variation-file path, making `quietRun` public, fixing the manual's unqualified public names,
+giving the three migration methods defaults, and `registerSimulator!`. The four that *do* change the
+interface — collapsing the five version-bookkeeping methods, the XML seam, an MM-owned schema
+version, and the `skip_missing` reducer default — are deliberately not started here.
+
+### Decisions
+- **`variationFilePath(location, M)` is a computation, not a lookup.** PCMM rebuilt
+  `<location>_variation_<id>.xml` at eight sites. The published version derives the path from the
+  monad's variation ID and never touches the filesystem, so it answers before the file is written —
+  which is what `createXMLFile` itself needs, and what lets a backend name a file it is about to
+  create. `createXMLFile` now calls it, so the two cannot drift.
+- **The unexported names stay unexported; the manual was the bug.** These are downstream-developer
+  contracts, and a downstream `@reexport using ModelManager` forwards only exports — so a name
+  documented here as a bare call is an `UndefVarError` for that package's users. The fix is to write
+  `ModelManager.name` wherever a manual page presents such a name as something the reader calls.
+  The dividing line: a name introduced in the third person as "the backend's `setupMonad` hook" is
+  describing machinery and stays bare; a name in a list of helpers, or in a code block, is qualified.
+  That caught five the issue's list missed — `getMonadIDDataFrame`, `methodString`,
+  `simulationsTableFromQuery`, `monadsTableFromQuery`, `buildWhereClause`.
+- **`upgradeToMilestone`'s default throws rather than no-opping.** `upgradeMilestones` defaulting to
+  empty already makes it unreachable for a fresh backend, so the only way to arrive there is to have
+  declared a milestone and not written the handler — and silently skipping that would leave the
+  version table stamped as migrated. The message names that inconsistency instead of reporting an
+  unimplemented required method.
+- **`dbVersionTableName` derives from the package, not from a new hook.** #30 already resolves
+  package identity from the module defining the simulator type (`_packageModule`), and both the
+  loaded and installed version lookups go through it. Reusing it keeps one answer to "which package
+  does this database track".
+- **`registerSimulator!` is idempotent by backend *type*.** A second call for the same type returns
+  the existing globals untouched rather than rebuilding them, so a package reload does not discard
+  an open project's data directory, DB handle, or provenance. The cost is that a re-registration
+  cannot change `max_number_of_parallel_simulations`; `setNumberOfParallelSims` is the way to do
+  that, and it always was.
+
+### Rejected
+- **Exporting the names in issue #54's item-4 list.** They are dev contracts, not end-user API, so
+  export would put `simulatorVersionIDName` and friends in every user's tab completion to fix a docs
+  problem. Qualifying the manual costs nothing at the API surface.
+- **Qualifying every `@compat public` mention in `docs/src/man/`.** A blanket sweep would put
+  `ModelManager.` in front of `postSimulationCleanup`, `simulationThreads` and `clearSimulatorArtifacts`
+  in sentences that already say "the backend's … hook" — noise, and misleading, since a reader is
+  meant to *implement* those rather than call them. The type names (`GSASampling`, `MOATSampling`,
+  `SimulationSpec`) are left bare for the same reason: they appear as descriptions of what a call
+  returns, not as code to type.
+- **Removing `mm_globals_ref` from the public surface entirely.** The test suite swaps the whole
+  globals object, and a backend may legitimately need the handle; un-exporting plus `@compat public`
+  keeps that possible while taking it out of end-user tab completion. PCMM already writes it fully
+  qualified, so nothing downstream breaks.
+
+### Traps
+- **A default whose signature is more specific than an existing override is an ambiguity, not an
+  override.** The first `upgradeToMilestone` default was written `(sim::AbstractSimulator, version, args...)`,
+  which is ambiguous against the test suite's `(::TestSimulator, args...)` — neither is strictly more
+  specific. Keeping the default at `(sim::AbstractSimulator, args...)`, exactly the shape of the
+  error stub it replaced, avoids it.
+- **`@compat public` on an already-exported name is a load-time error**, so `mm_globals_ref` had to
+  leave both `export` lists (`src/globals.jl` and `src/ModelManager.jl`) in the same change that
+  declared it public.
+- **The docstring-ref testset does not read manual pages.** It walks `Docs.meta` only, so an
+  `@ref` written in `docs/src/man/*.md` is caught by nothing but the docs build. Every change to a
+  manual `@ref` in this session was verified with `julia --project=docs docs/make.jl`.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger

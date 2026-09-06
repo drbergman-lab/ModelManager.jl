@@ -96,6 +96,14 @@ module _NestedSimModule
     struct NestedSimulator <: ModelManager.AbstractSimulator end
 end
 
+# A backend that implements nothing at all -- the fresh-backend case, for exercising the interface
+# defaults. TestSimulator cannot serve: it overrides dbVersionTableName and the upgrade methods, so
+# every default they are meant to supply is shadowed. _packageModule is pointed at ModelManager for
+# the same reason it is on TestSimulator: a real backend's type lives in a versioned package, and
+# the derived version-table name needs one to name.
+struct _DefaultsSimulator <: AbstractSimulator end
+ModelManager._packageModule(::_DefaultsSimulator) = ModelManager
+
 # ---- Trial execution --------------------------------------------------------
 # Records the keywords setupSampling last received, so tests can assert that a simulator option
 # actually arrived rather than only that the merge helper computed the right NamedTuple.
@@ -2351,6 +2359,64 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test cb0(:finish, 0) === nothing
     end
 
+    # A backend whose schema has never changed shape should implement none of the three migration
+    # methods. Before these defaults all three errored, so every backend had to write them out.
+    @testset "a backend that declares no milestones implements nothing" begin
+        sim = _DefaultsSimulator()
+
+        # Derived from the package defining the simulator type -- the identity #30 already resolves.
+        @test ModelManager.dbVersionTableName(sim) == "modelmanager_version"
+        @test ModelManager.upgradeMilestones(sim) == VersionNumber[]
+
+        # Reachable only once a backend declares a milestone, so the error names that, rather than
+        # reporting an unimplemented required method.
+        err = try
+            ModelManager.upgradeToMilestone(sim, v"1.0.0", true)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ErrorException
+        @test occursin("upgradeMilestones", err.msg)
+
+        # With the defaults in place a version bump is a clean "no schema change" stamp: nothing
+        # calls upgradeToMilestone, so nothing throws.
+        db = ModelManager.SQLite.DB()
+        table = ModelManager.dbVersionTableName(sim)
+        ModelManager.DBInterface.execute(db, "CREATE TABLE $(table) (version TEXT PRIMARY KEY);")
+        ModelManager.DBInterface.execute(db, "INSERT INTO $(table) (version) VALUES ('0.1.0');")
+        @test ModelManager.upgradePackage(sim, db, v"0.1.0", v"0.2.0", true)
+        @test ModelManager.queryToDataFrame("SELECT * FROM $(table);"; db=db).version[1] == "0.2.0"
+        close(db)
+    end
+
+    @testset "registerSimulator!" begin
+        saved = ModelManager.mm_globals_ref[]
+        try
+            ModelManager.mm_globals_ref[] = nothing
+            g = ModelManager.registerSimulator!(TestSimulator(); max_number_of_parallel_simulations=3)
+            @test ModelManager.mm_globals_ref[] === g
+            @test g.simulator isa TestSimulator
+            @test g.max_number_of_parallel_simulations == 3
+
+            # Same backend type: the globals survive with everything accumulated in them, so
+            # reloading the package does not discard an open project.
+            g.data_dir = "/somewhere"
+            g2 = @test_logs ModelManager.registerSimulator!(TestSimulator())
+            @test g2 === g
+            @test g2.data_dir == "/somewhere"
+            @test g2.max_number_of_parallel_simulations == 3
+
+            # A different backend replaces them, and the warning names both.
+            g3 = @test_logs (:warn, r"TestSimulator with _DefaultsSimulator") ModelManager.registerSimulator!(_DefaultsSimulator())
+            @test g3 !== g
+            @test g3.simulator isa _DefaultsSimulator
+            @test ModelManager.mm_globals_ref[] === g3
+        finally
+            ModelManager.mm_globals_ref[] = saved
+        end
+    end
+
     @testset "DB-backed integration" begin
         mktempdir() do project_dir
             _make_test_project(project_dir)
@@ -3201,6 +3267,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # Unvaried parameter falls back to XML default
                 val_y = getParameterValue(m, :config, xp_y)
                 @test val_y ≈ 2.0
+            end
+
+            # The naming convention is ModelManager's, so a backend must be able to ask for the
+            # path rather than rebuild `<location>_variation_<id>.xml` on its own.
+            @testset "variationFilePath is the path createXMLFile writes" begin
+                # 44.0 is used by no other testset, so the variation is new and its file unwritten.
+                dv = DiscreteVariation(:config, xp_x, 44.0)
+                m  = createTrial(inputs, [dv]; n_replicates=1)
+
+                path = ModelManager.variationFilePath(:config, m)
+                # Computed from the monad's variation ID, so it answers before anything is written.
+                @test !isfile(path)
+                @test ModelManager.createXMLFile(:config, m) == path
+                @test isfile(path)
+                @test dirname(path) ==
+                      joinpath(ModelManager.locationPath(:config, m),
+                               ModelManager.locationVariationsFolder(:config))
             end
 
             # ---------- calibration end-to-end ----------

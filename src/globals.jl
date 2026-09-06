@@ -1,6 +1,6 @@
 using Parameters, SQLite
 
-export ModelManagerGlobals, mm_globals_ref, mm_globals
+export ModelManagerGlobals, mm_globals
 export centralDB, dataDir, isInitialized, assertInitialized
 export projectLocations, inputsDict, simulator
 export initializeModelManager, waitForDiagnostics
@@ -11,8 +11,8 @@ export initializeModelManager, waitForDiagnostics
 Mutable struct holding all global state for a ModelManager project.
 
 The active instance is accessed via [`mm_globals`](@ref).  Concrete simulator
-packages (e.g. `PhysiCellModelManager`) create an instance of this struct and
-register it via [`mm_globals_ref`](@ref) in their `__init__`.
+packages (e.g. `PhysiCellModelManager`) create an instance of this struct in their `__init__`
+by calling [`registerSimulator!`](@ref).
 
 # Fields
 - `initialized::Bool`: `true` after [`initializeModelManager`](@ref) succeeds.
@@ -79,16 +79,53 @@ end
 """
     mm_globals_ref
 
-Module-level `Ref` holding the active [`ModelManagerGlobals`](@ref) instance.
+Module-level `Ref` holding the active [`ModelManagerGlobals`](@ref) instance, or `nothing`
+before a simulator package has registered one.
 
-Set by the concrete simulator package in its `__init__`, e.g.:
-```julia
-function __init__()
-    ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = MySimulator(), ...)
-end
-```
+Backends set it through [`registerSimulator!`](@ref) rather than assigning to it directly;
+assign only to swap the whole state object, as the test suite does.
 """
 const mm_globals_ref = Ref{Union{Nothing,ModelManagerGlobals}}(nothing)
+
+#! Public despite not being exported: a backend reaches for it as `ModelManager.mm_globals_ref`,
+#! and end users never touch it — exporting it only put it in their tab completion.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public mm_globals_ref
+
+"""
+    registerSimulator!(sim::AbstractSimulator; max_number_of_parallel_simulations::Int=1)
+
+Make `sim` the active simulator backend, creating the [`ModelManagerGlobals`](@ref) that holds it.
+This is the one line a simulator package writes in its `__init__`:
+
+```julia
+function __init__()
+    ModelManager.registerSimulator!(MySimulator("/path", v"0.1.0"))
+end
+```
+
+Idempotent for a backend that is already registered: a second call with the same simulator type
+leaves the existing globals — and everything accumulated in them — untouched, so reloading the
+package does not discard an open project. Registering a *different* backend replaces the globals
+and warns, naming both types; one process serves one backend.
+
+Returns the active `ModelManagerGlobals`.
+"""
+function registerSimulator!(sim::AbstractSimulator; max_number_of_parallel_simulations::Int=1)
+    g = mm_globals_ref[]
+    if !isnothing(g)
+        typeof(g.simulator) === typeof(sim) && return g
+        @warn "Replacing the registered simulator $(nameof(typeof(g.simulator))) with $(nameof(typeof(sim))). ModelManager serves one backend per process; the state of the previous project is discarded."
+    end
+    mm_globals_ref[] = ModelManagerGlobals(; simulator=sim,
+                                           max_number_of_parallel_simulations=max_number_of_parallel_simulations)
+    return mm_globals_ref[]
+end
+
+#! Public despite not being exported: the registration half of the backend contract, called as
+#! `ModelManager.registerSimulator!` from a package's `__init__` and never by an end user.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public registerSimulator!
 
 """
     mm_globals()::ModelManagerGlobals

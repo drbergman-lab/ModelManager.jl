@@ -24,7 +24,7 @@ useHPC(false)   # force local execution even on a cluster login node
 
 ## Job options
 
-SLURM job parameters are held in a `Dict` of `sbatch` options. [`defaultJobOptions`](@ref) sets
+SLURM job parameters are held in a `Dict` of `sbatch` options. [`ModelManager.defaultJobOptions`](@ref) sets
 two: a job name, `S<simulation id>`, and `cpus-per-task` from the backend's `simulationThreads`
 when it implements that hook (PhysiCellModelManager does, from the config's `omp_num_threads`).
 Time, memory and partition are the site's defaults until you say otherwise with
@@ -164,7 +164,7 @@ the database, but it has not been deleted. The first time it happens in a projec
 so and names the directory.
 [`initializeModelManager`](@ref) retries the removal in the background at the start of every
 later session, so staged paths normally clear themselves once the jobs holding those files
-exit; `databaseDiagnostics` reports whatever is still there.
+exit; `ModelManager.databaseDiagnostics` reports whatever is still there.
 
 If you want that space reclaimed automatically instead, put the project's `data/` directory on
 scratch — `data/.trash` then lives on scratch too and your site's purge policy sweeps it with

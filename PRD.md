@@ -56,18 +56,27 @@ them), and `addVariationRows` takes no simulator argument. Both were listed here
 - `simulationThreads(sim, simulation)` → `Union{Nothing,Int}` — threads the simulation will start, requested as `--cpus-per-task` on SLURM (default `nothing`: no request)
 - `postVariationXMLProcessing(sim, location, path)` — after a variation XML file is written
 - `centralDBFileName(sim)` → `String` (default `"mm.db"`)
-- `dbVersionTableName(sim)` → `String` — tracks migration state
-- `upgradeMilestones(sim)` → `Vector{VersionNumber}`
-- `upgradeToMilestone(sim, version, auto_upgrade)` → `Bool`
+- `dbVersionTableName(sim)` → `String` — the table tracking migration state; defaults to the lowercased name of the package defining `typeof(sim)` with `_version` appended, resolved through the same package identity `getInstalledVersion` uses
+- `upgradeMilestones(sim)` → `Vector{VersionNumber}` (default empty: no release has changed the schema)
+- `upgradeToMilestone(sim, version, auto_upgrade)` → `Bool` — the default throws, naming the inconsistency; it is reachable only once `upgradeMilestones` is non-empty, so a backend that declares a milestone must implement it
+
+A backend whose schema has never changed shape therefore implements none of these three.
 
 **Visibility:** these methods are deliberately **not exported** — a simulator package implements
 `ModelManager.runSimulation`, it never calls an exported one — but they are public API and are
 declared `@compat public` so that downstream docs builds can resolve `@ref` links to them. See
 the "Docstring Cross-References" section of `CLAUDE.md`.
 
+The same rule governs every other `@compat public` name: unexported, because a downstream
+package's `@reexport using ModelManager` forwards only exports, so a name that is not exported
+here cannot be typed bare after `using ThatPackage`. `docs/src/man/*.md` therefore writes any
+such name a reader is meant to call as `ModelManager.name`; a name described in the third person
+as a hook the backend implements is left bare.
+
 **Acceptance criteria:**
 - A package implementing all required methods compiles and runs simulations end-to-end.
 - A package implementing only optional methods falls back gracefully to defaults.
+- A backend that implements none of `dbVersionTableName` / `upgradeMilestones` / `upgradeToMilestone` opens a project and takes a version bump as a "no schema change" stamp.
 - Every interface method satisfies `Base.ispublic(ModelManager, name)` on Julia ≥ 1.11.
 
 ---
@@ -81,16 +90,17 @@ the "Docstring Cross-References" section of `CLAUDE.md`.
 **Behavioral specification:**
 - `ModelManagerGlobals` is a `@with_kw mutable struct` with fields for all generic state (db, data_dir, inputs_dict, etc.).
 - The `simulator` field has no default — it must be provided by the caller.
-- `mm_globals_ref = Ref{Union{Nothing,ModelManagerGlobals}}(nothing)` is the module-level storage.
+- `mm_globals_ref = Ref{Union{Nothing,ModelManagerGlobals}}(nothing)` is the module-level storage. Public but unexported: end users never touch it.
 - `mm_globals()` returns the current globals, asserting it has been initialized.
-- Simulator packages call `mm_globals_ref[] = ModelManagerGlobals(simulator=MySimulator(...))` in their `__init__`.
+- Simulator packages call `registerSimulator!(MySimulator(...); max_number_of_parallel_simulations=1)` in their `__init__`. It creates the globals when none exist, returns the existing ones untouched when the same backend type is already registered, and warns naming both types when it replaces a different backend's. One process serves one backend.
 - Zero-arg accessor functions (`centralDB()`, `dataDir()`, `projectLocations()`, etc.) read from `mm_globals()`.
 - `initializeModelManager` seeds `run_on_hpc` from `isRunningOnHPC()` (a probe for `sbatch` on the `PATH`) on every call, placed after all early-return failure paths and before `postInitDisplay` prints it. `useHPC(use)` overrides it afterwards; a subsequent `initializeModelManager` re-detects unconditionally and discards the override.
 - `useHPC(true)` when `run_on_hpc` is already `true` emits a one-time `@warn` that the call is redundant — pre-v0.9.0 scripts called it to work around the auto-detection that was specified but never implemented.
 
 **Acceptance criteria:**
 - Calling `mm_globals()` before initialization throws a descriptive error.
-- After a simulator package sets `mm_globals_ref[]`, all zero-arg accessors return correct values.
+- After a simulator package calls `registerSimulator!`, all zero-arg accessors return correct values.
+- A second `registerSimulator!` for the same backend type preserves the existing globals, including an open project's state.
 - After `initializeModelManager` returns `true`, `mm_globals().run_on_hpc == isRunningOnHPC()`.
 
 ---
@@ -146,6 +156,7 @@ the "Docstring Cross-References" section of `CLAUDE.md`.
 - `ParsedVariations` converts any mix of variation types to `LatentVariation`s for uniform processing.
 - `addVariations(method, inputs, avs, reference_variation_id)` writes rows to the variations DB and returns `Vector{VariationID}`.
 - `addVariationRows(sim, inputs, reference_variation_id, loc_dicts)` is the simulator-dispatched write operation.
+- `variationFilePath(location, M)` returns the path `createXMLFile(location, M)` writes to, `<location folder>/<variations subfolder>/<location>_variation_<id>.xml`. Computed from the monad's variation ID rather than looked up on disk, so it answers before the file exists; public so a backend asks for the path instead of rebuilding the convention.
 
 **Space-filling methods:** `GridVariation`, `LHSVariation`, `SobolVariation`, `RBDVariation`.
 
@@ -484,7 +495,7 @@ target location's file type.
 
 **Behavioral specification:**
 - `upgradePackage(sim, db, from_version, to_version, auto_upgrade)` walks the milestones in `(from_version, to_version]`, calling `upgradeToMilestone(sim, v, auto_upgrade)` for each.
-- Simulator packages implement `upgradeMilestones`, `upgradeToMilestone`, and `dbVersionTableName`.
+- All three of `upgradeMilestones`, `upgradeToMilestone` and `dbVersionTableName` have defaults, so a simulator package implements them only once its schema changes shape. See the AbstractSimulator section for what each default is.
 - `continueMilestoneUpgrade(version, auto_upgrade)` prompts the user for destructive migrations (unless `auto_upgrade=true`).
 - The package whose version the database tracks is **not configurable**: it is the package defining `typeof(sim)`, resolved through `Base.moduleroot` so a type in a submodule reports its package. Both the loaded version (`pkgversion` of that module) and the installed version (`Pkg` keyed on that module's UUID) derive from it, as does the name used in messages. There is no backend hook for any of it.
 - `_loadedPackageVersion` is internal, yielding `nothing` when that module belongs to no versioned package — a simulator written in a script or at the REPL.
