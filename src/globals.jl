@@ -23,7 +23,11 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
 - `db::SQLite.DB`: Connection to the central project database.
 - `run_on_hpc::Bool`: `true` to submit simulations as SLURM jobs and to route file removal
   through the staging path of [`rm_hpc_safe`](@ref). [`initializeModelManager`](@ref) sets it
-  from [`isRunningOnHPC`](@ref) on every call; override afterwards with [`useHPC`](@ref).
+  from [`isRunningOnHPC`](@ref) on every call *unless* it has been pinned; pin it with
+  [`useHPC`](@ref).
+- `run_on_hpc_overridden::Bool`: `true` once [`useHPC`](@ref) has set `run_on_hpc` by hand, which
+  stops [`initializeModelManager`](@ref) from overwriting it with the probe. Session state rather
+  than project state: a script that says `useHPC(false)` means it for every project it opens.
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
 - `hpc_completion::HPCCompletionOptions`: How the runner detects that a submitted SLURM job has
   finished. See [`setHPCCompletionOptions`](@ref).
@@ -60,6 +64,7 @@ register it via [`mm_globals_ref`](@ref) in their `__init__`.
     db::SQLite.DB = SQLite.DB()
 
     run_on_hpc::Bool = false
+    run_on_hpc_overridden::Bool = false
     sbatch_options::Dict{String,Any} = defaultJobOptions()
     hpc_completion::HPCCompletionOptions = HPCCompletionOptions()
 
@@ -197,7 +202,7 @@ It performs all framework-agnostic initialization steps in order:
 4. Parse `inputs.toml`.
 5. Initialize the database schema (tables, folder registration).
 6. Detect whether SLURM is available via [`isRunningOnHPC`](@ref) and store the result in
-   `run_on_hpc`. Override it afterwards with [`useHPC`](@ref).
+   `run_on_hpc`, unless [`useHPC`](@ref) has already pinned it in this session.
 7. Call [`postInitDisplay`](@ref) to print startup information.
 8. Launch a background `@async` task that retries the removal of anything
    [`rm_hpc_safe`](@ref) had to stage in `data/.trash/`, then runs `databaseDiagnostics`.
@@ -271,7 +276,10 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     end
     #! Detected here, after every failure path has returned, so that `_abortInitialization`
     #! need not know about this field. Still ahead of `postInitDisplay`, which prints it.
-    mm_globals().run_on_hpc = isRunningOnHPC()
+    #! A `useHPC` call wins over the probe and keeps winning: a downstream package's `__init__`
+    #! initializes a project on its own, and scripts re-initialize routinely, so without the pin
+    #! a `useHPC(false)` written at the top of a script would be undone before its first `run`.
+    mm_globals().run_on_hpc_overridden || (mm_globals().run_on_hpc = isRunningOnHPC())
     postInitDisplay(simulator)
     flush(stdout)
     # Snapshot max IDs now (before any simulations launch) so that diagnostics

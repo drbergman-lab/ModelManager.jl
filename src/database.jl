@@ -593,10 +593,134 @@ function _snapshotMaxIDs()
 end
 
 """
+    _simulationIDsAtStatus(status_code::String, max_ids) → Vector{Int}
+
+The simulations currently recorded at `status_code`, capped by the diagnostics snapshot so a
+simulation created after `initializeModelManager` returned is left to the session running it.
+"""
+function _simulationIDsAtStatus(status_code::String, max_ids::Dict{Type{<:AbstractTrial},Int})
+    query = constructSelectQuery("simulations", "WHERE status_code_id=$(statusCodeID(status_code))";
+                                 selection="simulation_id")
+    ids = Int.(queryToDataFrame(query)[!, 1])
+    haskey(max_ids, Simulation) && filter!(id -> id ≤ max_ids[Simulation], ids)
+    return ids
+end
+
+"""
+    _reconcileStrandedSimulations(max_ids)
+
+Record the outcomes of simulations whose driver process died before it could.
+
+A simulation is marked `Running` before its backend is called and `Queued` when a worker takes it.
+If the Julia process is then killed -- Ctrl-C twice, a login-node reaper, a driver job hitting its
+time limit -- nothing in-process can write what happened, and the row keeps that status forever.
+`isStarted` counts everything but `Not Started` as started, so every later run skips those
+simulations *and* announces that it found matching ones and will save you time by not re-running
+them, about simulations that never finished.
+
+Two sources of truth, in order:
+
+- the exit-code sentinel the job's own shell trap wrote, which is the same file the worker would
+  have read; it is left in place rather than consumed, so a worker in another live session that is
+  still waiting on it is not robbed of its result. The age-gated stray sweep reclaims it.
+- failing that, `sacct` on the job ID in the simulation's `hpc.out`. `sacct` reads slurmdbd, so it
+  answers for jobs that left the queue long ago -- which `squeue`, the runner's reaper, cannot.
+
+A simulation still `PENDING` or `RUNNING` is left alone, as is one whose state `sacct` reports but
+this does not classify, or that offers neither source. A `Queued` simulation with no `hpc.out` was
+never submitted at all, so it goes back to `Not Started` and the next `run` picks it up.
+
+Nothing here throws: each simulation is guarded on its own, so one unreadable folder costs one
+simulation rather than the whole report.
+"""
+function _reconcileStrandedSimulations(max_ids::Dict{Type{<:AbstractTrial},Int})
+    completed, failed, restarted = Int[], Int[], Int[]
+    unclassified = Tuple{Int,String}[]
+
+    running = _simulationIDsAtStatus("Running", max_ids)
+    if !isempty(running)
+        sentinels = _sentinelsBySimulation()
+        #! Probed once. Without `sacct` the sentinel is the only source, which is the ordinary case
+        #! on a workstation and no reason to report anything.
+        has_sacct = shellCommandExists(`sacct`)
+        for simulation_id in running
+            try
+                exit_code = haskey(sentinels, simulation_id) ?
+                            _readSentinel(sentinels[simulation_id]) : nothing
+                if !isnothing(exit_code)
+                    updateDatabaseOnCompletion(simulation_id, missing, exit_code == 0)
+                    push!(exit_code == 0 ? completed : failed, simulation_id)
+                    continue
+                end
+                has_sacct || continue
+                job_id = _jobIDFromSubmission(simulation_id)
+                isnothing(job_id) && continue
+                state = _sacctState(job_id)
+                isnothing(state) && continue
+                if state in _SACCT_SUCCESS_STATES
+                    updateDatabaseOnCompletion(simulation_id, missing, true)
+                    push!(completed, simulation_id)
+                elseif state in _SACCT_FAILURE_STATES
+                    updateDatabaseOnCompletion(simulation_id, missing, false)
+                    push!(failed, simulation_id)
+                elseif !(state in _SACCT_WAITING_STATES)
+                    push!(unclassified, (simulation_id, state))
+                end
+            catch e
+                e isa InterruptException && rethrow()
+            end
+        end
+    end
+
+    for simulation_id in _simulationIDsAtStatus("Queued", max_ids)
+        try
+            #! `hpc.out` is written by the submission itself, so its absence is proof no job was
+            #! ever created for this simulation -- the driver died between claiming the row and
+            #! submitting. One that was submitted keeps its status and is left to the `Running`
+            #! pass on a later session, once its job has an outcome to report.
+            isfile(joinpath(trialFolder(Simulation, simulation_id), "hpc.out")) && continue
+            _resetToNotStarted(simulation_id; from="Queued")
+            push!(restarted, simulation_id)
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
+
+    n = length(completed) + length(failed) + length(restarted)
+    if n > 0
+        lines = String[]
+        isempty(completed) || push!(lines, "- $(length(completed)) recorded Completed: $(_compressedIDStr(completed))")
+        isempty(failed)    || push!(lines, "- $(length(failed)) recorded Failed: $(_compressedIDStr(failed))")
+        isempty(restarted) || push!(lines, "- $(length(restarted)) never submitted, returned to Not Started: $(_compressedIDStr(restarted))")
+        @info """
+        Reconciled $(n) simulation$(n == 1 ? "" : "s") left behind by a session that ended before it
+        could record them:
+        $(join(lines, "\n"))
+        A simulation recorded Failed here is erased from its monad, exactly as it would have been
+        had the failure been seen at the time.
+        """
+    end
+    if !isempty(unclassified)
+        @warn """
+        `sacct` reports a state ModelManager does not classify for \
+        $(length(unclassified)) simulation$(length(unclassified) == 1 ? "" : "s"), \
+        left at Running:
+        $(join(["- simulation $(id): $(state)" for (id, state) in unclassified], "\n"))
+        """
+    end
+    return nothing
+end
+
+"""
     databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int} = Dict{Type{<:AbstractTrial},Int}())
 
 Check consistency between the database and the output folders.
 Prints warnings for any discrepancies found.
+
+Also recovers simulations a killed session left at `Running` or `Queued`, from the exit-code
+sentinels their SLURM jobs wrote and from `sacct` — see `_reconcileStrandedSimulations`. That is
+the one thing here that writes: without it those rows stay started forever and every later run
+skips them while reporting that it saved you time.
 
 When `max_ids` is provided (as returned by `_snapshotMaxIDs`), each check is
 restricted to IDs ≤ the snapshot value for that type. This prevents false positives from
@@ -684,6 +808,16 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     if !isempty(msg)
         msg = "The following constituents are expected but not found:\n" * msg
         @error msg
+    end
+
+    #! Before the status report, not after: reconciling is what makes that report accurate for a
+    #! project whose last session was killed. Guarded whole, on top of the per-simulation guards
+    #! inside, because a diagnostic that cannot run must still let the session start.
+    try
+        _reconcileStrandedSimulations(max_ids)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "Could not check for simulations left behind by an earlier session." exception=(e, catch_backtrace())
     end
 
     #! check simulation status of all simulations; warn on concerning codes, info on Failed

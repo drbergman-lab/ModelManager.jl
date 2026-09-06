@@ -18,7 +18,7 @@ export centralDB, dataDir, isInitialized, projectLocations, inputsDict
 export withTransaction
 export initializeModelManager
 export setNumberOfParallelSims
-export isRunningOnHPC, useHPC, setJobOptions, setHPCCompletionOptions, rm_hpc_safe
+export isRunningOnHPC, useHPC, setJobOptions, setHPCCompletionOptions, submitDriver, rm_hpc_safe
 export ProjectLocations, parseProjectInputsConfigurationFile
 export locationIDName, locationVariationIDName, locationTableName, locationFolder
 export locationVariationsTableName, locationVariationsFolder, locationVariationsDBName

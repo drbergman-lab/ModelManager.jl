@@ -5,6 +5,92 @@
 
 ---
 
+## Session: recovering a campaign whose driver died (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #53, the remainder of the 0.9 HPC architecture review. The Julia process that calls `run` is
+the only thing that records outcomes; when it dies -- an SSH drop, a login-node reaper, a driver
+job hitting its own time limit -- the jobs finish, nothing writes their results, and the rows stay
+`Running` forever. `isStarted` counts everything but `Not Started` as started, so every later run
+skips them *and* prints "found matching simulations and will save you time by not re-running
+them", about simulations that never finished. The only recovery on offer was
+`deleteSimulationsByStatus`, which deletes rows and output folders and recycles the IDs.
+
+### Decisions
+- **Reconcile inside `databaseDiagnostics`, not as a standalone function.** Diagnostics already
+  runs at every `initializeModelManager` and already reports orphaned rows and staged `.trash`
+  paths, so a stranded `Running` row is the same kind of finding; a separate entry point would be
+  one the affected user has to know to call. It writes, which the file's own comment says a
+  function named "diagnostics" should not -- accepted deliberately, and said in its docstring,
+  because the alternative is a report about rows nothing will ever fix.
+- **Two sources, in that order: the sentinel, then `sacct`.** The sentinel is the same file the
+  worker would have read, so it gives the exit code directly. `sacct` reads slurmdbd rather than
+  the queue, which is what lets it answer for a job that left hours ago -- `squeue`, the runner's
+  reaper, cannot. `COMPLETED` is success; `FAILED`/`TIMEOUT`/`CANCELLED`/`OUT_OF_MEMORY`/
+  `NODE_FAIL` are failure; `PENDING`/`RUNNING`/`SUSPENDED` are left alone; anything else is
+  reported by name rather than guessed at.
+- **A reconciled sentinel is read, not consumed.** Deleting it would be closer to what the worker
+  does, but diagnostics cannot tell an abandoned simulation from one another live session is still
+  waiting on, and consuming that session's sentinel would leave its worker to be failed by the
+  reaper minutes later. The age-gated stray sweep already exists to reclaim these.
+- **`done_dir` is gone; sentinels live at `data/outputs/.hpc_done`.** The knob bought one thing --
+  escaping NFS's 30-60 s directory-attribute caching by pointing sentinels at scratch -- and cost
+  the failure where a directory the compute nodes cannot write makes *every* successful job look
+  scheduler-killed, silently. Latency is the lesser failure and the visible one. `outputs/` rather
+  than `data/` root so it sits beside the simulation folders it is about; it is a sibling of
+  `outputs/simulations`, so nothing that scans those sees it. Breaking, in an unreleased version.
+- **`useHPC` pins the flag for the session.** One extra `Bool`, `run_on_hpc_overridden`, consulted
+  by `initializeModelManager` before it re-seeds `run_on_hpc` from the probe. Without it a
+  downstream package's `__init__` -- which initializes a project on its own -- or any script that
+  re-initializes would put the probed value back, and a `useHPC(false)` at the top of a script
+  would be gone before its first `run`. Session state, not project state: a script that says
+  `useHPC(false)` means it for every project it opens.
+- **`submitDriver` makes the driver a job.** It writes `data/outputs/drivers/<timestamp>/driver.sh`
+  (body `julia --project=<project> <script>`), submits it `--parsable` with that folder's
+  `--output`/`--error` and a default `--job-name=mm-driver`, keeps the client's streams as
+  `hpc.out`/`hpc.err` so the job ID is on disk, prints the `squeue`/`sacct` lines, and returns the
+  ID. Keyword underscores become hyphens, since `cpus_per_task=2` is writable and
+  `var"cpus-per-task"=2` is not. Values must be strings or numbers -- unlike `setJobOptions` there
+  is no `Simulation` to call a `Function` with. The docstring leads with the trap: the driver's own
+  `--time` must cover the whole campaign *including* the queue waits of the jobs it submits.
+- **Nested submission stays.** Inside the driver job, detection stays on and each simulation is
+  still its own job, which is the design -- it hands scheduling to SLURM. The review had proposed
+  hinting at `useHPC(false)` when `SLURM_JOB_ID` is set; that would have told users to undo the
+  design, so it was dropped in favour of this helper.
+- **`_SubmissionRefused` → `SubmissionRefused`, `@compat public`.** It is what a user catches to
+  tell a refused submission from a simulation that ran and failed, and PhysiCellModelManager's
+  tests already reach for it. `simulation_id` widened to `Union{Nothing,Int}` for the driver
+  submission, which belongs to no simulation. `hpc_completion.jl` joins `hpc.jl` on the HPC
+  reference page, or the `@ref` to it would not resolve in a docs build.
+
+### Rejected
+- **A hint at `SLURM_JOB_ID`.** See above: the nested submission is intended, so the hint would
+  have advised undoing it.
+- **A job array keyed by simulation ID.** Feasible (`--array=<ids>` with `SLURM_ARRAY_TASK_ID`
+  mapped back), and it keeps per-simulation logs, but every task shares one resource request --
+  right for a sampling, wrong for a mixed trial -- and the reaper would have to understand
+  `jobid_taskid`. Worth its own brief if per-job submission overhead ever becomes the bottleneck;
+  with the sentinel design it has not.
+- **A probe job to validate the sentinel directory on first submission.** Moot once the path is
+  fixed: it is now always on the same filesystem the jobs already write their output into.
+- **Resolving the monad before recording a reconciled failure.** `updateDatabaseOnCompletion` and
+  `simulationFailed` now take `Union{Missing,Int}`, so `missing` reaches the lookup
+  `eraseSimulationIDFromConstituents` already does from the simulation's own parameterization.
+  Duplicating that lookup in the reconciler would have been a second place to keep in step.
+
+### Traps
+- **`useHPC` in the test suite is now sticky.** Every testset that flips it leaves the pin set, so
+  a later `initializeModelManager` keeps that value instead of re-probing. The SLURM testsets clear
+  `run_on_hpc_overridden` before initializing, since they need the `sbatch` shim on `PATH` to be
+  honoured; anything new that depends on the probe must do the same.
+- **`databaseDiagnostics` is `@compat public`, not exported.** A test calling it bare gets
+  `UndefVarError` in `Main`, with a hint naming the module.
+- **The `sacct` shim needs `sacct.out` cleared between subtests.** `_reset_hpc!` removes it along
+  with the other shim state; a leftover state string from an earlier subtest would otherwise
+  decide a later one's outcome.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger
