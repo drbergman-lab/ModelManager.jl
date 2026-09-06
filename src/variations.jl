@@ -724,11 +724,18 @@ Base.size(lv::LatentVariation{<:Vector{<:Real}}) = length.(lv.latent_parameters)
 #! sentinel `GridVariation` checks: a continuous prior has no grid to walk, a discrete one does.
 #! The `DiscreteUnivariateDistribution` test is load-bearing — `Uniform(0,1)` is finitely *bounded*
 #! but not finitely *enumerable*, so bounds alone are not enough.
+#!
+#! `length(support(d))` rather than `hi - lo + 1`, which measures the *span*. The two agree for the
+#! contiguous unit-step supports the discrete path builds for itself (`DiscreteUniform(1, k)`), and
+#! disagree for any other level set: `DiscreteNonParametric([1, 5, 9])` has three levels and a span
+#! of nine, so a grid walk over it asked for nine points and indexed six that do not exist. The
+#! `isfinite` guard stays and comes first — it is what keeps an unbounded support (`Poisson`, whose
+#! `support` is `0:Inf`) out of `length` entirely.
 _supportSize(::Distribution) = -1
 function _supportSize(d::DiscreteUnivariateDistribution)
     lo, hi = minimum(d), maximum(d)
     (isfinite(lo) && isfinite(hi)) || return -1
-    return Int(hi - lo + 1)
+    return length(support(d))
 end
 
 Base.size(lv::LatentVariation{<:Distribution}) = [_supportSize(d) for d in lv.latent_parameters]

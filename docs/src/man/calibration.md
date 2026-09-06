@@ -49,10 +49,11 @@ problem = CalibrationProblem(
 )
 ```
 
-The parameters can be any mix of [`DistributedVariation`](@ref),
-[`CoVariation`](@ref){[`DistributedVariation`](@ref)}, or
-[`LatentVariation`](@ref){<:Distribution} — they are converted to the internal
-[`CalibrationParameter`](@ref) representation automatically.
+The parameters can be any mix of [`DistributedVariation`](@ref), [`DiscreteVariation`](@ref), a
+[`CoVariation`](@ref) of either, or [`LatentVariation`](@ref){<:Distribution} — they are converted
+to the internal [`CalibrationParameter`](@ref) representation automatically. A discrete parameter
+needs at least two levels; one that can never vary is rejected rather than given a particle
+coordinate no proposal can move, so set such a value in the reference monad instead.
 
 Two functions you supply:
 

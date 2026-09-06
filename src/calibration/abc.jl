@@ -797,13 +797,18 @@ to the underlying database column names (XML paths), along with the prior distri
 Complements `problem.jld2` (the machine-readable full serialization) for quick inspection
 without loading Julia.
 
-Each entry in the `[[parameters]]` array has a `source_type` field (`"DVSource"`,
-`"CVSource"`, or `"LVSource"`) and source-specific fields:
+Each entry in the `[[parameters]]` array has a `source_type` field and source-specific fields:
 
 - `DVSource`: `display_name`, `db_column`, `prior`
 - `CVSource`: `covariation_name`, `display_names`, `db_columns`, `priors`
+- `DiscreteSource`: `display_name`, `db_column`, `values`
+- `DiscreteCoSource`: `covariation_name`, `display_names`, `db_columns`, `values`
 - `LVSource`: `lv_name`, `latent_display_names`, `latent_priors`,
   `target_display_names`, `db_columns`
+
+A discrete source records `values` — the levels themselves — where a continuous one records a
+prior: the levels are what the CDF is quantised against, so they say which values the run could
+have visited, where the internal `DiscreteUniform` would say only how many.
 """
 function _writeParametersTOML(calibration::Calibration, cps::Vector{CalibrationParameter})
     path = joinpath(calibrationFolder(calibration), "parameters.toml")

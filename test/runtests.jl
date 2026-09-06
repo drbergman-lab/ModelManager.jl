@@ -489,6 +489,39 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test occursin("[2]", msg)          # the second parameter
         @test occursin("[3]", msg)          # ...and the third, in the same error
         @test occursin("2 of 3 parameters", msg)
+        # The old trailing line claimed ABC-SMC needs a continuous prior for every parameter, which
+        # discrete calibration made false — and it was the last thing the message said.
+        @test !occursin("continuous prior for every parameter", msg)
+
+        # A single-level discrete parameter can never vary, so it is rejected rather than costing a
+        # kernel dimension no proposal can move. It was silently accepted.
+        one_level = DiscreteVariation(:config, xp2, [1.0])
+        @test !isnothing(ModelManager._calibrationRejection(one_level))
+        @test_throws ArgumentError ModelManager._toCalibrationParameter(one_level)
+        one_level_cv = CoVariation(DiscreteVariation(:config, xp2, [1.0]),
+                                   DiscreteVariation(:config, xp3, [2.0]))
+        @test !isnothing(ModelManager._calibrationRejection(one_level_cv))
+        @test_throws ArgumentError ModelManager._toCalibrationParameter(one_level_cv)
+        single_err = try
+            ModelManager._toCalibrationParameters([dv, one_level])
+            nothing
+        catch e
+            e
+        end
+        @test single_err isa ArgumentError
+        @test occursin("can never vary", sprint(showerror, single_err))
+
+        # Something that is not a variation at all joins the aggregated report instead of raising a
+        # MethodError from inside `_calibrationRejection`.
+        not_a_variation = try
+            ModelManager._toCalibrationParameters([dv, 42, nothing])
+            nothing
+        catch e
+            e
+        end
+        @test not_a_variation isa ArgumentError
+        @test occursin("Not a variation: Int", sprint(showerror, not_a_variation))
+        @test occursin("Not a variation: Nothing", sprint(showerror, not_a_variation))
         # A mixed continuous/discrete set converts, which is the point of the change.
         mixed = ModelManager._toCalibrationParameters(
             [dv, cv, DiscreteVariation(:config, xp2, [5.0, 6.0])])
@@ -1456,6 +1489,19 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         # --- DVSource: missing column → nothing ---
         coords_miss = ModelManager._bankCdfCoords(cp, Dict{String,Float64}())
         @test isnothing(coords_miss)
+
+        # --- the interior filter is per latent dimension ---
+        # `0 < u < 1` is a statement about a continuous prior, whose CDF reaches its bounds only in
+        # the limit. A discrete parameter's top level has cdf exactly 1.0, so the strict test threw
+        # every monad run at that level out of the bank — a level proposed as often as any other.
+        disc_cp_bank = ModelManager._toCalibrationParameter(
+            DiscreteVariation(:config, xp, [1.0, 2.0, 3.0]))
+        @test ModelManager._bankCdfCoords(
+            disc_cp_bank, Dict{String,Float64}("overall/max_time" => 3.0)) ≈ [1.0]
+        @test ModelManager._bankCoordsUsable(disc_cp_bank.lv, [1.0])
+        @test !ModelManager._bankCoordsUsable(disc_cp_bank.lv, [0.0])   # no level maps there
+        @test !ModelManager._bankCoordsUsable(cp.lv, [1.0])             # continuous: still strict
+        @test ModelManager._bankCoordsUsable(cp.lv, [0.5])
 
         # --- CVSource: single latent CDF, two targets ---
         dv2 = DistributedVariation(:config, xp2, Uniform(0.0, 2.0))
@@ -2694,6 +2740,18 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 res = ModelManager.addVariations(GridVariation(), inputs,
                                                  [DiscreteVariation(:config, xp_x, [6.0, 7.0])])
                 @test length(res.variation_ids) == 2
+
+                # Cardinality, not span. `_supportSize` reported `maximum - minimum + 1`, which
+                # counts the gaps: the three levels [1, 5, 9] were sized 9, and the grid walk —
+                # which indexes `collect(support(d))` — then ran off the end of a 3-element support.
+                gappy_prior = ModelManager._discreteLevelDistribution([1.0, 5.0, 9.0])
+                @test ModelManager._supportSize(gappy_prior)       == 3
+                @test ModelManager._supportSize(DiscreteUniform(1, 4)) == 4   # contiguous: unchanged
+                @test ModelManager._supportSize(Poisson(3.0))      == -1      # unbounded: sentinel
+                gappy = LatentVariation([gappy_prior], XMLPath[xp_x],
+                                        Function[lp -> lp[1]], ["g"], Symbol[:config])
+                @test size(gappy) == [3]
+                @test vec(ModelManager.variationValues(gappy)) == [1.0, 5.0, 9.0]
             end
 
             @testset "LHS over a discrete parameter maps to values" begin
@@ -5866,6 +5924,35 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test occursin("3 passed ε", n_o)
             @test occursin("2 kept as particles", n_o)
             @test occursin("overflow trimmed", n_o)
+        end
+
+        @testset "parameters.toml display mapping covers every source type" begin
+            # Written and read back through the real pair, so the reader's branches are checked
+            # against the `source_type` strings the writer actually emits. A discrete parameter had
+            # no branch at all: it dropped out of the mapping, and the disk-resident :transition
+            # plot then dropped its column, since the mapping is what renames the simulationsTable
+            # columns into the display names the plot selects on.
+            xp1 = XMLPath(["data", "x"]); xp2 = XMLPath(["data", "y"])
+            xp3 = XMLPath(["data", "z"]); xp4 = XMLPath(["data", "w"])
+            disc = DiscreteVariation(:config, xp2, [1.0, 2.0])
+            cps = [ModelManager._toCalibrationParameter(
+                       DistributedVariation(:config, xp1, Uniform(0.0, 1.0))),
+                   ModelManager._toCalibrationParameter(disc),
+                   ModelManager._toCalibrationParameter(
+                       CoVariation(DiscreteVariation(:config, xp3, [1.0, 2.0]),
+                                   DiscreteVariation(:config, xp4, [3.0, 4.0])))]
+            mktempdir() do dir
+                path = joinpath(dir, "parameters.toml")
+                open(path, "w") do io
+                    TOML.print(io, Dict("parameters" =>
+                        [ModelManager._parameterTOMLEntry(cp) for cp in cps]))
+                end
+                mapping = ModelManager._buildDbToDisplayMappingFromTOML(path)
+                for cp in cps, col in ModelManager.columnName.(cp.lv.targets)
+                    @test haskey(mapping, col)
+                end
+                @test mapping[ModelManager.columnName(xp2)] == ModelManager.variationName(disc)
+            end
         end
 
         @testset "existing calibration recipes still apply" begin
