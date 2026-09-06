@@ -130,18 +130,24 @@ function _sentinelWrap(cmd_str::AbstractString, sentinel::String)
 end
 
 """
-    _userJobFlags(simulation_id::Int) → Vector{String}
+    _userJobFlags(simulation::Simulation) → Vector{String}
 
-Render the global `sbatch_options` as `--key=value` flags, resolving `Function` values against
-`simulation_id` and rejecting any key ModelManager sets itself.
+Render the global `sbatch_options` as `--key=value` flags, calling `Function` values with
+`simulation`, omitting a flag whose value resolves to `nothing`, and rejecting any key ModelManager
+sets itself.
 """
-function _userJobFlags(simulation_id::Int)
+function _userJobFlags(simulation::Simulation)
     flags = String[]
     for (k, v) in mm_globals().sbatch_options
-        @assert !(k in _RESERVED_SBATCH_KEYS) "The key $k is reserved for ModelManager to set in the sbatch command."
-        if typeof(v) <: Function
-            v = v(simulation_id)
+        #! `setJobOptions` already refuses these; this catches a value written into the Dict by hand.
+        k in _RESERVED_SBATCH_KEYS && throw(ArgumentError(
+            "The sbatch option `$(k)` is set by ModelManager itself and cannot be overridden."))
+        if v isa Function
+            v = v(simulation)
         end
+        #! `nothing` says "no request for this simulation" -- the default `cpus-per-task` when the
+        #! backend does not implement `simulationThreads` -- and leaves the site's default in force.
+        isnothing(v) && continue
         #! `sbatch_options` is a `Dict{String,Any}`, so a numeric value like
         #! `"cpus-per-task" => 4` is ordinary; stringify rather than assuming `AbstractString`.
         #! A value containing a space needs no quoting: each flag is one argv element, so no shell
@@ -151,10 +157,8 @@ function _userJobFlags(simulation_id::Int)
     return flags
 end
 
-const _RESERVED_SBATCH_KEYS = ["wrap", "output", "error", "wait", "parsable", "chdir"]
-
 """
-    _prepareHPCSubmitCommand(cmd::Cmd, simulation_id::Int, sentinel::String) → Cmd
+    _prepareHPCSubmitCommand(cmd::Cmd, simulation::Simulation, sentinel::String) → Cmd
 
 Wrap `cmd` in the `sbatch` invocation `_runHPCSimulation` submits: `--parsable` (never `--wait`),
 the exit-code sentinel installed by `_sentinelWrap` at `sentinel`, per-simulation
@@ -165,17 +169,20 @@ job options.
 directory otherwise -- the same rule the local path applies, so a command means the same thing on
 the cluster as on a laptop.
 """
-function _prepareHPCSubmitCommand(cmd::Cmd, simulation_id::Int, sentinel::String)
-    path_to_simulation_folder = trialFolder(Simulation, simulation_id)
+function _prepareHPCSubmitCommand(cmd::Cmd, simulation::Simulation, sentinel::String)
+    path_to_simulation_folder = trialFolder(simulation)
     flags = ["--wrap=$(_sentinelWrap(prepCmdForWrap(Cmd(cmd.exec)), sentinel))",
              "--parsable",
              "--output=$(joinpath(path_to_simulation_folder, "output.log"))",
              "--error=$(joinpath(path_to_simulation_folder, "output.err"))",
              "--chdir=$(_workingDirectory(cmd))"
             ]
-    append!(flags, _userJobFlags(simulation_id))
+    append!(flags, _userJobFlags(simulation))
     return `sbatch $flags`
 end
+
+_prepareHPCSubmitCommand(cmd::Cmd, simulation_id::Int, sentinel::String) =
+    _prepareHPCSubmitCommand(cmd, Simulation(simulation_id), sentinel)
 
 """
     _workingDirectory(cmd::Cmd) → String
@@ -269,7 +276,7 @@ function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
     mkpath(folder)
 
     if mm_globals().run_on_hpc
-        exit_code = _runHPCSimulation(cmd, simulation_id)
+        exit_code = _runHPCSimulation(cmd, spec.simulation)
         return SimulationProcess(spec.simulation, spec.monad_id, nothing, exit_code == 0, cmd)
     end
 
@@ -474,24 +481,43 @@ function run(T::AbstractTrial; quiet::Bool=false,
             #! backend bug that throws for every simulation therefore bricks the whole trial.
             #! Record it the same way any other unsuccessful simulation is recorded, then rethrow
             #! so `run` still fails fast -- a bug in the backend is not a result.
+            #!
+            #! A refused SLURM submission is the one exception: the job never existed, so nothing
+            #! is known about the simulation and recording a failure would erase it from its monad
+            #! (`simulationFailed` -> `eraseSimulationIDFromConstituents`). Put the row back to
+            #! "Not Started" so the next `run` picks it up. See `_SubmissionRefused`.
             try
                 runSimulation(mm_globals().simulator, spec)
-            catch
-                updateDatabaseOnCompletion(spec.simulation.id, spec.monad_id, false)
+            catch e
+                if e isa _SubmissionRefused
+                    _resetToNotStarted(spec.simulation.id)
+                else
+                    updateDatabaseOnCompletion(spec.simulation.id, spec.monad_id, false)
+                end
                 rethrow()
             end
         end
         for spec in specs
     ]
 
-    queue_channel = Channel{Task}(n_simulation_tasks)
+    queue_channel = Channel{Int}(n_simulation_tasks)
     result_channel = Channel{Union{_PostProcessedResult,_SimulationStageError}}(n_simulation_tasks)
-    @async for simulation_task in simulation_tasks
-        put!(queue_channel, simulation_task)
+    #! Filled synchronously: the channel holds every index, so this never blocks, and there is no
+    #! producer task left to race the `close` below.
+    for i in eachindex(simulation_tasks)
+        put!(queue_channel, i)
     end
 
+    #! Which simulations a worker owns. Set the instant a worker dequeues an index -- before it
+    #! schedules the task, with no yield in between -- so the shutdown reset below cannot mistake a
+    #! simulation a worker already holds for one nobody picked up. `istaskstarted` was the proxy
+    #! before, and it lied in exactly that window: a retried `run` would then have scheduled the
+    #! same simulation a second time.
+    claimed = falses(n_simulation_tasks)
     for _ in 1:mm_globals().max_number_of_parallel_simulations
-        @async for simulation_task in queue_channel
+        @async for i in queue_channel
+            claimed[i] = true
+            simulation_task = simulation_tasks[i]
             #! Always deliver a result. Without this catch, an exception in
             #! processSimulationTask (a throwing runSimulation/fetch, simulator hook, or user
             #! post_processor) would kill this worker silently and the completion loop's
@@ -499,8 +525,7 @@ function run(T::AbstractTrial; quiet::Bool=false,
             result = try
                 processSimulationTask(simulation_task; post_processor=post_processor, kwargs...)
             catch e
-                e isa _SimulationStageError ? e :
-                    _SimulationStageError(:simulation, nothing, CapturedException(e, catch_backtrace()))
+                _stageError(e, CapturedException(e, catch_backtrace()))
             end
             put!(result_channel, result)
         end
@@ -527,6 +552,15 @@ function run(T::AbstractTrial; quiet::Bool=false,
         end
     finally
         isnothing(sink_db) || close(sink_db)
+        #! However this loop ended -- normally, by fail-fast, or by Ctrl-C -- no further simulation
+        #! may start. Closing the queue ends each worker's `for` once it has finished what it holds
+        #! (it also releases the workers, which used to block on the never-closed channel for the
+        #! rest of the session). A simulation no worker picked up was marked "Queued" up front by
+        #! `pendingSimulationSpecs`; put it back to "Not Started" so the next `run` sees it as
+        #! pending rather than as already claimed. Jobs already submitted keep running and are
+        #! recorded by their workers as they finish, for as long as this Julia session lives.
+        close(queue_channel)
+        _resetUnclaimedSimulations(claimed, specs)
     end
     isnothing(on_progress) || on_progress(:finish, n_success)
 
@@ -593,9 +627,9 @@ end
     _SimulationStageError <: Exception
 
 A failure inside a per-simulation worker: which stage threw (`:simulation` for the launch and
-bookkeeping itself, `:postSimulationProcessing`, `:post_processor`, or
-`:postSimulationCleanup`), which simulation (when known), and the original exception with its
-backtrace as a `CapturedException`.
+bookkeeping itself, `:submission` for a SLURM submission `sbatch` refused,
+`:postSimulationProcessing`, `:post_processor`, or `:postSimulationCleanup`), which simulation
+(when known), and the original exception with its backtrace as a `CapturedException`.
 
 Workers must never let an exception escape — that would kill the worker task silently and
 leave the completion loop in [`run`](@ref) blocked forever on `take!`. Instead the failure is
@@ -609,8 +643,51 @@ struct _SimulationStageError <: Exception
     captured::CapturedException
 end
 
+"""
+    _stageError(e, captured::CapturedException) → _SimulationStageError
+
+Classify an exception that escaped a worker. A `_SimulationStageError` passes through. `fetch` on
+a failed simulation task wraps the backend's exception in a `TaskFailedException`; that is looked
+through so a refused SLURM submission is reported as `:submission`, with its simulation, rather
+than as a generic worker failure.
+"""
+function _stageError(e, captured::CapturedException)
+    e isa _SimulationStageError && return e
+    inner = e isa TaskFailedException ? e.task.exception : e
+    inner isa _SubmissionRefused && return _SimulationStageError(:submission, inner.simulation_id, captured)
+    return _SimulationStageError(:simulation, nothing, captured)
+end
+
+"""
+    _resetToNotStarted(simulation_id; from=nothing)
+
+Put a simulation's status back to "Not Started" -- only from status `from` when one is given, so a
+row a worker has meanwhile moved on is left alone.
+"""
+function _resetToNotStarted(simulation_id::Int; from::Union{Nothing,String}=nothing)
+    guard = isnothing(from) ? "" : " AND status_code_id=$(statusCodeID(from))"
+    DBInterface.execute(centralDB(), "UPDATE simulations SET status_code_id=$(statusCodeID("Not Started")) WHERE simulation_id=$(simulation_id)$(guard);")
+    return
+end
+
+"""
+    _resetUnclaimedSimulations(claimed, specs)
+
+After `run`'s completion loop has ended, return every simulation no worker claimed to "Not Started".
+A claimed one belongs to its worker, which will run it and record its outcome even though `run` has
+returned. Guarded on the row still being "Queued" as well, so nothing a worker has already moved on
+is touched.
+"""
+function _resetUnclaimedSimulations(claimed::AbstractVector{Bool}, specs::AbstractVector{SimulationSpec})
+    for (owned, spec) in zip(claimed, specs)
+        owned || _resetToNotStarted(spec.simulation.id; from="Queued")
+    end
+    return
+end
+
 function Base.showerror(io::IO, err::_SimulationStageError)
-    stage_desc = err.stage === :post_processor           ? "the user post_processor" :
+    stage_desc = err.stage === :submission               ? "the SLURM submission" :
+                 err.stage === :post_processor           ? "the user post_processor" :
                  err.stage === :postSimulationProcessing ? "the simulator's postSimulationProcessing hook" :
                  err.stage === :postSimulationCleanup    ? "the simulator's postSimulationCleanup hook" :
                                                            "the simulation worker"

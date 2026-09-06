@@ -50,23 +50,33 @@ end
 """
     defaultJobOptions()
 
-Return a `Dict` with default SLURM options.
+Return a `Dict` with default SLURM options. Two keys, both resolved per simulation:
 
-Current defaults:
-- `"job-name"` — `simulation_id -> "S\$(simulation_id)"`
-- `"mem"` — `"1G"`
+- `"job-name"`: `S<simulation id>`, so a job can be found again with `sacct --name=S<id>`.
+- `"cpus-per-task"`: whatever the backend's [`simulationThreads`](@ref) reports for the
+  simulation; `nothing` (the default for a backend that does not implement it) omits the flag.
+
+Everything else -- `time`, `mem`, `partition` -- is left to the site's defaults until
+[`setJobOptions`](@ref) says otherwise: a memory or time default chosen here would be wrong for
+most simulators, and a job that exceeds it is killed silently and takes minutes to be declared
+failed.
 """
 function defaultJobOptions()
     return Dict{String,Any}(
-        "job-name" => simulation_id -> "S$(simulation_id)",
-        "mem" => "1G"
+        "job-name" => simulation -> "S$(simulation.id)",
+        "cpus-per-task" => simulation -> simulationThreads(mm_globals().simulator, simulation),
     )
 end
+
+#! Flags ModelManager renders itself in `_prepareHPCSubmitCommand`. A user value for one of them
+#! would either be overridden or make the submission line contradict itself, so they are refused
+#! when set rather than when the first job is built.
+const _RESERVED_SBATCH_KEYS = ["wrap", "output", "error", "wait", "parsable", "chdir"]
 
 """
     HPCCompletionOptions
 
-How the runner learns that a SLURM job has finished. Held on
+How the runner submits a SLURM job and learns that it has finished. Held on
 [`ModelManagerGlobals`](@ref); adjust with [`setHPCCompletionOptions`](@ref).
 
 Jobs report their exit code by writing a sentinel file to a shared directory; the worker that
@@ -74,6 +84,12 @@ submitted each job waits for its file. `squeue` is consulted only as a reaper, f
 without writing anything, through one answer shared by every waiting worker.
 
 # Fields
+- `submit_retry_period::Float64`: How long a worker keeps retrying a submission that `sbatch`
+  refused for a reason that clears up on its own -- a per-user submit limit while earlier jobs
+  drain, a controller that is not answering -- before giving up. Retries back off from 2 s to
+  60 s. A refusal that does not look transient (a wrong partition, an invalid option, no
+  `sbatch` at all) is not retried. Either way, giving up stops the run and puts the simulation
+  back to `Not Started`; it is never recorded as failed, because no job ever ran.
 - `done_dir::String`: Where sentinels are written. Empty means `<dataDir()>/.hpc_done`. Point it
   at a faster filesystem when the project lives on an NFS mount: NFS caches directory attributes
   for `acdirmin`/`acdirmax` (30s/60s by default), which delays how quickly a sentinel written on a
@@ -88,6 +104,7 @@ without writing anything, through one answer shared by every waiting worker.
   it, so it must exceed the filesystem's worst-case directory-attribute staleness.
 """
 @with_kw mutable struct HPCCompletionOptions
+    submit_retry_period::Float64 = 900.0
     done_dir::String = ""
     poll_interval::Float64 = 1.0
     reap_interval::Float64 = 300.0
@@ -120,13 +137,28 @@ end
 
 Merge `options` into the global `sbatch_options` dictionary.
 
-Each key–value pair becomes a `--key=value` flag appended to the `sbatch`
-command when running simulations on an HPC. Values that are `Function`s are
-called with the simulation ID at runtime.
+Each key–value pair becomes a `--key=value` flag appended to the `sbatch` command when running
+simulations on an HPC. A value that is a `Function` is called with the [`Simulation`](@ref) about
+to be submitted, so an option can follow a varied parameter; returning `nothing` omits the flag
+for that simulation:
+
+```julia
+setJobOptions(Dict("time" => "02:00:00", "mem" => "8G",
+                   "comment" => simulation -> "monad \$(only(monadIDs(simulation)))"))
+```
+
+Keys must be `String`s. The keys ModelManager renders itself (`wrap`, `output`, `error`, `wait`,
+`parsable`, `chdir`) are refused with an `ArgumentError`.
 """
 function setJobOptions(options::Dict)
     for (key, value) in options
-        mm_globals().sbatch_options[key] = value
+        key isa AbstractString || throw(ArgumentError(
+            "sbatch option keys must be Strings naming the flag (\"time\", \"mem\", …); got " *
+            "$(repr(key))::$(typeof(key))."))
+        key in _RESERVED_SBATCH_KEYS && throw(ArgumentError(
+            "The sbatch option `$(key)` is set by ModelManager itself and cannot be overridden; " *
+            "reserved keys are $(join(_RESERVED_SBATCH_KEYS, ", "))."))
+        mm_globals().sbatch_options[String(key)] = value
     end
 end
 

@@ -5,6 +5,71 @@
 
 ---
 
+## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
+
+### Trigger
+An architecture review of the 0.9 HPC path, from the user's seat: what happens on a cluster whose
+per-user submit limit is smaller than `setNumberOfParallelSims`, or when slurmctld times out for
+thirty seconds mid-campaign.
+
+### What happened before
+`_submitHPCJob` returned `nothing` on any nonzero `sbatch` exit; `runSimulation` turned that into
+`success=false`; `updateDatabaseOnCompletion` called `simulationFailed`, which marked the row `Failed`
+and erased it from its monad -- deleting the monad and its superiors when it was the last
+constituent. A refused worker returns instantly and takes the next spec, so with 100 workers and a
+submit limit of 20, the other 80 marked ~980 simulations failed and deleted their monads within
+seconds. The generated script template defaults `n_replicates = 1`, so every monad had one simulation.
+
+### Decisions
+- **A refusal throws.** `_SubmissionRefused` is a distinct exception, caught in the task wrapper
+  (which resets the row to `Not Started` instead of recording a failure) and classified by the
+  worker as stage `:submission` with its simulation ID, so `run` fails fast with the scheduler's own
+  message. The reaped-job path (`_waitForHPCJob` returning `nothing`) is unchanged: there a job did
+  run and died, which is a result.
+- **Transient refusals are retried, by message.** Every refusal exits 1, so the text is the only
+  signal. A curated pattern list (QOS/submit-limit wording, socket timeouts, controller unreachable)
+  is retried with backoff 2 s doubling to 60 s for `submit_retry_period` (900 s default, on
+  `HPCCompletionOptions`), then refused. The QOS wording is shared by submit-count limits
+  (transient) and size/time limits (permanent); retrying the latter for 15 minutes is the price of
+  not shredding the former. Unmatched messages fail fast -- a wrong partition does not fix itself.
+  Rejected: retrying every refusal for a fixed short window (a submit limit lasts as long as the
+  jobs ahead of it, so a minute is not enough), and retrying indefinitely (hides a permanent error).
+- **`run` closes its queue in a `finally`.** Whether the completion loop ends normally, by fail-fast
+  or by Ctrl-C, no further simulation starts, and every simulation no worker picked up is returned
+  from `Queued` to `Not Started` (guarded on the row still being `Queued`). Before this the worker
+  tasks kept draining the queue after `run` had thrown -- submitting jobs with options the user was
+  in the middle of fixing -- and then blocked forever on the never-closed channel, one leaked task
+  per worker per `run`. Jobs already submitted are deliberately *not* cancelled: they are paid for,
+  and their workers record them as they finish. The queue is now filled synchronously (it holds
+  every task, so `put!` never blocks) so there is no producer task to race the `close`.
+- **`defaultJobOptions` loses `"mem" => "1G"`.** A one-gigabyte default is PhysiCell-sized at best
+  and wrong for most 3D runs; a job killed for exceeding it writes no sentinel and takes five to ten
+  minutes to be declared failed. The site default is the honest default. `job-name` stays, because
+  `S<id>` is the only bridge from a simulation to `sacct` besides `hpc.out`.
+- **Reserved sbatch keys are refused in `setJobOptions`**, not asserted at the first submission;
+  so are non-`String` keys (review).
+- **`cpus-per-task` is a default, filled by the backend.** Review asked whether the manual's
+  `sim_id -> threadsFor(sim_id)` example should be a real function, and of a `Simulation` rather
+  than an ID. Yes to both: only the backend knows its thread count, so ModelManager stubs
+  `simulationThreads(sim, simulation)` (default `nothing`, which omits the flag) and
+  `defaultJobOptions` requests it per submission; PCMM implements it from `omp_num_threads`. Every
+  `Function`-valued job option now receives the `Simulation`, matching the measurement contract.
+- **Ownership is tracked, not inferred.** Review (Copilot) found the shutdown reset used
+  `istaskstarted` as "no worker took this", which lies between a worker's dequeue and its
+  `schedule`; a retried `run` could then schedule the same simulation twice. Workers now mark a
+  `claimed` bit the instant they dequeue an index, with no yield in between, and the reset consults
+  that.
+- **The reaper's warning is uncapped.** `maxlog=10` hid the SLURM-specific cause (and the
+  `sacct -j` hint) after ten kills; one line per reaped job is the right amount.
+
+### Not done here, recorded for the brief
+Driver death still strands `Running` rows with only a destructive recovery (`deleteSimulationsByStatus`);
+a non-destructive reconcile that reads leftover sentinels and `sacct` is designed but not built.
+`isRunningOnHPC` still overrides a `useHPC` call on re-initialization and does not recognise
+`SLURM_JOB_ID`. Both are documented in the manual's new "Keeping the driver alive" section instead.
+
+---
+
 ## Session: QoI evaluation moves into qoi.jl (2026-09-05) — ships in v0.9.1
 
 ### Trigger
