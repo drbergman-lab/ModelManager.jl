@@ -49,10 +49,11 @@ problem = CalibrationProblem(
 )
 ```
 
-The parameters can be any mix of [`DistributedVariation`](@ref),
-[`CoVariation`](@ref){[`DistributedVariation`](@ref)}, or
-[`LatentVariation`](@ref){<:Distribution} — they are converted to the internal
-[`CalibrationParameter`](@ref) representation automatically.
+The parameters can be any mix of [`DistributedVariation`](@ref), [`DiscreteVariation`](@ref), a
+[`CoVariation`](@ref) of either, or [`LatentVariation`](@ref){<:Distribution} — they are converted
+to the internal [`CalibrationParameter`](@ref) representation automatically. A discrete parameter
+needs at least two levels; one that can never vary is rejected rather than given a particle
+coordinate no proposal can move, so set such a value in the reference monad instead.
 
 Two functions you supply:
 
@@ -220,7 +221,7 @@ printCalibrationsTable(; tags = true)
 ```
 
 A [`Calibration`](@ref) also prints its own summary, including how many generations completed and
-the ε it reached:
+the largest distance the last one accepted:
 
 ```julia
 julia> Calibration(3)
@@ -228,8 +229,8 @@ Calibration (ID=3):
   Created:     2026-08-17T10:22:31
   Method:      ABC-SMC
   Description: dose-response fit
-  Generations: 4
-  Final ε:     0.031
+  Generations:  4
+  Max ε accepted: 0.031
 ```
 
 Label runs with [tags](@ref tagging) rather than the `description=` keyword. Tags are queryable,
@@ -322,8 +323,8 @@ plot(Calibration(42), :distances; generation=3)
 
 ### Proposal distances
 
-`:distances` bins every proposal a generation evaluated and colours the accepted ones separately, so
-you can see how much of the proposal distribution is landing inside the threshold:
+`:distances` bins the proposals a generation measured a distance for and colours the accepted ones
+separately, so you can see how much of the proposal distribution is landing inside the threshold:
 
 ```julia
 plot(result, :distances)                    # final generation
@@ -336,7 +337,10 @@ rejected bars never share a bin. A shrinking accepted fraction across generation
 working; an accepted fraction that collapses toward zero means the threshold is tightening faster
 than the proposals can follow.
 
-Generation 1 accepts everything it evaluates, so it has no threshold line. Runs recorded before
+Two kinds of proposal are left out, both counted in the title rather than drawn: one whose monad had
+no successful simulation, which has no distance at all, and one whose distance is not finite, which
+has no bin — `Inf` is a perfectly ordinary thing for a `distance` to return for a hopeless parameter
+set. Generation 1 accepts everything it evaluates, so it has no threshold line. Runs recorded before
 proposal distances were kept still plot, from the accepted distances alone, and say so in the title.
 
 ## [When things go wrong](@id calibration_troubleshooting)

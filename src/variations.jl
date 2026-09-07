@@ -567,7 +567,9 @@ Check that `lv.inverse_maps` are consistent with `lv.maps` via two round-trip te
 
 **Forward-then-inverse** (`u → lp → target_vals → lp′`): for `n_samples` draws of `u ∈ (0,1)^n`,
 compute latent and target values via the forward maps, then recover latent parameter values via the
-inverse maps. Verifies `lp′ ≈ lp_vals` and that `cdf(dist_i, lp′_i) ∈ (0,1)`.
+inverse maps. Verifies `lp′ ≈ lp_vals` and that each `lp′_i` is `insupport` of `dist_i` — not that
+its `cdf` lies in `(0,1)`, which stood in for the same test and wrongly rejected the legitimate
+extreme values of a bounded or discrete distribution.
 
 **Inverse-then-forward** (`lp → target_vals → lp′ → target_vals′`): using the same draws,
 forward-maps `lp′` back to target values and verifies `target_vals′ ≈ target_vals`.
@@ -724,11 +726,18 @@ Base.size(lv::LatentVariation{<:Vector{<:Real}}) = length.(lv.latent_parameters)
 #! sentinel `GridVariation` checks: a continuous prior has no grid to walk, a discrete one does.
 #! The `DiscreteUnivariateDistribution` test is load-bearing — `Uniform(0,1)` is finitely *bounded*
 #! but not finitely *enumerable*, so bounds alone are not enough.
+#!
+#! `length(support(d))` rather than `hi - lo + 1`, which measures the *span*. The two agree for the
+#! contiguous unit-step supports the discrete path builds for itself (`DiscreteUniform(1, k)`), and
+#! disagree for any other level set: `DiscreteNonParametric([1, 5, 9])` has three levels and a span
+#! of nine, so a grid walk over it asked for nine points and indexed six that do not exist. The
+#! `isfinite` guard stays and comes first — it is what keeps an unbounded support (`Poisson`, whose
+#! `support` is `0:Inf`) out of `length` entirely.
 _supportSize(::Distribution) = -1
 function _supportSize(d::DiscreteUnivariateDistribution)
     lo, hi = minimum(d), maximum(d)
     (isfinite(lo) && isfinite(hi)) || return -1
-    return Int(hi - lo + 1)
+    return length(support(d))
 end
 
 Base.size(lv::LatentVariation{<:Distribution}) = [_supportSize(d) for d in lv.latent_parameters]

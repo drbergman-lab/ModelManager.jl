@@ -149,8 +149,22 @@ _calibrationRejection(::LatentVariation{<:Distribution}) = nothing
 #! parameter costs is resolution, not correctness: the sampler explores within-bin variation that has
 #! no effect on the simulation, which `cdf_grid_k` snapping and the `SimulationBank` already mitigate
 #! by collapsing repeated grid points.
-_calibrationRejection(::DiscreteVariation) = nothing
-_calibrationRejection(::CoVariation{<:DiscreteVariation}) = nothing
+#!
+#! A single level is the exception, and it is rejected rather than accepted as a degenerate case: the
+#! latent `DiscreteUniform(1, 1)` still costs a kernel dimension, one that every proposal draws and no
+#! proposal can move, diluting the covariance the kernel fits and adding a coordinate for the bank and
+#! the CDF grid to carry. Nothing about the run says so — the posterior column is simply constant — so
+#! a value list that lost its other entries used to look like a calibrated parameter.
+_singleLevelRejection(n::Int) =
+    "$(n == 1 ? "A single value" : "No values") means the parameter can never vary, so ABC-SMC would " *
+    "carry a particle coordinate that no proposal can move. Give it at least two levels, or — if the " *
+    "value is meant to be fixed — set it in the reference monad the problem's " *
+    "`reference_variation_id` comes from and leave it out of `parameters`."
+
+_calibrationRejection(dv::DiscreteVariation) =
+    length(dv) < 2 ? _singleLevelRejection(length(dv)) : nothing
+_calibrationRejection(cv::CoVariation{<:DiscreteVariation}) =
+    length(cv) < 2 ? _singleLevelRejection(length(cv)) : nothing
 
 #! Still rejected: a `LatentVariation` whose latent parameters are a raw value vector rather than a
 #! distribution. `variationValues` treats that branch's latent values as *indices* in the CDF path,
@@ -164,11 +178,23 @@ _calibrationRejection(::LatentVariation) =
 _calibrationRejection(av::AbstractVariation) =
     "Unsupported variation type for calibration: $(typeof(av))."
 
+#! `Any`, not `AbstractVariation`: `parameters` is an `AbstractVector` and nothing narrows it before
+#! this, so a stray number or `nothing` in the list reached `_calibrationRejection` and raised a
+#! `MethodError` on an internal — the one input that escaped the aggregated report built for exactly
+#! this kind of mistake.
+_calibrationRejection(av) =
+    "Not a variation: $(typeof(av)). Calibration parameters are DistributedVariation, " *
+    "CoVariation, DiscreteVariation, or LatentVariation with Distribution latent parameters."
+
 function _toCalibrationParameter(dv::DiscreteVariation)
+    reason = _calibrationRejection(dv)
+    isnothing(reason) || throw(ArgumentError(reason))
     return CalibrationParameter(DiscreteSource(dv), LatentVariation(dv))
 end
 
 function _toCalibrationParameter(cv::CoVariation{<:DiscreteVariation})
+    reason = _calibrationRejection(cv)
+    isnothing(reason) || throw(ArgumentError(reason))
     return CalibrationParameter(DiscreteCoSource(cv), LatentVariation(cv))
 end
 _toCalibrationParameter(av::LatentVariation) = throw(ArgumentError(_calibrationRejection(av)))
@@ -191,11 +217,13 @@ function _toCalibrationParameters(parameters::AbstractVector)
     end
     if !isempty(rejected)
         lines = ["  [$(i)] $(name): $(reason)" for (i, name, reason) in rejected]
+        #! No blanket explanation any more. It used to say ABC-SMC needs a continuous prior for every
+        #! parameter, which stopped being true when discrete variations became calibratable — and it
+        #! was the last line of the message, so it outranked the per-parameter reasons above it. Each
+        #! rejection now says what is wrong with that parameter and what to pass instead.
         throw(ArgumentError("""
         $(length(rejected)) of $(length(parameters)) parameters cannot be used for calibration:
         $(join(lines, "\n"))
-        These are usable for sensitivity analysis, which accepts discrete variations; ABC-SMC needs a
-        continuous prior for every parameter in order to weight and perturb particles.
         """))
     end
     return CalibrationParameter[_toCalibrationParameter(av) for av in parameters]

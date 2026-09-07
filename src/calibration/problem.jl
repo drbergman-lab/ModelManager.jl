@@ -395,8 +395,9 @@ and behaves like a DataFrame for property access (`cs.max_epsilon_accepted`, etc
 # Columns
 - `t`: Generation index.
 - `max_epsilon_accepted`: The largest distance the generation accepted.
-- `epsilon_threshold`: The cutoff it was run against; `nothing` for generation 1 and for generations
-  recorded before this was stored.
+- `epsilon_threshold`: The cutoff it was run against; `missing` for generation 1 and for generations
+  recorded before this was stored. `missing` rather than `nothing` so the table stays writable —
+  `CSV.write` has no serialisation for a `nothing`.
 - `acceptance_rate`: Fraction of proposals accepted.
 - `n_accepted`: Number of accepted particles (equals `population_size` when
   `accept_overflow=false`; may be larger when `accept_overflow=true`).
@@ -429,7 +430,11 @@ function ConvergenceSummary(result::ABCResult)
     df = DataFrame(
         t               = [g.t                       for g in result.generations],
         max_epsilon_accepted = [g.max_epsilon_accepted for g in result.generations],
-        epsilon_threshold    = [g.epsilon_threshold    for g in result.generations],
+        #! `missing`, not the `nothing` a `GenerationResult` carries: this is a DataFrame a user
+        #! writes out, and `CSV.write` cannot serialise a `nothing` column. The field keeps
+        #! `nothing`, which is what a generation with no threshold means in code.
+        epsilon_threshold    = [something(g.epsilon_threshold, missing)
+                                for g in result.generations],
         acceptance_rate = [g.acceptance_rate         for g in result.generations],
         n_accepted      = [nrow(g.particles)         for g in result.generations],
         ess             = [g.ess                     for g in result.generations],
@@ -446,7 +451,7 @@ function ConvergenceSummary(cal::Calibration)
     isempty(indices) && error("No generation metadata found for Calibration($(cal.id)).")
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
-    thresholds = Union{Nothing,Float64}[]
+    thresholds = Union{Missing,Float64}[]
     n_accepteds = Int[]; esss = Float64[]; ess_fractions = Float64[]
     n_evaluationss = Int[]
 
@@ -464,7 +469,7 @@ function ConvergenceSummary(cal::Calibration)
         push!(ts, t)
         #! Pre-rename runs wrote this as "epsilon"; read either spelling so they still load.
         push!(epsilons, get(d, "max_epsilon_accepted", get(d, "epsilon", NaN)))
-        push!(thresholds, get(d, "epsilon_threshold", nothing))
+        push!(thresholds, get(d, "epsilon_threshold", missing))
         push!(acceptance_rates, d["acceptance_rate"]); push!(n_accepteds, n_acc)
         push!(esss, d["ess"]); push!(ess_fractions, d["ess"] / n_acc)
         push!(n_evaluationss, d["n_evaluations"])

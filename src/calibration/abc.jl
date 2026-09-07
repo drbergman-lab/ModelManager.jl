@@ -319,6 +319,9 @@ saved in two forms:
 # Arguments
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
 - `description::String=""`: stored in the `calibrations` DB row.
+- `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
+  they survive an interrupted run. A lone `"key" => "value"` is one tag, as it is in [`tag!`](@ref);
+  the keys are validated before the run's database row and folder are created.
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise.
@@ -340,16 +343,18 @@ function runCalibration(method::ABCSMC, problem::CalibrationProblem;
                         description::String="", tags=(), run_kwargs::NamedTuple=(;),
                         progress::Symbol=:auto,
                         on_monad_failure::Symbol=:reject)
-    #! Both controls are validated before `createCalibration`, so a typo cannot leave behind a stray
-    #! DB row and output folder for a run that never starts.
+    #! Every control is validated before `createCalibration`, so a typo cannot leave behind a stray
+    #! DB row and output folder for a run that never starts. The tags belong in that list: a
+    #! malformed key throws from inside `tag!`, which used to run after the row and folder existed.
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
+    tag_pairs = [k => v for (k, v) in normalizeTagPairs(_asTagCollection(tags))]
     refreshProvenance!()
     calibration = createCalibration("ABC-SMC"; description=description)
     #! Applied before anything is dispatched, so the labels survive an interrupted run and the
     #! calibration is queryable by tag while its simulations are still in flight — the same
     #! reasoning, and the same order, as `run`'s `tags=` keyword.
-    tag!(calibration, tags...)
+    tag!(calibration, tag_pairs...)
     #! Labels the run itself, mirroring what a sensitivity sweep puts on its sampling. The value is
     #! the method *type*, as it is there, so `findTrials(Calibration; tags=("mm:method" => ...))`
     #! reads the same way across both; the `calibrations.method` column keeps its own
@@ -387,7 +392,9 @@ constructor, so every field it accepts is accepted here, with the same defaults.
 - `description::String=""`: free-text prose stored in the `calibrations` DB row and shown by
   `calibrationsTable`. For labels you intend to search on, prefer `tags`.
 - `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
-  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`.
+  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`. A lone
+  `"key" => "value"` is one tag, as it is in [`tag!`](@ref); the keys are validated before the run's
+  database row and folder are created, so a malformed one leaves nothing behind.
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; ...)` call.
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`,
   `:bar`). `:auto` shows a live progress bar on an interactive terminal and per-generation
@@ -797,13 +804,18 @@ to the underlying database column names (XML paths), along with the prior distri
 Complements `problem.jld2` (the machine-readable full serialization) for quick inspection
 without loading Julia.
 
-Each entry in the `[[parameters]]` array has a `source_type` field (`"DVSource"`,
-`"CVSource"`, or `"LVSource"`) and source-specific fields:
+Each entry in the `[[parameters]]` array has a `source_type` field and source-specific fields:
 
 - `DVSource`: `display_name`, `db_column`, `prior`
 - `CVSource`: `covariation_name`, `display_names`, `db_columns`, `priors`
+- `DiscreteSource`: `display_name`, `db_column`, `values`
+- `DiscreteCoSource`: `covariation_name`, `display_names`, `db_columns`, `values`
 - `LVSource`: `lv_name`, `latent_display_names`, `latent_priors`,
   `target_display_names`, `db_columns`
+
+A discrete source records `values` — the levels themselves — where a continuous one records a
+prior: the levels are what the CDF is quantised against, so they say which values the run could
+have visited, where the internal `DiscreteUniform` would say only how many.
 """
 function _writeParametersTOML(calibration::Calibration, cps::Vector{CalibrationParameter})
     path = joinpath(calibrationFolder(calibration), "parameters.toml")
@@ -1170,7 +1182,9 @@ new definition is used silently. Passing `problem=` in this case forces full val
   Passing both a method object and individual settings is an error.
 - Any `ABCSMC` field may be given as a keyword; it patches the saved value for that one field.
   Whenever the effective settings differ from `method.toml`, the file is rewritten to match and the
-  changed keys are reported, so a later resume does not revert to the original run's values.
+  changed keys are reported, so a later resume does not revert to the original run's values. The
+  rewrite happens only once the resume is going to run a generation: a resume that stops on its
+  own criteria, or fails validating the problem, leaves the file describing the run that did happen.
 
 # What a changed setting does to a resumed run
 
@@ -1182,7 +1196,8 @@ takes effect from the next generation onward. What that means in practice differ
 | `max_nr_populations` | New total cap. It counts *all* generations, not just new ones. |
 | `minimum_epsilon`, `min_acceptance_rate`, `min_epsilon_decrease`, `min_ess_fraction` | Checked after each new generation, as usual. |
 | `epsilon_quantile` | Sets the next threshold from the previous generation's accepted distances. |
-| `accept_overflow`, `max_evaluations`, `store_rejected` | Apply per generation; no interaction with what came before. |
+| `accept_overflow`, `store_rejected` | Apply per generation; no interaction with what came before. |
+| `max_evaluations` | New total budget. Like `max_nr_populations` it counts *all* evaluations, including those the completed generations made, so a resume that is to run anything needs an N above that total. A resume whose budget is already spent runs nothing and says so. |
 | `population_size` | New generations get the new size; earlier ones keep theirs. Legal — weights are normalised per generation, so resampling from a differently-sized parent is well defined — but the run ends up with generations of different sizes. |
 | `perturbation_kernel` | Refitted from the previous generation each time, so every generation stays internally consistent. The proposal simply changes from here on. |
 | `cdf_grid_k` | Resolved once when the loop starts, so turning snapping on or off applies only to new generations. Earlier particles were never snapped, so bank reuse differs either side of the resume. |
@@ -1255,11 +1270,6 @@ function resumeCalibration(calibration::Calibration,
         end
     end
 
-    changed = _persistEffectiveMethod(calibration, m)
-    isempty(changed) || @info "Updated method.toml to the settings this resume is running with: " *
-                              "$(join(sort(changed), ", ")). The file described the original run, " *
-                              "so a later resume would otherwise have reverted to it."
-
     #! Before anything reads or writes a generation file, bring the directory to the current layout:
     #! move any flat-layout generation into its own folder, and re-pad folder names if the cap changed.
     #! Readers handle both layouts at any width, so this is tidiness rather than a precondition — which
@@ -1275,13 +1285,41 @@ function resumeCalibration(calibration::Calibration,
     start_generations = _loadGenerations(calibration, param_names, m.max_nr_populations)
 
     if !isempty(start_generations)
-        stop_reason = _stoppingReason(m, start_generations)
+        #! `budget_hit` has to be recomputed here. It is the one stopping criterion that is not a
+        #! property of the last generation — the budget counts evaluations across the whole run, and
+        #! nothing on disk records that it was spent — so omitting it left `_stoppingReason`'s budget
+        #! branch unreachable from a resume. The loop then started generation `t`, trimmed its first
+        #! batch to nothing, accepted nothing, and died in `maximum(distances)` without ever naming
+        #! the budget.
+        n_evals_done = sum(gen.n_evaluations for gen in start_generations)
+        budget_hit   = !isnothing(m.max_evaluations) && n_evals_done >= m.max_evaluations
+        stop_reason  = _stoppingReason(m, start_generations; budget_hit=budget_hit)
         if !isnothing(stop_reason)
-            _verbosityRank(verbosity) >= _verbosityRank(:generation) &&
-                @info "ABC-SMC (resume): $stop_reason — no new generations needed."
+            #! Warned unconditionally rather than logged at `:generation`, and alone among the
+            #! stopping reasons in that: the others describe a run that finished, while this one
+            #! describes a resume that was asked for more generations and could not run any. Same
+            #! reasoning as `_runABCSMC`'s warning about a `max_nr_populations` no-op.
+            if budget_hit
+                @warn "ABC-SMC (resume): $stop_reason after $(n_evals_done) evaluations, so no " *
+                      "new generations were run. Continue with " *
+                      "`resumeCalibration(cal; max_evaluations=N)` for an N above $(n_evals_done) " *
+                      "— the budget counts every evaluation the run has made, not only new ones."
+            else
+                _verbosityRank(verbosity) >= _verbosityRank(:generation) &&
+                    @info "ABC-SMC (resume): $stop_reason — no new generations needed."
+            end
             return ABCResult(calibration, start_generations, active_problem.parameters, m)
         end
     end
+
+    #! Written only once the resume is known to be running something. `method.toml` describes the
+    #! settings a run used, so rewriting it before the validation above could throw — or before
+    #! discovering that the stopping criteria leave nothing to do — left the file describing a run
+    #! that never happened.
+    changed = _persistEffectiveMethod(calibration, m)
+    isempty(changed) || @info "Updated method.toml to the settings this resume is running with: " *
+                              "$(join(sort(changed), ", ")). The file described the original run, " *
+                              "so a later resume would otherwise have reverted to it."
 
     return _executeCalibration(active_problem, calibration, m, run_kwargs;
                                verbosity=verbosity, on_monad_failure=on_monad_failure,

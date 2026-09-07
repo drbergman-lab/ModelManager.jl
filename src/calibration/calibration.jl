@@ -544,8 +544,10 @@ function printCalibrationsTable(args...; sink=println, kwargs...)
     calibrationsTable(args...; kwargs...) |> sink
 end
 
-#! `(number of generations, final epsilon)` from the on-disk metadata, or `(0, nothing)` when there
-#! is none. Guarded throughout: this feeds `show`, which must never throw.
+#! `(number of generations, largest accepted epsilon)` from the last generation's on-disk metadata,
+#! or `(0, nothing)` when there is none. Not the threshold that generation was run against — that is
+#! `epsilon_threshold`, a different number. Guarded throughout: this feeds `show`, which must never
+#! throw.
 function _generationSummary(calibration::Calibration)
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
     indices = _generationIndices(gen_dir)
@@ -578,8 +580,12 @@ function Base.show(io::IO, calibration::Calibration)
     _pushField!(lines, "Method", df.method[1])
     _pushField!(lines, "Description", df.description[1])
     n_generations, epsilon = _generationSummary(calibration)
-    push!(lines, "  Generations: $(n_generations)")
-    isnothing(epsilon) || push!(lines, "  Final ε:     $(epsilon)")
+    _pushField!(lines, "Generations", n_generations)
+    #! Named, not "Final ε". A run records two epsilons — the threshold a generation was run against
+    #! and the worst distance it actually accepted — and this is the second. Everywhere else names
+    #! them apart; this was the one user-facing place that did not, and the bare label reads as
+    #! either.
+    isnothing(epsilon) || _pushField!(lines, "Max ε accepted", epsilon)
     print(io, join(lines, "\n"))
 end
 

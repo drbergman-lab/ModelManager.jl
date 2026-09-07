@@ -5,6 +5,88 @@
 
 ---
 
+## Session: the nineteen remaining calibration findings (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #62: what was left of the adversarial review of the calibration PRs (#33-#40) after the four
+highest findings were split off. Nineteen items in four groups, each naming a file and a line and a
+recommended fix. Every item was re-verified against the code before it was touched; the three that
+were design questions rather than defects were left for their own briefs, and one — the stale
+GSA-over-`CalibrationProblem` line in the PRD — was already being handled by the records-compaction
+PR. One commit per group, so the four can be reviewed apart.
+
+### Decisions
+- **A resume recomputes `budget_hit` rather than trusting the last generation.** Every other stopping
+  criterion is a property of the generation just finished; the budget spans the run, and nothing on
+  disk records that it was spent. Omitting it made `_stoppingReason`'s budget branch unreachable from
+  a resume, and the crash it produced (`maximum` over an empty vector) never named the budget. The
+  warning it now emits is unconditional, unlike the `@info` for the other reasons, because a resume
+  that was asked for more generations and could run none is a dead end the caller has to act on.
+- **A generation that accepts nothing is discarded, never persisted.** The issue's own words, and the
+  reason is structural: the next generation resamples from this one's particles, so a zero-particle
+  generation is not a smaller generation but a broken one. `_runSubsequentGeneration` returns
+  `nothing` and the loop stops with what is already on disk. Rejected: `maximum(...; init=0.0)`,
+  which trades the error for exactly that broken generation.
+- **The warning reports the closest distance seen against ε.** Only the budget can end that loop, so
+  "budget spent" and "ε unreachable" always arrive together and cannot be told apart automatically.
+  Naming the one number that discriminates is the honest form of "distinguish the two".
+- **`method.toml` is written only once the resume commits to running a generation.** It describes the
+  settings a run used; writing it before validation could throw, or before the stopping check, left
+  it describing a run that never happened.
+- **`_supportSize` uses `length(support(d))`.** The span `maximum - minimum + 1` is right only for a
+  contiguous unit-step support — which is what the discrete path builds for itself, hence the long
+  life of the bug — and the grid walk indexes `collect(support(d))` with the result, so a gappy
+  support did not merely mis-size, it ran off the end.
+- **A single-level discrete parameter is rejected.** It cannot vary, and its latent
+  `DiscreteUniform(1, 1)` still costs a kernel dimension that dilutes the fitted covariance. Nothing
+  in the output would say so: the posterior column is simply constant.
+- **The bank's interior filter became per latent dimension.** `0 < u < 1` is a statement about a
+  continuous prior; a discrete top level has `cdf` exactly 1. Checked that admitting 1.0 is safe
+  downstream — L∞ box comparison, `quantile(DiscreteUniform(1, k), 1.0) == k`, kernels confined to
+  [0,1], and a prior density of 1 everywhere in CDF space — before widening it.
+- **The negative-axis fix moved the axis, not the bins.** The recipe passes one `bar_width` for every
+  bar, so uniform bin width is load-bearing and an existing test asserts it. Clamping the first edge
+  was written, caught by that test, and reverted in favour of an `xlims` default that starts at the
+  data. Rejected: shrinking the bin width so the leftmost edge lands on the data — it keeps every
+  property but can explode the bin count when ε sits just above the smallest distance.
+- **A non-finite proposal distance is dropped and counted in the title, not clamped.** Clamping would
+  draw a distance the run never measured, in a plot whose whole subject is where the distances fell.
+- **`tags=` accepts a lone `Pair` in `runCalibration` only.** `_asTagCollection` lives in `tags.jl`
+  and would fix `run` and `createTrial` in a word each, but the issue scoped this to the calibration
+  entry point and a triage PR is not the place to change `run`'s keyword handling. Noted for a
+  follow-up.
+- **Calibration tag keys are validated before `createCalibration`.** They join `progress` and
+  `on_monad_failure` in the block of controls checked up front, for the same reason: a typo must not
+  leave a database row and an output folder behind for a run that never started.
+
+### Rejected
+- Erroring instead of stopping gracefully when a generation accepts nothing. The budget-exhausted
+  partial generation is already returned rather than thrown, and an exception would also throw away
+  the `ABCResult` for the generations that did succeed.
+- Making the empty-`accepted` message distinguish "budget already spent" (`n_evaluations == 0`) from
+  "spent mid-generation". With the resume-time check fixed, the first is unreachable: the first batch
+  of a generation is trimmed to empty only when the budget was spent before the generation started,
+  and the resume now stops before that.
+- Keeping `_DistanceData.max_epsilon_accepted` "for future use". It was written by two call sites,
+  one of which read a TOML key solely to supply it, and read by none.
+
+### Traps
+- **A `Pair` is iterable.** `tags = "a" => "b"` splatted into `tag!` arrives as two arguments and
+  becomes two valueless tags — silently, since both are legal keys. So is a `String`, one tag per
+  character, though that one at least fails on the charset.
+- **A recipe that declares keyword arguments cannot be applied without a plotting backend.**
+  RecipesBase's cleanup step calls `is_key_supported`, which only Plots defines, so
+  `apply_recipe(Dict(), result, :distances)` throws `MethodError` — which is why the `ABCResult` and
+  `Calibration` recipes had no direct coverage. The test suite now defines it as `true`; recipes
+  with no keywords (`_DistanceData`, `_RidgelineData`) never needed it.
+- **`normalizeTagPairs` returns tuples, not pairs.** Feeding its output straight back into `tag!`
+  hits `_tagPair`, which has no `Tuple` method.
+- **The generations a result holds are not indexed by generation number.** `_loadGenerations` skips a
+  generation whose CDF file is missing, so `generations[i].t == i` holds only until a resume follows
+  an interrupted write — which is exactly when a plot is being read.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger
