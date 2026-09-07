@@ -99,10 +99,6 @@ function __init__()
 end
 ```
 
-It takes the simulator and nothing else: every other global has its own setter. A backend that
-wants a concurrency default calls [`setNumberOfParallelSims`](@ref) on the next line — that needs
-only registration, not an initialized project.
-
 Idempotent for a backend that is already registered: a second call with the same simulator type
 leaves the existing globals — and everything accumulated in them — untouched, so reloading the
 package does not discard an open project. Registering a *different* backend replaces the globals

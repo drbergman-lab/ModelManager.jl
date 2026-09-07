@@ -41,9 +41,9 @@ pkg> add ModelManager
 using ModelManager
 
 mutable struct MySimulator <: AbstractSimulator
+    # Whatever your backend needs; ModelManager requires no fields at all.
     dir::String
     version::VersionNumber
-    # ...simulator-specific fields
 end
 
 function __init__()

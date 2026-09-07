@@ -43,9 +43,9 @@ depending on whether the method is optional or required).
 using ModelManager
 
 mutable struct MySimulator <: AbstractSimulator
+    # Whatever your backend needs; ModelManager requires no fields at all.
     dir::String
     version::VersionNumber
-    # ...any state your backend needs
 end
 ```
 
@@ -60,12 +60,10 @@ function __init__()
 end
 ```
 
-[`registerSimulator!`](@ref) takes the simulator and nothing else; every other global has its
-own setter, so a backend that wants a concurrency default calls
-[`setNumberOfParallelSims`](@ref) on the next line. It is idempotent for your own backend, so
-reloading the package does not wipe an open project, and it warns rather than silently taking over
-if another backend is already registered: **one process serves one backend.** The `Ref` behind it
-is internal; this call is the whole registration API.
+[`registerSimulator!`](@ref) is idempotent for your own backend, so reloading the package does
+not wipe an open project, and it warns rather than silently taking over if another backend is
+already registered: **one process serves one backend.** The `Ref` behind it is internal; this call
+is the whole registration API.
 
 ## 3. Provide an initialization entry point
 

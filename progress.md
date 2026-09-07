@@ -336,10 +336,9 @@ version, and the `skip_missing` reducer default — are deliberately not started
   does this database track".
 - **`registerSimulator!` is idempotent by backend *type*.** A second call for the same type returns
   the existing globals untouched rather than rebuilding them, so a package reload does not discard
-  an open project's data directory, DB handle, or provenance. It also takes nothing but the
-  simulator: the concurrency default it briefly accepted as a keyword was the one global singled
-  out for no reason, and `setNumberOfParallelSims` — usable on registration alone — is the way to
-  set it, as it always was. (Review of PR #65.)
+  an open project's data directory, DB handle, or provenance. It takes nothing but the simulator;
+  the one keyword it briefly accepted singled out a single global for no reason and was dropped in
+  review. (PR #65.)
 - **`mm_globals_ref` is internal, not merely unexported.** Its only outside reader was a backend's
   `__init__` assigning to it, and `registerSimulator!` replaces that; a backend reads state through
   `mm_globals()`. Making it `public` would have kept a second door open for no caller. (Review of
