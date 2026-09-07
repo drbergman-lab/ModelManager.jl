@@ -912,6 +912,12 @@ function _lookupAndSnap(latent_cdfs::Dict{String,Float64}, param_names::Vector{S
                          priors::Vector{<:Distribution}, k_eff::Int, radius::Float64,
                          bank::SimulationBank,
                          mid_gen_additions::Vector{Tuple{Vector{Float64},Int}})
+    #! `priors` is read positionally against `param_names` below, and the two are built by the
+    #! caller; checked here so a mismatch is a message naming both lengths rather than a
+    #! `BoundsError` from inside the snap.
+    length(priors) == length(param_names) || throw(ArgumentError(
+        "_lookupAndSnap: `priors` has $(length(priors)) entries but `param_names` has " *
+        "$(length(param_names)); the two must run parallel, one prior per parameter."))
     raw_cdf = [latent_cdfs[name] for name in param_names]
 
     # Concurrent lookup: KD-tree bank + mid-generation additions

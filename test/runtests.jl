@@ -1968,6 +1968,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test eff6["x"] ≈ 0.26   # untouched
         @test eff6["y"] ≈ 0.75   # snapped
         @test isnothing(mid6)
+
+        # `priors` is read positionally against `param_names`, so a length mismatch is refused up
+        # front with both lengths named rather than surfacing as a BoundsError mid-snap.
+        @test_throws ArgumentError ModelManager._lookupAndSnap(
+            Dict("x" => 0.26, "y" => 0.74), param_names, [Uniform(0, 1)], k_eff, radius,
+            empty_bank, Tuple{Vector{Float64},Int}[])
     end
 
     @testset "_snapToCDFGrid with a prior" begin
