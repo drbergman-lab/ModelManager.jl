@@ -366,7 +366,7 @@ function _executeCalibration(problem::CalibrationProblem, calibration::Calibrati
 end
 
 """
-    runCalibration(method::ABCSMC, problem::CalibrationProblem; description="") → ABCResult
+    runCalibration(method::ABCSMC, problem::CalibrationProblem; kwargs...) → ABCResult
 
 Run ABC-SMC calibration. See [`ABCSMC`](@ref) for method settings.
 
@@ -377,11 +377,16 @@ saved in two forms:
 - `generations/{t}/cdfs.csv`: raw CDF coordinates for exact resume.
 
 # Arguments
-- `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
-- `description::String=""`: stored in the `calibrations` DB row.
+- `method::ABCSMC`: the method settings — population size, stopping criteria, kernel.
+- `problem::CalibrationProblem`: the model, parameters, observed data and distance to calibrate.
+
+# Keywords
+- `description::String=""`: free-text prose stored in the `calibrations` DB row and shown by
+  `calibrationsTable`. For labels you intend to search on, prefer `tags`.
 - `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
   they survive an interrupted run. A lone `"key" => "value"` is one tag, as it is in [`tag!`](@ref);
   the keys are validated before the run's database row and folder are created.
+- `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise.

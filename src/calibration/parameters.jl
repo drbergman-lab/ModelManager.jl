@@ -161,8 +161,8 @@ _calibrationRejection(::LatentVariation{<:Distribution}) = nothing
 _singleLevelRejection(n::Int) =
     "$(n == 1 ? "A single value" : "No values") means the parameter can never vary, so ABC-SMC would " *
     "carry a particle coordinate that no proposal can move. Give it at least two levels, or — if the " *
-    "value is meant to be fixed — set it in the reference monad the problem's " *
-    "`reference_variation_id` comes from and leave it out of `parameters`."
+    "value is meant to be fixed — set it in the reference simulation or monad the problem is built " *
+    "from and leave it out of `parameters`."
 
 _calibrationRejection(dv::DiscreteVariation) =
     length(dv) < 2 ? _singleLevelRejection(length(dv)) : nothing

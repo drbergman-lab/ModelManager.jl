@@ -17,7 +17,10 @@ import GlobalSensitivity
 # every recipe that declares keyword arguments calls it — so `plot(::ABCResult, :distances)` and its
 # siblings cannot be applied at all without a backend loaded. The suite has none, so say every key
 # is supported: nothing here checks an attribute dictionary against what a backend would accept.
-RecipesBase.is_key_supported(::Symbol) = true
+# Guarded, so a backend that some later test loads keeps its own answer instead of being overwritten.
+if !hasmethod(RecipesBase.is_key_supported, Tuple{Symbol})
+    RecipesBase.is_key_supported(::Symbol) = true
+end
 
 # Full-featured stub simulator used by both the existing in-memory unit tests and the
 # new DB-backed integration tests.
