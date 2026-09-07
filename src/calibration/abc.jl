@@ -130,6 +130,9 @@ detected from the database *before* any user code runs, and `on_monad_failure` d
 Partially failed monads (at least one success) are evaluated normally from whatever succeeded;
 their failed simulations are still recorded. Re-running to "top off" the missing replicates is
 deliberately not attempted.
+
+A monad that *does* have output but whose every replicate's `compute` returned `missing` is in the
+same position — no value to compare — and follows the same policy, from `_evaluateParticle`.
 """
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
                               max_nr_populations::Int, run_kwargs::NamedTuple=(;);
@@ -187,7 +190,8 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
                 (missing, monad.id)
             else
                 (_evaluateParticle(problem, monad.id,
-                                   count(in(failed_set), sim_ids_before[monad.id])),
+                                   count(in(failed_set), sim_ids_before[monad.id]),
+                                   on_monad_failure),
                  monad.id)
             end
             for monad in monads]
@@ -195,11 +199,22 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
     return evaluate_batch
 end
 
+#! A `missing` summary is not a bug in the user's functions, so it does not go down the fail-fast
+#! path with them. A QoI says `missing` when a simulation produced no value, and a monad every one of
+#! whose replicates said so is in exactly the position of a monad with no successful simulation:
+#! there is no output to compare. So it follows `on_monad_failure` -- rejected under `:reject`, fatal
+#! under `:error` -- rather than being reported as a fault the user must fix in their code.
+#!
+#! Checked between the two calls rather than after them, so a `missing` returned by the user's own
+#! `distance` still raises "a `Real` is required". Those are different mistakes.
 """
-    _evaluateParticle(problem, monad_id, n_failed_simulations) → Float64
+    _evaluateParticle(problem, monad_id, n_failed_simulations, on_monad_failure) → Float64 or missing
 
 Compute one particle's distance by calling the user's `summary_statistic` and `distance` on a
 monad that has at least one successful simulation.
+
+Returns `missing` when the summary statistic has no value for this monad — every replicate's
+`compute` returned `missing` — under `on_monad_failure=:reject`; `:error` stops the run instead.
 
 Both calls are user code, so both are guarded — but neither failure is recoverable: the monad
 *does* have output, so an exception (or a `distance` return value that is not a `Real`) is a
@@ -209,19 +224,34 @@ surfaces much later as an unrelated `MethodError`. `n_failed_simulations` is rep
 non-zero, since a partially failed monad is the likeliest reason otherwise-correct user code
 trips here.
 """
-function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int)
+function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int,
+                           on_monad_failure::Symbol)
     partial_note = n_failed_simulations == 0 ? "" :
         "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
         "they would have produced is missing."
+    user_code_note = """
+    Calibration failed while evaluating monad $monad_id: `summary_statistic` or `distance` \
+    raised. This monad has at least one successful simulation, so the fault is in those \
+    functions rather than in the simulations.$partial_note
+    """
+    simulated = try
+        _evaluateSummary(problem.summary_statistic, monad_id)
+    catch
+        @error user_code_note
+        rethrow()
+    end
+    if ismissing(simulated)
+        on_monad_failure === :error && error("""
+        Calibration stopped: the summary statistic has no value for monad $monad_id — every one of \
+        its simulations returned `missing`, so there is nothing to compare with `observed_data`.$partial_note
+        Pass `on_monad_failure=:reject` to reject such particles and continue the run instead.
+        """)
+        return missing
+    end
     distance = try
-        simulated = _evaluateSummary(problem.summary_statistic, monad_id)
         problem.distance(simulated, problem.observed_data)
     catch
-        @error """
-        Calibration failed while evaluating monad $monad_id: `summary_statistic` or `distance` \
-        raised. This monad has at least one successful simulation, so the fault is in those \
-        functions rather than in the simulations.$partial_note
-        """
+        @error user_code_note
         rethrow()
     end
     distance isa Real || error("""
@@ -322,9 +352,10 @@ saved in two forms:
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
-  simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
-  which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad yields no distance — no
+  successful simulation, or a summary statistic that is `missing` because every replicate's
+  `compute` was. `:reject` records the distance as `missing`, which ABC-SMC never accepts, and
+  continues; `:error` stops the run. Either way the failed
   simulation and monad IDs are recorded per generation in
   `generations/{t}/failed_simulations.csv` and
   `generations/{t}/failed_monads.csv`.
@@ -392,7 +423,8 @@ constructor, so every field it accepts is accepted here, with the same defaults.
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`,
   `:bar`). `:auto` shows a live progress bar on an interactive terminal and per-generation
   milestones otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful simulation.
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad yields no distance — no
+  successful simulation, or a summary statistic that is `missing` because every replicate's was.
   `:reject` records its distance as `missing` (so the particle is never accepted) and continues;
   `:error` stops the run. Failed simulation and monad IDs are recorded per generation either way, in
   `generations/{t}/failed_simulations.csv` and
@@ -618,9 +650,10 @@ At resume time:
 struct _ProblemManifest
     inputs::InputFolders
     sources::Vector{Any}       # DVSource | CVSource | LVSource | _StrippedLVSource
-    #! Untyped to match `CalibrationProblem.observed_data`: `mseDistance` accepts a `Dict`, a
-    #! `Vector` or a scalar, and `_saveProblem` runs before generation 1, so a narrower type here
-    #! rejects two of the three documented shapes before a run can start.
+    #! Untyped to match `CalibrationProblem.observed_data`, which is whatever the problem's own
+    #! `distance` accepts as its second argument -- `mseDistance` alone takes a `Dict` or a scalar.
+    #! `_saveProblem` runs before generation 1, so a narrower type here would reject a shape before
+    #! the run could start.
     observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID

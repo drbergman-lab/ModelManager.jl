@@ -17,22 +17,25 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function — ideally one that
-  **declares it takes a [`Simulation`](@ref)**, `f(s::Simulation)` or `(s::Simulation) -> …`, since
-  one that does not is warned about. In every case the
-  measurement is made once per *simulation* and the replicates are combined by `reduce` (`mean` for a
-  plain function; a `QoI` is how you choose otherwise, and its `reduce` receives every replicate's
-  value, so a step that must happen *after* averaging goes there). A single QoI or a plain function
-  reports its value directly; a vector of QoIs reports a `Dict` keyed by QoI name.
+- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function (wrapped into a `QoI`
+  with the default reducer). The measurement is made once per *simulation* and the replicates are
+  combined by `reduce`, which receives every replicate's value — so a step that must happen *after*
+  averaging goes there.
 
-  The annotation matters because the previous contract called a bare function once per *monad* and
-  let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
-  reinterpreting one silently would change results without raising. It is warned about rather than
-  refused, since refusing every unannotated function would also reject `sim -> measure(sim)`, the
-  natural way to write a new-contract lambda. The warning is transitional and goes in v0.10.
+  **The keys `distance` sees are the keys your `compute`/`reduce` produced.** A single QoI hands its
+  value over unwrapped, so a `Real`-valued one gives `distance` a number and a keyed one gives the
+  very `Dict`/`NamedTuple` keys it wrote. A vector of QoIs gives one flat `Dict{String,Float64}`
+  merging them: a `Real`-valued member under its own name, a keyed member under its own keys. Two
+  members claiming one key is an error naming both. Nothing is prefixed with a QoI's name here —
+  unlike sensitivity labels and sink columns, which are flat namespaces shared across a whole
+  project, `distance`'s two arguments are private to this problem, and you write the other one.
+
+  A monad whose every replicate returned `missing` has no summary; its particle is handled by
+  `on_monad_failure` (see [`runCalibration`](@ref)) rather than reported as a bug in your functions.
 - `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
   of `summary_statistic`; `observed` is `observed_data`.
-  Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
+  Built-in: [`mseDistance`](@ref) — a `Dict` against a `Dict` with the same keys, or scalar against
+  scalar.
 - `n_replicates::Int`: Number of replicate simulations to run per proposed particle
   (default 1). Values > 1 reduce stochastic noise in each particle evaluation at the cost
   of N× more compute.
@@ -53,7 +56,8 @@ function countDefaultCells(sim::Simulation)
     return Float64(only(counts[counts.cell_type .== "default", :count]))
 end
 
-# A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
+# A vector of QoIs reports one flat `Dict`; a `Real`-valued QoI contributes its own name as the
+# key, so `observed` is keyed the same way.
 observed = Dict("default" => 100.0)
 problem = CalibrationProblem(
     ref,

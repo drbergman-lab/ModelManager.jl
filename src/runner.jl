@@ -414,21 +414,24 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   `only(monadIDs(simulation))` (which queries the database, and throws if the simulation is gone);
   reading the actual simulation output into usable data is the responsibility of the user
   or the simulator package (e.g. PhysiCellModelManager loaders keyed by `simulationID`).
-  Its return value determines storage:
-  - `nothing` → nothing is stored (pure side effects).
-  - a `NamedTuple` or `AbstractDict` of `name => scalar` → one row keyed by `simulation_id`
-    is upserted into the project's post-processing sink (`data/outputs/postprocessing.db`),
-    readable via [`postProcessingTable`](@ref). Each key becomes the column
-    `"<qoi name>.<key>"`, so two measurements that both report a `tumor` stay separate; a
-    scalar return uses the name alone. Columns grow dynamically; sims lacking a given
-    quantity have `NULL`.
-  - any other type → an `ArgumentError` is thrown.
+  Its return value determines storage, and follows the [`QoI`](@ref) value contract:
+  - `missing` → nothing is stored for that simulation. This is also how a callback whose only
+    job is a side effect says so; `nothing` is **refused**, because it is what a callback
+    returns by accident when a block falls through.
+  - a `Real` → one column named after the QoI.
+  - a `NamedTuple` or `AbstractDict` of `name => Real` → one column per key, named
+    `"<qoi name>.<key>"`, so two measurements that both report a `tumor` stay separate. Either
+    way one row keyed by `simulation_id` is upserted into the project's post-processing sink
+    (`data/outputs/postprocessing.db`), readable via [`postProcessingTable`](@ref). Columns grow
+    dynamically; sims lacking a given quantity have `NULL`.
+  - any other type — a `Vector`, a `String`, a nested value → an `ArgumentError` naming the QoI
+    and the type.
 
   Because every column is named after the [`QoI`](@ref) that wrote it, a **bare anonymous
   function that stores anything is refused**: its derived name is a gensym that changes
   between sessions, so the same script would write a fresh, half-empty set of columns each
   run. Wrap it — `QoI("counts", sim -> …)` — or pass a named function. A callback returning
-  `nothing` is unaffected.
+  `missing` is unaffected.
   The callback runs inside the per-simulation worker task (so heavy compute parallelizes),
   but all sink writes are serialized in the main completion loop; user code never touches the
   sink DB directly. `post_processor` is not forwarded to the simulator hooks. If the callback

@@ -1,68 +1,45 @@
 export mseDistance
 
+#! Strict about keys, where it used to warn once and impute an absent key as zero. Zero-filling turned
+#! a naming mistake into a converged, wrong posterior: a summary keyed one way and an `observed_data`
+#! keyed another compared every key against 0, which is a perfectly finite distance, so ABC-SMC
+#! accepted particles on it and returned the prior with one `@warn maxlog=1` somewhere in the log.
+#! There is no fill that makes the answer approximate rather than wrong, so the mismatch is refused.
 """
     mseDistance(simulated, observed)
 
 Built-in distance functions for use as `distance` in a [`CalibrationProblem`](@ref).
-Three calling conventions are supported:
+Two calling conventions are supported:
 
-- `mseDistance(sim::Dict{String,<:Any}, obs::Dict{String,<:Any})` — mean of per-key MSE
-  contributions, averaged across all keys in `obs`. Scalar keys contribute `(sim−obs)²`;
-  vector keys contribute `mean((sim .- obs).^2)`. Keys missing from `sim` are treated as
-  zero. Keys in `sim` not in `obs` are ignored (with a one-time warning).
-
-- `mseDistance(sim::AbstractVector{<:Real}, obs::AbstractVector{<:Real})` — sum of squared
-  differences `Σ(simᵢ−obsᵢ)²`. Throws `DimensionMismatch` when lengths differ.
+- `mseDistance(sim::AbstractDict, obs::AbstractDict)` — mean of the per-key squared errors
+  `(sim[k] − obs[k])²`. The two must carry **exactly the same keys**; a mismatch is an
+  `ArgumentError` listing what each side has. The keys are the ones your `compute`/`reduce`
+  produced, so `observed_data` is written with those.
 
 - `mseDistance(sim::Real, obs::Real)` — squared difference `(sim − obs)²`.
 """
-function mseDistance(simulated::Dict{String,<:Any}, observed::Dict{String,<:Any})
-    if any(!in(keys(observed)), keys(simulated))
-        @warn """
-        Found keys in simulated that are not in the observed dict.
-        - Keys in simulated but not observed: $(setdiff(keys(simulated), keys(observed)))
-        - These will not contribute to the MSE calculation.
-        """ maxlog=1
-    end
-    if any(!in(keys(simulated)), keys(observed))
-        @warn """
-        Found keys in observed that are not in the simulated dict.
-        - Keys in observed but not simulated: $(setdiff(keys(observed), keys(simulated)))
-        - The MSE will be calculated by assuming the simulated value is 0.
-        """ maxlog=1
+function mseDistance(simulated::AbstractDict, observed::AbstractDict)
+    if Set(keys(simulated)) != Set(keys(observed))
+        throw(ArgumentError("""
+        mseDistance was given a simulated and an observed value with different keys, so there is no \
+        set of quantities to compare.
+        - simulated: $(repr(sort(string.(collect(keys(simulated))))))
+        - observed:  $(repr(sort(string.(collect(keys(observed))))))
+        A summary statistic's keys are the ones its `compute`/`reduce` produced — for a vector of \
+        QoIs, a `Real`-valued one contributes its own name and a keyed one contributes its keys. \
+        Key `observed_data` the same way.
+        """))
     end
     n = length(observed)
     n == 0 && return 0.0
     total = 0.0
     for (k, obs_val) in observed
-        sim_val = get(simulated, k, _zeroLike(obs_val))
-        total += _mseContribution(sim_val, obs_val)
+        total += _mseContribution(simulated[k], obs_val)
     end
     return total / n
 end
 
 # Scalar contribution: single squared error term
 _mseContribution(sim::Real, obs::Real) = Float64((sim - obs)^2)
-
-# Vector contribution: mean squared error across the time series
-function _mseContribution(sim::AbstractVector{<:Real}, obs::AbstractVector{<:Real})
-    length(sim) == length(obs) || throw(DimensionMismatch(
-        "Simulated and observed vectors have different lengths ($(length(sim)) vs $(length(obs))). " *
-        "Ensure the time grids match."
-    ))
-    return mean((sim .- obs) .^ 2)
-end
-
-# Zero sentinel that matches the shape of the observed value (used for missing keys)
-_zeroLike(::Real) = 0.0
-_zeroLike(v::AbstractVector{<:Real}) = zeros(Float64, length(v))
-
-function mseDistance(simulated::AbstractVector{<:Real}, observed::AbstractVector{<:Real})
-    length(simulated) == length(observed) || throw(DimensionMismatch(
-        "Simulated and observed vectors have different lengths " *
-        "($(length(simulated)) vs $(length(observed)))."
-    ))
-    return sum((simulated .- observed) .^ 2)
-end
 
 mseDistance(simulated::Real, observed::Real) = Float64((simulated - observed)^2)

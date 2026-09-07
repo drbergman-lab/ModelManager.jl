@@ -661,9 +661,10 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     end
 
     #! Every monad is checked, not just the first. A key set that differs anywhere leaves a hole in
-    #! that key's design matrix, and there is no defensible value to fill it with -- unlike
-    #! `mseDistance`, which treats an absent key as zero and warns once. A sensitivity index computed
-    #! over a hole is wrong rather than approximate, so this refuses instead.
+    #! that key's design matrix, and there is no defensible value to fill it with. A sensitivity
+    #! index computed over a hole is wrong rather than approximate, so this refuses instead. The
+    #! same reasoning covers a monad that reduced to `missing`; `_qoiComponentKeys` has a method for
+    #! it so the message says no replicate produced a value rather than naming a type.
     reference_id = first(monad_ids)
     component_keys = _qoiComponentKeys(q, reduced[reference_id], reference_id)
     #! Walked in DESIGN order, so the monad an error names is the first mismatch someone scanning

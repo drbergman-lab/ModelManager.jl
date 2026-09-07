@@ -41,42 +41,49 @@ provide loaders keyed by `simulationID`.
 
 ## What to return
 
-The return value decides storage:
+The return value follows the one [`QoI`](@ref) value contract, and decides storage:
 
-- `nothing` → nothing is stored (pure side effects — compute, write files, or clean up however
-  you like).
-- a `NamedTuple` or `AbstractDict` of `name => scalar` (where each value is a `Real`, `Bool`, or
-  `String`) → one row (keyed by `simulation_id`) is upserted into the project's post-processing
-  sink at `data/outputs/postprocessing.db`. Columns are added on demand, so a quantity not
-  computed for a given simulation reads back as `missing`; re-running overwrites that
-  simulation's row. Anything else (including a non-scalar value such as a vector) raises an
-  `ArgumentError`.
+- `missing` → nothing is stored for this simulation. This is also how a callback whose only job is
+  a side effect — writing your own output file, deleting data, logging — says so.
+- a `Real` → one column, named after the QoI.
+- a `NamedTuple` or `AbstractDict` of `name => Real` → one column per key. Either way one row
+  (keyed by `simulation_id`) is upserted into the project's post-processing sink at
+  `data/outputs/postprocessing.db`. Columns are added on demand, so a quantity not computed for a
+  given simulation reads back as `missing`; re-running overwrites that simulation's row.
+- anything else — a `Vector`, a `String`, a nested value, `nothing` — raises an `ArgumentError`
+  naming the QoI and the offending type.
+
+!!! note "`nothing` is refused; say `missing`"
+    A callback's value is its **last expression**, and `nothing` is what a block returns when it
+    falls through — a trailing `if` with no `else`, a `for` loop, a `push!`. Accepting it as "store
+    nothing" would make a dropped measurement indistinguishable from an intended skip, so the sink
+    refuses it and asks for `missing`:
+
+    ```julia
+    run(sampling; post_processor = function (sp)
+        writeCustomSummary(pathToOutputFolder(sp))   # your own file, in the sim's output folder
+        return missing                               # <-- required; `nothing` is an error
+    end)
+    ```
+
+!!! note "Text belongs on a tag"
+    A `String` is not a QoI value in any consumer, so the sink no longer stores one and has no TEXT
+    columns. To attach text to a simulation — a label, a classification, a reason — [tag
+    it](@ref tagging): tags are queryable, hold several values per key, and can be applied
+    retroactively.
 
 !!! note "Every column is named `<qoi name>.<key>`"
     A returned key does not become a bare column: it is prefixed with the name of the [`QoI`](@ref)
     that produced it, so `QoI("counts", …)` returning `(; tumor = 3)` writes `counts.tumor`. That is
     what lets two measurements both report a `tumor` without landing in one column, and it matches
-    how [sensitivity analysis](@ref sensitivity_analysis) labels the same spread.
+    how [sensitivity analysis](@ref sensitivity_analysis) labels the same spread. Calibration is the
+    one consumer that does *not* prefix — see [Calibration](@ref calibration_man) for why.
 
     **A bare anonymous function therefore cannot write to the sink.** Its name is derived from a
     gensym (`anon_9`) that changes between sessions, so the same script would write a fresh,
     half-empty set of columns on every run. Wrap it — `QoI("counts", sim -> …)` — or pass a named
-    function, whose name is stable. A callback returning `nothing` is unaffected, since it stores
+    function, whose name is stable. A callback returning `missing` is unaffected, since it stores
     nothing to name.
-
-### Storing nothing (side effects only)
-
-If you only want side effects — writing your own output file, deleting data, logging — return
-`nothing` explicitly. This matters: a callback's value is its **last expression**, so a block
-that ends with a computation would store that value by accident. End with `return nothing`
-(or a bare `nothing`) to store nothing:
-
-```julia
-run(sampling; post_processor = function (sp)
-    writeCustomSummary(pathToOutputFolder(sp))   # your own file, in the sim's output folder
-    return nothing                               # <-- required; without it the summary would be stored
-end)
-```
 
 ### Storing a NamedTuple
 
