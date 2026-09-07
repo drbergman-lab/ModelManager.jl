@@ -29,18 +29,29 @@
 #!   sever the submitter from the job, which may start hours later. Writing a file needs only `>`.
 #! - It does not clean up with `rm_hpc_safe`. That exists for output directories a *running* job on
 #!   another node still holds open; a sentinel's writer has exited before the file is even readable.
-#!   It would also stage into `data/.trash/` -- a cross-mount move whenever `done_dir` is on another
-#!   filesystem -- and warn about the staged path, all for a few bytes.
+#!   It would also stage into `data/.trash/` and warn about the staged path, all for a few bytes.
+
+"""
+    _hpcDoneDirPath()
+
+Where SLURM jobs deposit their exit-code sentinels: `<dataDir()>/outputs/.hpc_done`, a sibling of
+the simulation folders the sentinels are about.
+
+The location is fixed rather than configurable. A configurable one, pointed somewhere the compute
+nodes could not write, made every successful job look scheduler-killed, and said nothing about why;
+the escape hatch it bought -- sentinels on a faster filesystem than an NFS `data/` -- only ever
+traded latency, which is the lesser and the visible failure.
+"""
+_hpcDoneDirPath() = joinpath(dataDir(), "outputs", ".hpc_done")
 
 """
     _hpcDoneDir()
 
-Absolute path to the directory where SLURM jobs deposit their exit-code sentinels, creating it if
-needed. Defaults to `<dataDir()>/.hpc_done`; see `HPCCompletionOptions.done_dir` for when to move it.
+`_hpcDoneDirPath()`, created if it is not there yet. Read paths use the path helper instead, so
+that merely inspecting the directory does not bring it into existence.
 """
 function _hpcDoneDir()
-    configured = mm_globals().hpc_completion.done_dir
-    dir = isempty(configured) ? joinpath(dataDir(), ".hpc_done") : configured
+    dir = _hpcDoneDirPath()
     mkpath(dir)
     return dir
 end
@@ -319,26 +330,35 @@ function _recordSubmissionOutput(simulation_id::Int, stdout_text::AbstractString
 end
 
 """
-    _SubmissionRefused <: Exception
+    SubmissionRefused <: Exception
 
 `sbatch` would not take the job: it could not be invoked, it exited non-zero, or its output held no
-job ID. Thrown by `_submitHPCJob` once its retry policy is exhausted; `run` turns it into a
-fail-fast error naming the simulation.
+job ID. Thrown by the runner once its retry policy is exhausted, and by [`submitDriver`](@ref);
+[`run`](@ref) turns it into a fail-fast error naming the simulation. `simulation_id` is `nothing`
+for a refused driver submission, which belongs to no simulation.
 
 A refusal is not a simulation failure. The job never existed, so nothing is known about the
 simulation -- what is wrong is the environment: a per-user submit limit, a controller that is not
 answering, a mistyped partition, no `sbatch` on this machine. Recording it as `Failed` would erase
 the simulation from its monad, and since a refused worker returns at once and takes the next spec,
 a persistent refusal would shred a whole campaign in seconds. Instead the simulation goes back to
-`Not Started` and the run stops.
+`Not Started` and the run stops. Catch this to tell a refused submission from a simulation that ran
+and failed.
 """
-struct _SubmissionRefused <: Exception
-    simulation_id::Int
+struct SubmissionRefused <: Exception
+    simulation_id::Union{Nothing,Int}
     message::String
 end
 
-Base.showerror(io::IO, e::_SubmissionRefused) =
-    print(io, "sbatch refused the job for simulation $(e.simulation_id): $(e.message)")
+Base.showerror(io::IO, e::SubmissionRefused) =
+    print(io, "sbatch refused the ",
+          isnothing(e.simulation_id) ? "driver job" : "job for simulation $(e.simulation_id)",
+          ": ", e.message)
+
+#! Public despite not being exported: it is the exception a user catches to detect a refused
+#! submission, so it is API even though nothing needs to construct one.
+#! See CLAUDE.md, "Docstring cross-references".
+@compat public SubmissionRefused
 
 #! Refusals that clear up on their own: a submit limit while earlier jobs drain, a controller too
 #! busy to answer. Matched on sbatch's own wording, because every refusal exits 1. Anything not
@@ -392,7 +412,7 @@ end
 
 Run the prepared `sbatch` command and return the job ID. A refusal whose message looks transient is
 retried with backoff for up to `HPCCompletionOptions.submit_retry_period`; any other refusal, or a
-transient one that outlasts that period, throws `_SubmissionRefused`.
+transient one that outlasts that period, throws `SubmissionRefused`.
 """
 function _submitHPCJob(cmd::Cmd, simulation_id::Int)
     period = mm_globals().hpc_completion.submit_retry_period
@@ -403,7 +423,7 @@ function _submitHPCJob(cmd::Cmd, simulation_id::Int)
         outcome = _trySubmit(cmd, simulation_id)
         outcome isa Int && return outcome
         (_isTransientRefusal(outcome) && _elapsedSeconds(started) < period) ||
-            throw(_SubmissionRefused(simulation_id, outcome))
+            throw(SubmissionRefused(simulation_id, outcome))
         attempt == 1 && @warn "sbatch refused the job for simulation $(simulation_id) with a message \
                                that usually clears up on its own; retrying for up to \
                                $(round(Int, period)) s. If this is a per-user submit limit, set \
@@ -435,7 +455,7 @@ end
 
 Submit `cmd` as a SLURM job, block until it finishes, and return its exit code -- or `nothing` if
 it never produced one because the scheduler lost it before it could write. A submission `sbatch`
-refuses throws `_SubmissionRefused` instead: no job ran, so there is no outcome to report. The
+refuses throws `SubmissionRefused` instead: no job ran, so there is no outcome to report. The
 caller decides what a nonzero code means; this only reports it.
 
 Blocking the calling worker is what preserves the throttle: `max_number_of_parallel_simulations`
@@ -460,4 +480,96 @@ function _runHPCSimulation(cmd::Cmd, simulation::Simulation)
     sentinel = joinpath(done_dir, "$(simulation_id).$(string(time_ns(); base=16))")
     job_id = _submitHPCJob(_prepareHPCSubmitCommand(cmd, simulation, sentinel), simulation_id)
     return _waitForHPCJob(job_id, sentinel, time_ns())
+end
+
+########### What a dead driver left behind ###########
+
+#! Everything below is read after the fact, by `databaseDiagnostics`, for a session whose driver
+#! process died before it could record what its jobs did. Nothing here is on the hot path, and
+#! nothing here throws: a diagnostic that fails must report less, never abort the session.
+
+"""
+    _sentinelsBySimulation() → Dict{Int,String}
+
+The newest exit-code sentinel on disk for each simulation ID, from names of the form
+`<simulation_id>.<time_ns hex>`.
+
+Staged `.tmp` writes are skipped: a job killed between the `echo` and the `mv` leaves one, and its
+contents may be half a number. Several submissions of one simulation can each leave a sentinel, and
+a row still at `Running` belongs to the last of them, so the newest file is the only one that can
+describe it.
+"""
+function _sentinelsBySimulation()
+    newest = Dict{Int,String}()
+    done_dir = _hpcDoneDirPath()
+    isdir(done_dir) || return newest
+    for name in readdir(done_dir)
+        parts = split(name, '.')
+        length(parts) == 2 || continue
+        simulation_id = tryparse(Int, parts[1])
+        isnothing(simulation_id) && continue
+        path = joinpath(done_dir, name)
+        if !haskey(newest, simulation_id) || mtime(path) > mtime(newest[simulation_id])
+            newest[simulation_id] = path
+        end
+    end
+    return newest
+end
+
+"""
+    _jobIDFromSubmission(simulation_id::Int) → Union{Nothing,Int}
+
+The SLURM job ID in the simulation's `hpc.out`, or `nothing` if the file is absent or holds no
+single ID. With `--parsable` this file is the only record on disk of which job ran a simulation.
+"""
+function _jobIDFromSubmission(simulation_id::Int)
+    path = joinpath(trialFolder(Simulation, simulation_id), "hpc.out")
+    isfile(path) || return nothing
+    return _parseJobID(read(path, String))
+end
+
+#! Bounded like `_SQUEUE_TIMEOUT_S`, and for a sharper reason: `sacct` queries slurmdbd, which is a
+#! second daemon and a database behind it, and diagnostics runs one call per stranded simulation.
+const _SACCT_TIMEOUT_S = Ref(60.0)
+
+#! What a job state says about the simulation. A state in none of the three lists is reported
+#! rather than guessed at -- `REQUEUED` and `RESIZING` are neither an outcome nor a plain wait, and
+#! a site can add its own. `SUSPENDED` counts as still running for the same reason `_squeueUserJobs`
+#! passes `-t all`: a preempted job is alive and will resume.
+const _SACCT_SUCCESS_STATES = ("COMPLETED",)
+const _SACCT_FAILURE_STATES = ("FAILED", "TIMEOUT", "CANCELLED", "OUT_OF_MEMORY", "NODE_FAIL")
+const _SACCT_WAITING_STATES = ("PENDING", "RUNNING", "SUSPENDED")
+
+"""
+    _sacctState(job_id::Int) → Union{Nothing,String}
+
+The state SLURM's accounting database records for `job_id`, upper-cased, or `nothing` if `sacct`
+could not answer -- it is absent, the query failed or hung, or the job has aged out of the
+database. Never throws.
+
+The first line is the job allocation's own; the `.batch` and `.extern` steps that follow describe
+pieces of it. A cancelled job reports `CANCELLED by 1234`, so only the first word is kept.
+"""
+function _sacctState(job_id::Int)
+    try
+        out = IOBuffer()
+        p = run(pipeline(ignorestatus(`sacct -j $(job_id) -n -P --format=State,ExitCode`);
+                         stdout=out, stderr=devnull); wait=false)
+        if timedwait(() -> process_exited(p), _SACCT_TIMEOUT_S[]) === :timed_out
+            #! Kill and leave, for the reason spelled out in `_squeueUserJobs`: `wait` here would
+            #! block on a pipe a grandchild may still hold open.
+            kill(p)
+            return nothing
+        end
+        wait(p)
+        success(p) || return nothing
+        for line in eachline(seekstart(out))
+            s = strip(line)
+            isempty(s) && continue
+            return uppercase(String(first(split(first(split(s, '|')), ' '))))
+        end
+        return nothing
+    catch
+        return nothing
+    end
 end
