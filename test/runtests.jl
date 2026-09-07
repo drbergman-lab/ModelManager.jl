@@ -126,6 +126,10 @@ function ModelManager.runSimulation(sim::TestSimulator, spec::ModelManager.Simul
                                         Tuple{AbstractSimulator,ModelManager.SimulationSpec}, sim, spec)
     # No-op: immediately report success without launching any process.
     _throw_in_run[] && error("backend blew up launching simulation $(spec.simulation.id)")
+    # A real backend leaves an output/ folder behind, and its existence is what
+    # `verifyStoredValues` reads as "this simulation can be recomputed". Without it every
+    # simulation is classed unverifiable and the compare-and-report branch never runs at all.
+    mkpath(pathToOutputFolder(spec.simulation.id))
     should_fail = !isnothing(_fail_sim_predicate[]) && _fail_sim_predicate[](spec)
     return ModelManager.SimulationProcess(spec.simulation, spec.monad_id, nothing, !should_fail)
 end
@@ -186,6 +190,10 @@ _test_nonzero_ss           = [QoI("x", _sim_two)]
 # Named and top-level, like a user's own. _qoi_sim reads the simulation's own x so replicate
 # values differ; _qoi_monad sees the whole monad at once.
 _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"]))
+_qoi_sim_y(s::Simulation) = getParameterValue(s, :config, XMLPath(["data", "y"]))
+# Every replicate of a monad shares its parameter values, so a measurement of one cannot tell
+# `mean` from `maximum`. The simulation ID is the one per-replicate quantity that differs.
+_qoi_sim_id(s::Simulation) = Float64(s.id)
 # A bare function in `functions=`: it now receives a `Simulation`, exactly like a QoI's `compute`.
 # Untyped on purpose -- that is how users write them, and it is the case dispatch cannot sniff.
 _qoi_by_id(sim)           = getParameterValue(sim, :config, XMLPath(["data", "x"]))
@@ -4188,8 +4196,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
                 # Reducer honoured, and it is the QoI's own -- not a hard-coded mean.
                 @test ModelManager._reduceOverMonad(QoI("x", _qoi_sim), mid) ≈ mean(sim_vals)
-                @test ModelManager._reduceOverMonad(QoI("x", _qoi_sim; reduce=maximum), mid) ≈
-                      maximum(sim_vals)
+                # Measured on the replicates' IDs, not their shared parameter value: `mean` and
+                # `maximum` of one repeated number are the same number, so a QoI over `_qoi_sim`
+                # cannot tell a honoured reducer from an ignored one.
+                id_vals = Float64.(sids)
+                @test mean(id_vals) != maximum(id_vals)
+                @test ModelManager._reduceOverMonad(QoI("id", _qoi_sim_id), mid) ≈ mean(id_vals)
+                @test ModelManager._reduceOverMonad(QoI("id", _qoi_sim_id; reduce=maximum), mid) ≈
+                      maximum(id_vals)
 
                 # Calibration: the QoI itself is the summary statistic.
                 prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
@@ -4215,6 +4229,50 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
                 @test_throws ArgumentError ModelManager._validateSummaryStatistic(
                     [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
+            end
+
+            @testset "a two-QoI summary reaches mseDistance keyed by name" begin
+                # A vector summary statistic reports a `Dict` keyed by QoI name, which is the shape
+                # `mseDistance`'s Dict method consumes. With one element that Dict is
+                # indistinguishable from a scalar summary in every number it produces, so only two
+                # QoIs exercise the keying -- and the division by the key count.
+                qx = QoI("x", _qoi_sim)
+                qy = QoI("y", _qoi_sim_y)
+                observed = Dict{String,Any}("x" => 1.0, "y" => 2.0)
+
+                m = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1511.0])];
+                                n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+
+                by_name = ModelManager._evaluateSummary([qx, qy], mid)
+                @test by_name isa Dict{String,Any}
+                @test Set(keys(by_name)) == Set(["x", "y"])
+                @test by_name["x"] ≈ 1511.0
+                @test by_name["y"] ≈ 2.0                        # unvaried: the XML's own default
+                # Both keys contribute and the total is averaged over both. The `y` term and the
+                # halving are exactly what a single-element vector cannot show.
+                @test mseDistance(by_name, observed) ≈ ((1511.0 - 1.0)^2 + (2.0 - 2.0)^2) / 2
+
+                # End to end: the same vector is a calibration's summary statistic, and each
+                # particle's recorded distance is the two-key mean for the `x` it proposed.
+                prob = CalibrationProblem(inputs,
+                                          [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))],
+                                          observed, [qx, qy], mseDistance)
+                res = runCalibration(ABCSMC(population_size=4, max_nr_populations=1,
+                                            minimum_epsilon=0.0), prob;
+                                     description="two-QoI summary", progress=:none)
+                waitForDiagnostics()
+                @test res isa ABCResult
+                @test nrow(res.generations[1].particles) == 4
+                # `particles` holds CDF coordinates; the posterior is where the target values are,
+                # alongside the distance each one earned. `y` never varies, so every distance is
+                # the `x` term halved -- and the halving is the key count.
+                post_df, _ = posterior(res; generation=1)
+                @test all(isapprox(row.distance, ((row[string(columnName(xp_x))] - 1.0)^2) / 2;
+                                   rtol=1e-6, atol=1e-12)
+                          for row in eachrow(post_df))
             end
 
             @testset "a non-scalar QoI is fine except at the sink" begin
@@ -4331,20 +4389,31 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test ModelManager._computeOn(fallback, first(sids)) ≈
                       _qoi_sim(Simulation(first(sids)))
 
-                # verifyStoredValues recomputes where the output survives.
+                # verifyStoredValues recomputes where the output survives. Every simulation here
+                # has one, so agreement is asserted for all of them rather than for whatever
+                # happened to be checkable -- `n_agreed + n_unverifiable == length(sids)` holds
+                # just as well when nothing at all was compared.
                 rep = verifyStoredValues(QoI("stored_x", _qoi_sim), t)
                 @test rep.n_checked == length(sids)
-                @test rep.n_agreed + rep.n_unverifiable == length(sids)
+                @test rep.n_agreed == length(sids)
+                @test rep.n_unverifiable == 0
                 @test rep.n_mismatched == 0
                 @test isempty(rep.mismatches)
 
                 # A disagreeing compute is caught and reported, not averaged over.
                 bad = verifyStoredValues(QoI("stored_x", s -> _qoi_sim(s) + 1000.0), t)
-                if bad.n_unverifiable < length(sids)      # only if some output survives to check
-                    @test bad.n_mismatched > 0
-                    @test !isempty(bad.mismatches)
-                    @test bad.mismatches[1].stored != bad.mismatches[1].recomputed
-                end
+                @test bad.n_mismatched == length(sids)
+                @test length(bad.mismatches) == length(sids)
+                @test all(m -> m.recomputed ≈ m.stored + 1000.0, bad.mismatches)
+
+                # Delete one output folder and that simulation -- and only that one -- becomes
+                # unverifiable, which is the state `stored` exists for.
+                pruned = first(sids)
+                rm(pathToOutputFolder(Int(pruned)); recursive=true)
+                gone = verifyStoredValues(QoI("stored_x", _qoi_sim), t)
+                @test gone.n_unverifiable == 1
+                @test gone.n_agreed == length(sids) - 1
+                @test gone.n_mismatched == 0
 
                 # And a name that was never stored is reported as missing, not as agreement.
                 none = verifyStoredValues(QoI("no_such_column", _qoi_sim), t)
@@ -4678,16 +4747,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # run_kwargs used to be splatted LAST, so a simulator bundle could replace the
                 # progress machinery the `progress=` keyword had just configured. The calibration's
                 # own controls now come after it.
+                #
+                # The hijacking callback counts its own calls, which is what makes the precedence
+                # observable: `run` calls `on_progress(:init, n)` once per batch whenever it is
+                # honoured at all, so a zero count is the calibration's own `on_progress` -- and at
+                # progress=:none that is `nothing` -- having won. Handing the bundle `nothing`
+                # instead compares nothing against nothing.
                 dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 prob = CalibrationProblem(inputs, [dv], Dict{String,Any}("x" => 1.0),
                                           _test_nonzero_ss, mseDistance)
+                hijacked = Ref(0)
+                hijack(args...) = (hijacked[] += 1; nothing)
                 res = runCalibration(ABCSMC(population_size=4, max_nr_populations=1,
                                             minimum_epsilon=0.0, max_evaluations=32), prob;
                                      description="run_kwargs precedence", progress=:none,
-                                     run_kwargs=(quiet=false, on_progress=nothing))
+                                     run_kwargs=(quiet=false, on_progress=hijack))
                 waitForDiagnostics()
                 @test res isa ABCResult
                 @test length(res.generations) == 1
+                @test hijacked[] == 0
             end
 
             @testset "StudySpec feeds both sensitivity and calibration" begin
@@ -4727,11 +4805,21 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 waitForDiagnostics()
                 @test gsa isa ModelManager.GSASampling
 
-                # A caller keyword beats the spec's, since kwargs... comes last.
-                spec1 = StudySpec(inputs, [dv1, dv2]; n_replicates=1)
-                gsa2 = run(MOAT(), spec1; functions=Function[], n_replicates=1)
+                # A caller keyword beats the spec's, since kwargs... comes last -- observable only
+                # if the two values differ. Counted in simulations rather than in a monad's
+                # constituents: MOAT's design is deterministic for a given set of variations, so
+                # this sweep lands on monads earlier sweeps already built, and their constituents
+                # carry those runs' replicates too. What `use_previous=false` guarantees is that
+                # each monad in the design takes on exactly `n_replicates` NEW simulations.
+                spec1 = StudySpec(inputs, [dv1, dv2]; n_replicates=1, use_previous=false)
+                _n_simulations() = nrow(ModelManager.queryToDataFrame(
+                    ModelManager.constructSelectQuery("simulations"; selection="simulation_id")))
+                n_before = _n_simulations()
+                gsa2 = run(MOAT(), spec1; functions=Function[], n_replicates=3)
                 waitForDiagnostics()
                 @test gsa2 isa ModelManager.GSASampling
+                @test spec1.n_replicates == 1
+                @test _n_simulations() - n_before == 3 * length(ModelManager.monadIDs(gsa2))
             end
 
             @testset "StudySpec from a monad takes its reference variation" begin
@@ -6862,6 +6950,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 mv(path * ".tmp", path; force=true)
                 return path
             end
+            # A bounded `fetch`. Every wait here ends in a worker noticing something; one that
+            # never does should fail the suite rather than block it forever.
+            function _await(t, seconds::Real=20.0)
+                timedwait(() -> istaskdone(t), seconds) === :ok ||
+                    error("a simulation worker did not finish within $(seconds)s")
+                return fetch(t)
+            end
+            # The condition every "the job is still unresolved" assertion is really waiting on:
+            # sbatch has returned and the worker is in its polling loop. `hpc.out` holds the
+            # client's stdout and is written once the submission completes, so the job id
+            # appearing there is the event a fixed sleep was standing in for -- and unlike the
+            # sleep it does not quietly go vacuous when a cold JIT makes the first submission
+            # slower than the sleep.
+            function _submitted(job_id::Integer; simulation_id::Int=sim.id, seconds::Real=15.0)
+                out = joinpath(MM.trialFolder(Simulation, simulation_id), "hpc.out")
+                return timedwait(seconds) do
+                    isfile(out) && occursin(string(job_id), read(out, String))
+                end
+            end
 
             @testset "sentinel carries the outcome: zero succeeds, nonzero fails" begin
                 for (job_id, ec) in [(9001, 0), (9002, 1), (9003, 137)]
@@ -6869,10 +6976,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     _next_job!(job_id)
                     _queue!(job_id)                              # still queued: only the file resolves it
                     t = @async MM._runHPCSimulation(`true`, sim.id)
-                    sleep(0.2)
+                    @test _submitted(job_id) === :ok
                     @test !istaskdone(t)
                     path = _publish(ec)
-                    @test fetch(t) == ec                              # the code itself; the caller decides
+                    @test _await(t) == ec                             # the code itself; the caller decides
                     @test !isfile(path)                               # consumed
                     @test occursin("--parsable", _last("sbatch.log"))
                     @test !occursin("--wait", _last("sbatch.log"))
@@ -6894,7 +7001,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 for n in 1:3
                     _publish(0; nth=n)
                 end
-                @test all(fetch(t) == 0 for t in tasks)
+                @test all(_await(t) == 0 for t in tasks)
             end
 
             @testset "a job gone from the queue with no sentinel is failed, but only on a second snapshot" begin
@@ -6923,11 +7030,11 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 sleep(0.01)
                 _next_job!(9250)
                 t = @async MM._runHPCSimulation(`true`, sim.id)
-                sleep(0.2)
+                @test _submitted(9250) === :ok
                 @test !istaskdone(t)                            # the empty snapshot said nothing about it
                 @test _calls("squeue.log") == 0                 # and was fresh enough not to be refreshed
                 _publish(0)
-                @test fetch(t) == 0
+                @test _await(t) == 0
                 setHPCCompletionOptions(reap_interval=0.05)
             end
 
@@ -6936,10 +7043,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 setHPCCompletionOptions(grace_period=3600.0)
                 _next_job!(9300)                                 # queue empty: already gone
                 t = @async MM._runHPCSimulation(`true`, sim.id)
-                sleep(0.2)
+                @test _submitted(9300) === :ok
                 @test !istaskdone(t)                            # grace is holding it open
                 _publish(0)
-                @test fetch(t) == 0
+                @test _await(t) == 0
                 setHPCCompletionOptions(grace_period=0.0)
             end
 
@@ -6959,7 +7066,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 for n in 1:20
                     _publish(0; nth=n)
                 end
-                @test all(fetch(t) == 0 for t in tasks)
+                @test all(_await(t) == 0 for t in tasks)
                 setHPCCompletionOptions(reap_interval=0.05, grace_period=0.0)
             end
 
@@ -7007,6 +7114,62 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 rm(joinpath(shim, "sbatch.fail"))
             end
 
+            @testset "a run() over the SLURM path completes every simulation" begin
+                # The success counterpart of the refusal above, and the only place `run()` itself
+                # drives the SLURM branch: every other test here calls `_runHPCSimulation`
+                # directly, so nothing checked what the worker does with the
+                # `SimulationProcess(process=nothing, success=true, cmd)` a submitted job returns
+                # -- the status code it writes, the count `run` reports, or the sbatch client
+                # streams left in the simulation folder.
+                #
+                # It picks up the very simulations the refusal left pending, which is also what
+                # makes that test's claim worth something: they were still runnable afterwards.
+                _reset_hpc!()
+                _next_job!(9800)
+                _queue!(9800, 9801, 9802)                        # live jobs: only sentinels resolve them
+                _status(id) = MM.queryToDataFrame(
+                    MM.constructSelectQuery("simulations", "WHERE simulation_id=$(id)";
+                                            selection="status_code_id"); is_row=true)[1, :status_code_id]
+                COMPLETED = MM.statusCodeID("Completed")
+
+                monad = Monad(InputFolders(config="default"); n_replicates=3)
+                ids = simulationIDs(monad)
+                # A refused submission also writes these, so clear them to make their reappearance
+                # evidence of this run rather than of the previous one.
+                for id in ids
+                    rm(joinpath(MM.trialFolder(Simulation, id), "hpc.out"); force=true)
+                end
+
+                _use_default_run[] = true                        # TestSimulator normally bypasses sbatch
+                runner = @async run(monad; quiet=true)
+                try
+                    # Play all three jobs. `_publish` waits for the nth submission to reach the
+                    # shim before writing its sentinel, so this cannot outrun the workers, and it
+                    # raises rather than hanging if a submission never arrives.
+                    for n in 1:3
+                        _publish(0; nth=n)
+                    end
+                    # Wait for `run` to return before restoring the override: a worker that has not
+                    # dispatched yet would otherwise take TestSimulator's no-op path instead.
+                    timedwait(() -> istaskdone(runner), 30.0) === :ok ||
+                        error("run() over the SLURM path never returned")
+                finally
+                    _use_default_run[] = false
+                end
+                out = fetch(runner)
+
+                @test out.n_scheduled == 3
+                @test out.n_success == 3
+                @test all(_status(id) == COMPLETED for id in ids)
+                # Success, so nothing was erased: `simulationFailed` is the only thing that prunes
+                # a monad's constituents.
+                @test sort(constituentIDs(Monad, monad.id)) == sort(ids)
+                # hpc.out is where a submitted simulation's SLURM job id lands, so one per
+                # simulation is what says each of these went out as a job rather than running here.
+                @test all(isfile(joinpath(MM.trialFolder(Simulation, id), "hpc.out")) for id in ids)
+                @test _calls("sbatch.log") == 3
+            end
+
             @testset "a transient refusal is retried until it clears" begin
                 # The QOS submit-limit message is what a user sees when parallelism exceeds
                 # MaxSubmitJobs; it clears as earlier jobs finish, so the worker waits rather than
@@ -7021,7 +7184,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test timedwait(() -> _calls("sbatch.log") >= 4, 10.0) === :ok
                 @test !istaskdone(t)
                 _publish(0; nth=4)
-                @test fetch(t) == 0
+                @test _await(t) == 0
                 @test _calls("sbatch.log") == 4
             end
 
@@ -7075,7 +7238,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test strip(read(joinpath(folder, "hpc.out"), String)) == "9950"   # the job id
                 @test isfile(joinpath(folder, "hpc.err"))                          # created even when empty
                 _publish(0)
-                @test fetch(t) == 0
+                @test _await(t) == 0
             end
 
             @testset "a leftover sentinel for the same simulation cannot be read as the new result" begin
@@ -7088,11 +7251,11 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _next_job!(9500)
                 _queue!(9500)
                 t = @async MM._runHPCSimulation(`true`, sim.id)
-                sleep(0.2)
+                @test _submitted(9500) === :ok
                 @test !istaskdone(t)                            # the leftover did not resolve it
                 path = _publish(0)
                 @test path != stale
-                @test fetch(t) == 0
+                @test _await(t) == 0
                 @test isfile(stale)                             # untouched
                 rm(stale; force=true)
             end
@@ -7104,14 +7267,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _next_job!(9600)
                 _queue!(9600)
                 t = @async MM._runHPCSimulation(`true`, sim.id)
-                sleep(0.1)
+                @test _submitted(9600) === :ok
                 chmod(done_dir, 0o000)
                 blocked = try
                     isfile(joinpath(done_dir, "9600")); false
                 catch
                     true
                 end
-                sleep(0.15)
+                sleep(0.15)                                     # let it poll while the dir is shut
                 chmod(done_dir, 0o700)
                 if blocked
                     @test !istaskdone(t)                        # still waiting, did not throw
@@ -7119,7 +7282,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     @test_skip "directory permissions do not block stat here (root?)"
                 end
                 _publish(0)
-                @test fetch(t) == 0
+                @test _await(t) == 0
             end
 
             @testset "an undeletable sentinel still resolves the job" begin
@@ -7128,10 +7291,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _next_job!(9700)
                 _queue!(9700)
                 t = @async MM._runHPCSimulation(`true`, sim.id)
-                sleep(0.1)
+                @test _submitted(9700) === :ok
                 path = _publish(0)
                 chmod(done_dir, 0o500)                            # readable, not writable: unlink fails
-                result = fetch(t)
+                result = _await(t)
                 chmod(done_dir, 0o700)
                 @test result == 0                                 # resolved despite cleanup failing
                 rm(path; force=true)
@@ -7207,10 +7370,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _next_job!(9750)
                 _queue!(9750)
                 t = @async MM._runHPCSimulation(`true`, sim.id)
-                sleep(0.2)
+                @test _submitted(9750) === :ok
                 @test !istaskdone(t)                                # submitted and waiting, not "failed"
                 _publish(0)
-                @test fetch(t) == 0
+                @test _await(t) == 0
                 write(banner_sbatch, original)
             end
 
@@ -7362,10 +7525,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _queue!(9900)
                 _test_sim_cmd[] = `true`
                 t = @async default(spec)
-                sleep(0.2)
+                @test _submitted(9900) === :ok
                 @test _calls("sbatch.log") == 1
                 _publish(0)
-                sp = fetch(t)
+                sp = _await(t)
                 @test sp.success && isnothing(sp.process)
                 @test sp.cmd == `true`                                 # ran, on a compute node
                 useHPC(false)

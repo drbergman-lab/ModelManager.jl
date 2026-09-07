@@ -5,6 +5,64 @@
 
 ---
 
+## Session: assertions whose two arms coincided (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #59, from the second review pass: four places where the suite could not fail if the behaviour
+regressed, plus the fact that no `run()` had ever reached the SLURM branch. Tests only — no `src/`
+change, and the one source edit made during the session was a deliberate mutation, reverted after it
+confirmed the new assertion fails without the fix.
+
+### Decisions
+- **`TestSimulator.runSimulation` now creates the simulation's `output/` folder.** That absence was
+  the root cause of the dead `verifyStoredValues` branch: `!isdir(pathToOutputFolder(sid))` classed
+  every simulation unverifiable, so `n_agreed` was 0, `n_agreed + n_unverifiable == length(sids)`
+  held trivially, and the mismatch block was skipped by its own guard. Fixed in the stub rather than
+  in the one testset because a real backend leaves an output folder behind — the stub was
+  unfaithful, not the test. The assertions are now `n_agreed == 4`, `n_mismatched == 4` with each
+  mismatch checked against `stored + 1000`, and then one folder is pruned so `n_unverifiable == 1`
+  is a positive assertion rather than a residue.
+- **Reducer tests measure the simulation ID.** Every replicate of a monad shares its parameter
+  values, so `mean` and `maximum` of a measurement of those values are the same number; `_qoi_sim_id`
+  gives 107.5 against 108.0 where `_qoi_sim` gave 1051.0 against 1051.0.
+- **`run_kwargs` precedence is observed by a callback that counts itself.** Both arms were
+  `on_progress=nothing` before. The bundle now carries a counting callback, and the calibration's own
+  control winning means it is never called. Verified by reverting `_buildEvaluateBatch`'s splat order:
+  the counter reaches 2 and the test fails.
+- **The `StudySpec` override is counted in new simulation rows, not in a monad's constituents.**
+  MOAT's design is deterministic for a given set of variations, so a second sweep over the same
+  `StudySpec` lands on monads an earlier sweep already built and their constituent lists carry that
+  run's replicates too — 45 monads came back with 6, 5 and 3 simulations. What `use_previous=false`
+  guarantees is that each monad in the design takes on exactly `n_replicates` *new* simulations, so
+  the sweep adds 135 rows where the spec's own value would have added 45.
+- **A `run()` success case on the SLURM path sits beside the refusal test** and picks up the very
+  simulations that refusal left pending, which is also what makes the refusal test's claim worth
+  something. It asserts `n_success == 3`, every row `Completed`, and one `hpc.out` per simulation
+  folder — the first coverage of what `run`'s worker does with the
+  `SimulationProcess(process=nothing, success=true, cmd)` a submitted job returns.
+- **Timing-shaped SLURM assertions wait on `hpc.out` carrying the job id.** That file is written once
+  the submission completes, so it is the event the fixed sleeps stood in for, and `_await` bounds
+  every `fetch` so a worker that never notices its sentinel fails the suite instead of blocking it.
+
+### Rejected
+- **Capturing stdout to assert `quiet=true` also wins.** `redirect_stdout` takes no `IOBuffer` on
+  1.12, so this needs a `Pipe` plus a reader task wrapped around a whole calibration; the deadlock
+  and leak surface is not worth a second assertion about the same one-line precedence rule.
+- **Asserting a per-monad constituent count for the `StudySpec` override** — see above; it is not an
+  invariant, because monads are shared between sweeps.
+- **A `Vector{QoI}` whose elements are non-scalar.** The issue asks only that the
+  `Dict`-keyed-by-QoI-name path reach `mseDistance` with more than one element; two scalar QoIs do
+  that, and the distances come back as `((x - 1)² + 0)/2`, which pins both the second key and the
+  division by the key count.
+
+### Traps
+- **`GenerationResult.particles` holds CDF coordinates, not target values.** The first version of the
+  two-QoI test compared distances against the particle column directly and failed. `posterior(result;
+  generation=t)` is the display-value view, and it carries `distance` and `monad_id` alongside, so it
+  is the single source for both halves of that assertion.
+- **`stored=` was skipped deliberately.** PR #56 already adds keyed read-back tests; #59's bullet
+  about a `Dict`-valued QoI under `:prefer`/`:require` is covered there.
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger
