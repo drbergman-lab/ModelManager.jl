@@ -13,6 +13,12 @@ using RecipesBase
 using Dates
 import GlobalSensitivity
 
+# RecipesBase leaves `is_key_supported` for a plotting backend to define, and the cleanup step of
+# every recipe that declares keyword arguments calls it — so `plot(::ABCResult, :distances)` and its
+# siblings cannot be applied at all without a backend loaded. The suite has none, so say every key
+# is supported: nothing here checks an attribute dictionary against what a backend would accept.
+RecipesBase.is_key_supported(::Symbol) = true
+
 # Full-featured stub simulator used by both the existing in-memory unit tests and the
 # new DB-backed integration tests.
 #
@@ -3772,7 +3778,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test occursin("shown", out)                  # the description
                 @test occursin("ABC-SMC", out)
                 @test occursin("Generations: 1", out)         # distance is 0, so it stops at gen 1
-                @test occursin("Final ε", out)
+                @test occursin("Max ε accepted", out)
 
                 # A description was optional before this table was ever read back; an empty one
                 # is omitted rather than printed blank.
@@ -4896,6 +4902,44 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test ConvergenceSummary(cal).df.t == [1, 2, 10]
                 @test posterior(cal; generation=10)[1].p == [10.0]
                 @test posterior(cal)[1].p == [10.0]
+
+                # Give the last generation a threshold, so the column mixes a real value with the
+                # two generations that have none — the shape a run actually produces, since
+                # generation 1 never has one.
+                meta10 = ModelManager._generationArtifact(gdir, 10, :metadata)
+                let d10 = TOML.parsefile(meta10)
+                    d10["epsilon_threshold"] = 0.02
+                    open(io -> TOML.print(io, d10; sorted=true), meta10, "w")
+                end
+
+                # A ConvergenceSummary is a table users write out, and `nothing` is not something
+                # CSV.jl can serialise: the absent threshold is `missing`.
+                cs2 = ConvergenceSummary(cal)
+                @test ismissing(cs2.df.epsilon_threshold[1])
+                csv_path = joinpath(mktempdir(), "convergence.csv")
+                CSV.write(csv_path, cs2.df)
+                back = CSV.read(csv_path, DataFrame)
+                @test back.t == [1, 2, 10]
+                @test ismissing(back.epsilon_threshold[1])
+                @test back.epsilon_threshold[3] ≈ 0.02
+
+                # The in-memory form is the same table by another route.
+                loaded = ModelManager._loadGenerations(cal, ["p"], 10)
+                @test [g.t for g in loaded] == [1, 2, 10]
+                res = ModelManager.ABCResult(cal, loaded, ModelManager.CalibrationParameter[],
+                                             ABCSMC(population_size=4, max_nr_populations=10))
+                CSV.write(csv_path, ConvergenceSummary(res).df)
+                @test ismissing(CSV.read(csv_path, DataFrame).epsilon_threshold[1])
+
+                # :distances took its generation by position and then labelled the plot with that
+                # position. Position 3 is generation 10 here, and the title has to say 10.
+                applied = RecipesBase.apply_recipe(Dict{Symbol,Any}(:generation => 3),
+                                                   res, :distances)
+                @test only(applied).args[1].t == 10
+                # ...and an out-of-range one is an ArgumentError naming the range, not a
+                # BoundsError from inside an internal.
+                @test_throws ArgumentError RecipesBase.apply_recipe(
+                    Dict{Symbol,Any}(:generation => 4), res, :distances)
             end
 
             @testset "reusability filter — started or completed simulations" begin
@@ -5846,7 +5890,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             # Accepted below the threshold, rejected above — the shape the plot exists to show.
             acc = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
             rej = [0.6, 0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0]
-            dd  = ModelManager._buildDistanceData(acc, rej, 0.5, 0.5, 3)
+            dd  = ModelManager._buildDistanceData(acc, rej, 0.5, 3)
 
             # Uniform width, with the threshold falling exactly on a bin edge.
             w = dd.edges[2] - dd.edges[1]
@@ -5873,24 +5917,53 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @testset "distance distribution: degenerate and log cases" begin
             acc = [0.1, 0.2, 0.3]
             # Generation 1 has no threshold: one series, no threshold line.
-            d1 = ModelManager._buildDistanceData(acc, Float64[], nothing, 0.3, 1)
+            d1 = ModelManager._buildDistanceData(acc, Float64[], nothing, 1)
             @test sum(d1.accepted_counts) == length(acc)
             @test isnothing(d1.epsilon_threshold)
             @test nseries(apply(d1)) == 1
 
             # A single distinct value still bins.
-            dsingle = ModelManager._buildDistanceData([0.4, 0.4], Float64[], nothing, 0.4, 1)
+            dsingle = ModelManager._buildDistanceData([0.4, 0.4], Float64[], nothing, 1)
             @test sum(dsingle.accepted_counts) == 2
 
             # mseDistance legitimately returns 0.0; log10(0) is -Inf, so it is dropped and reported.
-            dl = ModelManager._buildDistanceData([0.0, 0.01, 0.1], [1.0, 10.0], 0.1, 0.1, 2;
+            dl = ModelManager._buildDistanceData([0.0, 0.01, 0.1], [1.0, 10.0], 0.1, 2;
                                                  logscale=true)
             @test occursin("non-positive", dl.note)
             @test sum(dl.accepted_counts) == 2      # the 0.0 is gone, the other two remain
 
             # Empty input is an error with a clear message, not a BoundsError.
             @test_throws ErrorException ModelManager._buildDistanceData(Float64[], Float64[],
-                                                                        nothing, 0.0, 1)
+                                                                        nothing, 1)
+
+            # A rejected proposal is where an Inf distance shows up — `Inf` is an ordinary thing for
+            # a distance function to return — and it has no bin: `extrema` used to hand `range` an
+            # infinite endpoint and the plot threw. Dropped and counted in the title instead.
+            dinf = ModelManager._buildDistanceData([0.1, 0.2], [0.9, Inf, NaN], 0.5, 4)
+            @test occursin("2 non-finite", dinf.note)
+            @test sum(dinf.accepted_counts) == 2
+            @test sum(dinf.rejected_counts) == 1
+            @test all(isfinite, dinf.edges)
+
+            # ...and when that leaves nothing, the message says which of the two emptinesses it is.
+            @test_throws ErrorException ModelManager._buildDistanceData([Inf], [Inf], nothing, 4)
+
+            # Squared-error distances are non-negative, but the edges walk left from ε in whole
+            # bins, so the leftmost one lands below zero and the axis opened on a negative value.
+            # The bins stay uniform — `bar_width` is one number for every bar — so it is the view
+            # that starts at the data.
+            dpos = ModelManager._buildDistanceData([0.01, 0.02, 0.03], [0.5, 1.0], 0.05, 5)
+            @test dpos.edges[1] < 0.0                            # the grid itself is unchanged
+            @test sum(dpos.accepted_counts) + sum(dpos.rejected_counts) == 5
+            attrs = Dict{Symbol,Any}()
+            RecipesBase.apply_recipe(attrs, dpos)
+            @test attrs[:xlims][1] == 0.0
+            @test attrs[:xlims][2] == dpos.edges[end]
+            # A histogram whose data really does start below zero keeps its own minimum.
+            dneg = ModelManager._buildDistanceData([-2.0, -1.5], [0.5, 1.0], 0.0, 6)
+            neg_attrs = Dict{Symbol,Any}()
+            RecipesBase.apply_recipe(neg_attrs, dneg)
+            @test neg_attrs[:xlims][1] <= -2.0
         end
 
         @testset "distance distribution: legacy runs degrade" begin

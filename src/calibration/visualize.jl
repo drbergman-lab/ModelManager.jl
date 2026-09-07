@@ -594,9 +594,6 @@ end
 
 ################## Distance distribution ##################
 
-#! `only` throws on an empty collection; this returns `nothing` so callers can decide.
-only_or_nothing(v) = length(v) == 1 ? first(v) : nothing
-
 #! One generation's TOML metadata, or an empty Dict when it is missing.
 function _calibrationGenerationMeta(cal::Calibration, t::Int)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
@@ -615,7 +612,7 @@ struct _DistanceData
     accepted_counts::Vector{Float64}
     rejected_counts::Vector{Float64}
     epsilon_threshold::Union{Nothing,Float64}
-    max_epsilon_accepted::Float64
+    data_min::Float64
     t::Int
     logscale::Bool
     note::String
@@ -629,19 +626,35 @@ end
 #! Plain overlaid `:bar` series then render correctly on any backend, with no `bar_position := :stack`
 #! (a Plots-level attribute a backend-agnostic recipe should not require).
 function _buildDistanceData(accepted::Vector{Float64}, rejected::Vector{Float64},
-                            epsilon_threshold::Union{Nothing,Float64},
-                            max_epsilon_accepted::Float64, t::Int;
+                            epsilon_threshold::Union{Nothing,Float64}, t::Int;
                             logscale::Bool=false, note::String="")
-    vals = vcat(accepted, rejected)
-    isempty(vals) && error("No proposal distances to plot for generation $t.")
+    n_proposals = length(accepted) + length(rejected)
+    n_proposals == 0 && error("No proposal distances to plot for generation $t.")
 
-    acc, rej, thr, extra = accepted, rejected, epsilon_threshold, note
+    #! A rejected proposal is exactly where a non-finite distance turns up — returning `Inf` for a
+    #! hopeless parameter set is an ordinary thing for a `distance` to do — and rejected distances
+    #! started being persisted, so they now reach this plot. There is no bin for one: `extrema` hands
+    #! `range` an infinite endpoint and the call throws. They are dropped and counted in the title
+    #! rather than clamped onto the last bar, which would draw a distance the run never measured.
+    acc  = filter(isfinite, accepted)
+    rej  = filter(isfinite, rejected)
+    n_nonfinite = n_proposals - length(acc) - length(rej)
+    extra = n_nonfinite > 0 ?
+        note * " ($(n_nonfinite) non-finite distance$(n_nonfinite == 1 ? "" : "s") omitted)" : note
+    vals = vcat(acc, rej)
+    isempty(vals) &&
+        error("No finite proposal distances to plot for generation $t: all $(n_proposals) are " *
+              "infinite or NaN.")
+
+    thr = epsilon_threshold
     if logscale
         #! `mseDistance` legitimately returns 0.0 on a perfect match, and log10(0) is -Inf. Drop
         #! non-positive distances and say how many rather than failing the plot.
-        n_before = length(accepted) + length(rejected)
-        acc = log10.(filter(>(0.0), accepted))
-        rej = log10.(filter(>(0.0), rejected))
+        #! Counted against the finite values, not the arguments: a non-finite distance is already
+        #! reported by its own note, and counting it twice would overstate this one.
+        n_before = length(acc) + length(rej)
+        acc = log10.(filter(>(0.0), acc))
+        rej = log10.(filter(>(0.0), rej))
         n_dropped = n_before - length(acc) - length(rej)
         n_dropped > 0 && (extra *= " ($(n_dropped) non-positive distance$(n_dropped == 1 ? "" : "s") omitted)")
         thr = isnothing(epsilon_threshold) || epsilon_threshold <= 0 ? nothing : log10(epsilon_threshold)
@@ -683,8 +696,7 @@ function _buildDistanceData(accepted::Vector{Float64}, rejected::Vector{Float64}
         isnothing(split) || (i = max(i, min(split, nb)))
         rej_counts[i] += 1
     end
-    return _DistanceData(edges, acc_counts, rej_counts, thr, max_epsilon_accepted, t,
-                         logscale, extra)
+    return _DistanceData(edges, acc_counts, rej_counts, thr, lo, t, logscale, extra)
 end
 
 @recipe function f(dd::_DistanceData)
@@ -692,6 +704,11 @@ end
     step = length(dd.edges) > 1 ? dd.edges[2] - dd.edges[1] : 1.0
 
     legend --> :topright
+    #! Walking left from ε in whole bins puts the first edge up to one bin below the smallest
+    #! distance, so a squared-error histogram — every distance non-negative — opened on a negative
+    #! axis. The *bins* must stay uniform, since `bar_width` below is one number for every bar, so
+    #! it is the view that starts at the data instead. `-->`, so an explicit `xlims` still wins.
+    xlims  --> (max(dd.edges[1], min(dd.data_min, 0.0)), dd.edges[end])
     xlabel --> (dd.logscale ? "log10(distance)" : "distance")
     ylabel --> "proposals"
     title  --> "Generation $(dd.t) proposal distances$(dd.note)"
@@ -831,10 +848,16 @@ Dispatch to specialized visualization recipes for `ABCResult`:
                         show_particles, aggregate_duplicates)
 
     elseif style === :distances
+        #! Bounds-checked like `:transition` above, rather than left to a `BoundsError` from an
+        #! internal. And the *generation* is labelled, not the position: `_loadGenerations` skips a
+        #! generation whose CDF file is missing, so after such a resume position and generation
+        #! number are two different things and only `gen.t` is the run's own numbering.
+        (1 <= resolved_gen <= T) || throw(ArgumentError(
+            "generation must be in [1, $T] for :distances, got $resolved_gen"))
         gen = result.generations[resolved_gen]
         acc, rej, note = _distanceSeries(gen.proposal_distances, gen.distances)
-        _buildDistanceData(acc, rej, gen.epsilon_threshold, gen.max_epsilon_accepted,
-                           resolved_gen; logscale=logscale, note=note)
+        _buildDistanceData(acc, rej, gen.epsilon_threshold, gen.t;
+                           logscale=logscale, note=note)
     else
         error("Unknown ABCResult plot style :$style. Use :ridgeline, :transition or :distances.")
     end
@@ -943,10 +966,8 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
         acc_dists = hasproperty(raw, :distance) ? Float64.(raw[!, :distance]) : Float64[]
         meta = _calibrationGenerationMeta(cal, t)
         acc, rej, note = _distanceSeries(prop_df, acc_dists)
-        _buildDistanceData(acc, rej, get(meta, "epsilon_threshold", nothing),
-                           Float64(get(meta, "max_epsilon_accepted",
-                                       get(meta, "epsilon", NaN))),
-                           t; logscale=logscale, note=note)
+        _buildDistanceData(acc, rej, get(meta, "epsilon_threshold", nothing), t;
+                           logscale=logscale, note=note)
     else
         error("Unknown Calibration plot style :$style. Use :ridgeline, :transition or :distances.")
     end
