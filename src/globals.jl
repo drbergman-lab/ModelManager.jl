@@ -87,13 +87,8 @@ assign only to swap the whole state object, as the test suite does.
 """
 const mm_globals_ref = Ref{Union{Nothing,ModelManagerGlobals}}(nothing)
 
-#! Public despite not being exported: a backend reaches for it as `ModelManager.mm_globals_ref`,
-#! and end users never touch it — exporting it only put it in their tab completion.
-#! See CLAUDE.md, "Docstring cross-references".
-@compat public mm_globals_ref
-
 """
-    registerSimulator!(sim::AbstractSimulator; max_number_of_parallel_simulations::Int=1)
+    registerSimulator!(sim::AbstractSimulator)
 
 Make `sim` the active simulator backend, creating the [`ModelManagerGlobals`](@ref) that holds it.
 This is the one line a simulator package writes in its `__init__`:
@@ -104,6 +99,10 @@ function __init__()
 end
 ```
 
+It takes the simulator and nothing else: every other global has its own setter. A backend that
+wants a concurrency default calls [`setNumberOfParallelSims`](@ref) on the next line — that needs
+only registration, not an initialized project.
+
 Idempotent for a backend that is already registered: a second call with the same simulator type
 leaves the existing globals — and everything accumulated in them — untouched, so reloading the
 package does not discard an open project. Registering a *different* backend replaces the globals
@@ -111,14 +110,13 @@ and warns, naming both types; one process serves one backend.
 
 Returns the active `ModelManagerGlobals`.
 """
-function registerSimulator!(sim::AbstractSimulator; max_number_of_parallel_simulations::Int=1)
+function registerSimulator!(sim::AbstractSimulator)
     g = mm_globals_ref[]
     if !isnothing(g)
         typeof(g.simulator) === typeof(sim) && return g
         @warn "Replacing the registered simulator $(nameof(typeof(g.simulator))) with $(nameof(typeof(sim))). ModelManager serves one backend per process; the state of the previous project is discarded."
     end
-    mm_globals_ref[] = ModelManagerGlobals(; simulator=sim,
-                                           max_number_of_parallel_simulations=max_number_of_parallel_simulations)
+    mm_globals_ref[] = ModelManagerGlobals(; simulator=sim)
     return mm_globals_ref[]
 end
 

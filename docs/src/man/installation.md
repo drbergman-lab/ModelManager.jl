@@ -42,11 +42,12 @@ using ModelManager
 
 mutable struct MySimulator <: AbstractSimulator
     dir::String
+    version::VersionNumber
     # ...simulator-specific fields
 end
 
 function __init__()
-    ModelManager.registerSimulator!(MySimulator("/path"))
+    ModelManager.registerSimulator!(MySimulator("/path", v"0.1.0"))
 end
 ```
 

@@ -2693,7 +2693,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         saved = ModelManager.mm_globals_ref[]
         try
             ModelManager.mm_globals_ref[] = nothing
-            g = ModelManager.registerSimulator!(TestSimulator(); max_number_of_parallel_simulations=3)
+            g = ModelManager.registerSimulator!(TestSimulator())
+            # The concurrency default is a separate setter, usable on registration alone.
+            setNumberOfParallelSims(3)
             @test ModelManager.mm_globals_ref[] === g
             @test g.simulator isa TestSimulator
             @test g.max_number_of_parallel_simulations == 3

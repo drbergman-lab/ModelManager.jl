@@ -60,12 +60,12 @@ function __init__()
 end
 ```
 
-[`registerSimulator!`](@ref) takes whatever the globals need — currently
-`max_number_of_parallel_simulations`, which users change afterwards with
-[`setNumberOfParallelSims`](@ref). It is idempotent for your own backend, so reloading the
-package does not wipe an open project, and it warns rather than silently taking over if another
-backend is already registered: **one process serves one backend.** The `Ref` behind it,
-[`mm_globals_ref`](@ref), is public but is not the registration API.
+[`registerSimulator!`](@ref) takes the simulator and nothing else; every other global has its
+own setter, so a backend that wants a concurrency default calls
+[`setNumberOfParallelSims`](@ref) on the next line. It is idempotent for your own backend, so
+reloading the package does not wipe an open project, and it warns rather than silently taking over
+if another backend is already registered: **one process serves one backend.** The `Ref` behind it
+is internal; this call is the whole registration API.
 
 ## 3. Provide an initialization entry point
 
