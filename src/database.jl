@@ -610,55 +610,118 @@ function _simulationIDsAtStatus(status_code::String, max_ids::Dict{Type{<:Abstra
 end
 
 """
-    _reconcileStrandedSimulations(max_ids)
+    _strandedSimulationIDs() → Dict{String,Vector{Int}}
+
+The simulations sitting at `Running` and at `Queued` right now — the two statuses that, for a
+simulation no live session owns, mean a driver process died without recording what happened.
+
+Called by [`initializeModelManager`](@ref) *synchronously*, before it returns, and handed to the
+background diagnostics task. Diagnostics itself runs at the first yield after initialization, by
+which time a `run` on the very next line of the user's script may already have marked this
+session's own simulations `Queued` and `Running` — which is precisely what the reconciler reads as
+evidence of a dead driver. Taking the two lists at a moment when no `run` of this session can have
+started is what keeps it off them.
+"""
+_strandedSimulationIDs() =
+    Dict(code => _simulationIDsAtStatus(code, Dict{Type{<:AbstractTrial},Int}())
+         for code in ("Running", "Queued"))
+
+"""
+    _reconcileStrandedSimulations(max_ids; stranded=nothing)
 
 Record the outcomes of simulations whose driver process died before it could.
 
-A simulation is marked `Running` before its backend is called and `Queued` when a worker takes it.
-If the Julia process is then killed -- Ctrl-C twice, a login-node reaper, a driver job hitting its
-time limit -- nothing in-process can write what happened, and the row keeps that status forever.
-`isStarted` counts everything but `Not Started` as started, so every later run skips those
-simulations *and* announces that it found matching ones and will save you time by not re-running
-them, about simulations that never finished.
+`run` marks every simulation it is about to run `Queued` up front, and the worker that claims one
+marks it `Running` immediately before calling the backend -- and so before any `sbatch`. `Queued`
+therefore means *scheduled by a `run`, not yet claimed*, and `Running` means *claimed, backend
+about to be called or already running*. If the Julia process is then killed -- Ctrl-C twice, a
+login-node reaper, a driver job hitting its time limit -- nothing in-process can write what
+happened, and the row keeps that status forever. `isStarted` counts everything but `Not Started` as
+started, so every later run skips those simulations *and* announces that it found matching ones and
+will save you time by not re-running them, about simulations that never finished.
 
-Two sources of truth, in order:
+A `Queued` row has no job and no process, by construction: nothing had claimed it. Every one in
+`stranded` therefore goes back to `Not Started`.
+
+A `Running` row is resolved from two sources, in order:
 
 - the exit-code sentinel the job's own shell trap wrote, which is the same file the worker would
   have read; it is left in place rather than consumed, so a worker in another live session that is
   still waiting on it is not robbed of its result. The age-gated stray sweep reclaims it.
-- failing that, `sacct` on the job ID in the simulation's `hpc.out`. `sacct` reads slurmdbd, so it
-  answers for jobs that left the queue long ago -- which `squeue`, the runner's reaper, cannot.
+- failing that, `sacct` on the job ID in the simulation's `hpc.out`, in one query for every
+  simulation that got that far. `sacct` reads slurmdbd, so it answers for jobs that left the queue
+  long ago -- which `squeue`, the runner's reaper, cannot.
 
-A simulation still `PENDING` or `RUNNING` is left alone, as is one whose state `sacct` reports but
-this does not classify, or that offers neither source. A `Queued` simulation with no `hpc.out` was
-never submitted at all, so it goes back to `Not Started` and the next `run` picks it up.
+A `Running` row with neither -- no sentinel, and an `hpc.out` that is absent or holds no job ID --
+never reached the scheduler at all: the driver died between claiming the row and `sbatch` returning,
+possibly inside the transient-refusal retry loop. On HPC that is proof no job exists, so the
+simulation returns to `Not Started`. Off HPC it is left alone: what a local process did after the
+session ended is not knowable after the fact.
+
+A job still `PENDING` or `RUNNING` is left alone, as is one whose state `sacct` reports but this
+does not classify.
+
+`stranded`, as returned by `_strandedSimulationIDs`, is the snapshot `initializeModelManager` takes
+before any `run` of this session could have started; without it the two statuses are queried live,
+which is what a user calling [`databaseDiagnostics`](@ref) by hand gets. Mid-run, live is still
+safe: a `Running` row this session owns has a sentinel or a job ID, so at worst it is recorded with
+the status its own worker is about to record, and a `Queued` row reset here is one the worker will
+mark `Running` when it claims it anyway.
 
 Nothing here throws: each simulation is guarded on its own, so one unreadable folder costs one
 simulation rather than the whole report.
 """
-function _reconcileStrandedSimulations(max_ids::Dict{Type{<:AbstractTrial},Int})
+function _reconcileStrandedSimulations(max_ids::Dict{Type{<:AbstractTrial},Int};
+                                       stranded::Union{Nothing,Dict{String,Vector{Int}}}=nothing)
     completed, failed, restarted = Int[], Int[], Int[]
     unclassified = Tuple{Int,String}[]
+    atStatus(code) = isnothing(stranded) ? _simulationIDsAtStatus(code, max_ids) : get(stranded, code, Int[])
 
-    running = _simulationIDsAtStatus("Running", max_ids)
-    if !isempty(running)
-        sentinels = _sentinelsBySimulation()
-        #! Probed once. Without `sacct` the sentinel is the only source, which is the ordinary case
-        #! on a workstation and no reason to report anything.
-        has_sacct = shellCommandExists(`sacct`)
-        for simulation_id in running
-            try
-                exit_code = haskey(sentinels, simulation_id) ?
-                            _readSentinel(sentinels[simulation_id]) : nothing
-                if !isnothing(exit_code)
-                    updateDatabaseOnCompletion(simulation_id, missing, exit_code == 0)
-                    push!(exit_code == 0 ? completed : failed, simulation_id)
-                    continue
+    #! First pass: everything a sentinel can settle, plus the job IDs of everything it cannot. The
+    #! scheduler is asked once, after this loop, rather than once per simulation: slurmdbd is a
+    #! second daemon with a database behind it, and a stranded campaign can be hundreds of rows.
+    running = atStatus("Running")
+    sentinels = isempty(running) ? Dict{Int,String}() : _sentinelsBySimulation()
+    to_query = Tuple{Int,Int}[]
+    for simulation_id in running
+        try
+            #! `_readSentinel` answers `nothing` for a file that has vanished since the listing --
+            #! another session's worker consuming its own sentinel is exactly that -- so a race
+            #! here costs this simulation its sentinel, not the pass.
+            exit_code = haskey(sentinels, simulation_id) ?
+                        _readSentinel(sentinels[simulation_id]) : nothing
+            if !isnothing(exit_code)
+                updateDatabaseOnCompletion(simulation_id, missing, exit_code == 0)
+                push!(exit_code == 0 ? completed : failed, simulation_id)
+                continue
+            end
+            job_id = _jobIDFromSubmission(simulation_id)
+            if isnothing(job_id)
+                #! `_recordSubmissionOutput` writes `hpc.out` on every attempt, refused ones
+                #! included, so neither a missing file nor an empty one can belong to a job that
+                #! exists. Off HPC the same emptiness says nothing -- there was never going to be a
+                #! job ID -- and a local process's outcome is unknowable once its session is gone,
+                #! so the row is left for the status report to warn about.
+                if mm_globals().run_on_hpc
+                    _resetToNotStarted(simulation_id; from="Running")
+                    push!(restarted, simulation_id)
                 end
-                has_sacct || continue
-                job_id = _jobIDFromSubmission(simulation_id)
-                isnothing(job_id) && continue
-                state = _sacctState(job_id)
+                continue
+            end
+            push!(to_query, (simulation_id, job_id))
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
+
+    #! Probed rather than assumed. Without `sacct` the sentinel is the only source, which is the
+    #! ordinary case on a workstation and no reason to report anything.
+    states = isempty(to_query) || !shellCommandExists(`sacct`) ? nothing :
+             _sacctStates([job_id for (_, job_id) in to_query])
+    if !isnothing(states)
+        for (simulation_id, job_id) in to_query
+            try
+                state = get(states, job_id, nothing)
                 isnothing(state) && continue
                 if state in _SACCT_SUCCESS_STATES
                     updateDatabaseOnCompletion(simulation_id, missing, true)
@@ -675,13 +738,13 @@ function _reconcileStrandedSimulations(max_ids::Dict{Type{<:AbstractTrial},Int})
         end
     end
 
-    for simulation_id in _simulationIDsAtStatus("Queued", max_ids)
+    for simulation_id in atStatus("Queued")
         try
-            #! `hpc.out` is written by the submission itself, so its absence is proof no job was
-            #! ever created for this simulation -- the driver died between claiming the row and
-            #! submitting. One that was submitted keeps its status and is left to the `Running`
-            #! pass on a later session, once its job has an outcome to report.
-            isfile(joinpath(trialFolder(Simulation, simulation_id), "hpc.out")) && continue
+            #! Unconditional: `Queued` is set by `run` before any worker takes the simulation, so
+            #! there is no job and no process to ask about. An `hpc.out` in the folder is a file an
+            #! *earlier* run of the same simulation left -- a refused submission writes an empty
+            #! one -- and treating it as evidence of a live job would leave the row `Queued` for
+            #! good.
             _resetToNotStarted(simulation_id; from="Queued")
             push!(restarted, simulation_id)
         catch e
@@ -715,7 +778,8 @@ function _reconcileStrandedSimulations(max_ids::Dict{Type{<:AbstractTrial},Int})
 end
 
 """
-    databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int} = Dict{Type{<:AbstractTrial},Int}())
+    databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int} = Dict{Type{<:AbstractTrial},Int}();
+                        stranded = nothing)
 
 Check consistency between the database and the output folders.
 Prints warnings for any discrepancies found.
@@ -727,9 +791,14 @@ skips them while reporting that it saved you time.
 
 When `max_ids` is provided (as returned by `_snapshotMaxIDs`), each check is
 restricted to IDs ≤ the snapshot value for that type. This prevents false positives from
-simulations that were created or started after `initializeModelManager` returned.
+simulations that were created or started after `initializeModelManager` returned. `stranded` is the
+matching snapshot of which simulations sat at `Running` and at `Queued`, taken at the same moment;
+called by hand, with neither, both are queried live, which is safe mid-run — a `Running` row this
+session owns is recorded with the status its own worker is about to record, and a `Queued` row
+reset here is one its worker sets `Running` when it claims it.
 """
-function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{<:AbstractTrial},Int}())
+function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{<:AbstractTrial},Int}();
+                             stranded::Union{Nothing,Dict{String,Vector{Int}}}=nothing)
     assertInitialized()
     consensus_ids = Dict{Type{<:AbstractTrial}, Set{Int}}()
 
@@ -817,7 +886,7 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     #! project whose last session was killed. Guarded whole, on top of the per-simulation guards
     #! inside, because a diagnostic that cannot run must still let the session start.
     try
-        _reconcileStrandedSimulations(max_ids)
+        _reconcileStrandedSimulations(max_ids; stranded=stranded)
     catch e
         e isa InterruptException && rethrow()
         @warn "Could not check for simulations left behind by an earlier session." exception=(e, catch_backtrace())

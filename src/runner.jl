@@ -255,11 +255,10 @@ simulation, not raised: one broken simulation should not abort a campaign of tho
 killed by a signal is also a failure -- Julia reports `exitcode == 0` for those, so the check is
 `success(p)`, not the exit code.
 
-A submission `sbatch` *refuses* is the one launch problem that is raised rather than recorded, as
-[`SubmissionRefused`](@ref): no job ran, so nothing is known about the simulation, and calling it
-failed would erase it from its monad. `run` catches it, leaves the simulation at `Not Started` and
-stops the campaign; catch it yourself to tell a refused submission from a simulation that ran and
-failed.
+A submission `sbatch` *refuses* is the one launch problem that is raised rather than recorded: no
+job ran, so nothing is known about the simulation, and calling it failed would erase it from its
+monad. `run` leaves that simulation at `Not Started`, stops the campaign, and reports the
+submission stage and the simulation in its error.
 """
 function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
     cmd = simulationCommand(sim, spec)
@@ -502,11 +501,11 @@ function run(T::AbstractTrial; quiet::Bool=false,
             #! A refused SLURM submission is the one exception: the job never existed, so nothing
             #! is known about the simulation and recording a failure would erase it from its monad
             #! (`simulationFailed` -> `eraseSimulationIDFromConstituents`). Put the row back to
-            #! "Not Started" so the next `run` picks it up. See `SubmissionRefused`.
+            #! "Not Started" so the next `run` picks it up. See `_SubmissionRefused`.
             try
                 runSimulation(mm_globals().simulator, spec)
             catch e
-                if e isa SubmissionRefused
+                if e isa _SubmissionRefused
                     _resetToNotStarted(spec.simulation.id)
                 else
                     updateDatabaseOnCompletion(spec.simulation.id, spec.monad_id, false)
@@ -671,7 +670,7 @@ than as a generic worker failure.
 function _stageError(e, captured::CapturedException)
     e isa _SimulationStageError && return e
     inner = e isa TaskFailedException ? e.task.exception : e
-    inner isa SubmissionRefused && return _SimulationStageError(:submission, inner.simulation_id, captured)
+    inner isa _SubmissionRefused && return _SimulationStageError(:submission, inner.simulation_id, captured)
     return _SimulationStageError(:simulation, nothing, captured)
 end
 

@@ -749,42 +749,88 @@ them", about simulations that never finished. The only recovery on offer was
 - **Two sources, in that order: the sentinel, then `sacct`.** The sentinel is the same file the
   worker would have read, so it gives the exit code directly. `sacct` reads slurmdbd rather than
   the queue, which is what lets it answer for a job that left hours ago -- `squeue`, the runner's
-  reaper, cannot. `COMPLETED` is success; `FAILED`/`TIMEOUT`/`CANCELLED`/`OUT_OF_MEMORY`/
-  `NODE_FAIL` are failure; `PENDING`/`RUNNING`/`SUSPENDED` are left alone; anything else is
-  reported by name rather than guessed at.
+  reaper, cannot. `COMPLETED` is success; the failure and waiting lists cover every state SLURM
+  currently documents, split by whether the job is over; anything else is reported by name and left
+  at `Running`, because the lists cannot be exhaustive -- SLURM adds states between releases and a
+  site can define its own.
+- **One `sacct` call per pass, not one per simulation.** slurmdbd is a second daemon with a
+  database behind it and a stranded campaign can be hundreds of rows, so the reconciler makes two
+  passes: the first settles everything a sentinel can and collects the job IDs of the rest, then
+  one `sacct -j <all ids> -n -P --format=JobID,State` answers for all of them. `JobID` joins the
+  format because the reply has to be keyed back to a job; rows for `.batch`/`.extern` steps are
+  dropped, since a step's state can differ from its allocation's.
+- **Sentinels are ordered by the stamp in the name, and the stamp is wall clock.** Two submissions
+  of one simulation each leave a sentinel, and the row still at `Running` belongs to the *later
+  submission* -- which `mtime` gets backwards whenever the earlier-submitted job outlived the
+  later one, quite apart from `mtime` being unreliable on a network filesystem (attribute caching,
+  clock skew, tied resolution) and costing a `stat` that can throw on a file swept mid-scan. So the
+  stamp moved from `time_ns()` to `round(UInt64, time() * 1e9)`: `time_ns()`'s epoch is per-boot,
+  so stamps from two driver sessions were never comparable. Uniqueness per submission is unchanged;
+  a name whose stamp is not hex is ignored, which is also what skips staged `.tmp` writes.
 - **A reconciled sentinel is read, not consumed.** Deleting it would be closer to what the worker
   does, but diagnostics cannot tell an abandoned simulation from one another live session is still
   waiting on, and consuming that session's sentinel would leave its worker to be failed by the
   reaper minutes later. The age-gated stray sweep already exists to reclaim these.
-- **`done_dir` is gone; sentinels live at `data/outputs/.hpc_done`.** The knob bought one thing --
-  escaping NFS's 30-60 s directory-attribute caching by pointing sentinels at scratch -- and cost
-  the failure where a directory the compute nodes cannot write makes *every* successful job look
-  scheduler-killed, silently. Latency is the lesser failure and the visible one. `outputs/` rather
-  than `data/` root so it sits beside the simulation folders it is about; it is a sibling of
-  `outputs/simulations`, so nothing that scans those sees it. Breaking, in an unreleased version.
+- **The sentinel directory is fixed per session and moved only by an environment variable.**
+  `HPCCompletionOptions.done_dir` is gone -- a setter could move the directory mid-session, and
+  diagnostics reads it at initialization, so it has to be fixed by then. The replacement is
+  `MODELMANAGER_HPC_DONE_DIR`, read once by `initializeModelManager` onto the new
+  `ModelManagerGlobals.hpc_done_dir` (globals, not `HPCCompletionOptions`, which is the settable
+  bag). Default `data/outputs/.hpc_done`: on the filesystem the jobs already write into, so
+  writable by construction, and a sibling of `outputs/simulations` so nothing scanning those sees
+  it. A value that is given is `mkpath`ed and write-probed at init, throwing an `ArgumentError`
+  naming the variable, because a directory the compute nodes cannot write makes *every* successful
+  job look scheduler-killed, silently, and this is the one check a login node can make. Accepted
+  cost, stated in the manual: sentinels written under a previous value are not where diagnostics
+  looks, so a user who changes it between launches is forced to think about where the sentinels of
+  a campaign in flight are. Breaking, in an unreleased version.
 - **`useHPC` pins the flag for the session.** One extra `Bool`, `run_on_hpc_overridden`, consulted
   by `initializeModelManager` before it re-seeds `run_on_hpc` from the probe. Without it a
   downstream package's `__init__` -- which initializes a project on its own -- or any script that
   re-initializes would put the probed value back, and a `useHPC(false)` at the top of a script
   would be gone before its first `run`. Session state, not project state: a script that says
   `useHPC(false)` means it for every project it opens.
-- **`submitDriver` makes the driver a job.** It writes `data/outputs/drivers/<timestamp>/driver.sh`
-  (body `julia --project=<project> <script>`), submits it `--parsable` with that folder's
-  `--output`/`--error` and a default `--job-name=mm-driver`, keeps the client's streams as
-  `hpc.out`/`hpc.err` so the job ID is on disk, prints the `squeue`/`sacct` lines, and returns the
-  ID. Keyword underscores become hyphens, since `cpus_per_task=2` is writable and
-  `var"cpus-per-task"=2` is not. Values must be strings or numbers -- unlike `setJobOptions` there
-  is no `Simulation` to call a `Function` with. The docstring leads with the trap: the driver's own
-  `--time` must cover the whole campaign *including* the queue waits of the jobs it submits.
+- **A template, not a `submitDriver` function.** Submission is one line of `sbatch`; what has to
+  go *above* that line is site knowledge ModelManager does not have -- a `module load julia`, a
+  specific version, an account -- and a generated command line cannot carry it. Loading Julia and a
+  whole downstream package just to do that string substitution is minutes of load time on a
+  cluster, for something the user can type. So `initializeModelManager` (whenever `run_on_hpc` ends
+  up `true`) and `useHPC(true)` (when a project is initialized) write `driver_template.sbatch` into
+  `<project root>/scripts/` if that folder exists -- PCMM's `createProject` makes one -- and into
+  the project root otherwise, `dirname(dataDir())` either way, so it sits beside the scripts a user
+  edits rather than inside the `data/` the deletion helpers sweep. Written once, never overwritten,
+  announced only on the write. It carries commented `#SBATCH` lines, a commented-out
+  `module load julia`, `echo` lines around the run, and `julia --project=<active project> "$@"` so
+  the campaign script is an argument. The `--time` comment names the trap: it must cover the whole
+  campaign *including* the queue waits of every simulation job the driver submits.
 - **Nested submission stays.** Inside the driver job, detection stays on and each simulation is
   still its own job, which is the design -- it hands scheduling to SLURM. The review had proposed
   hinting at `useHPC(false)` when `SLURM_JOB_ID` is set; that would have told users to undo the
-  design, so it was dropped in favour of this helper.
-- **`_SubmissionRefused` → `SubmissionRefused`, `@compat public`.** It is what a user catches to
-  tell a refused submission from a simulation that ran and failed, and PhysiCellModelManager's
-  tests already reach for it. `simulation_id` widened to `Union{Nothing,Int}` for the driver
-  submission, which belongs to no simulation. `hpc_completion.jl` joins `hpc.jl` on the HPC
-  reference page, or the `@ref` to it would not resolve in a docs build.
+  design, so the template says so in a comment instead.
+- **`_SubmissionRefused` stays internal.** Publishing it was only ever in service of
+  `submitDriver`, whose refusal a user had to be able to catch; with the template there is no such
+  refusal, every throw again belongs to a simulation, and `simulation_id` goes back to `Int`.
+  `hpc_completion.jl` accordingly leaves the HPC reference page's `Pages` list: nothing in the file
+  is public, and a `Pages` entry that renders nothing is a claim that it does.
+- **`Queued` and `Running` mean what `run` sets them to.** `run` marks every simulation it is about
+  to run `Queued` up front, and the worker that claims one marks it `Running` before calling the
+  backend -- and so before any `sbatch`. The old reconciler had this backwards, and drew two wrong
+  conclusions from it. A `Queued` row was checked for an `hpc.out`, which it can only have from an
+  *earlier* run of the same simulation (a refused submission writes an empty one), and such a row
+  would have stayed `Queued` forever; every `Queued` row in the pass now returns to `Not Started`.
+  And a `Running` row with no sentinel and no job ID was left alone, when on HPC that is proof no
+  job exists -- the driver died between claiming the row and `sbatch` returning, possibly inside
+  the transient-refusal retry loop -- so those return to `Not Started` too. Off HPC they are left:
+  what a local process did after its session ended is not knowable.
+- **The stranded ID sets are taken synchronously at init.** Diagnostics runs in an `@async` task
+  after `initializeModelManager` returns, so a `run` on the next line of the script can have marked
+  this session's own simulations `Queued`/`Running` before the reconciler looks -- exactly the two
+  statuses it treats as evidence of a dead driver. Two cheap queries at init, when no `run` of this
+  session can have started, and the sets travel with `max_ids`. A hand call to
+  `databaseDiagnostics()` still queries live, which is safe mid-run and documented as such: a
+  `Running` row this session owns has a sentinel or a job ID and is at worst recorded with the
+  status its own worker is about to record, and a `Queued` row reset here is one its worker marks
+  `Running` when it claims it.
 
 ### Rejected
 - **A hint at `SLURM_JOB_ID`.** See above: the nested submission is intended, so the hint would
@@ -794,8 +840,15 @@ them", about simulations that never finished. The only recovery on offer was
   right for a sampling, wrong for a mixed trial -- and the reaper would have to understand
   `jobid_taskid`. Worth its own brief if per-job submission overhead ever becomes the bottleneck;
   with the sentinel design it has not.
-- **A probe job to validate the sentinel directory on first submission.** Moot once the path is
-  fixed: it is now always on the same filesystem the jobs already write their output into.
+- **A probe job to validate the sentinel directory on first submission.** A compute node is the
+  only thing that can prove the directory is writable *from a compute node*, but a probe job means
+  submitting and waiting on a job before the campaign starts, on every session. The login-node
+  `mkpath` plus one probe file at init catches the mistakes people actually make (a typo, a path on
+  a filesystem the nodes do not mount is not among them) and costs nothing.
+- **A `setHPCDoneDir` setter, or a `done_dir` back on `HPCCompletionOptions`.** Either would let
+  the directory move after diagnostics had already read the old one, which is the failure the fixed
+  location existed to prevent. An environment variable read once at init is the same expressiveness
+  with the mutation removed.
 - **Resolving the monad before recording a reconciled failure.** `updateDatabaseOnCompletion` and
   `simulationFailed` now take `Union{Missing,Int}`, so `missing` reaches the lookup
   `eraseSimulationIDFromConstituents` already does from the simulation's own parameterization.
@@ -811,6 +864,10 @@ them", about simulations that never finished. The only recovery on offer was
 - **The `sacct` shim needs `sacct.out` cleared between subtests.** `_reset_hpc!` removes it along
   with the other shim state; a leftover state string from an earlier subtest would otherwise
   decide a later one's outcome.
+- **Test projects now nest their data directory.** `initializeModelManager` takes the *data*
+  directory, and the template is written to its parent. A test that passed `mktempdir()` itself as
+  the data directory would drop `driver_template.sbatch` into the system temp directory, so the
+  blocks that turn HPC on use `<mktempdir()>/data` and keep the write inside the temp tree.
 
 ---
 

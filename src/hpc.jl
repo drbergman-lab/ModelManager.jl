@@ -1,5 +1,3 @@
-using Dates
-
 """
     shellCommandExists(cmd::Union{String,Cmd})
 
@@ -55,7 +53,96 @@ function useHPC(use::Bool=true)
     end
     mm_globals().run_on_hpc = use
     mm_globals().run_on_hpc_overridden = true
+    #! Turning HPC mode on by hand is the other moment a user could want the driver template, and
+    #! it is the only one on a machine where the SLURM probe fails. It needs a project to write
+    #! into, so before initialization there is nothing to do and nothing worth saying: the flag is
+    #! what the caller asked for, and the next `initializeModelManager` writes the template.
+    use && isInitialized() && _writeDriverTemplate()
     return use
+end
+
+"""
+    _driverTemplatePath() → String
+
+Where the driver batch-script template belongs: `scripts/driver_template.sbatch` under the project
+root if that folder exists (a downstream `createProject` makes one), else `driver_template.sbatch`
+in the project root itself.
+
+The project root is the parent of `dataDir()`, so the template lands beside the scripts a user
+actually edits and runs rather than inside the `data/` tree the campaign writes into and the
+deletion helpers sweep.
+"""
+function _driverTemplatePath()
+    root = dirname(dataDir())
+    scripts = joinpath(root, "scripts")
+    return joinpath(isdir(scripts) ? scripts : root, "driver_template.sbatch")
+end
+
+"""
+    _driverTemplateContents() → String
+
+The text of the driver-job template, with `--project` pinned to the environment active when it is
+written.
+
+The template runs `julia --project=… "\$@"`, so the script to drive a campaign with is an argument
+to `sbatch`, not part of the file: one template serves every campaign in the project.
+"""
+function _driverTemplateContents()
+    #! Quoted because a project path can contain spaces, and the line is re-read by bash.
+    project = _shQuote(string(Base.active_project()))
+    return """
+    #!/bin/bash
+    #SBATCH --job-name=mm-driver     # so `squeue --name=mm-driver` finds this job
+    #SBATCH --time=48:00:00          # must cover the WHOLE campaign -- including the queue wait of every simulation job this driver submits, since the driver sits blocked until the last one finishes
+    #SBATCH --cpus-per-task=1        # the driver only submits and waits; each simulation gets its own allocation
+    #SBATCH --mem=4G                 # Julia's own footprint, not a simulation's
+    #SBATCH --output=driver-%j.log   # the driver's stdout, %j being the job id
+    #SBATCH --error=driver-%j.err    # the driver's stderr
+
+    # Written by ModelManager because SLURM was detected on this machine. It is a starting point,
+    # not something ModelManager owns: edit it freely, it is written once and never overwritten.
+    #
+    #   submit:  sbatch driver_template.sbatch my_script.jl
+    #   watch:   squeue -j <jobid>
+    #   after:   sacct -j <jobid>
+    #
+    # Inside this job, HPC detection stays on and each simulation is still submitted as its own
+    # job. That is the design -- SLURM schedules the simulations, ModelManager does not -- so the
+    # driver itself needs no more than the single core and small memory request above.
+
+    # module load julia   # uncomment / adjust for your site
+
+    echo "ModelManager driver job \$SLURM_JOB_ID starting on \$(hostname) at \$(date)"
+
+    julia --project=$(project) "\$@"
+
+    echo "ModelManager driver job \$SLURM_JOB_ID finished at \$(date)"
+    """
+end
+
+"""
+    _writeDriverTemplate() → String
+
+Write the driver-job template if it is not already there, and return its path. Announces the write
+on stdout the first time; says nothing on any later call.
+
+The Julia process that calls `run` is what records outcomes, so it should be a job itself rather
+than a login-node process an SSH drop or a reaper can kill. ModelManager writes a template instead
+of submitting the driver for the user: submission is a one-line `sbatch`, while what to put *above*
+that line is site knowledge ModelManager does not have -- a `module load julia`, a specific Julia
+version, an account or partition -- and starting Julia and a whole simulator package just to
+assemble that command line would be minutes of load time to do a string substitution.
+
+Never overwrites: after the first write the file is the user's, and the next session finding it
+already edited is the normal case.
+"""
+function _writeDriverTemplate()
+    path = _driverTemplatePath()
+    ispath(path) && return path
+    write(path, _driverTemplateContents())
+    println("Wrote a SLURM driver-job template to $(path) — submit a campaign with `sbatch $(basename(path)) my_script.jl`.")
+    flush(stdout)
+    return path
 end
 
 """
@@ -93,6 +180,13 @@ How the runner submits a SLURM job and learns that it has finished. Held on
 Jobs report their exit code by writing a sentinel file to a shared directory; the worker that
 submitted each job waits for its file. `squeue` is consulted only as a reaper, for jobs that died
 without writing anything, through one answer shared by every waiting worker.
+
+*Where* that directory is is deliberately not one of these options. It is
+`data/outputs/.hpc_done` unless the `MODELMANAGER_HPC_DONE_DIR` environment variable says
+otherwise, and it is fixed for the session: [`initializeModelManager`](@ref) reads the variable
+once, checks that the directory can be created and written, and diagnostics reads the directory at
+that moment — a location that could move mid-session would leave it looking where the sentinels are
+not.
 
 # Fields
 - `submit_retry_period::Float64`: How long a worker keeps retrying a submission that `sbatch`
@@ -163,120 +257,6 @@ function setJobOptions(options::Dict)
             "reserved keys are $(join(_RESERVED_SBATCH_KEYS, ", "))."))
         mm_globals().sbatch_options[String(key)] = value
     end
-end
-
-"""
-    _driverJobDir() → String
-
-A fresh, timestamped directory under `data/outputs/drivers/` for one driver submission, holding
-the generated batch script, the job's own streams, and the `sbatch` client's. A second submission
-inside the same second gets a `-2`, `-3`, … suffix rather than overwriting the first one's logs.
-"""
-function _driverJobDir()
-    root = joinpath(dataDir(), "outputs", "drivers")
-    stamp = Dates.format(now(), "yyyymmdd-HHMMSS")
-    dir = joinpath(root, stamp)
-    n = 1
-    while ispath(dir)
-        n += 1
-        dir = joinpath(root, "$(stamp)-$(n)")
-    end
-    mkpath(dir)
-    return dir
-end
-
-"""
-    _driverJobFlags(options) → Vector{String}
-
-Render a `submitDriver` keyword splat as `--key=value` flags, defaulting `job-name` to
-`mm-driver`. An underscore in a keyword becomes a hyphen, since `cpus_per_task=4` is writable and
-`var"cpus-per-task"=4` is not.
-"""
-function _driverJobFlags(options)
-    opts = Dict{String,Any}("job-name" => "mm-driver")
-    for (key, value) in options
-        flag = replace(String(key), "_" => "-")
-        flag in _RESERVED_SBATCH_KEYS && throw(ArgumentError(
-            "The sbatch option `$(flag)` is set by ModelManager itself and cannot be overridden; " *
-            "reserved keys are $(join(_RESERVED_SBATCH_KEYS, ", "))."))
-        #! No `Function` values here, unlike `setJobOptions`: there is no `Simulation` to call one
-        #! with. The driver is one job, so a literal is the only thing that could be meant.
-        value isa Union{AbstractString,Number} || throw(ArgumentError(
-            "The sbatch option `$(flag)` for submitDriver must be a String or a number; got " *
-            "$(repr(value))::$(typeof(value))."))
-        opts[flag] = value
-    end
-    #! Sorted so the submitted command line is reproducible between sessions.
-    return ["--$(k)=$(opts[k])" for k in sort(collect(keys(opts)))]
-end
-
-"""
-    submitDriver(script; project=Base.active_project(), options...) → Int
-
-Submit `script` itself as a SLURM job, so the Julia process that drives a campaign runs on a
-compute node under the scheduler's clock instead of in an SSH session that a dropped connection
-would kill. Returns the job ID, and prints the `squeue`/`sacct` lines that follow it.
-
-The job's body is `julia --project=<project> <script>`, resolved from the `PATH` the job inherits
-(SLURM exports the submitting environment by default), so submit from a shell where `julia` runs.
-Each `options` keyword becomes an `sbatch` flag, with underscores turned into hyphens
-(`cpus_per_task=4` → `--cpus-per-task=4`); values must be strings or numbers, and the flags
-ModelManager renders itself are refused. `job-name` defaults to `mm-driver`. The generated batch
-script and the job's `output.log`/`output.err` are kept under
-`data/outputs/drivers/<timestamp>/`.
-
-**The driver's own `--time` has to cover the entire campaign** — not just the compute, but the
-queue wait of every simulation job it will submit, since it sits blocked until the last one
-finishes. A driver killed at its time limit strands exactly the rows this helper exists to
-protect; `databaseDiagnostics` can recover them afterwards, but the campaign still stops.
-
-Inside the driver job, HPC detection stays on and each simulation is still submitted as its own
-job. That is the intended design — it hands scheduling to SLURM — so the driver itself needs only
-one core and a small memory request, whatever the simulations need.
-
-```julia
-submitDriver("run_campaign.jl"; time="48:00:00", mem="4G", partition="long")
-```
-"""
-function submitDriver(script::AbstractString; project=Base.active_project(), options...)
-    assertInitialized()
-    isfile(script) || throw(ArgumentError("submitDriver: no script at `$(script)`."))
-    dir = _driverJobDir()
-    body = "julia --project=$(_shQuote(string(project))) $(_shQuote(abspath(script)))"
-    job_script = joinpath(dir, "driver.sh")
-    #! `exec` so the job's exit status is Julia's own, with no shell frame in between for SLURM to
-    #! report instead. sbatch requires the leading shebang.
-    write(job_script, "#!/bin/sh\nexec $(body)\n")
-    chmod(job_script, 0o755)
-
-    flags = ["--parsable",
-             "--output=$(joinpath(dir, "output.log"))",
-             "--error=$(joinpath(dir, "output.err"))"]
-    append!(flags, _driverJobFlags(options))
-    out, err = IOBuffer(), IOBuffer()
-    p = try
-        run(pipeline(ignorestatus(`sbatch $flags $job_script`); stdout=out, stderr=err))
-    catch e
-        throw(SubmissionRefused(nothing, "sbatch could not be invoked: $(sprint(showerror, e))"))
-    end
-    stdout_text, stderr_text = String(take!(out)), String(take!(err))
-    #! The same pair the per-simulation path writes, for the same reason: with `--parsable` this is
-    #! the only place the job ID lands on disk.
-    write(joinpath(dir, "hpc.out"), stdout_text)
-    write(joinpath(dir, "hpc.err"), stderr_text)
-    success(p) || throw(SubmissionRefused(nothing, "sbatch exited $(p.exitcode): $(strip(stderr_text))"))
-    job_id = _parseJobID(stdout_text)
-    isnothing(job_id) && throw(SubmissionRefused(nothing,
-        "could not find exactly one job ID in sbatch's output. Output was:\n$(stdout_text)"))
-
-    println("""
-    Submitted driver job $(job_id): $(body)
-        while it waits or runs:  squeue -j $(job_id)
-        once it has finished:    sacct -j $(job_id)
-        its output:              $(joinpath(dir, "output.log"))
-    """)
-    flush(stdout)
-    return job_id
 end
 
 #! Public despite not being exported: the manual documents it as the starting point users

@@ -102,30 +102,40 @@ The Julia process that called `run` is what waits for the jobs and records their
 dies, the jobs still finish but nothing writes their results to the database, and the simulations
 they belonged to stay at `Running`.
 
-The fix is to make the driver a job too, with [`submitDriver`](@ref) — then it runs on a compute
-node under SLURM's clock rather than in an SSH session. `tmux`, `screen` and
-`nohup julia script.jl &` also survive a dropped connection, but not a login node that reaps
-long-running processes.
+The fix is to make the driver a job too, so it runs on a compute node under SLURM's clock rather
+than in an SSH session. `tmux`, `screen` and `nohup julia script.jl &` also survive a dropped
+connection, but not a login node that reaps long-running processes.
 
-If a driver does die anyway, the next `initializeModelManager` recovers what it left behind: for
-every simulation still at `Running`, `databaseDiagnostics` reads the exit code its job recorded,
-or asks `sacct` about the job ID in that simulation's `hpc.out`, and marks the simulation
-`Completed` or `Failed` accordingly; simulations that were claimed but never submitted go back to
-`Not Started`. It reports what it changed. A simulation whose job is still queued or running is
-left alone, so re-running the diagnostics after those jobs finish resolves them.
+If a driver does die anyway, the next `initializeModelManager` recovers what it left behind. Its
+statuses say how far each simulation got: `Queued` means a `run` scheduled it and no worker had
+claimed it yet, `Running` means a worker claimed it and was about to call the backend. So for every
+simulation still at `Running`, `databaseDiagnostics` reads the exit code its job recorded, or asks
+`sacct` about the job ID in that simulation's `hpc.out` — one `sacct` call for the whole pass,
+carrying every job ID it still needs an answer for — and marks the simulation `Completed` or
+`Failed` accordingly; every simulation at `Queued`, and on a cluster every `Running` one that never
+reached the scheduler, goes back to `Not Started`. It reports what it changed. A simulation whose
+job is still queued or running is left alone, so re-running the diagnostics after those jobs finish
+resolves them.
 
 ### Running the driver as a job
 
-```julia
-submitDriver("run_campaign.jl"; time="48:00:00", mem="4G", partition="long")
+The first initialization on a machine with `sbatch` — or the first `useHPC(true)` after one —
+writes a template into your project, into `scripts/` if you have one and else next to `data/`:
+
+```
+driver_template.sbatch
 ```
 
-This writes a small batch script whose body is `julia --project=<project> run_campaign.jl`,
-submits it, prints the job ID with the `squeue`/`sacct` lines that follow it, and returns the ID.
-The script, the job's `output.log`/`output.err`, and the submission's own output are kept under
-`data/outputs/drivers/<timestamp>/`. Keyword arguments become `sbatch` flags, with underscores
-turned into hyphens (`cpus_per_task=2` → `--cpus-per-task=2`); `--job-name` defaults to
-`mm-driver`.
+Submit a campaign with it, passing the script to run as an argument:
+
+```bash
+sbatch driver_template.sbatch run_campaign.jl
+```
+
+The template is a starting point, not something ModelManager owns: it is written once, never
+overwritten, and the commented-out `module load julia` line near the top is there because loading
+Julia is site-specific and ModelManager cannot know your site's incantation. Edit the `#SBATCH`
+lines and that one to taste.
 
 Two things to get right:
 
@@ -165,14 +175,30 @@ setHPCCompletionOptions(
 )
 ```
 
-Sentinels are written to `data/outputs/.hpc_done`, always, and the location is not configurable.
-What that costs is turnaround on NFS: it caches directory attributes for 30–60 seconds by default,
-so a sentinel written on a compute node can take that long to become visible to your driver, and
-that is then the floor on how quickly one simulation finishing frees a slot for the next. Lustre
-and GPFS have no such delay, and neither does a project on scratch. What it buys is that the
-directory is always somewhere the compute nodes can write, on the same filesystem as the `data/`
-they are already writing into: a sentinel directory the nodes cannot see makes every successful job
-look scheduler-killed, and says nothing about why.
+Sentinels are written to `data/outputs/.hpc_done` by default. That default is on the same
+filesystem the jobs already write their output into, so it is somewhere the compute nodes can write
+by construction — which matters, because a sentinel directory the nodes cannot write makes every
+successful job look scheduler-killed and says nothing about why. What it costs is turnaround on
+NFS: it caches directory attributes for 30–60 seconds by default, so a sentinel written on a
+compute node can take that long to become visible to your driver, and that is then the floor on how
+quickly one simulation finishing frees a slot for the next. Lustre and GPFS have no such delay, and
+neither does a project on scratch.
+
+To put the sentinels somewhere else — scratch, say, to escape that NFS delay — set
+`MODELMANAGER_HPC_DONE_DIR` before starting Julia:
+
+```bash
+export MODELMANAGER_HPC_DONE_DIR=/scratch/$USER/mm_done
+```
+
+That environment variable is the only way to move the directory, and it is read once, by
+`initializeModelManager`: changing it mid-session does nothing until the next initialization. The
+directory is created and write-tested at that point, and an `ArgumentError` naming the variable
+says so if either fails, rather than leaving you to discover it a campaign later. The cost of
+moving it is the obvious one, and it is on you: sentinels written into the previous directory are
+not where diagnostics looks, so switching between launches means a campaign stranded under the old
+value cannot be reconciled from its sentinels. Changing the variable is deliberate, so it is worth
+a moment's thought about where the sentinels of any campaign still in flight are.
 
 ### Finding a job again
 

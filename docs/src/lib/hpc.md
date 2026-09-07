@@ -8,6 +8,6 @@ SLURM detection and job-option configuration.
 
 ```@autodocs
 Modules = [ModelManager]
-Pages = ["hpc.jl", "hpc_completion.jl"]
+Pages = ["hpc.jl"]
 Private = false
 ```
