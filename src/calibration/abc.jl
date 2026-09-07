@@ -319,6 +319,9 @@ saved in two forms:
 # Arguments
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
 - `description::String=""`: stored in the `calibrations` DB row.
+- `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
+  they survive an interrupted run. A lone `"key" => "value"` is one tag, as it is in [`tag!`](@ref);
+  the keys are validated before the run's database row and folder are created.
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise.
@@ -340,16 +343,18 @@ function runCalibration(method::ABCSMC, problem::CalibrationProblem;
                         description::String="", tags=(), run_kwargs::NamedTuple=(;),
                         progress::Symbol=:auto,
                         on_monad_failure::Symbol=:reject)
-    #! Both controls are validated before `createCalibration`, so a typo cannot leave behind a stray
-    #! DB row and output folder for a run that never starts.
+    #! Every control is validated before `createCalibration`, so a typo cannot leave behind a stray
+    #! DB row and output folder for a run that never starts. The tags belong in that list: a
+    #! malformed key throws from inside `tag!`, which used to run after the row and folder existed.
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
+    tag_pairs = [k => v for (k, v) in normalizeTagPairs(_asTagCollection(tags))]
     refreshProvenance!()
     calibration = createCalibration("ABC-SMC"; description=description)
     #! Applied before anything is dispatched, so the labels survive an interrupted run and the
     #! calibration is queryable by tag while its simulations are still in flight — the same
     #! reasoning, and the same order, as `run`'s `tags=` keyword.
-    tag!(calibration, tags...)
+    tag!(calibration, tag_pairs...)
     #! Labels the run itself, mirroring what a sensitivity sweep puts on its sampling. The value is
     #! the method *type*, as it is there, so `findTrials(Calibration; tags=("mm:method" => ...))`
     #! reads the same way across both; the `calibrations.method` column keeps its own
@@ -387,7 +392,9 @@ constructor, so every field it accepts is accepted here, with the same defaults.
 - `description::String=""`: free-text prose stored in the `calibrations` DB row and shown by
   `calibrationsTable`. For labels you intend to search on, prefer `tags`.
 - `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
-  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`.
+  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`. A lone
+  `"key" => "value"` is one tag, as it is in [`tag!`](@ref); the keys are validated before the run's
+  database row and folder are created, so a malformed one leaves nothing behind.
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; ...)` call.
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`,
   `:bar`). `:auto` shows a live progress bar on an interactive terminal and per-generation

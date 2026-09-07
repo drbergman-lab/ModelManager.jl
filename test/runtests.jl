@@ -3483,6 +3483,24 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                                  minimum_epsilon=0.0, tags=("purpose" => "smoke",))
                 waitForDiagnostics()
                 @test tags(via_abc.calibration)["purpose"] == ["smoke"]
+
+                # A bare Pair is one tag, as it is in tag!. A Pair is iterable, so splatting one
+                # into tag! made two valueless tags out of one label.
+                bare = runCalibration(method, prob; tags="arm" => "high")
+                waitForDiagnostics()
+                @test tags(bare.calibration)["arm"] == ["high"]
+                @test !haskey(tags(bare.calibration), "high")
+                @test ModelManager.normalizeTagPairs(
+                    ModelManager._asTagCollection("arm" => "high")) == [("arm", "high")]
+                # ...and a lone bare key is one tag too, not one per character.
+                @test ModelManager.normalizeTagPairs(
+                    ModelManager._asTagCollection("baseline")) == [("baseline", "")]
+
+                # A malformed key is caught before the run's row and folder exist. It used to throw
+                # from inside tag!, one line after createCalibration, leaving an orphan of each.
+                n_before = nrow(calibrationsTable())
+                @test_throws ArgumentError runCalibration(method, prob; tags=("bad key" => "x",))
+                @test nrow(calibrationsTable()) == n_before
             end
 
             # ---------- calibration as coalesced Sampling views ----------

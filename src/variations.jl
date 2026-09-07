@@ -567,7 +567,9 @@ Check that `lv.inverse_maps` are consistent with `lv.maps` via two round-trip te
 
 **Forward-then-inverse** (`u → lp → target_vals → lp′`): for `n_samples` draws of `u ∈ (0,1)^n`,
 compute latent and target values via the forward maps, then recover latent parameter values via the
-inverse maps. Verifies `lp′ ≈ lp_vals` and that `cdf(dist_i, lp′_i) ∈ (0,1)`.
+inverse maps. Verifies `lp′ ≈ lp_vals` and that each `lp′_i` is `insupport` of `dist_i` — not that
+its `cdf` lies in `(0,1)`, which stood in for the same test and wrongly rejected the legitimate
+extreme values of a bounded or discrete distribution.
 
 **Inverse-then-forward** (`lp → target_vals → lp′ → target_vals′`): using the same draws,
 forward-maps `lp′` back to target values and verifies `target_vals′ ≈ target_vals`.
