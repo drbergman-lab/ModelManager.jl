@@ -19,40 +19,56 @@ run(method, inputs, variations; functions = [f1, f2, ...])
   [`CoVariation`](@ref)s), so each can be sampled across its range.
 - `functions` — output functions of the form `simulation -> Real`, or [`QoI`](@ref)s. Each is called
   once per *simulation* with a [`Simulation`](@ref), and the values are combined over a monad's
-  replicates by `mean` — pass a `QoI` to choose a different reduction.
+  replicates by the default per-key mean — pass a `QoI` with `reduce=` to choose another.
 
 `run` builds the appropriate sampling design, runs the simulations, evaluates your output
 functions, and returns a [`GSASampling`](@ref) result holding the sensitivity indices.
 
 ## One measurement, several quantities
 
-An entry of `functions` need not define a single output. If a `QoI`'s `reduce` returns a `Dict` or
+An entry of `functions` need not define a single output. If a `QoI`'s value is a `Dict` or
 `NamedTuple` instead of a number, each key becomes its own sensitivity analysis, labelled
 `"<qoi name>.<key>"`:
 
 ```julia
-counts = QoI("counts", finalPopulationCount;
-             reduce = per_sim -> Dict(k => mean(getindex.(per_sim, k)) for k in ("tumor", "immune")))
+counts = QoI("counts", finalPopulationCount)    # Dict("tumor" => …, "immune" => …)
 
 gsa = run(MOAT(15), inputs, dists; functions=[counts])
 ModelManager.gsaLabels(gsa)     # ["counts.immune", "counts.tumor"]
 gsa.results["counts.tumor"]
 ```
 
-This is what lets the same measurement feed all three consumers: a `Dict`-valued quantity already
-worked as a [`CalibrationProblem`](@ref)'s `summary_statistic` and as a `post_processor`, and no
-longer has to be rewritten once per key to ask a sensitivity question about it.
+The default `reduce` already averages a keyed value per key, so a keyed measurement needs no
+reducer of its own. This is what lets the same measurement feed all three consumers: the sink stores
+`counts.tumor` per simulation, sensitivity analysis reports `counts.tumor` per parameter set, and
+calibration compares the key `"tumor"` — the same quantity at three granularities rather than three
+things sharing a name.
 
-Two constraints follow from what a sensitivity index needs:
+What a `QoI` may hand back is one rule everywhere — a `Real`, or a flat `Dict`/`NamedTuple` of
+`Real`s — and `reduce` keeps the shape it was given. Two constraints follow from what a sensitivity
+index needs on top of that:
 
 - **Every monad must produce the same keys.** Each key's indices are computed over a value from every
-  monad in the design, so a monad missing one leaves a hole — and unlike [`mseDistance`](@ref), which
-  treats an absent key as zero, there is no fill that makes the answer merely approximate rather than
-  wrong. A mismatch is refused, naming both key sets.
-- **A `Vector` is not spread by index.** Only its length could be checked against the other monads',
-  and equal length is not equal meaning: two series sampled at different times have the same length
-  and different contents. Return a `Dict` whose keys name the components — you know what they mean,
-  and the framework does not.
+  monad in the design, so a monad missing one leaves a hole, and there is no fill that makes the
+  answer merely approximate rather than wrong. A mismatch is refused, naming both key sets.
+- **A monad whose value is `missing` is refused too** — every one of its replicates declined to
+  produce a value, and a sensitivity index has no cell to put that in. Calibration can absorb a
+  `missing` (the particle is rejected); an index cannot.
+
+A `Vector` is not a QoI value at all, and the reason is the same one: only its length could be
+checked against the other monads', and equal length is not equal meaning — two series sampled at
+different times have the same length and different contents. Return a `Dict` whose keys name the
+components; you know what they mean, and the framework does not.
+
+!!! note "A score computed after averaging"
+    Sensitivity analysis on a discrepancy-to-data score is the case where the order matters:
+    averaging squared errors is not the same number as squaring the averaged error, and a
+    per-simulation `compute` has no access to the mean. Because `reduce` must keep its shape, the
+    score travels as one more *key* rather than as the whole return — `compute` reports the raw
+    quantities plus its own per-simulation score, and `reduce` averages the raw quantities and
+    recomputes the score from those means. The analysis is then `"<name>.my_dist"` alongside
+    `"<name>.tumor"`, and the sink gets a per-simulation score for free. The
+    [Calibration](@ref calibration_man) page works the pattern through end to end.
 
 A QoI's `name` may not contain a `.`, since that is the separator: reserving it is what lets a label
 be read back to the QoI that produced it, and so what lets [`calculateGSA!`](@ref) decide from a name

@@ -555,11 +555,12 @@ _firstGenerationProposals(results) =
 Build generation 1's accepted set. Generation 1 has no epsilon threshold and accepts every
 proposal — *except* those whose distance is `missing`, which are dropped here.
 
-`missing` means the particle has no distance at all: its monad had no successful simulation, so
-the summary statistic was never computed (see `_buildEvaluateBatch`). Such a particle
+`missing` means the particle has no distance at all: its monad had no successful simulation, so the
+summary statistic was never computed, or every replicate's `compute` returned `missing` so the
+summary has no value (see `_buildEvaluateBatch`). Such a particle
 cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` for the whole
-generation. Errors when no particle survives — a whole generation of failed monads is a broken
-model, not sampling noise.
+generation. Errors when no particle survives — a whole generation without a distance is a broken
+model or a broken measurement, not sampling noise.
 
 The generation therefore holds **fewer than `population_size` particles** when any monad failed;
 the uniform weights are renormalized over the survivors. Generation 1 proposes exactly
@@ -575,16 +576,17 @@ function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Uni
                                for i in eachindex(proposals) if !ismissing(results[i][1])]
     if isempty(accepted)
         error("""
-        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads had a successful \
-        simulation, so no particles could be accepted.
+        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads produced a distance \
+        — no successful simulation, or a summary statistic with no value — so no particles could be \
+        accepted.
         Check the generation's failure files and the failed simulations' output folders, and \
-        re-run with `on_monad_failure=:error` to stop at the first failure.
+        re-run with `on_monad_failure=:error` to stop at the first one.
         """)
     end
     n_dropped = length(proposals) - length(accepted)
     n_dropped > 0 && @warn "ABC-SMC generation 1: dropped $n_dropped of " *
-                           "$(length(proposals)) proposals whose monads had no successful " *
-                           "simulation; ε and the particle weights are set from the " *
+                           "$(length(proposals)) proposals whose monads produced no distance; " *
+                           "ε and the particle weights are set from the " *
                            "$(length(accepted)) surviving particles."
     return accepted
 end

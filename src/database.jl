@@ -1224,9 +1224,9 @@ end
     _postProcessingColumnSpec(name, value) -> (sqlite_type, db_value)
 
 Map a single quantity-of-interest `value` to its SQLite column type and stored value.
-Only scalar `Bool`, `Integer`, `Real`, and `AbstractString` values are supported; anything
-else throws an `ArgumentError` (richer outputs should be written to the simulation's output
-folder by the `post_processor` itself).
+Only scalar `Bool`, `Integer` and `Real` values are supported; anything else throws an
+`ArgumentError` (richer outputs should be written to the simulation's output folder by the
+`post_processor` itself).
 """
 function _postProcessingColumnSpec(name, value)
     if value isa Bool
@@ -1235,19 +1235,18 @@ function _postProcessingColumnSpec(name, value)
         return "INTEGER", value
     elseif value isa Real
         return "REAL", float(value)
-    elseif value isa AbstractString
-        return "TEXT", String(value)
     end
     throw(ArgumentError("post_processor returned an unsupported value for `$(name)`: a $(typeof(value)). " *
-        "Post-processing sink values must be a scalar Real, Bool, or String. " *
-        "For richer per-simulation outputs, write a file to the simulation's output folder instead."))
+        "Post-processing sink values must be a scalar `Real` (a `Bool` counts). " *
+        "Text belongs on a tag rather than in a measurement, and for richer per-simulation " *
+        "outputs write a file to the simulation's output folder instead."))
 end
 
 """
     _normalizePostProcessingQoI(qoi) -> Vector{Tuple{String,String,Any}}
 
 Normalize a `post_processor` return value into `(column_name, sqlite_type, db_value)` tuples.
-Accepts a `NamedTuple`, an `AbstractDict`, or an ordered vector of `name => scalar` pairs;
+Accepts a `NamedTuple`, an `AbstractDict`, or an ordered vector of `name => Real` pairs;
 throws an `ArgumentError`
 for any other type.
 """
@@ -1263,7 +1262,7 @@ function _normalizePostProcessingQoI(qoi)
         [string(k) => v for (k, v) in qoi]
     else
         throw(ArgumentError("post_processor must return `nothing`, a NamedTuple, or an AbstractDict " *
-            "of name => scalar; got a $(typeof(qoi))."))
+            "of name => Real; got a $(typeof(qoi))."))
     end
     col_names = first.(named_pairs)
     if !allunique(col_names)

@@ -19,7 +19,7 @@ A [`CalibrationProblem`](@ref) bundles the model, the parameters to infer, the d
 to compare:
 
 ```julia
-using Distributions, CSV, DataFrames
+using Distributions, CSV, DataFrames, Statistics
 
 # Fix non-calibrated parameters via a reference monad (n_replicates=0 just records the IDs).
 ref = createTrial(inputs, DiscreteVariation(:config, XMLPath(["overall","max_time"]), 120.0);
@@ -33,8 +33,8 @@ function measureTumor(sim::Simulation)
     return Float64(only(counts[counts.cell_type .== "tumor", :count]))
 end
 
-# One quantity, so `observed` is the bare value that quantity should match. Use a vector of QoIs
-# with a `Dict` of observations when you are comparing several named quantities at once.
+# One `Real`-valued quantity, so `observed` is the bare value it should match. A QoI whose value
+# is keyed — or a vector of QoIs — hands `distance` a `Dict`, and `observed` is keyed to match.
 observed = 100.0
 
 # The parameter to infer (a rate, say), addressed by its XMLPath.
@@ -56,20 +56,89 @@ The parameters can be any mix of [`DistributedVariation`](@ref),
 
 Two functions you supply:
 
-- **`summary_statistic`** — a [`QoI`](@ref), or a vector of them. Each QoI's `compute` is called
-  once per *simulation* with a [`Simulation`](@ref), and its replicates are combined by that QoI's
-  `reduce` (`mean` by default — pass `reduce=` for anything else, and note it receives every
-  replicate's value, so a step that must happen *after* averaging goes there). A single QoI reports
-  its value directly; a vector reports a `Dict` keyed by QoI name. A bare function is accepted, but
-  **warned about unless it declares `(s::Simulation)`**: such a function used to be called once per
-  *monad* and aggregate however it liked, the two cannot be told apart automatically, and
-  reinterpreting an old one per-simulation returns a different number without raising. Annotating it
-  silences the warning; passing a `QoI` also lets you choose the reduction.
-- **`distance`** — `(simulated, observed) -> Float64`. The built-in [`mseDistance`](@ref)
-  handles `Dict`, `Vector`, and scalar inputs; supply your own for anything else.
+- **`summary_statistic`** — a [`QoI`](@ref), or a vector of them (a bare function is wrapped into
+  one). Each QoI's `compute` is called once per *simulation* with a [`Simulation`](@ref), and its
+  replicates are combined by that QoI's `reduce` — the per-key mean by default; pass `reduce=` for
+  anything else, and note it receives every replicate's value, so a step that must happen *after*
+  averaging goes there.
+- **`distance`** — `(simulated, observed) -> Float64`. The built-in [`mseDistance`](@ref) takes a
+  `Dict` against a `Dict` with **exactly** the same keys, or a scalar against a scalar; supply your
+  own for anything else.
+
+### [The keys `distance` sees](@id calibration_keys)
+
+**They are the keys your `compute`/`reduce` produced.** There is no second spelling to learn:
+
+- a `Real`-valued QoI hands `distance` a number;
+- a keyed QoI hands over the very `Dict`/`NamedTuple` it wrote — `Dict("tumor" => …)` stays
+  `"tumor"`;
+- a **vector** of QoIs hands over one flat `Dict{String,Float64}` merging them: a `Real`-valued
+  member under its own name, a keyed member under its own keys. Two members claiming one key is an
+  error naming both.
+
+So `observed_data` is written with exactly the keys the measurement produces:
+
+```julia
+counts  = QoI("counts", finalPopulationCount)          # Dict("tumor" => …, "immune" => …)
+observed = Dict("tumor" => 320.0, "immune" => 102.0)   # the same keys
+problem  = CalibrationProblem(spec, observed, counts, mseDistance)
+```
+
+Nothing is prefixed with the QoI's name here, even though [sink columns](@ref post_processing) and
+[sensitivity labels](@ref sensitivity_analysis) are `"<qoi name>.<key>"`. Those two are flat
+namespaces shared by every QoI in a project and cannot drop the qualifier. `distance`'s two
+arguments are private to one problem — and you write the other one — so your keys win.
 
 Set `n_replicates > 1` in the problem to average out stochastic noise per particle (at N×
 the compute cost).
+
+### [Comparing after averaging](@id calibration_nonlinearity)
+
+Squaring is nonlinear, so the mean of the squared errors is not the square of the mean error. When
+the quantity you want is a discrepancy-to-data score, you almost always want the replicates
+*averaged first* and compared afterwards — and a per-simulation `compute` cannot do that, because it
+has no access to the mean. `reduce` can, because it receives every replicate.
+
+Because `reduce` keeps the shape it was given, the score travels as one more **key** rather than as
+the whole return. `compute` reports the raw counts plus its own per-simulation score; `reduce`
+averages the counts and recomputes the score from those means:
+
+```julia
+obs = Dict("tumor" => 320.0, "immune" => 102.0)   # data from experiment
+
+myDistance(sim_data, obs_data) = sum((obs_data[ct] - sim_data[ct])^2 for ct in keys(obs_data))
+
+struct FitTo{T} <: Function
+    obs::T
+end
+function (f::FitTo)(sim::Simulation)
+    counts = countByCellType(sim, :final)          # Dict("tumor" => …, "immune" => …)
+    return merge(counts, Dict("my_dist" => myDistance(counts, f.obs)))
+end
+
+struct ReduceFitTo{T} <: Function
+    obs::T
+end
+function (r::ReduceFitTo)(per_sim)
+    means = Dict(k => mean(d[k] for d in per_sim) for k in keys(r.obs))
+    return merge(means, Dict("my_dist" => myDistance(means, r.obs)))
+end
+
+fit = QoI("fit", FitTo(obs); reduce = ReduceFitTo(obs))
+problem = CalibrationProblem(spec, obs, fit, (simulated, _observed) -> simulated["my_dist"])
+```
+
+One QoI now serves all three consumers: the sink stores a per-simulation `fit.my_dist` alongside
+`fit.tumor`, sensitivity analysis can ask which parameters move `fit.my_dist`, and the problem's own
+`distance` is the trivial lookup above, because the comparison already happened where it had access
+to the means.
+
+!!! note "Why a callable struct rather than a closure"
+    `sim -> …` capturing `obs` would work, and would not survive a resume. `problem.jld2` stores
+    `nothing` for an anonymous `summary_statistic`, so a bare
+    `resumeCalibration(Calibration(id))` refuses and demands `problem=` — and a long calibration is
+    exactly the thing that gets interrupted. A callable struct is a *named type plus fields*, which
+    JLD2 round-trips, so `FitTo(obs)` restores itself with its data intact.
 
 ## Choosing the method
 
@@ -368,6 +437,7 @@ What happens to the particle depends on how much of its monad survived:
 | --- | --- |
 | At least one simulation completed | Evaluated normally from whatever succeeded. Calibration does **not** re-run to replace lost replicates, so with `n_replicates > 1` a particle may be summarized from fewer than you asked for. |
 | No simulation completed | No output exists for `summary_statistic` to read, and the runner has deleted the emptied monad — so the particle is handled by `on_monad_failure` below, without your functions being called at all. |
+| Every replicate's `compute` returned `missing` | The monad has output but the measurement has no value for it, which is the same position: the particle is handled by `on_monad_failure` too, rather than reported as a bug in your functions. |
 
 ### `on_monad_failure`
 
@@ -382,6 +452,10 @@ result = runABC(problem; on_monad_failure=:error)    # stop at the first one
   failed simulations. Use it when you want the first failure to be diagnosable rather than
   survivable.
 
+Both cover the two ways a particle can fail to yield a distance: a monad with no successful
+simulation, and a monad whose summary statistic is `missing` because every replicate's `compute`
+was.
+
 Rejected particles are not replaced, so a generation can hold fewer than `population_size`
 particles. Generation 1 proposes exactly `population_size` and keeps those whose monads produced
 output, renormalizing the weights over the survivors; later generations keep proposing until the
@@ -393,18 +467,25 @@ never ends a run.
 
 For a monad that *does* have output, your two functions are expected to work. If either raises, or
 `distance` returns something that is not a `Real`, the run stops immediately with the monad ID
-named — regardless of `on_monad_failure`, which governs simulation failures rather than bugs in
+named — regardless of `on_monad_failure`, which governs missing results rather than bugs in
 your own code. When the monad had some failed replicates, the message says how many, since that is
 the likeliest reason otherwise-correct code trips.
+
+A `compute` returning `missing` is **not** in this category — it is the supported way to say "no
+value for this simulation", and it follows `on_monad_failure`. `nothing` is refused outright, with a
+message asking for `missing`, because it is what a function returns when a block falls through.
 
 ### Error messages
 
 | Message | Cause | What to do |
 | --- | --- | --- |
 | `monad N has no successful simulation` | `on_monad_failure=:error` and every simulation in a proposed monad failed. | Read the failure files and the simulations' `output` folders. Switch to `:reject` to let the run continue past these. |
-| `none of the N proposed monads had a successful simulation` | Nothing survived generation 1. | The model or its fixed parameters are broken for the whole prior — not sampling noise. Check that a single simulation at a reference parameter set runs at all. |
+| `none of the N proposed monads produced a distance` | Nothing survived generation 1. | The model or its fixed parameters are broken for the whole prior, or the measurement returned `missing` everywhere — not sampling noise. Check that a single simulation at a reference parameter set runs, and that your `compute` returns a value for it. |
 | ``Calibration failed while evaluating monad N: `summary_statistic` or `distance` raised`` | Your function threw on a monad that has output. | The original exception and backtrace follow the message. |
 | ``distance returned a T, but a `Real` is required`` | `distance` returned a `Dict`, `missing`, `nothing`, … | Return a real number. If you are guarding against missing output yourself, you no longer need to — see the table above. |
+| ``mseDistance was given a simulated and an observed value with different keys`` | `observed_data` is keyed differently from what your `compute`/`reduce` produced. | Key the observation the way the measurement names its components — see [The keys `distance` sees](@ref calibration_keys). The mismatch used to be imputed as zero, which produced a converged, wrong posterior. |
+| ``a value must be a `Real`, or a flat `Dict`/`NamedTuple` of `Real`s`` | A `compute` or `reduce` returned a `Vector`, a `String`, or a nested value. | Return a number, or a flat keyed value whose keys name the components. |
+| ``` `reduce` must keep the shape of the values it is given ``` | A reducer collapsed a keyed value to one number, or widened a number into keys. | Carry the derived quantity as an extra key — see [Comparing after averaging](@ref calibration_nonlinearity). |
 | `simulation(s) X … have no row in the simulations table` | A monad's constituent record and the database disagree. | Run `ModelManager.databaseDiagnostics()`. This indicates corrupted bookkeeping, not a failed simulation. |
 | `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used anonymous functions, which JLD2 cannot serialize. | Pass the original problem: `resumeCalibration(cal; problem=my_problem)`. Define `summary_statistic`/`distance` as named functions to avoid it next time. |
 

@@ -5,6 +5,92 @@
 
 ---
 
+## Session: one QoI contract across the sink, sensitivity analysis and calibration (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #52, from the 0.9 architecture review. The 0.9 seam unified the *input* side of a
+measurement — every consumer calls `compute(::Simulation)` and reduces through one
+`_reduceOverMonad` — but the *value* side was still three contracts wearing one struct. The sink
+accepted a `String`, sensitivity analysis demanded a `Real` or a keyed value of them, and
+calibration accepted anything its `distance` did, including a `Vector` and a nested `Dict`. So
+`QoI("mse", counts; reduce = discrepancy)` — the old docstring's own example — stored raw
+per-simulation counts as `mse.tumor` in the sink while GSA reported one scalar `mse`. Same name,
+two quantities.
+
+### Decisions
+- **One value: a `Real`, or a flat `Dict`/`NamedTuple` of `Real`s.** Enforced at the seam rather
+  than per consumer: `compute`'s value in `_asPostProcessor` and in `_reduceOverMonad`, `reduce`'s
+  value in `_reduceOverMonad`. `String` is out (drops the sink's TEXT branch) because tagging
+  already covers per-simulation text, and it was the one thing only the sink accepted. Errors name
+  the QoI, the offending type, and which function produced it; the "equal length is not equal
+  meaning" advice moved with the `Vector` case rather than being lost.
+- **`reduce` is shape-preserving**, checked after it runs. The cost is stated rather than hidden:
+  a post-aggregation nonlinearity can no longer collapse a keyed value to one number. The
+  replacement, from the maintainer's own comment on #52 and now the `calibration.md` worked
+  example, is to carry the score as one more *key* — `compute` reports the raw quantities plus a
+  per-simulation score, `reduce` averages the raw ones and recomputes the score from those means.
+  Strictly better: one QoI serves all three consumers, the sink gets a per-simulation score for
+  free, and GSA can analyse `<name>.my_dist`.
+- **Replicate key agreement lives in `_reduceOverMonad`, not in the default reducer.** The issue
+  put it in the reducer, but the reducer cannot name the QoI, and R2's shape check is undefined
+  when the replicates disagree about what the keys are. So the check runs before `reduce` for
+  every reducer; `_qoiMean` keeps its own as a backstop for a direct call.
+- **Compute-vs-reduce shapes compare stringified key sets**, so `Dict("a" => …)` may reduce to
+  `(a = …,)`. Sensitivity analysis keeps its per-monad comparison unstringified for a different
+  reason: a `Dict` on one monad and a `NamedTuple` on another means one reducer doing two things.
+- **Calibration keys are the user's.** `distance` sees what `compute`/`reduce` produced —
+  unprefixed. A `Vector{QoI}` flattens into one `Dict{String,Float64}` (a `Real`-valued member
+  under its name, a keyed one under its keys) instead of nesting into
+  `Dict(name => Dict(...))`, which `mseDistance` had no method for at all. A key two QoIs both
+  claim is refused, naming both. Sink columns and GSA labels keep `"<name>.<key>"` because those
+  are flat namespaces shared across a project; `distance`'s two arguments are private to one
+  problem and the user writes the other half. That asymmetry is a trade, and the manual says so.
+- **`missing` is the way to say "no value here"; `nothing` is refused.** `nothing` is what a
+  function returns when a block falls through, so accepting it would make a dropped measurement
+  indistinguishable from an intended skip. The consequence is a breaking one for the sink: a
+  side-effects-only `post_processor` must now end with `missing`, not `nothing`.
+- **`skip_missing=true` by default**, dropping missing replicates with `collect(skipmissing(...))`
+  so the element type narrows to what a numeric reducer expects — the subtlety PCMM's `_reduceKept`
+  existed for. Nothing left ⇒ the parameter set is `missing`, and `reduce` is not called.
+- **A `missing` summary is not a user-code fault.** It follows `on_monad_failure`, exactly as a
+  monad with no successful simulation does. The check sits *between* the summary and distance calls
+  so that a `missing` returned by the user's own `distance` still raises "a `Real` is required" —
+  different mistakes. `_acceptFirstGeneration`'s message widened from "had a successful simulation"
+  to "produced a distance" to cover both.
+- **`mseDistance` refuses a key mismatch.** The warn-and-zero-fill turned a naming mistake into a
+  converged, wrong posterior: comparing every key against 0 is a perfectly finite distance, so
+  ABC-SMC accepted particles on it and returned the prior, with one `maxlog=1` warning somewhere in
+  the log. The `AbstractVector` methods and `_zeroLike` are gone — no summary can be a `Vector` now.
+- **Cleared the 0.9 transitional apparatus** on schedule: `_declaresSimulation`, `_WARNED_SUMMARIES`
+  and the migration warning (it fired on every ordinary `sim -> measure(sim)` lambda once the
+  migration was over), plus `qoiName(::Function)` and `_computeOn(::QoI, ::Integer)`, both dead.
+
+### Rejected
+- **Prefixing calibration keys with the QoI name** (the issue's original R4). It would make a
+  keyed QoI's `observed_data` need a second spelling — `compute` writing `"tumor"` and the
+  observation having to say `"counts.tumor"` — which is the two-spellings problem the whole change
+  exists to remove. Flatten-with-the-user's-keys-and-refuse-a-collision keeps the invariant.
+- **Allowing vectors anywhere.** Index meaning is implicit: only length can be checked across
+  monads, and two series sampled at different times share a length and not a meaning.
+- **Keeping `String` as a sink-only value.** It is the last per-consumer exception, and tags are
+  the queryable, multi-valued, retroactive home for text about a simulation.
+
+### Traps
+- **The empty-`Dict` and cross-monad-ragged GSA refusals became unreachable through a `Real`
+  compute.** Both used to be produced by a reducer widening a `Real`; the shape check now refuses
+  that first. The tests reach them the only way left — a keyed `compute` — which is also the only
+  way a user can now get there.
+- **Errors raised inside `_asPostProcessor` are per-simulation stage errors**, so they surface as
+  `_SimulationStageError`, not the bare `ArgumentError` the sink's own writer raises from the
+  serial completion loop. Test assertions on the sink's refusals had to move to the stage wrapper.
+- **`filter(!ismissing, v)` would not have narrowed the element type**, leaving `Missing` in every
+  downstream signature. `collect(skipmissing(v))` does, and only because the per-simulation values
+  are built by a comprehension whose eltype widens from the values themselves.
+- **The `QoI` struct gained a field.** A `problem.jld2` written by 0.10 will not reconstruct a
+  `QoI`; resume such a run with `problem=`.
+
+---
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger
