@@ -234,6 +234,15 @@ end
 
 normalizeTagPairs(ps...) = normalizeTagPairs(ps)
 
+#! One tag, or a collection of them, for a `tags=` keyword to hand to `tag!`. A `Pair` is iterable
+#! in Julia, so `tags = "a" => "b"` splatted straight into `tag!` arrived as two arguments and became
+#! two valueless tags, "a" and "b", while `tag!(target, "a" => "b")` — the same spelling, one door
+#! along — produced the one tag meant. A lone key has the same shape of problem: a `String` is a
+#! collection of characters.
+_asTagCollection(t::Pair) = (t,)
+_asTagCollection(t::Union{AbstractString,Symbol}) = (t,)
+_asTagCollection(t) = t
+
 ########################################################
 ############   Class helpers   #########################
 ########################################################
