@@ -1,4 +1,9 @@
-export CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior, ConvergenceSummary
+export CalibrationProblem, Calibration, GenerationResult, ABCResult, posterior, samplePosterior,
+       ConvergenceSummary
+
+#! Repeated in `abc_smc.jl` rather than hoisted: this file is included first, and `samplePosterior`
+#! needs the same four names for its kernel covariance.
+using LinearAlgebra: Symmetric, I, Diagonal, cholesky
 
 ################## CalibrationProblem ##################
 
@@ -323,14 +328,27 @@ println("Posterior mean: ", sum(df[!, "overall/max_time"] .* weights))
 ```
 """
 function posterior(result::ABCResult; generation::Union{Int,Symbol}=:final)
+    t = _resolveGeneration(result, generation)
+    gen = result.generations[t]
+    display_df = _buildDisplayDF(gen, result.parameters)
+    return display_df, gen.weights
+end
+
+"""
+    _resolveGeneration(result::ABCResult, generation) → Int
+
+Turn a `generation` keyword into a validated 1-based index into `result.generations`.
+
+Shared by `posterior` and `samplePosterior` so the `:final` convention and the range error cannot
+drift between them.
+"""
+function _resolveGeneration(result::ABCResult, generation::Union{Int,Symbol})
     isempty(result.generations) && error("No generations in ABCResult — calibration may not have completed.")
     t = generation === :final ? length(result.generations) : Int(generation)
     1 <= t <= length(result.generations) || throw(ArgumentError(
         "Generation $t is out of range [1, $(length(result.generations))]."
     ))
-    gen = result.generations[t]
-    display_df = _buildDisplayDF(gen, result.parameters)
-    return display_df, gen.weights
+    return t
 end
 
 """
@@ -356,14 +374,25 @@ df, weights = posterior(Calibration(42); generation=3)
 ```
 """
 function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:final)
+    display_df, weights, _ = _readGenerationParticles(calibration, generation)
+    return display_df, weights
+end
+
+"""
+    _resolveDiskGeneration(calibration, generation) → (gen_dir, t)
+
+Locate a calibration's `generations/` directory and resolve `generation` to an index that is
+actually present on disk.
+
+`:final` is the highest recorded generation, not the last entry of a listing: names are addressed by
+the index inside them, so a missing generation or a changed padding width cannot shift the answer.
+"""
+function _resolveDiskGeneration(calibration::Calibration, generation::Union{Int,Symbol})
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
     isdir(gen_dir) || error(
         "No generations directory found for Calibration($(calibration.id)). " *
         "Has the calibration been run?")
 
-    #! Addressed by generation index, not by position in a sorted file list. The old form sorted names
-    #! lexicographically and then used the list position as `t`, which is only correct while every name
-    #! has the same width and no generation is missing.
     indices = _generationIndices(gen_dir)
     isempty(indices) && error(
         "No completed generations found for Calibration($(calibration.id)).")
@@ -371,15 +400,264 @@ function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:fina
     t = generation === :final ? last(indices) : Int(generation)
     t in indices || throw(ArgumentError(
         "Generation $t not found for Calibration($(calibration.id)). Available: $(indices)."))
+    return gen_dir, t
+end
 
+"""
+    _readGenerationParticles(calibration, generation) → (display_df, weights, monad_ids)
+
+Read one generation's `particles.csv`, splitting the parameter columns from the three bookkeeping
+ones (`weight`, `distance`, `monad_id`).
+
+The single disk reader behind both `posterior(::Calibration)` and `samplePosterior(::Calibration)`.
+"""
+function _readGenerationParticles(calibration::Calibration, generation::Union{Int,Symbol})
+    gen_dir, t = _resolveDiskGeneration(calibration, generation)
     csv_path = _generationArtifact(gen_dir, t, :particles)
     isnothing(csv_path) && error(
         "Generation $t of Calibration($(calibration.id)) has no particle file.")
 
     df = CSV.read(csv_path, DataFrame)
     weights    = df[!, :weight]
+    monad_ids  = df[!, :monad_id]
     display_df = select(df, Not([:weight, :distance, :monad_id]))
-    return display_df, weights
+    return display_df, weights, monad_ids
+end
+
+################## samplePosterior ##################
+
+"""
+    samplePosterior(result::ABCResult, n::Int; generation=:final, smooth=false, rng=Random.default_rng())
+    samplePosterior(calibration::Calibration, n::Int; generation=:final, smooth=false, rng=Random.default_rng())
+
+Draw `n` parameter sets from a generation's posterior, as a `DataFrame` of display columns.
+
+By default each draw is one of the accepted particles, resampled i.i.d. with probability equal to
+its importance weight; the frame therefore carries a `monad_id` column, so a posterior predictive
+check can read the monad's existing outputs instead of simulating again. With `smooth=true` the
+weighted particles become a Gaussian kernel density estimate and the draws are new parameter sets
+between them, so there is no `monad_id`. Either way the frame holds [`posterior`](@ref)'s parameter
+columns and not its `weight`/`distance` ones — a draw's own weight is `1/n`.
+
+The kernel is fitted in CDF space, which is what keeps a draw inside every prior's support, respects
+a log-scaled prior, and lands a discrete parameter on one of its levels: the bandwidth is Scott's
+rule with the effective sample size in place of `N`, applied to the weighted particle covariance
+(`h² Σ_w`, `h = ESS^(-1/(d+4))`), a draw straying outside `[0, 1]` is reflected back rather than
+rejected, and the result is mapped through the prior quantiles exactly as [`posterior`](@ref) maps a
+particle. Note the bandwidth is *not* the run's `perturbation_kernel` scale, which is deliberately
+over-dispersed for proposals.
+
+`generation` is an integer index or `:final`, as in [`posterior`](@ref).
+
+Sampling a [`Calibration`](@ref) reads from disk. Plain mode needs only the generation's
+`particles.csv`; smoothed mode additionally rebuilds the parameters from `problem.jld2`, so it fails
+for a run whose `LatentVariation` carried anonymous maps — those are not serializable, and the error
+names [`resumeABC`](@ref)`(cal; problem=my_problem)`, which returns an [`ABCResult`](@ref) for a
+finished run without re-running it, as the way to get them back.
+
+# Examples
+```julia
+result = runABC(problem)
+
+draws = samplePosterior(result, 200)                    # existing particles, with monad_id
+new_points = samplePosterior(result, 200; smooth=true)  # new parameter sets, no monad_id
+samplePosterior(Calibration(42), 50; generation=2)
+```
+"""
+function samplePosterior(result::ABCResult, n::Int; generation::Union{Int,Symbol}=:final,
+                         smooth::Bool=false, rng::AbstractRNG=Random.default_rng())
+    _assertDrawCount(n)
+    t   = _resolveGeneration(result, generation)
+    gen = result.generations[t]
+
+    if !smooth
+        display_df, weights = posterior(result; generation=t)
+        return _plainPosteriorDraws(rng, display_df, weights, gen.monad_ids, n)
+    end
+
+    cps         = result.parameters
+    param_names = _cdfColumnNames(cps, names(gen.particles))
+    X           = Matrix{Float64}(gen.particles[!, param_names])
+    Y           = _smoothedCDFDraws(rng, X, Vector{Float64}(gen.weights), n)
+    return _cdfDrawsToDisplay(Y, cps, param_names)
+end
+
+function samplePosterior(calibration::Calibration, n::Int; generation::Union{Int,Symbol}=:final,
+                         smooth::Bool=false, rng::AbstractRNG=Random.default_rng())
+    _assertDrawCount(n)
+
+    if !smooth
+        display_df, weights, monad_ids = _readGenerationParticles(calibration, generation)
+        return _plainPosteriorDraws(rng, display_df, weights, monad_ids, n)
+    end
+
+    gen_dir, t = _resolveDiskGeneration(calibration, generation)
+    cdf_path   = _generationArtifact(gen_dir, t, :cdfs)
+    isnothing(cdf_path) && error(
+        "Generation $t of Calibration($(calibration.id)) has no cdfs.csv, which smoothed sampling " *
+        "needs for the particles' CDF coordinates.")
+
+    df          = CSV.read(cdf_path, DataFrame)
+    cps         = _diskCalibrationParameters(calibration)
+    param_names = _cdfColumnNames(cps, names(df))
+    X           = Matrix{Float64}(df[!, param_names])
+    Y           = _smoothedCDFDraws(rng, X, Vector{Float64}(df[!, :weight]), n)
+    return _cdfDrawsToDisplay(Y, cps, param_names)
+end
+
+_assertDrawCount(n::Int) = n >= 0 ||
+    throw(ArgumentError("samplePosterior needs a non-negative number of draws; got n = $n."))
+
+#! The three bookkeeping columns of a generation CSV. A resampled frame drops them: a draw's weight
+#! is `1/n` by construction, not the particle's, so carrying the particle's `weight` along would
+#! invite a second weighted average over an already-weighted sample.
+const _PARTICLE_BOOKKEEPING_COLUMNS = ("weight", "distance", "monad_id")
+
+"""
+    _cdfColumnNames(cps, available) → Vector{String}
+
+The CDF-coordinate columns to read, in latent-parameter order — or, when `cps` is empty (a
+`GenerationResult` built directly, as the tests do), whichever of `available` are not bookkeeping.
+"""
+_cdfColumnNames(cps::Vector{CalibrationParameter}, available::Vector{String}) =
+    isempty(cps) ? [c for c in available if !(c in _PARTICLE_BOOKKEEPING_COLUMNS)] :
+                   first(_latentNamesAndPriors(cps))
+
+"""
+    _multinomialDraw(rng, weights, n) → Vector{Int}
+
+Draw `n` particle indices i.i.d. with probability proportional to `weights`.
+
+Not `_systematicResample`, which is lower variance for propagating a population but makes the draws
+depend on each other and on their order — a caller handed `n` draws expects any subset of them to be
+a valid sample. A zero-weight particle is never drawn.
+"""
+function _multinomialDraw(rng::AbstractRNG, weights::AbstractVector{<:Real}, n::Int)
+    N = length(weights)
+    (n > 0 && N == 0) &&
+        throw(ArgumentError("Cannot draw from a generation with no particles."))
+    c = cumsum(weights)
+    return Int[clamp(searchsortedfirst(c, rand(rng) * c[end]), 1, N) for _ in 1:n]
+end
+
+#! `monad_id` is assigned rather than carried over from `display_df`, because only one of the two
+#! entry points has it there: `posterior(::ABCResult)` returns the bookkeeping columns while
+#! `posterior(::Calibration)` strips them. Taking it from the caller's vector keeps the two frames
+#! identical.
+"""
+    _plainPosteriorDraws(rng, display_df, weights, monad_ids, n) → DataFrame
+
+Resample `n` rows of `display_df` by `weights`, returning a fresh frame of the parameter columns
+plus the drawn rows' `monad_id`.
+"""
+function _plainPosteriorDraws(rng::AbstractRNG, display_df::DataFrame,
+                              weights::AbstractVector{<:Real},
+                              monad_ids::AbstractVector{<:Integer}, n::Int)
+    idx  = _multinomialDraw(rng, weights, n)
+    cols = [c for c in names(display_df) if !(c in _PARTICLE_BOOKKEEPING_COLUMNS)]
+    out  = display_df[idx, cols]
+    out[!, :monad_id] = collect(monad_ids[idx])
+    return out
+end
+
+"""
+    _smoothedCDFDraws(rng, X, w, n) → Matrix{Float64}
+
+Draw `n` rows from a weighted Gaussian KDE over the CDF-space particles `X` (one particle per row).
+
+Scott's factor uses the effective sample size `1/Σwᵢ²` rather than the particle count, since the
+particles are weighted. A `1e-10` diagonal floor keeps the covariance factorisable when a coordinate
+has collapsed onto one value, and each coordinate is reflected into `[0, 1]` rather than rejected —
+rejection would thin the edges of the estimate, and there are no importance weights here to correct
+for it.
+"""
+function _smoothedCDFDraws(rng::AbstractRNG, X::AbstractMatrix{Float64},
+                           w::AbstractVector{Float64}, n::Int)
+    d = size(X, 2)
+    n == 0 && return Matrix{Float64}(undef, 0, d)
+
+    mu      = vec(sum(w .* X, dims=1))
+    Xc      = X .- mu'
+    Sigma_w = Symmetric(Xc' * Diagonal(w) * Xc)
+    ess     = 1 / sum(abs2, w)
+    h2      = ess^(-2 / (d + 4))
+    H       = h2 * Sigma_w + 1e-10 * I(d)
+    L       = cholesky(Symmetric(Matrix(H))).L
+
+    out = Matrix{Float64}(undef, n, d)
+    for (i, j) in enumerate(_multinomialDraw(rng, w, n))
+        y = X[j, :] + L * randn(rng, d)
+        for k in 1:d
+            out[i, k] = _reflectIntoUnit(y[k])
+        end
+    end
+    return out
+end
+
+"""
+    _reflectIntoUnit(v) → Float64
+
+Fold `v` into `[0, 1]` by repeated reflection at both ends.
+"""
+function _reflectIntoUnit(v::Real)
+    r = mod(v, 2.0)
+    return r > 1 ? 2 - r : r
+end
+
+"""
+    _cdfDrawsToDisplay(Y, cps, param_names) → DataFrame
+
+Map each CDF-coordinate row of `Y` through the prior quantiles into display values, one group of
+columns per [`CalibrationParameter`](@ref).
+
+With `cps` empty the CDF coordinates *are* the display values, matching `_buildDisplayDF`.
+"""
+function _cdfDrawsToDisplay(Y::Matrix{Float64}, cps::Vector{CalibrationParameter},
+                            param_names::Vector{String})
+    isempty(cps) && return DataFrame(Y, param_names)
+
+    n        = size(Y, 1)
+    position = Dict(name => i for (i, name) in enumerate(param_names))
+    df       = DataFrame()
+    for cp in cps
+        dcols = _displayColumns(cp)
+        vecs  = [Vector{Float64}(undef, n) for _ in dcols]
+        cdf_positions = [position[name] for name in cp.lv.latent_parameter_names]
+        for i in 1:n
+            vals = _particleRowToDisplay(cp, Float64[Y[i, k] for k in cdf_positions])
+            for j in eachindex(dcols)
+                vecs[j][i] = vals[j]
+            end
+        end
+        for (name, vec) in zip(dcols, vecs)
+            df[!, name] = vec
+        end
+    end
+    return df
+end
+
+#! Smoothed sampling from disk needs the quantile maps, not just the CDF coordinates, so it is the
+#! one read path that depends on `problem.jld2` being complete.
+"""
+    _diskCalibrationParameters(calibration) → Vector{CalibrationParameter}
+
+Rebuild a run's calibration parameters from its serialized problem manifest.
+
+Errors when a `LatentVariation` was saved with anonymous maps, which JLD2 cannot store.
+"""
+function _diskCalibrationParameters(calibration::Calibration)
+    manifest = _loadProblem(calibration)
+    if any(s -> s isa _StrippedLVSource, manifest.sources)
+        error("""
+            Cannot draw smoothed samples for Calibration($(calibration.id)) from disk: its LatentVariation was saved with anonymous maps, so problem.jld2 does not carry the quantile maps a smoothed draw has to pass through.
+            Re-supply the problem to get an in-memory result, and sample that instead:
+
+                samplePosterior(resumeABC(Calibration($(calibration.id)); problem=my_problem), n; smooth=true)
+
+            On a finished run `resumeABC` returns the ABCResult without re-running anything.
+            """)
+    end
+    return CalibrationParameter[_sourceToCalibrationParameter(s) for s in manifest.sources]
 end
 
 ################## ConvergenceSummary ##################

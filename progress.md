@@ -5,6 +5,55 @@
 
 ---
 
+## Session: drawing from the posterior (2026-09-10) — ships in v0.10.0
+
+### Trigger
+The user needs to *draw* parameter sets from a calibrated posterior, not only plot it, and asked
+whether that means "a KDE with some fixed parameters".
+
+### What existed
+`posterior` returns weighted particles and nothing samples them. The plot recipes use
+KernelDensity.jl, which is 1D/2D only and cannot give joint draws that keep correlations. The one
+place the package already draws from a posterior is `_runSubsequentGeneration`: systematic
+resampling, then a kernel perturbation in CDF space, then the prior quantile. That is a weighted
+Gaussian KDE draw, unexposed and with a bandwidth tuned for proposals.
+
+### Decisions
+- **One exported function, `samplePosterior`, two modes, plain by default.** Plain mode resamples
+  existing particles and returns their `monad_id`s, because the common downstream use is a posterior
+  predictive check and the monads' outputs already exist. Smoothed mode is opt-in.
+- **Bandwidth is data-driven, not fixed.** Scott's rule with ESS in place of N on the weighted
+  covariance. Rejected: reusing `perturbation_kernel`'s `scale × Σ_w` — that scale is deliberately
+  over-dispersed so proposals explore, and the importance weights that correct it in SMC do not
+  exist here. Rejected: a user-supplied bandwidth keyword — nothing to say what a good value is,
+  and it is exactly the "fixed parameters" the user was wary of. If someone needs it later it is
+  one keyword.
+- **In CDF space, with reflection.** Target space would leak outside prior support and is
+  meaningless for discrete parameters; CDF space gets both for free via the quantile map. Reflect
+  rather than reject at `[0, 1]`: rejection is fine for proposals (weights correct it) but here it
+  would thin the edges of the estimate.
+- **i.i.d. multinomial resampling, not `_systematicResample`.** Systematic resampling is lower
+  variance for propagating a population, but it makes the draws dependent on each other and on
+  their order. A user handing back `n` draws expects any subset to be a valid sample.
+- **`Calibration` smoothed mode needs `problem.jld2`.** Plain mode only needs `particles.csv`.
+  Smoothed mode needs CDF coordinates *and* the quantile maps; sources round-trip through JLD2
+  except a `LatentVariation` with anonymous maps, in which case the error points at
+  `resumeABC(cal; problem=)`, which returns an `ABCResult` for a finished run without re-running.
+- **Lives in `problem.jl` beside `posterior`**, sharing a `_readGenerationParticles` helper so the
+  two disk readers cannot drift.
+- **A draw's frame is the parameter columns, plus `monad_id` in plain mode.** The two `posterior`
+  methods disagree on this today: `posterior(::ABCResult)` returns `_buildDisplayDF`, which appends
+  `weight`/`distance`/`monad_id`, while `posterior(::Calibration)` strips all three. Rather than
+  inherit that split, `samplePosterior` strips them on both paths and re-adds `monad_id` from the
+  drawn rows, so the two entry points return identical frames. A stale `weight` column on a
+  resampled frame is also a footgun -- a draw's weight is `1/n`, and a user averaging with the
+  particle's weight would be weighting an already-weighted sample twice. `posterior` itself is
+  unchanged.
+
+### Open questions
+- Turning draws back into runnable variations (a `createTrial` from a posterior sample) is the
+  natural next step for predictive checks at new parameter sets. Not in this change.
+
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
 ### Trigger

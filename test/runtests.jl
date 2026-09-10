@@ -1153,6 +1153,103 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test_throws ErrorException posterior(result_empty)
     end
 
+    @testset "samplePosterior" begin
+        cal    = Calibration(1)
+        method = ABCSMC()
+
+        w1 = [0.4, 0.6]; w2 = [0.25, 0.75]
+        gen1 = GenerationResult(1, DataFrame(x=[1.0, 2.0]), w1, [0.5, 0.3], 0.5, 4, [11, 22],
+                                2/4, 1/sum(w1.^2), nothing)
+        gen2 = GenerationResult(2, DataFrame(x=[3.0, 4.0]), w2, [0.1, 0.2], 0.2, 6, [33, 44],
+                                2/6, 1/sum(w2.^2), nothing)
+        result = ABCResult(cal, [gen1, gen2], CalibrationParameter[], method)
+
+        # Plain mode: every draw is an existing particle, carrying that particle's monad.
+        draws = samplePosterior(result, 50; rng=MersenneTwister(1))
+        @test nrow(draws) == 50
+        @test names(draws) == ["x", "monad_id"]
+        @test all(v -> v in [3.0, 4.0], draws.x)
+        monad_of = Dict(3.0 => 33, 4.0 => 44)
+        @test all(i -> draws.monad_id[i] == monad_of[draws.x[i]], 1:nrow(draws))
+
+        # Same seed, same frame.
+        @test samplePosterior(result, 50; rng=MersenneTwister(1)) == draws
+
+        # Frequencies follow the weights.
+        many = samplePosterior(result, 4000; rng=MersenneTwister(3))
+        @test isapprox(count(==(4.0), many.x) / 4000, 0.75; atol=0.05)
+
+        # A zero-weight particle is never drawn.
+        zero_gen = GenerationResult(1, DataFrame(x=[1.0, 2.0]), [0.0, 1.0], [0.5, 0.3], 0.5, 4,
+                                    [11, 22], 0.5, 1.0, nothing)
+        zero_res = ABCResult(cal, [zero_gen], CalibrationParameter[], method)
+        @test all(==(2.0), samplePosterior(zero_res, 200; rng=MersenneTwister(2)).x)
+
+        # `generation` selects, exactly as it does for `posterior`.
+        @test all(v -> v in [1.0, 2.0],
+                  samplePosterior(result, 20; generation=1, rng=MersenneTwister(4)).x)
+        @test_throws ArgumentError samplePosterior(result, 5; generation=99)
+
+        # Degenerate and invalid draw counts.
+        empty_draws = samplePosterior(result, 0)
+        @test nrow(empty_draws) == 0
+        @test names(empty_draws) == ["x", "monad_id"]
+        @test_throws ArgumentError samplePosterior(result, -1)
+
+        # Smoothed mode over CDF coordinates: new points, no monad_id, always inside [0, 1].
+        cdf_gen = GenerationResult(1, DataFrame(x=[0.2, 0.8]), [0.5, 0.5], [0.1, 0.2], 0.2, 2,
+                                   [11, 22], 1.0, 2.0, nothing)
+        cdf_res = ABCResult(cal, [cdf_gen], CalibrationParameter[], method)
+        sm = samplePosterior(cdf_res, 2000; smooth=true, rng=MersenneTwister(1))
+        @test nrow(sm) == 2000
+        @test names(sm) == ["x"]
+        @test all(v -> 0.0 <= v <= 1.0, sm.x)
+        # Smoothing spreads: resampling {0.2, 0.8} would give sd exactly 0.3 and never a draw
+        # between the two particles.
+        @test isapprox(mean(sm.x), 0.5; atol=0.05)
+        @test std(sm.x) > 0.3
+        @test count(v -> 0.4 < v < 0.6, sm.x) > 0
+        @test nrow(samplePosterior(cdf_res, 0; smooth=true)) == 0
+        @test names(samplePosterior(cdf_res, 0; smooth=true)) == ["x"]
+
+        # One particle: the kernel collapses onto the 1e-10 diagonal floor (sd 1e-5).
+        one_gen = GenerationResult(1, DataFrame(x=[0.3]), [1.0], [0.1], 0.1, 1, [7],
+                                   1.0, 1.0, nothing)
+        one_res = ABCResult(cal, [one_gen], CalibrationParameter[], method)
+        @test all(v -> abs(v - 0.3) < 1e-4,
+                  samplePosterior(one_res, 100; smooth=true, rng=MersenneTwister(6)).x)
+
+        # Reflection, not clipping: mass past a boundary comes back inside.
+        edge_gen = GenerationResult(1, DataFrame(x=[0.01, 0.99]), [0.5, 0.5], [0.1, 0.2], 0.2, 2,
+                                    [11, 22], 1.0, 2.0, nothing)
+        edge_res = ABCResult(cal, [edge_gen], CalibrationParameter[], method)
+        edge = samplePosterior(edge_res, 2000; smooth=true, rng=MersenneTwister(7)).x
+        @test all(v -> 0.0 <= v <= 1.0, edge)
+        @test any(v -> v < 0.01, edge)
+
+        # With real parameters the draws come back in display space: continuous ones inside the
+        # prior's support, discrete ones on a declared level.
+        cps = CalibrationParameter[
+            ModelManager._toCalibrationParameter(
+                DistributedVariation(:config, XMLPath(["a"]), Uniform(2.0, 5.0))),
+            ModelManager._toCalibrationParameter(
+                DiscreteVariation(:config, XMLPath(["b"]), [10, 20, 30])),
+        ]
+        pnames, _ = ModelManager._latentNamesAndPriors(cps)
+        real_gen = GenerationResult(1,
+            DataFrame([pnames[1] => [0.1, 0.5, 0.9], pnames[2] => [0.2, 0.6, 0.95]]),
+            [0.2, 0.3, 0.5], [0.3, 0.2, 0.1], 0.3, 3, [1, 2, 3], 1.0, 1/0.38, nothing)
+        real_res  = ABCResult(cal, [real_gen], cps, method)
+        post_cols = filter(c -> !(c in ["weight", "distance", "monad_id"]),
+                           names(posterior(real_res)[1]))
+        real_sm   = samplePosterior(real_res, 50; smooth=true, rng=MersenneTwister(8))
+        @test names(real_sm) == post_cols
+        @test all(v -> 2.0 <= v <= 5.0, real_sm[!, post_cols[1]])
+        @test all(v -> v in [10, 20, 30], real_sm[!, post_cols[2]])
+        @test names(samplePosterior(real_res, 50; rng=MersenneTwister(9))) ==
+              [post_cols; "monad_id"]
+    end
+
     ################## ABCSMC new fields — validation ##################
 
     @testset "ABCSMC epsilon_schedule validation" begin
@@ -3244,6 +3341,26 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
                 # out-of-range generation throws
                 @test_throws ArgumentError posterior(result; generation=99)
+
+                # samplePosterior from disk: plain mode resamples the recorded particles and
+                # names the monad each draw came from.
+                disk_draws = samplePosterior(result.calibration, 5)
+                @test nrow(disk_draws) == 5
+                @test issubset(disk_draws.monad_id,
+                               ModelManager.calibrationMonadIDs(result.calibration))
+                @test filter(!=("monad_id"), names(disk_draws)) ==
+                      names(posterior(result.calibration)[1])
+
+                # Smoothed mode rebuilds the parameters from problem.jld2 (this problem's
+                # functions are named, so the manifest is complete) and gives new points inside
+                # the prior's support, with no monad_id.
+                disk_smooth = samplePosterior(result.calibration, 5; smooth=true)
+                @test nrow(disk_smooth) == 5
+                @test "monad_id" ∉ names(disk_smooth)
+                @test all(v -> 0.5 <= v <= 3.0, disk_smooth[!, string(columnName(xp_x))])
+
+                # The in-memory result agrees with the disk read on the display columns.
+                @test names(samplePosterior(result, 5; smooth=true)) == names(disk_smooth)
             end
 
             @testset "calibration over discrete and mixed parameters" begin

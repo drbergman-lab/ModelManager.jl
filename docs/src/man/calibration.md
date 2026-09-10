@@ -159,6 +159,27 @@ post = posterior(result; generation=3)   # a specific generation
 summary = ConvergenceSummary(result)
 ```
 
+To *draw* from a posterior rather than describe it, use [`samplePosterior`](@ref). By default it
+resamples the accepted particles with probability equal to their importance weights, so every draw
+is a parameter set that was actually simulated and the frame carries its `monad_id` — a posterior
+predictive check can read those monads' outputs instead of running anything. With `smooth=true` the
+weighted particles become a Gaussian kernel density estimate and the draws are new points between
+them, which is what you want when the next step is simulating at fresh parameter values. The kernel
+is fitted in CDF space with a Scott's-rule bandwidth scaled by the effective sample size and
+reflected at the `[0, 1]` boundary, then mapped through the prior quantiles, so a draw always lands
+inside every prior's support and a discrete parameter always lands on one of its levels. Smoothed
+draws belong to no monad, so they come back without a `monad_id`.
+
+```julia
+draws = samplePosterior(result, 200)                   # existing particles, with monad_id
+points = samplePosterior(result, 200; smooth=true)     # new parameter sets, no monad_id
+```
+
+Both forms accept a [`Calibration`](@ref) as well, reading the generation from disk. Smoothed mode
+additionally needs `problem.jld2` to hold the quantile maps, which rules out a run whose
+`LatentVariation` was built from anonymous functions; sample the [`ABCResult`](@ref) from
+`resumeCalibration(cal; problem=my_problem)` in that case.
+
 Each generation records two epsilons: `max_epsilon_accepted`, the largest distance it accepted, and
 `epsilon_threshold`, the cutoff it was run against. Generation 1 accepts everything, so it has no
 threshold.
