@@ -140,7 +140,15 @@ plot(sobol; show_ST=false)       # S1 only
 
 # RBD — first-order index bars
 plot(rbd)
+
+# Any of them: only some parameters, in this order
+plot(moat; parameters=["k_on", "k_off"])
+plot(sobol; parameters=Not("dt"))
 ```
+
+`parameters` takes anything `select` does on a `DataFrame` — a name, a vector of names, positions, a
+`Regex`, or `Not(...)` — over the x-axis names, and a vector is drawn in the order given. An unknown
+name is an error that lists the available ones.
 
 The `:violin` style needs a backend that provides the `:violin` series type (e.g.
 [StatsPlots](https://github.com/JuliaPlots/StatsPlots.jl)); the others work with any
