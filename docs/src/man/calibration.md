@@ -320,6 +320,22 @@ the database, so you can plot a finished run without re-running it:
 plot(Calibration(42), :distances; generation=3)
 ```
 
+### Choosing which parameters to draw
+
+A corner plot of eight parameters is a 64-panel grid. Every recipe with a parameter axis — the corner
+plot, `:ridgeline` and `:transition` — takes `parameters`, which accepts anything `select` does on a
+`DataFrame`: a name, a vector of names, positions, a `Regex`, or `Not(...)`. The names are the columns
+of `posterior(result)` (the latent names when `space=:cdf`).
+
+```julia
+plot(result; parameters=["k_on", "k_off"])        # two parameters, panels in this order
+plot(result, :ridgeline; parameters=r"^rate_")     # everything whose name starts with rate_
+plot(result, :transition; parameters=Not("dt"))    # all but one
+```
+
+A vector of names is drawn in the order given, so it also reorders the panels. An unknown name is an
+error that lists the available ones. `:distances` has no parameter axis and refuses the keyword.
+
 ### Proposal distances
 
 `:distances` bins every proposal a generation evaluated and colours the accepted ones separately, so

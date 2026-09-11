@@ -18,6 +18,12 @@ function _vizParticles(result::ABCResult, t::Int, space::Symbol)
     end
 end
 
+# Restrict a particle frame to the recipe's `parameters` selection, in the selected order. The
+# resolver is the one the GSA recipes use, so both families accept the same selectors.
+_selectParameterColumns(df::DataFrame, ::Nothing) = df
+_selectParameterColumns(df::DataFrame, parameters) =
+    select(df, _selectParameters(names(df), parameters))
+
 # Convert a CDF-space DataFrame to target-parameter space, stripping metadata columns.
 function _cdfDFToTarget(cdf_df::DataFrame, params::Vector{CalibrationParameter})
     isempty(params) && return copy(cdf_df)
@@ -203,8 +209,8 @@ end
 ################## Pairs / corner plot ##################
 
 """
-    plot(result::ABCResult; generation=:final, space=:target)
-    plot(cal::Calibration; generation=:final, space=:target)
+    plot(result::ABCResult; generation=:final, space=:target, parameters=nothing)
+    plot(cal::Calibration; generation=:final, space=:target, parameters=nothing)
 
 Corner plot of an ABC-SMC posterior generation. Diagonal panels show weighted 1D KDE
 marginals; off-diagonal lower-triangle panels show weighted 2D KDE contours overlaid
@@ -213,6 +219,10 @@ with a weighted scatter (opacity ∝ weight).
 `generation` is an integer index (1-based) or `:final` (default).
 `space=:target` (default) shows biological-unit parameter values;
 `space=:cdf` shows ABC internal CDF coordinates.
+
+`parameters` restricts and orders the panels: a name, a vector of names (drawn in that order),
+positions, a `Regex`, or `Not(...)` over the columns [`posterior`](@ref) returns (the latent names
+when `space=:cdf`). The default draws every parameter.
 """
 @recipe function f(cpd::_CornerPlotData)
     df      = cpd.df
@@ -264,14 +274,14 @@ with a weighted scatter (opacity ∝ weight).
     end
 end
 
-@recipe function f(result::ABCResult; generation=:final, space=:target)
+@recipe function f(result::ABCResult; generation=:final, space=:target, parameters=nothing)
     isempty(result.generations) && error("No generations in ABCResult.")
     t = generation === :final ? length(result.generations) : Int(generation)
     df, w = _vizParticles(result, t, space)
-    _CornerPlotData(df, w)
+    _CornerPlotData(_selectParameterColumns(df, parameters), w)
 end
 
-@recipe function f(cal::Calibration; generation=:final, space=:target)
+@recipe function f(cal::Calibration; generation=:final, space=:target, parameters=nothing)
     if space === :target
         df, w = posterior(cal; generation=generation)
     else
@@ -290,7 +300,7 @@ end
         df = select(df_cdf, Not(intersect([:weight, :distance, :monad_id], Symbol.(names(df_cdf)))))
         w  = Float64.(weights_col)
     end
-    _CornerPlotData(df, w)
+    _CornerPlotData(_selectParameterColumns(df, parameters), w)
 end
 
 ################## Posterior narrowing / ridgeline plot ##################
@@ -588,6 +598,12 @@ end
 
 ################## Distance distribution ##################
 
+#! RecipesBase consumes every keyword a recipe's signature declares, so a `parameters` passed to a
+#! style with no parameter axis would otherwise vanish without a trace.
+_rejectParametersKeyword(::Nothing) = nothing
+_rejectParametersKeyword(parameters) = throw(ArgumentError(
+    "`parameters = $(repr(parameters))` does not apply to :distances, which has no parameter axis."))
+
 #! `only` throws on an empty collection; this returns `nothing` so callers can decide.
 only_or_nothing(v) = length(v) == 1 ? first(v) : nothing
 
@@ -765,13 +781,20 @@ Dispatch to specialized visualization recipes for `ABCResult`:
   - `show_particles::Bool` — overlay gen-t particles beneath the KDE (default `false`).
   - `space::Symbol` — `:target` (default) or `:cdf`.
   - `aggregate_duplicates::Bool` — group coincident proposals into bubbles (default `true`).
+
+- `:distances` — proposal-distance histogram for one generation; `logscale=true` bins in log10.
+
+`parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: a name, a
+vector of names (drawn in that order), positions, a `Regex`, or `Not(...)` over the parameter
+columns. `:distances` has no parameter axis and rejects it.
 """
 @recipe function f(result::ABCResult, style::Symbol;
                    space               = :target,
                    generation          = nothing,
                    show_particles      = false,
                    aggregate_duplicates = true,
-                   logscale            = false)
+                   logscale            = false,
+                   parameters          = nothing)
     isempty(result.generations) && error("No generations in ABCResult.")
     T = length(result.generations)
     resolved_gen = if isnothing(generation)
@@ -784,7 +807,8 @@ Dispatch to specialized visualization recipes for `ABCResult`:
         dfs = Vector{DataFrame}(undef, T)
         wts = Vector{Vector{Float64}}(undef, T)
         for t in 1:T
-            dfs[t], wts[t] = _vizParticles(result, t, space)
+            df_t, wts[t] = _vizParticles(result, t, space)
+            dfs[t] = _selectParameterColumns(df_t, parameters)
         end
         pnames = names(dfs[1])
 
@@ -796,7 +820,8 @@ Dispatch to specialized visualization recipes for `ABCResult`:
             cdf_vals  = collect((1:N_prior) ./ (N_prior + 1))   # uniform quantiles, avoids endpoints
             cdf_names = [n for cp in result.parameters for n in cp.lv.latent_parameter_names]
             prior_cdf = DataFrame([n => cdf_vals for n in cdf_names]...)
-            prior_df  = _cdfDFToTarget(prior_cdf, result.parameters)
+            prior_df  = _selectParameterColumns(_cdfDFToTarget(prior_cdf, result.parameters),
+                                                parameters)
             prior_wts = fill(1.0 / N_prior, N_prior)
         end
 
@@ -810,6 +835,7 @@ Dispatch to specialized visualization recipes for `ABCResult`:
             "generation must be in [1, $(T-1)] for :transition, got $t"))
 
         kde_df, kde_w = _vizParticles(result, t, space)
+        kde_df        = _selectParameterColumns(kde_df, parameters)
         acc_df, acc_w = _vizParticles(result, t_next, space)
         rej_df, note  = _getRejected(result, t_next, space)
 
@@ -825,6 +851,7 @@ Dispatch to specialized visualization recipes for `ABCResult`:
                         show_particles, aggregate_duplicates)
 
     elseif style === :distances
+        _rejectParametersKeyword(parameters)
         gen = result.generations[resolved_gen]
         acc, rej, note = _distanceSeries(gen.proposal_distances, gen.distances)
         _buildDistanceData(acc, rej, gen.epsilon_threshold, gen.max_epsilon_accepted,
@@ -847,12 +874,19 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
     Defaults to the penultimate completed generation.
   - `show_particles::Bool` — overlay gen-t particles beneath the KDE (default `false`).
   - `aggregate_duplicates::Bool` — group coincident proposals into bubbles (default `true`).
+
+- `:distances` — proposal-distance histogram for one generation; `logscale=true` bins in log10.
+
+`parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: a name, a
+vector of names (drawn in that order), positions, a `Regex`, or `Not(...)` over the parameter
+columns. `:distances` has no parameter axis and rejects it.
 """
 @recipe function f(cal::Calibration, style::Symbol;
                    generation           = nothing,
                    show_particles       = false,
                    aggregate_duplicates = true,
-                   logscale             = false)
+                   logscale             = false,
+                   parameters           = nothing)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
     #! Generations are addressed by index throughout, so both layouts and any padding width behave
@@ -878,7 +912,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
         wts = Vector{Vector{Float64}}()
         for t in indices
             df, w, _ = _readGenCSV(t)
-            push!(dfs, df)
+            push!(dfs, _selectParameterColumns(df, parameters))
             push!(wts, w)
         end
         pnames = names(dfs[1])
@@ -892,6 +926,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
             "generation must be one with a successor; got $t, available $(indices)"))
 
         kde_df, kde_w, _        = _readGenCSV(t)
+        kde_df                  = _selectParameterColumns(kde_df, parameters)
         acc_df, acc_w, acc_raw  = _readGenCSV(t_next)
 
         pnames = names(kde_df)
@@ -927,6 +962,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
                         pop_size, note,
                         show_particles, aggregate_duplicates)
     elseif style === :distances
+        _rejectParametersKeyword(parameters)
         t = isnothing(generation) ? last(indices) : Int(generation)
         t in indices || error("No generation $(t) for Calibration($(cal.id)).")
         prop_path = _generationArtifact(gen_dir, t, :proposals)

@@ -4372,3 +4372,46 @@ because every simulation was skipped as missing or unverifiable. One flag guarde
 can report clean on an empty check is worse than neither. I have tightened the documented pass
 condition to require `n_agreed > 0`, but whether the feature should exist is not mine to decide.
 
+
+## 2026-09-11 — Parameter subsets in calibration and GSA plots
+
+**Problem.** A corner or transition plot of an eight-parameter calibration is a 64-panel grid, and a
+GSA bar chart with fifteen parameters buries the three that matter. There was no way to plot a subset
+short of slicing the data by hand and calling the private recipe structs.
+
+**Design.** One keyword, `parameters`, on every recipe that has a parameter axis, and one resolver
+shared by both families. Two decisions worth recording:
+
+- **Resolution is delegated to DataFrames, not hand-rolled.** `_selectParameters(available, sel)`
+  builds a header-only `DataFrame` over the available names and calls `names(header, sel)`. That gives
+  the whole selector vocabulary — a name, a vector of names, positions, a `Regex`, `Not(...)`,
+  `Cols(...)` — with DataFrames' own validation, for free and in one place. Verified before writing:
+  a vector of names comes back in the order given (so `parameters=["beta", "alpha"]` reorders panels),
+  `Not` and `Regex` follow column order, and an unknown name or a duplicated one is an `ArgumentError`.
+  DataFrames' message does not list what *was* available, so the resolver rethrows with that appended.
+- **Filter at the top-level recipes, leave the wrapper structs alone.** `_CornerPlotData`,
+  `_RidgelineData` and `_TransitionData` already carry a frame plus parameter names and draw whatever
+  they are handed. Filtering the frame after the space is resolved (target vs. CDF names differ) and
+  before the wrapper is built means zero change to the drawing code and the existing smoke tests.
+  On the GSA side the builders take `parameters` as a keyword and slice the index vectors, so the
+  three MOAT charts cannot disagree about which parameters they show.
+
+**Rejected.** A `parameters` keyword on `posterior` itself — `select` on the returned frame already
+does that. A top-k / sort-by-index option for GSA — a different feature, and `parameters` with an
+explicit vector already covers "these three".
+
+**Edge worth knowing.** `:distances` and `ConvergenceSummary` have no parameter axis. RecipesBase
+consumes any keyword declared in a recipe's signature, so `plot(result, :distances; parameters=...)`
+would silently do nothing; it throws instead. `ConvergenceSummary` declares no such keyword and is left
+to the backend's normal unknown-attribute handling.
+
+**Found while testing.** The four top-level calibration recipes had never been applied in the test
+suite — only their wrapper structs were — and the reason turned out to be structural, not neglect. A
+recipe that declares keywords in its signature (`plot(result; generation, space)`) asks
+`RecipesBase.is_key_supported(k)` for each one so it can delete the non-attributes before they reach
+the backend, and that hook is left for the plotting package to define. With no backend loaded,
+`apply_recipe` on such a recipe is a `MethodError`; the GSA recipes dodge this by reading their
+keywords with `pop!(plotattributes, ...)` instead. The test file now defines
+`RecipesBase.is_key_supported(::Symbol) = false`, which is the answer Plots gives for every keyword
+these recipes declare, and the corner, `:ridgeline`, `:transition` and `:distances` recipes are applied
+end to end for the first time — in memory, and from disk on the integration run.

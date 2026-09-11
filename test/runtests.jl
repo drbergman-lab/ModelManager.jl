@@ -10,6 +10,12 @@ using JLD2
 using NearestNeighbors
 using LinearAlgebra
 using RecipesBase
+#! A recipe with keyword arguments in its signature (`plot(result; generation, parameters)`) asks
+#! RecipesBase whether each keyword is a plot attribute, so the non-attributes can be removed before
+#! they reach the backend. That hook is left for the plotting package to define, and none is loaded
+#! here — without it `apply_recipe` on such a recipe throws a `MethodError`. Answering `false` is what
+#! Plots answers for every keyword these recipes declare.
+RecipesBase.is_key_supported(::Symbol) = false
 using Dates
 import GlobalSensitivity
 
@@ -3244,6 +3250,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
                 # out-of-range generation throws
                 @test_throws ArgumentError posterior(result; generation=99)
+
+                # `parameters` on the recipes, in memory and from disk, by the display name the
+                # posterior frame uses.
+                pname = "$(columnName(xp_x))"
+                for target in (result, result.calibration)
+                    corner = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => pname), target)
+                    @test names(corner[1].args[1].df) == [pname]
+                    ridge = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => [pname]), target, :ridgeline)
+                    @test ridge[1].args[1].param_names == [pname]
+                    #! The run may stop after one generation, and `:transition` needs two.
+                    if length(result.generations) >= 2
+                        trans = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => pname), target, :transition)
+                        @test trans[1].args[1].param_names == [pname]
+                    end
+                    @test_throws ArgumentError RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => "not_a_parameter"), target)
+                    @test_throws ArgumentError RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => pname), target, :distances)
+                end
             end
 
             @testset "calibration over discrete and mixed parameters" begin
@@ -5293,6 +5316,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp)
                 @test rd[1].args[1] isa ModelManager._GSABarData
                 @test rd[1].args[1].param_names == names(samp.monad_ids_df)[2:end]
+                # `parameters` reaches the builder through the recipe's attribute dict.
+                last_name = last(names(samp.monad_ids_df))
+                rd_sub = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => last_name), samp)
+                @test rd_sub[1].args[1].param_names == [last_name]
+                @test length(rd_sub[1].args[1].groups[1].values) == 1
+                @test_throws ArgumentError RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => "base"), samp)
                 # Alternate MOAT styles dispatch without error; bad style throws.
                 @test RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp, :violin)[1].args[1] isa ModelManager._GSAViolinData
                 @test RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp, :scatter)[1].args[1] isa ModelManager._GSAScatterData
@@ -5726,6 +5755,66 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test_throws ErrorException apply(ModelManager._GSAViolinData(String[], [("f", zeros(0, 0))]))
             @test_throws ErrorException apply(ModelManager._GSAScatterData(String[], [("f", Float64[], Float64[])]))
         end
+
+        @testset "parameters selection" begin
+            # The resolver is shared with the calibration recipes: DataFrames' selector vocabulary,
+            # a vector honoured in the order given, and an error that names what was available.
+            sel = ModelManager._selectParameters
+            @test sel(pnames, nothing) === pnames
+            @test sel(pnames, ["p3", "p1"]) == ["p3", "p1"]
+            @test sel(pnames, "p2") == ["p2"]
+            @test sel(pnames, :p2) == ["p2"]
+            @test sel(pnames, [3, 1]) == ["p3", "p1"]
+            @test sel(pnames, r"^p[12]") == ["p1", "p2"]
+            @test sel(pnames, Not("p2")) == ["p1", "p3"]
+            err = try sel(pnames, "nope"); nothing catch e; e end
+            @test err isa ArgumentError
+            @test occursin("Available parameters", err.msg)
+            @test occursin("p1", err.msg)
+            @test_throws ArgumentError sel(pnames, ["p1", "p1"])
+            @test_throws ArgumentError sel(pnames, String[])
+            @test ModelManager._parameterIndices(pnames, ["p3", "p1"]) == [3, 1]
+
+            res1 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(11))
+            mres = res1[_GSA_LABEL_A]
+
+            # MOAT bar: names and every index vector sliced to the same positions, same order.
+            bd = ModelManager._moatBarData(res1, moat_df, true; parameters=["p3", "p1"])
+            @test bd.param_names == ["p3", "p1"]
+            @test bd.groups[1].values ≈ [0.2, 0.1]
+            @test bd.groups[1].yerror ≈ sqrt.([0.02, 0.01])
+            @test nseries(apply(bd)) == 1
+
+            # MOAT violin: the elementary-effect matrix keeps its rows and reorders its columns.
+            vd = ModelManager._moatViolinData(res1, moat_df; parameters=Not("p2"))
+            @test vd.param_names == ["p1", "p3"]
+            @test vd.groups[1][2] == mres.elementary_effects[:, [1, 3]]
+
+            # MOAT scatter: µ* and σ move together.
+            sd = ModelManager._moatScatterData(res1, moat_df; parameters=r"^p[23]")
+            @test sd.param_names == ["p2", "p3"]
+            @test sd.groups[1][2] ≈ [0.5, 0.2]
+            @test sd.groups[1][3] ≈ sqrt.([0.04, 0.02])
+
+            # Sobolʼ: S1 and ST sliced alike; a single name still plots.
+            sres = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol())
+            sb   = ModelManager._sobolBarData(sres, sobol_df, true; parameters="p2")
+            @test sb.param_names == ["p2"]
+            @test sb.groups[1].values ≈ [0.5]
+            @test sb.groups[2].values ≈ [0.6]
+            @test nseries(apply(sb)) == 2
+
+            # RBD: a plain vector result.
+            rres = Dict{String,Vector{Float64}}(_GSA_LABEL_A => [0.1, 0.2, 0.7])
+            rb   = ModelManager._rbdBarData(rres, rbd_df; parameters=[3, 1])
+            @test rb.param_names == ["p3", "p1"]
+            @test rb.groups[1].values ≈ [0.7, 0.1]
+
+            # Unknown names fail in the builder, before anything is drawn.
+            @test_throws ArgumentError ModelManager._moatBarData(res1, moat_df, false; parameters="base")
+            @test_throws ArgumentError ModelManager._sobolBarData(sres, sobol_df, true; parameters=["A"])
+            @test_throws ArgumentError ModelManager._rbdBarData(rres, rbd_df; parameters="p9")
+        end
     end
 
     @testset "calibration plot recipes" begin
@@ -5833,6 +5922,65 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             trans = ModelManager._TransitionData(df, wts, df, wts, nothing, pnames, 3, "",
                                                  false, true)
             @test nseries(apply(trans)) > 0
+        end
+
+        @testset "parameters keyword on the calibration recipes" begin
+            # An in-memory result with no CalibrationParameters: display columns are the particle
+            # columns themselves, which is all the selection logic needs.
+            applyk(kw, args...) = RecipesBase.apply_recipe(Dict{Symbol,Any}(kw), args...)
+            data(rd) = rd[1].args[1]
+
+            p1 = DataFrame(alpha = [0.1, 0.2, 0.3], beta = [1.0, 2.0, 3.0], gamma = [5.0, 6.0, 7.0])
+            p2 = DataFrame(alpha = [0.15, 0.25, 0.35], beta = [1.5, 2.5, 3.5], gamma = [5.5, 6.5, 7.5])
+            w  = [0.2, 0.3, 0.5]
+            g1 = GenerationResult(1, p1, w, [0.5, 0.4, 0.3], 0.5, 3, [1, 2, 3], 1.0, 1 / sum(w .^ 2), nothing)
+            # Rejected proposals held in memory (as `store_rejected=true` would), so `:transition`
+            # never reaches for a calibration folder on disk.
+            rej = DataFrame(alpha = [0.9], beta = [9.0], gamma = [9.5])
+            g2 = GenerationResult(2, p2, w, [0.2, 0.1, 0.1], 0.2, 6, [4, 5, 6], 0.5, 1 / sum(w .^ 2), rej)
+            res = ABCResult(Calibration(1), [g1, g2], CalibrationParameter[], ABCSMC(population_size=3))
+
+            # Corner plot: default keeps every column; a vector selects and reorders; the wrapper
+            # still draws (one diagonal panel per parameter, one panel below the diagonal).
+            @test names(data(applyk(Dict(), res)).df) == ["alpha", "beta", "gamma"]
+            cpd = data(applyk(Dict(:parameters => ["gamma", "alpha"]), res))
+            @test cpd isa ModelManager._CornerPlotData
+            @test names(cpd.df) == ["gamma", "alpha"]
+            @test cpd.df.gamma == p2.gamma
+            @test cpd.weights == w
+            @test nseries(apply(cpd)) == 4       # 2 KDE diagonals + contour + scatter
+            one = data(applyk(Dict(:parameters => "beta"), res))
+            @test names(one.df) == ["beta"]
+            @test nseries(apply(one)) == 1
+            @test names(data(applyk(Dict(:parameters => r"^[ab]"), res)).df) == ["alpha", "beta"]
+            @test names(data(applyk(Dict(:parameters => Not("beta")), res)).df) == ["alpha", "gamma"]
+            @test names(data(applyk(Dict(:parameters => [2, 1]), res)).df) == ["beta", "alpha"]
+            # `space=:cdf` resolves against the CDF column names — here the same names.
+            @test names(data(applyk(Dict(:parameters => "gamma", :space => :cdf), res)).df) == ["gamma"]
+            # Selection applies to the requested generation.
+            @test data(applyk(Dict(:parameters => "alpha", :generation => 1), res)).df.alpha == p1.alpha
+            @test_throws ArgumentError applyk(Dict(:parameters => "delta"), res)
+
+            # Ridgeline: every generation is filtered to the same columns, in the given order.
+            rd = data(applyk(Dict(:parameters => ["beta", "alpha"]), res, :ridgeline))
+            @test rd isa ModelManager._RidgelineData
+            @test rd.param_names == ["beta", "alpha"]
+            @test all(names(d) == ["beta", "alpha"] for d in rd.dfs)
+            @test nseries(apply(rd)) == 4        # 2 parameters × 2 generations
+            @test_throws ArgumentError applyk(Dict(:parameters => "delta"), res, :ridgeline)
+
+            # Transition: the KDE frame drives the names; accepted proposals follow.
+            td = data(applyk(Dict(:parameters => "gamma"), res, :transition))
+            @test td isa ModelManager._TransitionData
+            @test td.param_names == ["gamma"]
+            @test names(td.kde_df) == ["gamma"]
+            @test names(td.acc_df) == ["gamma"]
+            @test names(td.rej_df) == ["gamma"]
+            @test td.kde_df.gamma == p1.gamma
+            @test nseries(apply(td)) > 0
+
+            # No parameter axis: the keyword is refused, not swallowed.
+            @test_throws ArgumentError applyk(Dict(:parameters => "alpha"), res, :distances)
         end
     end
 
