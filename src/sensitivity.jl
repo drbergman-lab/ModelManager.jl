@@ -151,13 +151,13 @@ costs only the new one: `run(method, spec; functions=[q1])` followed by
 Results **accumulate**. A measurement absent from `functions` keeps whatever it produced earlier —
 that is what makes adding a quantity cheap, and its indices are not stale, having been computed from
 this same sampling. What `recompute` replaces is the labels of the measurements you *do* name, so a
-reducer that drops or renames a key leaves nothing behind; it never prunes ones you do not name.
-`empty!(gsa_sampling.results)` is how you start over.
+measurement whose value now carries different keys leaves nothing behind; it never prunes ones you do
+not name. `empty!(gsa_sampling.results)` is how you start over.
 
 # Keywords
 - `recompute`: evaluate even where results already exist, *replacing* every label that measurement
-  owns rather than merging into them — so a reducer that drops or renames a key leaves nothing stale
-  behind. Needed when the measurement itself has changed, because nothing can detect that — redefining a function's body in place leaves
+  owns rather than merging into them — so a measurement whose value now carries different keys leaves
+  nothing stale behind. Needed when the measurement itself has changed, because nothing can detect that — redefining a function's body in place leaves
   it indistinguishable from the one already evaluated, the same reason a [`QoI`](@ref)'s `stored`
   defaults to `:never`.
 
@@ -262,9 +262,9 @@ _gsaLabelsOf(gsa_sampling::GSASampling, name::AbstractString) =
 #! Computes without storing. Split out so the vector method above can see every label a call will
 #! produce before it commits any of them.
 """
-    _gsaResults(gsa_sampling, f) → Vector{Pair{String,result}}
+    _gsaResults(gsa_sampling, q::QoI) → Vector{Pair{String,result}}
 
-The sensitivity indices `f` yields on `gsa_sampling`, one labelled entry per quantity it measures.
+The sensitivity indices `q` yields on `gsa_sampling`, one labelled entry per quantity it measures.
 Stores nothing.
 """
 function _gsaResults end
@@ -386,9 +386,9 @@ function perturbVariation(pv::ParsedVariations, inputs::InputFolders, reference_
     return perturbed_variation_ids
 end
 
-function _gsaResults(moat_sampling::MOATSampling, f::Union{Function,QoI})
+function _gsaResults(moat_sampling::MOATSampling, q::QoI)
     out = Pair{String,GlobalSensitivity.MorrisResult}[]
-    for (label, vals) in evaluateFunctionOnSampling(moat_sampling, f)
+    for (label, vals) in evaluateFunctionOnSampling(moat_sampling, q)
         effects = 2 * (vals[:,2:end] .- vals[:,1])
         means = mean(effects, dims=1)
         means_star = mean(abs.(effects), dims=1)
@@ -493,9 +493,9 @@ function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::Parse
     return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods)
 end
 
-function _gsaResults(sobol_sampling::SobolSampling, f::Union{Function,QoI})
+function _gsaResults(sobol_sampling::SobolSampling, q::QoI)
     out = Pair{String,GlobalSensitivity.SobolResult}[]
-    for (label, vals) in evaluateFunctionOnSampling(sobol_sampling, f)
+    for (label, vals) in evaluateFunctionOnSampling(sobol_sampling, q)
         push!(out, label => _sobolResult(sobol_sampling, vals))
     end
     return out
@@ -607,9 +607,9 @@ function runSensitivitySampling(method::RBD, inputs::InputFolders, pv::ParsedVar
     return RBDSampling(sampling, monad_ids_df, method.rbd_variation.num_cycles; num_harmonics=method.num_harmonics)
 end
 
-function _gsaResults(rbd_sampling::RBDSampling, f::Union{Function,QoI})
+function _gsaResults(rbd_sampling::RBDSampling, q::QoI)
     out = Pair{String,Vector{<:Real}}[]
-    for (label, vals) in evaluateFunctionOnSampling(rbd_sampling, f)
+    for (label, vals) in evaluateFunctionOnSampling(rbd_sampling, q)
         if rbd_sampling.num_cycles == 1 // 2
             vals = vcat(vals, vals[end-1:-1:2, :])
         end
@@ -636,20 +636,24 @@ function recordSensitivityScheme(gsa_sampling::GSASampling)
 end
 
 """
-    evaluateFunctionOnSampling(gsa_sampling, f) → Vector{Pair{String,Matrix{Float64}}}
+    evaluateFunctionOnSampling(gsa_sampling, q::QoI) → Vector{Pair{String,Matrix{Float64}}}
 
-Evaluate `f` on every monad in the sampling and return one labelled matrix per quantity it measures.
+Evaluate `q` on every monad in the sampling and return one labelled matrix per quantity it measures.
 
 Each matrix is shaped like [`getMonadIDDataFrame`](@ref)`(gsa_sampling)` — one entry per cell of the
 method's design, holding that monad's reduced value — which is the layout each method's index
 arithmetic reads. A [`QoI`](@ref) whose `reduce` returns a `Real` gives one such matrix; one that
-returns a `Dict` or `NamedTuple` gives one per key.
+returns a flat `Dict` or `NamedTuple` of `Real`s gives one per key.
+
+This is where that requirement is imposed, and it is a requirement on `reduce`'s value alone:
+every cell of the design needs one number, so anything else — a `Vector`, a nested keyed value, a
+value that is `missing` for some monad, or a key set that differs between monads — is refused here.
+`compute` may return whatever the reducer knows how to turn into that.
 """
-function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function,QoI})
-    #! A bare `Function` is wrapped into a `QoI` here, so the rest of this works on one object with
-    #! one contract: `compute` gets a `Simulation`, `reduce` combines the replicates (`mean` for a
-    #! wrapped function, which is what this always did).
-    q = _asQoI(f)
+function evaluateFunctionOnSampling(gsa_sampling::GSASampling, q::QoI)
+    #! A `QoI` only: `calculateGSA!` wraps a bare function with `_asQoI` before anything reaches
+    #! `_gsaResults`, which is this function's only caller, and neither is public -- so accepting a
+    #! `Function` here was a second entrance to a room with one door.
     monad_id_df = getMonadIDDataFrame(gsa_sampling)
     monad_ids = monad_id_df |> Matrix
 
@@ -662,18 +666,36 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     #! `simulationsFromIDs` exists to avoid, and which `_reduceOverMonad` already avoided for
     #! calibration -- and it carried neither of that function's guards, so an empty monad reached
     #! `q.reduce([])` and a monad whose constituent list disagreed with the database went unnoticed.
+    #!
+    #! Wrapped the way `_evaluateParticle` wraps its two calls to user code, and for the same reason:
+    #! `compute` and `reduce` are the user's, and what they raise says nothing about WHERE. The
+    #! default reducer refusing to average two ragged replicates, say, throws from inside `_qoiMean`,
+    #! which knows neither the QoI's name nor the monad. Both are known here.
     reduced = Dict{Int,Any}()
     for monad_id in monad_ids
         haskey(reduced, monad_id) && continue
-        reduced[monad_id] = _reduceOverMonad(q, monad_id)
+        reduced[monad_id] = try
+            _reduceOverMonad(q, monad_id)
+        catch
+            @error "Sensitivity analysis failed evaluating QoI \"$(q.name)\" on monad $(monad_id)."
+            rethrow()
+        end
     end
 
+    #! THE place `reduce`'s value is held to a shape, and the only one: what a sensitivity index
+    #! needs is a number per monad, per key, so that requirement belongs to sensitivity analysis
+    #! rather than to the seam every consumer shares. (The sink applies the same rule to `compute`'s
+    #! value, which it and only it reads; calibration applies none.)
+    #!
     #! Every monad is checked, not just the first. A key set that differs anywhere leaves a hole in
-    #! that key's design matrix, and there is no defensible value to fill it with -- unlike
-    #! `mseDistance`, which treats an absent key as zero and warns once. A sensitivity index computed
-    #! over a hole is wrong rather than approximate, so this refuses instead.
+    #! that key's design matrix, and there is no defensible value to fill it with. A sensitivity
+    #! index computed over a hole is wrong rather than approximate, so this refuses instead. The
+    #! same reasoning covers a monad that reduced to `missing`; `_qoiValueShape` has a method for it
+    #! so the message says the monad has no value rather than naming a type. The source string is
+    #! this caller's to supply, like every other shape check's.
+    reduceSource(monad_id) = "`reduce` on monad $(monad_id)"
     reference_id = first(monad_ids)
-    component_keys = _qoiComponentKeys(q, reduced[reference_id], reference_id)
+    component_keys = _qoiValueShape(q, reduced[reference_id], reduceSource(reference_id))
     #! Walked in DESIGN order, so the monad an error names is the first mismatch someone scanning
     #! their design would reach -- iterating `reduced` instead would name whichever monad hashing
     #! happens to visit first, which is reproducible but not meaningful. Each DISTINCT monad is
@@ -683,37 +705,31 @@ function evaluateFunctionOnSampling(gsa_sampling::GSASampling, f::Union{Function
     for monad_id in monad_ids
         monad_id in checked && continue
         push!(checked, monad_id)
-        _qoiComponentKeys(q, reduced[monad_id], monad_id) == component_keys || throw(ArgumentError(
+        these_keys = _qoiValueShape(q, reduced[monad_id], reduceSource(monad_id))
+        these_keys == component_keys || throw(ArgumentError(
             "QoI \"$(q.name)\": every monad must reduce to the same keys, since each key becomes " *
             "its own sensitivity analysis and needs a value from every monad in the design. Monad " *
             "$(reference_id) gave $(repr(component_keys)) but monad $(monad_id) gave " *
-            "$(repr(_qoiComponentKeys(q, reduced[monad_id], monad_id)))."))
+            "$(repr(these_keys))."))
     end
 
-    #! An empty `Dict`/`NamedTuple` is not "no components" -- it is a reducer that named nothing, and
-    #! silently storing no result for a QoI the user explicitly asked for is the kind of quiet
-    #! nothing this path exists to avoid. It would also never be marked evaluated, so every later
-    #! call would re-read every simulation's output to store nothing again.
-    isnothing(component_keys) || !isempty(component_keys) || throw(ArgumentError(
-        "QoI \"$(q.name)\": its `reduce` returned an empty $(typeof(reduced[reference_id])), so it " *
-        "names no quantities and there is nothing to analyse. Return a `Real`, or a " *
-        "`Dict`/`NamedTuple` with at least one key."))
-    labels = isnothing(component_keys) ? [q.name] : [_qoiLabel(q.name, k) for k in component_keys]
-    #! Checked HERE, where the keys are still in hand, because afterwards only the labels survive.
-    #! Two distinct keys can land on one label -- `1` and `"1"`, the same collision the sink guards
-    #! against -- and neither downstream path handles it: `calculateGSA!`'s cross-QoI check reports
-    #! "comes from both QoI \"q\" and QoI \"q\". Rename one of them", advice that cannot work,
-    #! while the single-measurement method has no such check and simply lets one analysis overwrite
-    #! the other.
-    allunique(labels) || throw(ArgumentError(
-        "QoI \"$(q.name)\": " * _qoiDuplicateLabelMessage(component_keys, labels)))
+    #! Labels and values both come from `_keyedEntries`, the strict spreader the sink also uses;
+    #! calibration's `_summaryEntries` names components identically and differs only in imposing no
+    #! rule on what they hold. Building them here meant sensitivity analysis and the sink each wrote
+    #! `"<name>.<key>"` themselves and agreed only by inspection. It also refuses two keys that
+    #! collide once stringified (`1` and `"1"`), where the raw keys are still in hand, which is why
+    #! no `allunique(labels)` check follows: neither downstream path handled that case
+    #! (`calculateGSA!`'s cross-QoI check would name one QoI twice, and the single-measurement
+    #! method let one analysis overwrite the other).
+    entries = Dict{Int,Vector{Pair{_SummaryKey,Float64}}}(
+        monad_id => _keyedEntries(q, reduced[monad_id], "`reduce` on monad $(monad_id)")
+        for monad_id in checked)
+    labels = [summaryLabel(key) for (key, _) in entries[reference_id]]
     out = Pair{String,Matrix{Float64}}[]
     for (i, label) in enumerate(labels)
         vals = zeros(Float64, size(monad_id_df))
         for (ind, monad_id) in enumerate(monad_ids)
-            v = reduced[monad_id]
-            vals[ind] = _qoiComponentValue(q, label, monad_id,
-                                           isnothing(component_keys) ? v : v[component_keys[i]])
+            vals[ind] = last(entries[monad_id][i])
         end
         push!(out, label => vals)
     end

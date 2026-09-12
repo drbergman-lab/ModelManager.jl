@@ -305,6 +305,10 @@ _isAnonymousFunction(f::Function) = occursin('#', string(typeof(f)))
 #! A `QoI` is only as restorable as the two functions inside it, so it is anonymous if either is. Both
 #! are checked: a named `compute` with an anonymous `reduce` would round-trip as a QoI that silently
 #! averages instead of doing the monad-level step it was written for.
+#!
+#! `q.data` is deliberately NOT consulted. It is data, not code, and JLD2 stores it inside the `QoI`
+#! like any other field, so a `QoI` carrying an observation resumes with that observation — which is
+#! the whole point of the slot, and why `_ProblemManifest` needed no field for it.
 _isAnonymousFunction(q::QoI) = _isAnonymousFunction(q.compute) || _isAnonymousFunction(q.reduce)
 _isAnonymousFunction(qs::AbstractVector{QoI}) = any(_isAnonymousFunction, qs)
 

@@ -111,8 +111,9 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
 5. Classifies the outcome (see `_batchOutcome`) and records any failed simulation and
    monad IDs to the generation's failure files (see `_recordBatchFailures`).
 6. Returns a `Vector{Tuple{Union{Float64,Missing},Int}}` (distance, monad_id) in proposal order.
-   A `missing` distance means the monad had no successful simulation, so no distance exists —
-   distinct from any value the user's `distance` function could return.
+   A `missing` distance means no distance exists for that monad — no successful simulation, or a
+   summary statistic with no value — which is distinct from any value the user's `distance`
+   function could return.
 
 `verbosity` is a resolved level (see `_resolveVerbosity`); a per-generation batch
 counter is maintained across calls so batch milestones can be numbered within each generation.
@@ -130,14 +131,25 @@ detected from the database *before* any user code runs, and `on_monad_failure` d
 Partially failed monads (at least one success) are evaluated normally from whatever succeeded;
 their failed simulations are still recorded. Re-running to "top off" the missing replicates is
 deliberately not attempted.
+
+A monad that *does* have output but whose summary statistic has no value — every replicate's
+`compute` returned `missing`, or a QoI's `reduce` did — is in the same position, no value to compare,
+and follows the same policy, from `_evaluateParticle`. Its recording differs, because nothing
+failed: no simulation or monad ID goes to the failure files, so those monads are named in a
+per-generation `@warn` of their own (see `_warnMissingSummaries`) instead. Under `:error`,
+`_evaluateParticle` names the QoI that had no value rather than pointing at failure files that were
+never written.
 """
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
                               max_nr_populations::Int, run_kwargs::NamedTuple=(;);
                               verbosity::Symbol=:generation,
                               on_monad_failure::Symbol=:reject)
     _validateEvaluationFailurePolicy(on_monad_failure)
-    batch_counts       = Dict{Int,Int}()
-    warned_generations = Set{Int}()
+    batch_counts               = Dict{Int,Int}()
+    warned_generations         = Set{Int}()
+    #! A separate set from `warned_generations`: the two warnings report different things, so one
+    #! firing must not silence the other in the same generation.
+    warned_summary_generations = Set{Int}()
 
     function evaluate_batch(t::Int,
                              proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}})
@@ -179,7 +191,7 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         failed_set = Set(failed_simulations)
         no_success = Set(without_success)
 
-        return Tuple{Union{Float64,Missing},Int}[
+        results = Tuple{Union{Float64,Missing},Int}[
             if monad.id in no_success
                 on_monad_failure === :error &&
                     _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad.id,
@@ -187,21 +199,45 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
                 (missing, monad.id)
             else
                 (_evaluateParticle(problem, monad.id,
-                                   count(in(failed_set), sim_ids_before[monad.id])),
+                                   count(in(failed_set), sim_ids_before[monad.id]),
+                                   on_monad_failure),
                  monad.id)
             end
             for monad in monads]
+
+        #! The other half of `on_monad_failure` leaves no trace of its own: a monad that HAD output
+        #! but no summary value contributes to neither failure vector, so no failure file is written
+        #! and `_warnFailuresRecorded` never fires; from generation 2 on it does not even get a
+        #! proposal row. Rejected silently, a measurement that never has a value looks exactly like a
+        #! model that never fits — so it is reported here, once per generation, like a failure.
+        _warnMissingSummaries(verbosity, t, warned_summary_generations,
+                              [mid for (d, mid) in results if ismissing(d) && !(mid in no_success)])
+        return results
     end
     return evaluate_batch
 end
 
+#! A `missing` summary is not a bug in the user's functions, so it does not go down the fail-fast
+#! path with them. A QoI says `missing` when a simulation produced no value, and a monad every one of
+#! whose replicates said so is in exactly the position of a monad with no successful simulation:
+#! there is no output to compare. So it follows `on_monad_failure` -- rejected under `:reject`, fatal
+#! under `:error` -- rather than being reported as a fault the user must fix in their code.
+#!
+#! Checked between the two calls rather than after them, so a `missing` returned by the user's own
+#! `distance` still raises "a `Real` is required". Those are different mistakes.
 """
-    _evaluateParticle(problem, monad_id, n_failed_simulations) → Float64
+    _evaluateParticle(problem, monad_id, n_failed_simulations, on_monad_failure) → Float64 or missing
 
 Compute one particle's distance by calling the user's `summary_statistic` and `distance` on a
 monad that has at least one successful simulation.
 
-Both calls are user code, so both are guarded — but neither failure is recoverable: the monad
+Returns `missing` when the summary statistic has no value for this monad — every replicate's
+`compute` returned `missing`, or the QoI's `reduce` did — under `on_monad_failure=:reject`; `:error`
+stops the run instead, naming the QoI that had no value.
+
+Both calls are user code, so both are guarded — and the error names *which* of the two raised,
+since a `summary_statistic` failure is a fault in a `compute` or a `reduce` while a `distance`
+failure is usually a key mismatch against `observed_data`. Neither is recoverable: the monad
 *does* have output, so an exception (or a `distance` return value that is not a `Real`) is a
 fault in the user's functions, not a simulation failure. Either way the run stops with the monad
 ID named, rather than propagating a `missing`/`nothing` into the ABC-SMC internals where it
@@ -209,19 +245,43 @@ surfaces much later as an unrelated `MethodError`. `n_failed_simulations` is rep
 non-zero, since a partially failed monad is the likeliest reason otherwise-correct user code
 trips here.
 """
-function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int)
+function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int,
+                           on_monad_failure::Symbol)
     partial_note = n_failed_simulations == 0 ? "" :
         "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
         "they would have produced is missing."
+    #! Which of the two raised is known at each call site and nowhere else afterwards, so the note
+    #! takes it as an argument rather than naming both and leaving the reader to work it out from a
+    #! backtrace. The two are diagnosed differently: a `summary_statistic` failure is in a `compute`
+    #! or a `reduce`, while a `distance` failure is usually a key mismatch against `observed_data`.
+    user_code_note(which) = """
+    Calibration failed while evaluating monad $monad_id: `$(which)` raised. This monad has at \
+    least one successful simulation, so the fault is in that function rather than in the \
+    simulations.$partial_note
+    """
+    simulated, missing_source = try
+        _evaluateSummary(problem.summary_statistic, monad_id)
+    catch
+        @error user_code_note("summary_statistic")
+        rethrow()
+    end
+    if ismissing(simulated)
+        #! Names the QoI and BOTH causes rather than asserting one: the code cannot tell whether
+        #! every replicate's `compute` said `missing` or the reducer did, and a `Vector{QoI}` goes
+        #! missing as soon as its FIRST valueless member does, however healthy the others are. The
+        #! old message asserted "every one of its simulations returned `missing`" for all of that.
+        on_monad_failure === :error && error("""
+        Calibration stopped: the summary statistic has no value for monad $monad_id — QoI \
+        "$(missing_source)" has none for it, because every one of its simulations returned \
+        `missing` or its `reduce` did. There is nothing to compare with `observed_data`.$partial_note
+        Pass `on_monad_failure=:reject` to reject such particles and continue the run instead.
+        """)
+        return missing
+    end
     distance = try
-        simulated = _evaluateSummary(problem.summary_statistic, monad_id)
         problem.distance(simulated, problem.observed_data)
     catch
-        @error """
-        Calibration failed while evaluating monad $monad_id: `summary_statistic` or `distance` \
-        raised. This monad has at least one successful simulation, so the fault is in those \
-        functions rather than in the simulations.$partial_note
-        """
+        @error user_code_note("distance")
         rethrow()
     end
     distance isa Real || error("""
@@ -322,9 +382,10 @@ saved in two forms:
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
-  simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
-  which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad yields no distance — no
+  successful simulation, or a summary statistic that is `missing` because every replicate's
+  `compute` was. `:reject` records the distance as `missing`, which ABC-SMC never accepts, and
+  continues; `:error` stops the run. Either way the failed
   simulation and monad IDs are recorded per generation in
   `generations/{t}/failed_simulations.csv` and
   `generations/{t}/failed_monads.csv`.
@@ -392,7 +453,8 @@ constructor, so every field it accepts is accepted here, with the same defaults.
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`,
   `:bar`). `:auto` shows a live progress bar on an interactive terminal and per-generation
   milestones otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful simulation.
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad yields no distance — no
+  successful simulation, or a summary statistic that is `missing` because every replicate's was.
   `:reject` records its distance as `missing` (so the particle is never accepted) and continues;
   `:error` stops the run. Failed simulation and monad IDs are recorded per generation either way, in
   `generations/{t}/failed_simulations.csv` and
@@ -618,9 +680,10 @@ At resume time:
 struct _ProblemManifest
     inputs::InputFolders
     sources::Vector{Any}       # DVSource | CVSource | LVSource | _StrippedLVSource
-    #! Untyped to match `CalibrationProblem.observed_data`: `mseDistance` accepts a `Dict`, a
-    #! `Vector` or a scalar, and `_saveProblem` runs before generation 1, so a narrower type here
-    #! rejects two of the three documented shapes before a run can start.
+    #! Untyped to match `CalibrationProblem.observed_data`, which is whatever the problem's own
+    #! `distance` accepts as its second argument -- `mseDistance` alone takes a `Dict` or a scalar.
+    #! `_saveProblem` runs before generation 1, so a narrower type here would reject a shape before
+    #! the run could start.
     observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID
