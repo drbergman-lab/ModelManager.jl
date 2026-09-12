@@ -114,7 +114,9 @@ function _driverTemplateContents()
 
     echo "ModelManager driver job \$SLURM_JOB_ID starting on \$(hostname) at \$(date)"
 
-    julia --project=$(project) "\$@"
+    # "\$@" is whatever you passed after the script name -- see "submit:" above:
+    #     sbatch driver_template.sbatch my_script.jl
+    julia --project=$(project) "\$@"   # <-- LOOK AT HOW TO SUBMIT ABOVE
 
     echo "ModelManager driver job \$SLURM_JOB_ID finished at \$(date)"
     """
