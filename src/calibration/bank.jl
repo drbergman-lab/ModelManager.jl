@@ -3,8 +3,9 @@
 """
     SimulationBank
 
-Pre-built registry of existing monads whose calibrated parameters lie strictly
-within the prior support `(0,1)^d` in CDF space.
+Pre-built registry of existing monads whose calibrated parameters lie inside the prior
+support in CDF space — `(0,1)` per continuous dimension, `(0,1]` per discrete one, whose
+top level has a CDF of exactly 1.
 
 Built once at calibration start by `_buildSimulationBank` and reused across
 all generations for approximate simulation reuse (CDF-grid snapping).
@@ -40,7 +41,7 @@ end
     _buildSimulationBank(problem::CalibrationProblem) → SimulationBank
 
 Query the database for all existing monads compatible with `problem` whose calibrated
-parameters lie strictly within `(0,1)^d` in CDF space.
+parameters lie inside the prior support in CDF space.
 
 **Terminology used below:**
 - *Parameter*: a user-supplied `CalibrationParameter` target (may or may not have a
@@ -65,7 +66,8 @@ parameters lie strictly within `(0,1)^d` in CDF space.
    - **`CVSource` joint consistency**: the latent CDF recovered from the first target must
      forward-map back to all other targets within relative tolerance 1e-8. Monads that do
      not lie on the co-variation curve are excluded.
-4. All CDF coordinates are strictly in `(0, 1)`.
+4. Every CDF coordinate is inside its own prior's support: `(0, 1)` for a continuous latent
+   parameter, `(0, 1]` for a discrete one, since a discrete top level has a CDF of exactly 1.
 5. At least one of the monad's simulations has started or completed (see
    `_monadsWithStartedSimulations`). The point of the bank is to snap onto nearby
    work that is already (partly) done; a monad whose simulations have not started yet has
@@ -73,7 +75,8 @@ parameters lie strictly within `(0,1)^d` in CDF space.
 
 `LVSource` parameters without `inverse_maps` disable the bank (returns empty, informational
 log emitted). `LVSource` parameters with `inverse_maps` are supported: target-space bounds
-checks are skipped for their columns (Phase 2) and Phase 3 CDF inversion filters via `0 < u < 1`.
+checks are skipped for their columns (Phase 2) and Phase 3 filters on the CDF coordinates the
+inversion produces.
 
 Returns a `SimulationBank` with zero columns when no compatible monads exist.
 """
@@ -296,7 +299,7 @@ function _buildSimulationBank(problem::CalibrationProblem)
         cdf_coords = Float64[]
         for cp in cps
             coords = _bankCdfCoords(cp, all_targets)
-            if isnothing(coords) || any(u -> !(0 < u < 1), coords)
+            if isnothing(coords) || !_bankCoordsUsable(cp.lv, coords)
                 ok = false; break
             end
             append!(cdf_coords, coords)
@@ -409,6 +412,20 @@ end
 _bankColDistribution(::LVSource, ::LatentVariation, ::String) = nothing
 
 ################## CDF inversion helpers ##################
+
+#! The interior filter, per latent dimension rather than over the whole coordinate vector. `0 < u < 1`
+#! is a statement about a *continuous* prior, whose CDF reaches its bounds only in the limit, so a
+#! coordinate that got there came from a value outside the support. A discrete prior reaches 1.0 at its
+#! top level and nowhere else — `cdf(DiscreteUniform(1, k), k) == 1` — so the strict test threw away
+#! every monad run at that level, a level the sampler proposes as often as any other. Nothing
+#! downstream minds: the bank's coordinates are compared in an L∞ box and become a particle's own
+#! coordinates, `quantile(DiscreteUniform(1, k), 1.0)` is `k`, the kernels stay inside [0,1], and the
+#! prior density is 1 everywhere in CDF space. Zero stays excluded either way: no level maps to it.
+_bankCoordUsable(::Distribution, u::Real) = 0 < u < 1
+_bankCoordUsable(::DiscreteUnivariateDistribution, u::Real) = 0 < u <= 1
+
+_bankCoordsUsable(lv::LatentVariation, coords) =
+    all(_bankCoordUsable(d, u) for (d, u) in zip(lv.latent_parameters, coords))
 
 """
     _bankCdfCoords(cp::CalibrationParameter, vals::Dict{String,Float64})
