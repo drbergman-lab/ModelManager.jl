@@ -17,22 +17,31 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function — ideally one that
-  **declares it takes a [`Simulation`](@ref)**, `f(s::Simulation)` or `(s::Simulation) -> …`, since
-  one that does not is warned about. In every case the
-  measurement is made once per *simulation* and the replicates are combined by `reduce` (`mean` for a
-  plain function; a `QoI` is how you choose otherwise, and its `reduce` receives every replicate's
-  value, so a step that must happen *after* averaging goes there). A single QoI or a plain function
-  reports its value directly; a vector of QoIs reports a `Dict` keyed by QoI name.
+- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function (wrapped into a `QoI`
+  with the default reducer). The measurement is made once per *simulation* and the replicates are
+  combined by `reduce`, which receives every replicate's value — so a step that must happen *after*
+  averaging goes there.
 
-  The annotation matters because the previous contract called a bare function once per *monad* and
-  let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
-  reinterpreting one silently would change results without raising. It is warned about rather than
-  refused, since refusing every unannotated function would also reject `sim -> measure(sim)`, the
-  natural way to write a new-contract lambda. The warning is transitional and goes in v0.10.
-- `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
-  of `summary_statistic`; `observed` is `observed_data`.
-  Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
+  **`distance` receives a [`SummaryValues`](@ref)**, always — for one QoI as much as for a vector,
+  and for a `Real`-valued QoI as much as a keyed one. It is keyed by `(qoi name, component key)`
+  pairs, the same pairs the sink turns into columns and sensitivity analysis into labels, and
+  answers to three spellings: `"counts"` for a `Real`-valued QoI, `"counts.tumor"` for a component,
+  and the bare `"tumor"` when exactly one QoI reports that key. So two QoIs may share a name (with
+  disjoint keys) or a component key (under different names) without colliding.
+
+  **Calibration constrains the values themselves not at all.** Whatever `reduce` returned is what
+  arrives: a `Real` under `(name, nothing)`, a keyed value one entry per key, and anything else —
+  a `Vector`, a `Matrix`, your own struct — whole under `(name, nothing)`. Your `distance` is the
+  only reader, so it is the only thing that decides what can be compared. (The post-processing sink
+  and sensitivity analysis each need a number per column and per monad, and say so.)
+
+  A monad whose every replicate returned `missing` has no summary; its particle is handled by
+  `on_monad_failure` (see [`runCalibration`](@ref)) rather than reported as a bug in your functions.
+- `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the
+  [`SummaryValues`](@ref) described above; `observed` is `observed_data`.
+  Built-in: [`mseDistance`](@ref) — a keyed observation resolved through those spellings (extra
+  simulated components are ignored), an unkeyed observation against a one-value summary, or two
+  values that broadcast, including two arrays.
 - `n_replicates::Int`: Number of replicate simulations to run per proposed particle
   (default 1). Values > 1 reduce stochastic noise in each particle evaluation at the cost
   of N× more compute.
@@ -53,7 +62,7 @@ function countDefaultCells(sim::Simulation)
     return Float64(only(counts[counts.cell_type .== "default", :count]))
 end
 
-# A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
+# A `Real`-valued QoI is named by the QoI itself, so `observed` is keyed by that name.
 observed = Dict("default" => 100.0)
 problem = CalibrationProblem(
     ref,

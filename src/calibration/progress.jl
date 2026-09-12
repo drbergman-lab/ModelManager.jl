@@ -107,6 +107,36 @@ function _warnFailuresRecorded(verbosity::Symbol, t::Int, warned_generations::Se
     return nothing
 end
 
+#! No file to point at, deliberately: nothing failed. These monads ran, produced output, and were
+#! rejected because the measurement had no value for them -- so the IDs go in the warning itself,
+#! which is the only record of them. Once per generation, for the same reason as above: a
+#! measurement that never has a value would otherwise warn once per particle.
+"""
+    _warnMissingSummaries(verbosity, t, warned_generations, monad_ids)
+
+Warn, at most once per generation, that `monad_ids` produced output but no summary value, so their
+particles were rejected. Generations already reported are tracked in `warned_generations`. Silent
+when there are none, and when `verbosity` is `:none`.
+"""
+function _warnMissingSummaries(verbosity::Symbol, t::Int, warned_generations::Set{Int},
+                               monad_ids::AbstractVector{<:Integer})
+    isempty(monad_ids) && return nothing
+    _verbosityRank(verbosity) >= _verbosityRank(:generation) || return nothing
+    t in warned_generations && return nothing
+    push!(warned_generations, t)
+    n = length(monad_ids)
+    @warn """
+    ABC-SMC generation $t: $n monad$(n == 1 ? "" : "s") produced output but no summary value — \
+    every replicate's `compute` returned `missing`, or a QoI's `reduce` did — so $(n == 1 ?
+    "that particle was" : "those particles were") rejected. Nothing failed for these, so they are \
+    not in the generation's failure files; their monad IDs are
+      $(_compressedIDStr(sort(collect(monad_ids))))
+    Later ones in this generation are rejected without another warning. Re-run with \
+    `on_monad_failure=:error` to stop at the first one, naming the QoI.
+    """
+    return nothing
+end
+
 """
     _batchProgressCallback(verbosity, desc) → Union{Nothing,Function}
 

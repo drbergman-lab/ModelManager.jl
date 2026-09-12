@@ -291,8 +291,8 @@ unbiased prior sample while still avoiding redundant simulation work.
   caller to route provenance records to a per-generation file.
 
   A `missing` distance means no distance could be computed for that particle — for the
-  ModelManager implementation, that its monad had no successful simulation (see
-  `_buildEvaluateBatch`). Such particles are never accepted: generation 1 drops them
+  ModelManager implementation, that its monad had no successful simulation, or no summary value
+  (see `_buildEvaluateBatch`). Such particles are never accepted: generation 1 drops them
   before setting ε, and later generations reject them without comparing against ε. `missing`
   rather than a sentinel value keeps the signal distinct from any distance a user's `distance`
   function might legitimately return, `Inf` included.
@@ -555,11 +555,12 @@ _firstGenerationProposals(results) =
 Build generation 1's accepted set. Generation 1 has no epsilon threshold and accepts every
 proposal — *except* those whose distance is `missing`, which are dropped here.
 
-`missing` means the particle has no distance at all: its monad had no successful simulation, so
-the summary statistic was never computed (see `_buildEvaluateBatch`). Such a particle
+`missing` means the particle has no distance at all: its monad had no successful simulation, so the
+summary statistic was never computed, or the summary has no value for it — every replicate's
+`compute` returned `missing`, or a QoI's `reduce` did (see `_buildEvaluateBatch`). Such a particle
 cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` for the whole
-generation. Errors when no particle survives — a whole generation of failed monads is a broken
-model, not sampling noise.
+generation. Errors when no particle survives — a whole generation without a distance is a broken
+model or a broken measurement, not sampling noise.
 
 The generation therefore holds **fewer than `population_size` particles** when any monad failed;
 the uniform weights are renormalized over the survivors. Generation 1 proposes exactly
@@ -575,16 +576,19 @@ function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Uni
                                for i in eachindex(proposals) if !ismissing(results[i][1])]
     if isempty(accepted)
         error("""
-        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads had a successful \
-        simulation, so no particles could be accepted.
-        Check the generation's failure files and the failed simulations' output folders, and \
-        re-run with `on_monad_failure=:error` to stop at the first failure.
+        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads produced a distance \
+        — no successful simulation, or a summary statistic with no value — so no particles could be \
+        accepted.
+        Check the generation's failure files (if any simulations failed) and those simulations' \
+        output folders, and the warnings above (for monads whose summary was `missing`, where \
+        nothing failed and so nothing was written). Re-run with `on_monad_failure=:error` to stop \
+        at the first one.
         """)
     end
     n_dropped = length(proposals) - length(accepted)
     n_dropped > 0 && @warn "ABC-SMC generation 1: dropped $n_dropped of " *
-                           "$(length(proposals)) proposals whose monads had no successful " *
-                           "simulation; ε and the particle weights are set from the " *
+                           "$(length(proposals)) proposals whose monads produced no distance; " *
+                           "ε and the particle weights are set from the " *
                            "$(length(accepted)) surviving particles."
     return accepted
 end
@@ -671,8 +675,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
 
         n_accepted_this_round = 0
         for (i, (distance, metadata)) in enumerate(results)
-            #! A `missing` distance means the monad had no successful simulation, so there is
-            #! nothing to compare against ε — the particle is rejected outright.
+            #! A `missing` distance means the monad had no successful simulation or no summary
+            #! value, so there is nothing to compare against ε — the particle is rejected outright.
             if !ismissing(distance) && distance <= epsilon
                 n_accepted_this_round += 1
                 push!(proposal_rows, _proposalRow(distance, metadata, true))
@@ -1013,9 +1017,10 @@ function _adaptEpsilon(distances::Vector{Float64}, quantile_val::Float64,
 end
 
 #! Every proposal that produced a real distance, accepted or not. `missing` distances are left out:
-#! they mean the monad had no successful simulation, which is not a distance and cannot be binned —
-#! those monad IDs are already recorded in the generation's failed-monads file. Keeping them out also
-#! keeps `distance` a plain `Float64` column, so the reader needs no type hint.
+#! they mean the monad had no successful simulation, or no summary value, which is not a distance
+#! and cannot be binned — those monad IDs are recorded in the generation's failed-monads file, or,
+#! for a monad that ran but measured nothing, named in that generation's `@warn`. Keeping them out
+#! also keeps `distance` a plain `Float64` column, so the reader needs no type hint.
 #!
 #! `accepted` means "passed ε", not "ended up in the posterior". With `accept_overflow=false` a
 #! particle can pass ε and still be dropped because the batch overshot `population_size`; recording it

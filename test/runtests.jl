@@ -164,12 +164,6 @@ ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = TestSimulator())
 # The per-simulation measurements behind them. Named and top-level so the QoIs built from them are
 # restorable: a QoI is only as restorable as its `compute` and `reduce`.
 _sim_one(s::Simulation)    = 1.0
-# Signature shapes that broke `_declaresSimulation`'s method-table introspection. The `where` form is
-# a CORRECTLY migrated function, so rejecting it was worse than not checking at all.
-_sim_where(s::S) where {S<:Simulation}      = 1.0
-_sim_varargs(s::Simulation, extras...)      = 1.0
-_sim_unbounded(s::S) where {S}              = 1.0   # `S` is `Any`: carries no intent
-_sim_zeroarg()                              = 1.0
 _sim_two(s::Simulation)    = 2.0
 _sim_vec(s::Simulation)    = [1.0]
 # Shapes `_isAnonymousFunction` must tell apart. A factory's inner named function is a closure type
@@ -184,9 +178,24 @@ struct _Functor <: Function; k::Int; end
 _make_counting(calls::Ref{Int}) = (c(s) = (calls[] += 1; 1.0); c)
 # A single QoI reports its value directly; a vector reports a Dict keyed by name. That is what keeps
 # the scalar and vector `observed_data` shapes usable.
+# A keyed measurement: `compute` returns a Dict, the default reducer averages per key, and
+# calibration hands `distance` those very keys — unprefixed.
+_sim_keyed(s::Simulation)  = Dict("a" => 1.0, "b" => 2.0)
+# The same measurement in the other container. Its `Symbol` keys are stringified on the way to
+# `distance`, which is the only way a hand-written `observed_data` can name them.
+_sim_keyed_nt(s::Simulation) = (only = 1.0,)
+# Never has a value for any simulation. The whole monad therefore reduces to `missing`.
+_sim_never(s::Simulation)  = missing
+# Alternates, so a two-replicate monad always has exactly one value and one `missing` however many
+# times it is evaluated: the reduction is over what survived.
+const _half_missing_counter = Ref(0)
+_sim_half_missing(s::Simulation) = isodd(_half_missing_counter[] += 1) ? missing : 1.0
+# A single QoI reports its value directly; a vector reports one flat Dict keyed by whatever its
+# members named. That is what keeps a scalar `observed_data` usable.
 _test_named_ss             = [QoI("x", _sim_one)]
-_test_named_vec_ss         = QoI("vec", _sim_vec)
 _test_named_scalar_ss      = QoI("scalar", _sim_one)
+_test_never_ss             = [QoI("x", _sim_never)]
+_test_half_missing_ss      = [QoI("x", _sim_half_missing)]
 _test_named_dist(s, o)     = 0.0
 # Reports x=2.0 so mseDistance vs observed x=1.0 is always 1.0 (non-zero).
 # Used by resumeABC test to prevent premature convergence.
@@ -199,9 +208,79 @@ _qoi_sim(s::Simulation)   = getParameterValue(s, :config, XMLPath(["data", "x"])
 # A String-valued and a keyed compute, for the stored-value read-back tests.
 _qoi_label(s::Simulation) = "sim_$(s.id)"
 _qoi_pair(s::Simulation)  = (; a = _qoi_sim(s), b = 2 * _qoi_sim(s))
+# The calibration summary as `distance` sees it, without the "which QoI had no value" name that
+# `_evaluateSummary` pairs it with for `_evaluateParticle`.
+_summaryValue(ss, mid) = first(ModelManager._evaluateSummary(ss, mid))
+# A KEYED measurement of the same thing: the sink spreads it into "<name>.raw" / "<name>.twice"
+# columns, which is what `stored=` has to read back. Named and top-level so `stored=:require` can
+# be pointed at it from a second QoI.
+_qoi_keyed_from_x(s::Simulation) = Dict("raw" => _qoi_sim(s), "twice" => 2 * _qoi_sim(s))
+# The same measurement as a NamedTuple: the sink stores String keys either way, so verifying a
+# stored value against this compute is a stringified-key comparison.
+_qoi_keyed_nt_from_x(s::Simulation) = (raw = _qoi_sim(s), twice = 2 * _qoi_sim(s))
+# No value above a threshold on the parameter being calibrated, so one generation holds both
+# healthy particles and particles whose measurement has nothing to say. Generation 1 places its
+# particles on a Sobol sequence, so which side of the threshold each lands on is deterministic.
+_sim_missing_above(s::Simulation) = _qoi_sim(s) > 41.0 ? missing : 1.0
+_test_threshold_ss = [QoI("x", _sim_missing_above)]
+# Two measurements keyed the SAME way — one number per cell type each. The pairing that a bare-key
+# calibration namespace forbade, and the maintainer's own example: `count` and `speed` both report a
+# "tumor" and an "immune", and are told apart by the QoI's name.
+_qoi_count_by_type(s::Simulation) = Dict("tumor" => 10.0, "immune" => 20.0)
+_qoi_speed_by_type(s::Simulation) = Dict("tumor" => 1.0, "immune" => 2.0)
+
+# A `data`-carrying measurement: `compute` and `reduce` take the observation as a second argument
+# rather than closing over it, so both stay named functions and the QoI round-trips through JLD2.
+_qoi_with_data(s::Simulation, obs) = Dict("raw" => _qoi_sim(s),
+                                          "fit" => (_qoi_sim(s) - obs["target"])^2)
+function _qoi_reduce_with_data(per_sim, obs)
+    raw = mean(d["raw"] for d in per_sim)
+    return Dict("raw" => raw, "fit" => (raw - obs["target"])^2)
+end
+
 # A bare function in `functions=`: it now receives a `Simulation`, exactly like a QoI's `compute`.
 # Untyped on purpose -- that is how users write them, and it is the case dispatch cannot sniff.
 _qoi_by_id(sim)           = getParameterValue(sim, :config, XMLPath(["data", "x"]))
+
+# ---- The PCMM shape, as an acceptance test --------------------------------
+# A `compute` returning the simulator's own object (PCMM's is a population time series read out of
+# the output folder), a `reduce` turning the replicates into one series per cell type, and a
+# calibration comparing those series against observed ones with the built-in distance. None of this
+# could evaluate a single monad while the seam checked `compute`'s value before `reduce` ran.
+struct _TimeSeries
+    times::Vector{Float64}
+    counts::Dict{String,Vector{Float64}}
+end
+_qoi_time_series(s::Simulation) =
+    _TimeSeries([0.0, 1.0, 2.0],
+                Dict("tumor"  => [1.0, 2.0, 3.0] .* (_qoi_sim(s) / 1000),
+                     "immune" => [0.5, 1.0, 1.5]))
+function _qoi_time_series_reduce(per_sim)
+    types = sort(collect(keys(first(per_sim).counts)))
+    return Dict{String,Vector{Float64}}(t => mean(ts.counts[t] for ts in per_sim) for t in types)
+end
+
+# A `Vector`-valued `compute` consumed by a custom `reduce` and a custom `distance`: nothing in the
+# seam looks at either value, so this works without a key anywhere in sight.
+_qoi_vector(s::Simulation)   = [_qoi_sim(s), 2 * _qoi_sim(s)]
+_qoi_vector_reduce(per_sim)  = mean(per_sim)               # elementwise, giving a Vector back
+_qoi_vector_distance(sim, obs) = sum(abs2, sim["vecq"] .- obs)
+
+# A reducer returning one fixed object, so `distance` can be shown to receive that very object
+# rather than a converted copy of it.
+const _qoi_fixed_matrix      = [1.0 2.0; 3.0 4.0]
+_qoi_matrix_reduce(per_sim)  = _qoi_fixed_matrix
+
+# Ragged replicates reconciled by a custom reducer -- the shape PCMM's `endpointPopulationCountQoI`
+# was written for and which the seam refused before any reducer ran. Alternates so a two-replicate
+# monad always has one of each.
+const _ragged_calls = Ref(0)
+_qoi_ragged(s::Simulation) = isodd(_ragged_calls[] += 1) ? Dict("a" => 1.0) :
+                                                           Dict("a" => 3.0, "b" => 2.0)
+function _qoi_ragged_reduce(per_sim)
+    ks = union((keys(d) for d in per_sim)...)
+    return Dict(k => mean(get(d, k, 0.0) for d in per_sim) for k in ks)
+end
 
 # Reads a previously-stored post-processing value instead of recomputing from output. This is the
 # write-once-read-later path: the sink survives post-simulation cleanup, the output folder may not.
@@ -345,45 +424,228 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             Dict("a" => 1.0)
         ) ≈ 0.0
 
-        # Missing key in simulated → treated as 0.0
-        @test mseDistance(
-            Dict{String,Float64}(),
-            Dict("a" => 2.0)
-        ) ≈ 4.0
+        # An observed key the simulated value does not report is REFUSED, where it used to impute
+        # the absent key as zero. Zero-filling was a defensible reading — "there is nothing to
+        # report for that quantity" — but it meant an observation keyed one way and a summary keyed
+        # another compared every key against 0, which is a perfectly finite distance, so the run
+        # continued past the naming mistake with one warning in the log. Both key sets are named.
+        err = try; mseDistance(Dict{String,Float64}(), Dict("a" => 2.0)); nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("does not report", err.msg)
+        @test occursin("\"a\"", err.msg)
+        @test_throws ArgumentError mseDistance(Dict("a" => 1.0), Dict("b" => 1.0))
 
-        # Empty observed → distance is 0.0
-        @test mseDistance(
-            Dict("a" => 99.0),
-            Dict{String,Any}()
-        ) ≈ 0.0
+        # The OTHER direction is not a mistake at all: the observed keys are the comparison, and a
+        # simulated component the observation does not name is ignored. We always know more about a
+        # simulation than about the data, and refusing this forced a user to list every component
+        # of every summary QoI in `observed_data` or drop QoIs from the summary.
+        @test mseDistance(Dict("a" => 99.0), Dict{String,Any}()) ≈ 0.0
+        @test mseDistance(Dict("a" => 3.0, "b" => 99.0), Dict("a" => 1.0)) ≈ 4.0
+        @test mseDistance(Dict("a" => 1.0, "b" => 2.0), Dict("a" => 1.0)) ≈ 0.0
 
-        # Vector values (time-series): MSE averaged element-wise, then averaged across keys
-        @test mseDistance(
-            Dict{String,Any}("a" => [1.0, 2.0, 3.0]),
-            Dict{String,Any}("a" => [2.0, 2.0, 2.0])
-        ) ≈ (1.0 + 0.0 + 1.0) / 3
+        # A genuine key mismatch prints both sides' RAW keys with `repr`, so a `Symbol` and a
+        # `String` naming different quantities read differently rather than as two identical lists.
+        err = try; mseDistance(Dict(:a => 3.0), Dict("b" => 3.0)); nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("[:a]", err.msg) && occursin("[\"b\"]", err.msg)
 
-        # Mixed scalar and vector keys
-        @test mseDistance(
-            Dict{String,Any}("counts" => [1.0, 3.0], "frac" => 0.5),
-            Dict{String,Any}("counts" => [2.0, 2.0], "frac" => 1.0)
-        ) ≈ ((1.0 + 1.0)/2 + 0.25) / 2
+        # A key TYPE difference is NOT a mismatch: keys are matched as strings, so a `Dict` may be
+        # compared with a `NamedTuple` and `:a` with "a". The signature used to be stricter than the
+        # QoI contract it serves, which accepts either container for one measurement.
+        @test mseDistance(Dict(:a => 3.0), Dict("a" => 1.0)) ≈ 4.0
+        @test mseDistance((a = 3.0, b = 4.0), Dict("a" => 1.0, "b" => 2.0)) ≈ 4.0
+        @test mseDistance(Dict("a" => 3.0), (a = 1.0,)) ≈ 4.0
 
-        # Mismatched vector lengths → DimensionMismatch
-        @test_throws DimensionMismatch mseDistance(
-            Dict{String,Any}("a" => [1.0, 2.0]),
-            Dict{String,Any}("a" => [1.0, 2.0, 3.0])
-        )
+        # Two empty keyed values agree on their (empty) key set, so there is nothing to compare.
+        @test mseDistance(Dict{String,Float64}(), Dict{String,Any}()) ≈ 0.0
 
-        # Vector calling convention: sum of squared differences
-        @test mseDistance([1.0, 2.0], [3.0, 4.0]) ≈ 8.0   # (1-3)^2 + (2-4)^2 = 4+4
-        @test mseDistance([1.0, 2.0], [1.0, 2.0]) ≈ 0.0
-        @test_throws DimensionMismatch mseDistance([1.0], [1.0, 2.0])
+        # Any AbstractDict, not only Dict{String,<:Any}: `observed_data` is routinely Dict{String,Any}.
+        @test mseDistance(Dict(:a => 3.0), Dict(:a => 1.0)) ≈ 4.0
+        @test mseDistance(Dict{String,Float64}("a" => 3.0), Dict{String,Any}("a" => 1.0)) ≈ 4.0
+
+        # Two arrays compare through the generic fallback — the method that used to be refused on
+        # the grounds that no summary could be a `Vector`. A summary can hold one now, and this is
+        # what makes a QoI reducing to a time series calibratable with the built-in distance.
+        @test mseDistance([1.0, 2.0], [3.0, 4.0]) ≈ 4.0
+        @test mseDistance([1.0, 2.0], [3.0, 4.0]) ≈ mean(abs2, [1.0, 2.0] .- [3.0, 4.0])
+        @test mseDistance([1.0 2.0; 3.0 4.0], zeros(2, 2)) ≈ mean(abs2, [1.0, 2.0, 3.0, 4.0])
+
+        # A length mismatch is the commonest array mistake by a distance, so the message names BOTH
+        # lengths rather than reporting two identical types at the reader.
+        err = try; mseDistance([1.0, 2.0, 3.0], [1.0, 2.0]); nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("cannot compare", err.msg)
+        @test occursin("lengths 3 and 2", err.msg)
+
+        # A pair that cannot be subtracted at all is named by type.
+        err = try; mseDistance("a", 1.0); nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("cannot compare", err.msg)
+
+        # One term helper again, deliberately: the second pass inlined it on the grounds that one
+        # squared difference at one call site is not a function, and with a value that may be an
+        # array the arithmetic and its failure message have a real body. It returns a COUNT as well
+        # as a sum, which is what lets every method divide once at the end.
+        @test ModelManager._mseTerms(3.0, 1.0) == (4.0, 1)
+        @test ModelManager._mseTerms([1.0, 2.0], [3.0, 4.0]) == (8.0, 2)
+
+        # Normalisation is ONE global mean: the total over the number of DIFFERENCES computed. So a
+        # single array-valued key gives exactly mean(abs2, sim .- obs), and the same two arrays
+        # inside a keyed comparison give the same number as bare.
+        @test mseDistance(Dict("a" => [1.0, 2.0]), Dict("a" => [3.0, 4.0])) ≈
+              mseDistance([1.0, 2.0], [3.0, 4.0])
+        # ...and for all-scalar keys it is arithmetically what it always was.
+        @test mseDistance(Dict("a" => 3.0, "b" => 4.0), Dict("a" => 1.0, "b" => 2.0)) ≈ 4.0
 
         # Scalar calling convention: squared difference
         @test mseDistance(3.0, 1.0) ≈ 4.0
         @test mseDistance(1.0, 3.0) ≈ 4.0
         @test mseDistance(1.0, 1.0) ≈ 0.0
+    end
+
+    ################## mseDistance against a SummaryValues ##################
+
+    @testset "mseDistance over a SummaryValues" begin
+        sv = ModelManager.SummaryValues()
+        ModelManager._insertSummary!(sv, ("counts", "tumor"), 3.0)
+        ModelManager._insertSummary!(sv, ("counts", "immune"), 99.0)
+
+        # The observed keys are the comparison, in either spelling, and the summary component no
+        # observed key named is simply not compared rather than refused.
+        @test mseDistance(sv, Dict("counts.tumor" => 1.0)) ≈ 4.0
+        @test mseDistance(sv, Dict("tumor" => 1.0)) ≈ 4.0
+        @test mseDistance(sv, Dict(("counts", "tumor") => 1.0)) ≈ 4.0
+
+        # An observation that names NOTHING is refused. Without the guard there are no terms, so
+        # the mean is 0/0 and any number returned for it makes every particle perfect: ABC-SMC
+        # would accept the whole prior and report convergence. That is the zero-fill failure trying
+        # to come back in through the other door, which is why opening one closed the other.
+        err = try; mseDistance(sv, Dict{String,Float64}()); nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("no entries", err.msg)
+        @test occursin("counts.tumor", err.msg)
+
+        # Two spellings of ONE entry are refused, naming both: each resolves perfectly well alone,
+        # so the double counting is visible only from here.
+        err = try
+            mseDistance(sv, Dict("tumor" => 1.0, "counts.tumor" => 1.0)); nothing
+        catch e; e end
+        @test err isa ArgumentError
+        @test occursin("name one value", err.msg)
+        @test occursin("counts.tumor", err.msg)
+
+        # A `missing` component — a `reduce` returning Dict(k => missing), which nothing refuses
+        # now — is named here rather than surfacing a frame later as "distance returned a Missing".
+        miss = ModelManager.SummaryValues()
+        ModelManager._insertSummary!(miss, ("counts", "tumor"), missing)
+        err = try; mseDistance(miss, Dict("tumor" => 1.0)); nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("counts.tumor", err.msg)
+        @test occursin("`missing`", err.msg)
+
+        # A one-entry summary holding an ARRAY works against an array observation — the widening
+        # that replaced the `(::SummaryValues, ::Real)` method — and agrees with the bare
+        # comparison of the same two arrays.
+        arr = ModelManager.SummaryValues()
+        ModelManager._insertSummary!(arr, ("series", nothing), [1.0, 2.0])
+        @test mseDistance(arr, [3.0, 4.0]) ≈ mseDistance([1.0, 2.0], [3.0, 4.0])
+        @test mseDistance(arr, Dict("series" => [3.0, 4.0])) ≈ 4.0
+        # ...and a bare observation against several values is still refused, since which of them it
+        # meant cannot be guessed.
+        @test_throws ArgumentError mseDistance(sv, 1.0)
+        @test_throws ArgumentError mseDistance(sv, [1.0, 2.0])
+
+        # A summary must never reach the generic fallback: `broadcastable(::AbstractDict)` throws,
+        # so the ArgumentError above is what stands between a user and a broadcast error.
+        @test which(mseDistance, Tuple{ModelManager.SummaryValues,Vector{Float64}}).sig !==
+              which(mseDistance, Tuple{Vector{Float64},Vector{Float64}}).sig
+    end
+
+    ################## SummaryValues ##################
+
+    @testset "SummaryValues" begin
+        # The key space every consumer shares: a component is named by the QoI that produced it AND
+        # the key that QoI gave it. That is what lets a `count` and a `speed` both be keyed by cell
+        # type, which keying `distance`'s argument by the user's bare keys forbade.
+        s = ModelManager.SummaryValues()
+        ModelManager._insertSummary!(s, ("counts", "tumor"), 1.0)
+        ModelManager._insertSummary!(s, ("counts", "immune"), 2.0)
+        ModelManager._insertSummary!(s, ("speed", "tumor"), 3.0)
+        ModelManager._insertSummary!(s, ("score", nothing), 4.0)
+
+        @test s isa AbstractDict
+        @test length(s) == 4
+        # Insertion order, not hash order: QoIs as listed, components as `compute`/`reduce` gave them.
+        @test collect(keys(s)) == [("counts", "tumor"), ("counts", "immune"),
+                                   ("speed", "tumor"), ("score", nothing)]
+        @test collect(values(s)) == [1.0, 2.0, 3.0, 4.0]
+        @test first(collect(s)) == (("counts", "tumor") => 1.0)
+
+        # Three spellings, in the documented order.
+        @test s["score"] == 4.0                    # a Real-valued QoI, by its own name
+        @test s["counts.tumor"] == 1.0             # the sink-column / GSA-label spelling
+        @test s["immune"] == 2.0                   # a bare key only one QoI reports
+        @test s[:immune] == 2.0                    # a Symbol is stringified
+        @test s[("speed", "tumor")] == 3.0         # exact, no resolution
+        @test s[("score", nothing)] == 4.0
+
+        # A bare key two QoIs both report names no single value, and the message offers the
+        # qualified labels to choose between rather than picking one.
+        err = try; s["tumor"]; nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("\"counts.tumor\"", err.msg) && occursin("\"speed.tumor\"", err.msg)
+
+        # An unknown key lists what does exist.
+        err = try; s["nope"]; nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("\"counts.tumor\"", err.msg) && occursin("\"score\"", err.msg)
+
+        # `haskey` agrees with `getindex`: true exactly when the lookup resolves to one entry.
+        @test haskey(s, "score") && haskey(s, "counts.tumor") && haskey(s, "immune")
+        @test haskey(s, ("speed", "tumor")) && haskey(s, ("score", nothing))
+        @test !haskey(s, "tumor")            # ambiguous resolves to nothing, rather than throwing
+        @test !haskey(s, "nope")
+        @test get(s, "immune", -1.0) == 2.0
+        @test get(s, "tumor", -1.0) == -1.0
+
+        # `show` prints labels, which is what a user writes in `observed_data`.
+        @test occursin("\"counts.tumor\" => 1.0", sprint(show, s))
+
+        # The label is one function, and it is the sink column and the GSA label too.
+        @test ModelManager.summaryLabel(("counts", "tumor")) == "counts.tumor"
+        @test ModelManager.summaryLabel(("score", nothing)) == "score"
+
+        # A QoI name cannot contain a `.` but a component key can, so the split is at the FIRST one.
+        dotted = ModelManager.SummaryValues()
+        ModelManager._insertSummary!(dotted, ("counts", "a.b"), 7.0)
+        @test dotted["counts.a.b"] == 7.0
+        @test dotted["a.b"] == 7.0           # still resolvable as a bare key
+
+        # It holds whatever `reduce` returned, not numbers. One word — `Any` in the element type —
+        # is what makes calibrating a time series against a time series possible, since `distance`
+        # is the reader that decides what can be compared.
+        series = collect(1.0:10_000.0)
+        held = ModelManager.SummaryValues()
+        ModelManager._insertSummary!(held, ("counts", "tumor"), series)
+        ModelManager._insertSummary!(held, ("shape", nothing), (a = 1, b = "two"))
+        @test eltype(values(held)) == Any
+        @test held["counts.tumor"] === series            # the object itself, unconverted
+        @test held["shape"] == (a = 1, b = "two")
+
+        # ...and `show` stays bounded, because a summary is printed mostly from inside an error
+        # message and 10,000 points would bury it.
+        shown = sprint(show, held)
+        @test occursin("\"counts.tumor\" => ", shown)
+        @test occursin("…", shown)
+        @test length(shown) < 500        # rather than one line per point
+
+        # An empty summary reads as "nothing" rather than leaving "It reports ." in the message. It
+        # is reachable: a `reduce` returning an empty keyed value contributes no entries.
+        @test ModelManager._summaryLabelListStr(ModelManager.SummaryValues()) == "nothing"
+        err = try; ModelManager.SummaryValues()["nope"]; nothing; catch e; e; end
+        @test err isa ArgumentError
+        @test occursin("It reports nothing.", err.msg)
+        @test !occursin("name one of those", err.msg)   # nothing to name
     end
 
     ################## CalibrationProblem accepts variation objects ##################
@@ -1312,7 +1574,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                             (1.0, 11), (Inf, 12), (2.0, 13), (3.0, 14)])) == 4
 
         # No monad succeeded → error rather than an all-rejected generation.
-        @test_throws "had a successful simulation" ModelManager._acceptFirstGeneration(proposals,
+        @test_throws "produced a distance" ModelManager._acceptFirstGeneration(proposals,
                         Tuple{Union{Float64,Missing},Int}[
                             (missing, 11), (missing, 12), (missing, 13), (missing, 14)])
 
@@ -3044,7 +3306,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 run(acc; post_processor = sim -> begin
                     seen[] = (simulationID(sim), only(ModelManager.monadIDs(sim)),
                               pathToOutputFolder(sim))
-                    nothing
+                    missing
                 end)
                 @test seen[][1] == acc_id
                 @test seen[][2] == Monad(acc).id
@@ -3109,12 +3371,24 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 run(samp; post_processor = QoI("pp", sim -> (; sid = sim.id)))
                 @test calls[] == 0
 
-                # Callback returning `nothing` ⇒ no sink row for that sim.
+                # Callback returning `missing` ⇒ no sink row for that sim. This is also how a
+                # side-effects-only callback says "store nothing".
                 m_none = createTrial(inputs, [DiscreteVariation(:config, xp_x, 311.0)]; n_replicates=1)
-                run(m_none; post_processor = sp -> nothing)
+                run(m_none; post_processor = sp -> missing)
                 none_id = simulationIDs(m_none)[1]
                 all_ids = ("SimID" in names(postProcessingTable())) ? postProcessingTable().SimID : Int[]
                 @test none_id ∉ all_ids
+
+                # `nothing` is REFUSED, and the message says to return `missing`. It is what a
+                # callback returns by accident — a trailing `if` with no `else`, a `for` loop — so
+                # accepting it as "store nothing" makes a dropped measurement indistinguishable from
+                # an intended skip.
+                e_nothing = @test_throws ModelManager._SimulationStageError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 312.0)]; n_replicates=1);
+                    post_processor = QoI("nq_nothing", sp -> nothing))
+                nothing_msg = sprint(showerror, e_nothing.value)
+                @test occursin("nq_nothing", nothing_msg)
+                @test occursin("`missing`", nothing_msg)
 
                 # AbstractDict return + a *new* quantity ⇒ dynamic column; earlier rows get `missing`.
                 m_new = createTrial(inputs, [DiscreteVariation(:config, xp_x, 321.0)]; n_replicates=1)
@@ -3139,13 +3413,29 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test up.a[1] == 2.0
                 @test up.b[1] == 3.0
 
-                # Invalid return values ⇒ ArgumentError (surfaced from the serial write loop).
-                @test_throws ArgumentError run(
+                # Invalid return values are refused at the QoI seam, so the error names the QoI and
+                # the offending type rather than surfacing from the DB layer. It is raised inside
+                # the per-simulation stage, hence the stage wrapper.
+                e_vec = @test_throws ModelManager._SimulationStageError run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 331.0)]; n_replicates=1);
-                    post_processor = sp -> [1, 2, 3])
-                @test_throws ArgumentError run(
+                    post_processor = QoI("vq", sp -> [1, 2, 3]))
+                @test occursin("vq", sprint(showerror, e_vec.value))
+                @test_throws ModelManager._SimulationStageError run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 332.0)]; n_replicates=1);
                     post_processor = QoI("bq", sp -> (; bad = [1.0, 2.0])))
+
+                # A `String` is no longer storable anywhere. Tagging is where text about a
+                # simulation belongs, and the sink's TEXT column type went with the rule.
+                e_str = @test_throws ModelManager._SimulationStageError run(
+                    createTrial(inputs, [DiscreteVariation(:config, xp_x, 333.0)]; n_replicates=1);
+                    post_processor = QoI("sq", sp -> "done"))
+                str_msg = sprint(showerror, e_str.value)
+                @test occursin("sq", str_msg)
+                @test occursin("tag", str_msg)
+                @test "sq" ∉ names(postProcessingTable())
+                # ...and the sink's own column-type guard agrees, so nothing reaches it by another
+                # route either.
+                @test_throws ArgumentError ModelManager._postProcessingColumnSpec("sq", "done")
 
                 # printPostProcessingTable routes the DataFrame through the sink.
                 captured = Ref{Any}(nothing)
@@ -3203,10 +3493,17 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test "wq.$(weird)" in names(pt)
                 @test pt[1, "wq.$(weird)"] == 5.0
 
-                # Dict keys that collide after string conversion (1 vs "1") → ArgumentError.
-                @test_throws ArgumentError run(
+                # Dict keys that collide after string conversion (1 vs "1") are refused where the
+                # RAW keys are still in hand — the one spreading function every consumer goes
+                # through — so the message can show which two they were. That is inside the
+                # per-simulation stage, hence the stage wrapper; the sink's own `allunique` remains
+                # as the guard for a value that reaches it by another route.
+                e_col = @test_throws ModelManager._SimulationStageError run(
                     createTrial(inputs, [DiscreteVariation(:config, xp_x, 372.0)]; n_replicates=1);
                     post_processor = QoI("cq", sp -> Dict(1 => 1.0, "1" => 2.0)))
+                @test occursin("all produce the label", sprint(showerror, e_col.value))
+                @test_throws ArgumentError ModelManager._normalizePostProcessingQoI(
+                    ["dup" => 1.0, "dup" => 2.0])
             end
 
             @testset "post-processing sink follows deletions" begin
@@ -3394,22 +3691,37 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @testset "non-Dict observed_data survives runCalibration" begin
                 # _ProblemManifest declared observed_data::Dict{String,Any} while
                 # CalibrationProblem declares it ::Any, and runCalibration saves the problem before
-                # generation 1 — so the Vector and scalar shapes mseDistance documents threw on
-                # conversion. This is the regression whose absence let that ship.
+                # generation 1 — so a non-Dict observation threw on conversion. This is the
+                # regression whose absence let that ship. `observed_data` is whatever the problem's
+                # own `distance` accepts, so the manifest must stay untyped even though mseDistance
+                # itself now takes only a Dict or a scalar.
                 dv     = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 method = ABCSMC(population_size=2, max_nr_populations=1, minimum_epsilon=0.0)
-
-                vec_prob = CalibrationProblem(inputs, [dv], [1.0],
-                                              _test_named_vec_ss, mseDistance)
-                vec_result = runCalibration(method, vec_prob)
-                waitForDiagnostics()
-                @test vec_result isa ABCResult
 
                 scalar_prob = CalibrationProblem(inputs, [dv], 1.0,
                                                  _test_named_scalar_ss, mseDistance)
                 scalar_result = runCalibration(method, scalar_prob)
                 waitForDiagnostics()
                 @test scalar_result isa ABCResult
+
+                # A shape only the user's own distance understands still round-trips.
+                tuple_prob = CalibrationProblem(inputs, [dv], (lo=0.5, hi=1.5),
+                                                _test_named_scalar_ss, _test_named_dist)
+                tuple_result = runCalibration(method, tuple_prob)
+                waitForDiagnostics()
+                @test tuple_result isa ABCResult
+
+                # A NamedTuple-VALUED QoI runs against mseDistance end to end. Its keys are
+                # stringified on the way to `distance`, which is what makes them comparable with a
+                # hand-written observation at all: unnormalised, this reached mseDistance as a
+                # NamedTuple and MethodError'd after the whole generation had been simulated,
+                # reported as a fault in the user's functions.
+                nt_prob = CalibrationProblem(inputs, [dv], Dict("only" => 1.0),
+                                             QoI("ntss", _sim_keyed_nt), mseDistance)
+                nt_result = runCalibration(method, nt_prob; description="NamedTuple summary")
+                waitForDiagnostics()
+                @test nt_result isa ABCResult
+                @test all(isfinite, nt_result.generations[1].distances)
             end
 
             @testset "tags keyword on calibration entry points" begin
@@ -3907,6 +4219,82 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test all(isfinite, result.generations[1].distances)
             end
 
+            @testset "a missing summary follows on_monad_failure" begin
+                # A monad WITH output whose every replicate's `compute` said `missing` is in the
+                # same position as one with no successful simulation: there is nothing to compare.
+                # It used to reach `distance` as a `missing` and be reported as a fault in the
+                # user's functions, which it is not.
+                dv       = DistributedVariation(:config, xp_x, Uniform(25.0, 27.0))
+                observed = Dict{String,Any}("x" => 1.0)
+                prob = CalibrationProblem(inputs, [dv], observed, _test_never_ss, mseDistance)
+
+                # :reject rejects every particle, so generation 1 keeps nothing and the run stops
+                # for the same reason a wholly failed generation does.
+                method = ABCSMC(population_size=3, max_nr_populations=1, minimum_epsilon=0.0)
+                @test_throws "produced a distance" runCalibration(method, prob;
+                    description="missing summary, reject")
+                waitForDiagnostics()
+
+                # :error stops at the first one instead, and says what happened rather than blaming
+                # the user's `distance`.
+                e = try
+                    runCalibration(ABCSMC(population_size=3, max_nr_populations=1,
+                                          minimum_epsilon=0.0), prob;
+                                   description="missing summary, error", on_monad_failure=:error)
+                    nothing
+                catch err; err end
+                @test !isnothing(e)
+                emsg = sprint(showerror, e)
+                @test occursin("returned `missing`", emsg)
+                # The QoI that had no value is named, and both causes are given: a `Vector{QoI}`
+                # goes missing as soon as its FIRST valueless member does, however healthy the
+                # others are, so "every one of its simulations returned `missing`" was not a claim
+                # this code could make.
+                @test occursin("QoI \"x\" has none for it", emsg)
+                @test occursin("or its `reduce` did", emsg)
+                waitForDiagnostics()
+
+                # A partly-missing monad is still evaluated from whatever had a value: that is the
+                # point of dropping missing replicates rather than poisoning the reduction.
+                half = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(28.0, 30.0))],
+                                          observed, _test_half_missing_ss, mseDistance;
+                                          n_replicates=2)
+                half_result = runCalibration(ABCSMC(population_size=2, max_nr_populations=1,
+                                                    minimum_epsilon=0.0), half;
+                                             description="half missing")
+                waitForDiagnostics()
+                @test half_result isa ABCResult
+                @test all(isfinite, half_result.generations[1].distances)
+
+                # And the mixed case the policy is really for: SOME particles' summaries have no
+                # value, the rest are healthy. The run survives on the survivors, the generation is
+                # smaller than the population asked for, and one warning per generation names the
+                # monads it happened to — nothing failed, so no failure file mentions them and
+                # without the warning they left no trace at all.
+                mixed_prob = CalibrationProblem(inputs,
+                                                [DistributedVariation(:config, xp_x,
+                                                                      Uniform(30.0, 50.0))],
+                                                observed, _test_threshold_ss, mseDistance)
+                mixed_result = nothing
+                logs, _ = Test.collect_test_logs() do
+                    mixed_result = runCalibration(ABCSMC(population_size=4, max_nr_populations=1,
+                                                         minimum_epsilon=0.0), mixed_prob;
+                                                  description="missing summary, mixed")
+                end
+                waitForDiagnostics()
+                @test mixed_result isa ABCResult
+                n_kept = nrow(mixed_result.generations[1].particles)
+                @test 0 < n_kept < 4
+                @test all(isfinite, mixed_result.generations[1].distances)
+                summary_warns = [l for l in logs
+                                 if l.level == Base.CoreLogging.Warn &&
+                                    occursin("produced output but no summary value",
+                                             string(l.message))]
+                @test length(summary_warns) == 1
+                @test occursin("rejected", string(summary_warns[1].message))
+            end
+
             @testset "on_monad_failure=:error" begin
                 dv       = DistributedVariation(:config, xp_x, Uniform(16.0, 18.0))
                 observed = Dict{String,Any}("x" => 1.0)
@@ -3942,7 +4330,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 _fail_sim_predicate[] = spec -> true
                 try
                     # Nothing survives generation 1 → error instead of an empty population.
-                    @test_throws "had a successful simulation" runCalibration(method, prob;
+                    @test_throws "produced a distance" runCalibration(method, prob;
                         description="all particles fail")
                 finally
                     _fail_sim_predicate[] = nothing
@@ -3985,6 +4373,24 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     ModelManager._warnFailuresRecorded(:none, 4, warned, "s.csv", "m.csv")
                 end
                 @test isempty(logs)
+
+                # Monads that ran but measured nothing get their own warning, on the same terms:
+                # once per generation, silent at :none, and silent when there are none. It points
+                # at no file, deliberately — nothing failed, so nothing was written, and the IDs in
+                # the warning are the only record of them. Its generations are tracked separately,
+                # so a generation that already warned about failures still reports these.
+                summary_warned = Set{Int}()
+                @test_logs (:warn, r"no summary value") match_mode=:any begin
+                    ModelManager._warnMissingSummaries(:generation, 3, summary_warned, [7, 8, 9])
+                end
+                @test 3 in summary_warned
+                slogs, _ = Test.collect_test_logs() do
+                    ModelManager._warnMissingSummaries(:generation, 3, summary_warned, [10])
+                    ModelManager._warnMissingSummaries(:none, 4, summary_warned, [11])
+                    ModelManager._warnMissingSummaries(:generation, 5, summary_warned, Int[])
+                end
+                @test isempty(slogs)
+                @test 5 ∉ summary_warned
 
                 # A batch with no failures writes nothing at all.
                 cal = ModelManager.createCalibration("ABC-SMC"; description="failure files")
@@ -4088,18 +4494,47 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @testset "QoI is compute-per-simulation plus a reducer" begin
                 q = QoI("x", _qoi_sim)
                 @test q.name == "x"
-                @test q.reduce === mean
+                @test q.reduce === ModelManager._qoiMean
+                @test q.skip_missing
                 @test QoI("x", _qoi_sim; reduce=maximum).reduce === maximum
+                @test !QoI("x", _qoi_sim; skip_missing=false).skip_missing
 
                 # A bare Function is wrapped into a QoI at the boundary, so nothing downstream sees
-                # one: it gains a name and reduce=mean, and its `compute` is the function itself.
+                # one: it gains a name and the default reducer, and its `compute` is the function
+                # itself.
                 @test ModelManager._asQoI(q) === q
                 wrapped = ModelManager._asQoI(_qoi_by_id)
                 @test wrapped isa QoI
                 @test wrapped.compute === _qoi_by_id
                 @test wrapped.name == "_qoi_by_id"
-                @test wrapped.reduce === mean
+                @test wrapped.reduce === ModelManager._qoiMean
                 @test_throws ArgumentError ModelManager._asQoI(42)
+            end
+
+            @testset "the default reducer is a keyed-aware mean" begin
+                # `mean` cannot combine two Dicts, so before this a keyed measurement — the natural
+                # shape for "counts per cell type" — needed a hand-rolled reducer before it could be
+                # used at all, and a bare keyed function died inside Statistics.mean naming no QoI.
+                m = ModelManager._qoiMean
+                @test m([1.0, 3.0]) ≈ 2.0
+
+                # Per key, in the same kind of container it was given.
+                d = m([Dict("a" => 1.0, "b" => 10.0), Dict("a" => 3.0, "b" => 20.0)])
+                @test d isa AbstractDict
+                @test d["a"] ≈ 2.0 && d["b"] ≈ 15.0
+                nt = m([(a=1.0, b=10.0), (a=3.0, b=20.0)])
+                @test nt isa NamedTuple
+                @test keys(nt) == (:a, :b)          # declaration order, not sorted
+                @test nt.a ≈ 2.0 && nt.b ≈ 15.0
+
+                # Replicates that disagree about their keys are refused rather than averaged over
+                # whichever subset happens to be shared.
+                @test_throws ArgumentError m([Dict("a" => 1.0), Dict("a" => 1.0, "b" => 2.0)])
+
+                # A `missing` among the replicates makes the mean `missing`, exactly as `mean` does.
+                # Only reachable with skip_missing=false, which is what that keyword is for.
+                @test ismissing(m([1.0, missing]))
+                @test ismissing(m([Dict("a" => 1.0), missing]))
             end
 
             @testset "one contract: every consumer hands over a Simulation" begin
@@ -4117,20 +4552,26 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 q = ModelManager._asQoI(rec)           # wrapped at the boundary, never stays a Function
                 @test q isa QoI
                 @test q.compute === rec
-                @test q.reduce === mean                 # the default reduction a bare function gets
-                ModelManager._computeOn(q, sid)
+                # the default reduction a bare function gets
+                @test q.reduce === ModelManager._qoiMean
+                ModelManager._computeOn(q, Simulation(sid))
                 @test seen[end] === Simulation          # GSA: a Simulation, not a bare Int
 
                 empty!(seen)
                 # Named, so the sink accepts it: `rec` is defined inside this testset and is therefore
                 # a closure, whose derived name the sink refuses to store under.
-                ModelManager._asPostProcessor(QoI("rec", rec))(Simulation(sid))
+                ModelManager._postProcess(ModelManager._validatePostProcessor(QoI("rec", rec)), Simulation(sid))
                 @test seen[end] === Simulation          # sink: a Simulation, not a SimulationProcess
 
                 # A QoI's compute already received a Simulation, so the two now agree exactly.
                 empty!(seen)
-                ModelManager._computeOn(QoI("rec", rec), sid)
+                ModelManager._computeOn(QoI("rec", rec), Simulation(sid))
                 @test seen[end] === Simulation
+
+                # `_computeOn` takes a Simulation and nothing else: the ID method it once carried
+                # existed only to skip a database round trip on a stored-value hit, and nothing in
+                # the package called it.
+                @test isempty(methods(ModelManager._computeOn, Tuple{QoI,Int}))
 
                 # And a bare function's name is regularised so it can be a column / Dict key.
                 @test ModelManager._qoiNameFromFunction(_sim_one) == "_sim_one"
@@ -4149,60 +4590,24 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test ModelManager._qoiNameFromFunction(μstar_top) == "μstar_top"
             end
 
-            @testset "_declaresSimulation survives every method signature shape" begin
-                # This guard reads the method table, and reaching for `m.sig.parameters[2]` unguarded
-                # threw on three shapes -- FieldError on a `where` clause, BoundsError on a zero-arg
-                # method -- which made a correctly written `f(s::S) where {S<:Simulation}` impossible
-                # to pass to CalibrationProblem at all. The guard added to make migration safe was
-                # what broke it.
-                @test ModelManager._declaresSimulation(_sim_one)
-                @test ModelManager._declaresSimulation(_sim_where)      # TypeVar upper bound
-                @test ModelManager._declaresSimulation(_sim_varargs)
-                @test !ModelManager._declaresSimulation(_sim_unbounded) # where {S} is Any
-                @test !ModelManager._declaresSimulation(_sim_zeroarg)   # no argument at all
-                # ...and each is constructable, which is the thing that actually broke.
-                dv = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
-                for f in (_sim_where, _sim_varargs, _sim_zeroarg, _sim_unbounded)
-                    @test CalibrationProblem(inputs, [dv], 1.0, f, mseDistance) isa CalibrationProblem
-                end
-            end
-
-            @testset "the migration warning is per function, not per session" begin
-                # `maxlog=1` counts callsite hits, so a script building several problems warned about
-                # the first and went silent for the rest -- exactly the case it exists for.
-                empty!(ModelManager._WARNED_SUMMARIES)
-                u1(mid) = 1.0
-                u2(mid) = 2.0
-                @test_logs (:warn,) match_mode=:any ModelManager._validateSummaryStatistic(u1)
-                @test_logs (:warn,) match_mode=:any ModelManager._validateSummaryStatistic(u2)
-                # ...and the same function warns only once.
-                @test_logs ModelManager._validateSummaryStatistic(u1)
-            end
-
             @testset "a bare summary statistic is wrapped into a QoI" begin
                 # Nothing stays a bare Function internally: the boundary wraps it, supplying the two
-                # things it lacks -- a name and reduce=mean.
+                # things it lacks -- a name and the default reducer.
                 dv   = DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))
                 prob = CalibrationProblem(inputs, [dv], 1.0, _sim_one, mseDistance)
                 @test prob.summary_statistic isa QoI
                 @test prob.summary_statistic.compute === _sim_one
                 @test prob.summary_statistic.name == "_sim_one"
-                @test prob.summary_statistic.reduce === mean
+                @test prob.summary_statistic.reduce === ModelManager._qoiMean
 
-                # An unannotated function is accepted but flagged: the declared argument type is the
-                # only signal that a function was written for the new per-simulation contract, and an
-                # old monad-level summary would otherwise return a different number silently.
-                @test ModelManager._declaresSimulation(_sim_one)                # f(s::Simulation)
-                @test ModelManager._declaresSimulation((s::Simulation) -> 1.0)  # annotated lambda
-                @test !ModelManager._declaresSimulation(_test_named_dist)       # untyped
-                @test !ModelManager._declaresSimulation(s -> 1.0)               # plain lambda
-                @test_logs (:warn, r"does not declare it takes a `Simulation`") match_mode=:any begin
-                    ModelManager._validateSummaryStatistic(_test_named_dist)
-                end
-                # ...and an annotated one is silent (@test_logs with no patterns asserts no records).
-                @test_logs ModelManager._validateSummaryStatistic(_sim_one)
+                # The 0.9 migration warning is gone: with that release behind us a bare function is
+                # simply a per-simulation measurement, and the check fired on every ordinary lambda.
+                @test !isdefined(ModelManager, :_declaresSimulation)
+                @test !isdefined(ModelManager, :_WARNED_SUMMARIES)
+                @test_logs ModelManager._validateSummaryStatistic(_test_named_dist)
+                @test_logs ModelManager._validateSummaryStatistic(s -> 1.0)
 
-                # The number that would silently change, for the record:
+                # The number the 0.9 change silently altered, for the record:
                 @test mean([10.0, 20.0])^2 != mean([10.0, 20.0] .^ 2)   # 225.0 vs 250.0
             end
 
@@ -4248,9 +4653,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                                           Dict{String,Any}("x" => 1.0),
                                           QoI("x", _qoi_sim), mseDistance)
                 # The QoI is preserved, not collapsed into a closure -- which is what keeps a
-                # QoI-backed problem restorable on resume. A single QoI reports its value directly.
+                # QoI-backed problem restorable on resume. A single QoI reports a SummaryValues,
+                # exactly as a vector of them does: `q` and `[q]` are one contract.
                 @test prob.summary_statistic isa QoI
-                @test ModelManager._evaluateSummary(prob.summary_statistic, mid) ≈ mean(sim_vals)
+                summary = _summaryValue(prob.summary_statistic, mid)
+                @test summary isa ModelManager.SummaryValues
+                @test summary["x"] ≈ mean(sim_vals)
 
                 # The sink: the QoI itself is the post_processor.
                 m2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1069.0])];
@@ -4261,32 +4669,197 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test "xval" in names(tbl)
                 @test Set(skipmissing(tbl.xval)) == Set([1069.0])
 
-                # Duplicate names are refused rather than silently collapsing a column.
-                @test_throws ArgumentError ModelManager._asPostProcessor(
-                    [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
-                @test_throws ArgumentError ModelManager._validateSummaryStatistic(
-                    [QoI("x", _qoi_sim), QoI("x", _qoi_sim)])
+                # Two QoIs sharing a NAME is not itself refused — keyed QoIs with disjoint keys are
+                # a legitimate use — so neither validator checks names any more. What is refused is
+                # a repeated (qoi name, key) pair, by each consumer's own collision check: two
+                # `Real` QoIs called "x" are two "x" columns at the sink...
+                dup_reals = [QoI("x", _qoi_sim), QoI("x", _qoi_sim)]
+                @test ModelManager._validatePostProcessor(dup_reals).qs == dup_reals
+                @test_throws ArgumentError ModelManager._normalizePostProcessingQoI(
+                    ModelManager._postProcess(ModelManager._validatePostProcessor(dup_reals),
+                                              Simulation(first(sids))))
+                # ...and one repeated key in the summary, named with both positions.
+                @test ModelManager._validateSummaryStatistic(dup_reals) == dup_reals
+                err = try; _summaryValue(dup_reals, mid); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("QoIs 1 and 2", err.msg)
+                @test occursin("`Real`-valued QoIs named \"x\"", err.msg)
+
+                # Same name, DISJOINT keys, works in all three consumers: that is the pairing the
+                # bare-key scheme forbade.
+                disjoint = [QoI("counts", s -> Dict("tumor" => 1.0)),
+                            QoI("counts", s -> Dict("immune" => 2.0))]
+                joint = _summaryValue(disjoint, mid)
+                @test joint["counts.tumor"] == 1.0 && joint["counts.immune"] == 2.0
+                @test first.(ModelManager._postProcess(ModelManager._validatePostProcessor(disjoint),
+                                                       Simulation(first(sids)))) ==
+                      ["counts.tumor", "counts.immune"]
+                # ...and an OVERLAPPING key under one name is refused, naming both.
+                overlap = [QoI("counts", s -> Dict("tumor" => 1.0)),
+                           QoI("counts", s -> Dict("tumor" => 2.0))]
+                err = try; _summaryValue(overlap, mid); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("counts.tumor", err.msg)
+                @test occursin("QoIs 1 and 2", err.msg)
             end
 
-            @testset "a non-scalar QoI is fine except at the sink" begin
-                # compute may return a vector or Dict, because `reduce` collapses it. The sink is the
-                # exception: it fires once per simulation, so `reduce` is never called and compute's
-                # own value is stored. That asymmetry is easy to trip over, so it is pinned here.
-                obs = Dict("x" => 2.0, "y" => 3.0)
-                vecq = QoI("both", s -> [getParameterValue(s, :config, XMLPath(["data", "x"])),
-                                         getParameterValue(s, :config, XMLPath(["data", "y"]))];
-                           reduce = per_sim -> sum(abs2, mean(per_sim) .- [obs["x"], obs["y"]]))
-
-                # Calibration and GSA are happy: reduce returns a scalar.
+            @testset "value constraints belong to the consumer that needs them" begin
+                # The seam interprets nothing. `compute` returns a value or `missing`, `reduce`
+                # returns a value or `missing`, `nothing` is refused, and that is all of it. Each
+                # consumer then applies its own rule where it reads the value — which is what lets
+                # one QoI be refused by the sink and taken by calibration, rather than one rule
+                # constraining `compute`'s value (one reader) and `reduce`'s (two others) together.
                 dv = DiscreteVariation(:config, xp_x, [1091.0])
                 m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
                 run(m)
                 waitForDiagnostics()
                 mid = first(ModelManager.monadIDs(m))
-                @test ModelManager._reduceOverMonad(vecq, mid) isa Real
+                sid = first(ModelManager.constituentIDs(Monad, mid))
 
-                # The sink refuses it, and the message names the QoI and the type rather than
-                # failing somewhere in the DB layer.
+                # A `Vector` `compute` passes the seam untouched, and its reducer decides what
+                # comes out. This used to be refused before `reduce` ran at all.
+                vec_compute = QoI("vecc", s -> [1.0, 2.0]; reduce = per_sim -> 0.0)
+                @test ModelManager._reduceOverMonad(vec_compute, mid) == 0.0
+
+                # The SINK refuses it, because each component becomes a column — and says whose
+                # rule that is, so a user does not rewrite a `compute` their `distance` would have
+                # taken unchanged.
+                err = try
+                    ModelManager._postProcess(
+                        ModelManager._validatePostProcessor([QoI("vecc", s -> [1.0, 2.0])]),
+                        Simulation(sid)); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("vecc", err.msg)
+                @test occursin("keys make the alignment explicit", err.msg)
+                @test occursin("sink and sensitivity analysis", err.msg)
+                @test occursin("Calibration asks for none of this", err.msg)
+
+                # ...and so is a String, which used to be storable at the sink.
+                err = try
+                    ModelManager._postProcess(
+                        ModelManager._validatePostProcessor([QoI("strc", s -> "done")]),
+                        Simulation(sid)); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("strc", err.msg)
+                @test occursin("tag", err.msg)
+
+                # A keyed value whose components are not numbers is caught at the component, with
+                # the label the component would have carried — again at the sink, not the seam.
+                err = try
+                    ModelManager._postProcess(
+                        ModelManager._validatePostProcessor(
+                            [QoI("nest", s -> Dict("a" => Dict("b" => 1.0)))]),
+                        Simulation(sid)); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("nest.a", err.msg)
+
+                # `reduce` need not keep the shape it was given, in either direction. Tying them
+                # constrained nothing that shares a reader, and the workaround it forced — carry
+                # the score as a key — produced the very "same name, two quantities" the rule
+                # existed to prevent: `fit.my_dist` is a per-simulation score at the sink and a
+                # score-of-means in GSA.
+                widen = QoI("widen", _qoi_sim; reduce = per_sim -> Dict("a" => mean(per_sim)))
+                @test ModelManager._reduceOverMonad(widen, mid)["a"] ≈
+                      mean(_qoi_sim(Simulation(i))
+                           for i in ModelManager.constituentIDs(Monad, mid))
+                narrow = QoI("narrow", _sim_keyed; reduce = per_sim -> 1.0)
+                @test ModelManager._reduceOverMonad(narrow, mid) == 1.0
+                rekey = QoI("rekey", _sim_keyed;
+                            reduce = per_sim -> Dict("a" => 1.0, "c" => 2.0))
+                @test ModelManager._reduceOverMonad(rekey, mid) == Dict("a" => 1.0, "c" => 2.0)
+                # The shape-preserving case is still what the default reducer does.
+                @test ModelManager._reduceOverMonad(QoI("keyed", _sim_keyed), mid) ==
+                      Dict("a" => 1.0, "b" => 2.0)
+
+                # Replicates disagreeing about their keys is the DEFAULT reducer's problem, not the
+                # contract's, so a reducer written to reconcile them now sees them. PCMM's
+                # `endpointPopulationCountQoI` zero-fills exactly this way and was unreachable.
+                _ragged_calls[] = 0
+                ragged_ok = QoI("ragged_ok", _qoi_ragged; reduce = _qoi_ragged_reduce)
+                @test ModelManager._reduceOverMonad(ragged_ok, mid) ==
+                      Dict("a" => 2.0, "b" => 1.0)
+
+                # ...and with the default reducer it is refused from inside `_qoiMean`, whose
+                # message says whose rule it is and points at `reduce=`.
+                _ragged_calls[] = 0
+                ragged_default = QoI("ragged", _qoi_ragged)
+                err = try
+                    ModelManager._reduceOverMonad(ragged_default, mid); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("same keys", err.msg)
+                @test occursin("this reducer's rule", err.msg)
+                @test occursin("reduce=", err.msg)
+
+                # Agreement is by key SET, stringified, so a `Dict` replicate and a `NamedTuple`
+                # one naming the same quantities agree -- and the default reducer averages them,
+                # returning the first replicate's container.
+                mixed_calls = Ref(0)
+                mixed = QoI("mixed", s -> (mixed_calls[] += 1) == 1 ? Dict("a" => 1.0, "b" => 3.0) :
+                                                                      (a = 3.0, b = 5.0))
+                mixed_v = ModelManager._reduceOverMonad(mixed, mid)
+                @test Dict(string(k) => v for (k, v) in pairs(mixed_v)) ==
+                      Dict("a" => 2.0, "b" => 4.0)
+                # The container that comes back is the FIRST replicate's, either way round, rather
+                # than one of the two kinds always winning. Called directly, since which replicate
+                # the monad hands over first is not something the test fixes.
+                @test ModelManager._qoiMean(Any[Dict("a" => 1.0, "b" => 3.0), (a = 3.0, b = 5.0)]) ==
+                      Dict("a" => 2.0, "b" => 4.0)
+                @test ModelManager._qoiMean(Any[(a = 1.0, b = 3.0), Dict("a" => 3.0, "b" => 5.0)]) ==
+                      (a = 2.0, b = 4.0)
+                # A genuine key disagreement is still refused, and the message shows the raw keys,
+                # so a Symbol-versus-String difference is visible rather than printed twice alike.
+                err = try
+                    ModelManager._qoiMean(Any[Dict("a" => 1.0), Dict("a" => 1.0, "b" => 2.0)])
+                    nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("\"a\"", err.msg)
+                @test occursin("\"b\"", err.msg)
+
+                # The default reducer does NOT require `Real` components: a Dict of Vectors
+                # averaging elementwise is an ordinary time-series measurement, and is the shape
+                # PCMM reduces to. Requiring numbers here would have broken it as surely as the
+                # seam did.
+                @test ModelManager._qoiMean([Dict("a" => [1.0, 2.0]), Dict("a" => [3.0, 6.0])]) ==
+                      Dict("a" => [2.0, 4.0])
+                # What it cannot average, it refuses by KEY and component type rather than dying in
+                # `mean` under a bare MethodError -- the labelled message the seam used to give.
+                err = try
+                    ModelManager._qoiMean([Dict("a" => Dict("b" => 1.0)),
+                                           Dict("a" => Dict("b" => 2.0))]); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("\"a\"", err.msg)
+                @test occursin("Dict", err.msg)
+
+                # A keyed value with no keys names no quantity. The sink and GSA refuse it, since
+                # neither a column nor an index can be made of it...
+                eq = QoI("emptyd", s -> Dict{String,Float64}())
+                err = try
+                    ModelManager._postProcess(ModelManager._validatePostProcessor([eq]),
+                                              Simulation(sid)); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("emptyd", err.msg)
+                @test occursin("names no quantity", err.msg)
+                @test_throws ArgumentError ModelManager._qoiValueShape(
+                    QoI("emptynt", _qoi_sim), NamedTuple(), "`compute` on a simulation")
+                # ...but calibration takes it, contributing no entries. Routing it to
+                # `(name, nothing)` instead would make the summary's key space depend on the
+                # value, so an `observed_data` would stop resolving on the run where it came back
+                # empty. `mseDistance` refuses to score against the result, which is the honest
+                # place to say so.
+                empty_summary = _summaryValue(eq, mid)
+                @test empty_summary isa ModelManager.SummaryValues
+                @test isempty(empty_summary)
+                @test_throws ArgumentError mseDistance(empty_summary, Dict("a" => 1.0))
+
+                # The sink's own column-type guard is the second line, and still names the QoI and
+                # the offending type rather than failing somewhere in the DB layer.
                 err = try
                     ModelManager._postProcessingColumnSpec("both", [1.0, 2.0]); nothing
                 catch e; e end
@@ -4294,6 +4867,445 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test occursin("both", err.msg)
                 @test occursin("Vector", err.msg)
                 @test occursin("scalar", err.msg)
+            end
+
+            @testset "missing is how a simulation says it has no value" begin
+                dv = DiscreteVariation(:config, xp_x, [1093.0])
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+                sids = ModelManager.constituentIDs(Monad, mid)
+
+                # Missing replicates are dropped before `reduce`, so the reducer sees only real
+                # values -- and the vector it gets is narrowed, not a Union{Missing,Float64} one.
+                # That narrowing is the whole reason to use `skipmissing` rather than a filter.
+                seen_type = Ref{Any}(nothing)
+                first_sid = first(sids)
+                halfq = QoI("half", s -> s.id == first_sid ? missing : _qoi_sim(s);
+                            reduce = v -> (seen_type[] = eltype(v); mean(v)))
+                @test ModelManager._reduceOverMonad(halfq, mid) ≈ _qoi_sim(Simulation(last(sids)))
+                @test seen_type[] == Float64
+
+                # Nothing left ⇒ the parameter set itself is `missing`, and `reduce` is not called.
+                called = Ref(0)
+                noneq = QoI("none", _sim_never; reduce = v -> (called[] += 1; mean(v)))
+                @test ismissing(ModelManager._reduceOverMonad(noneq, mid))
+                @test called[] == 0
+
+                # skip_missing=false hands the reducer the raw vector instead, missings included --
+                # for a reducer that wants to know how many replicates had no value.
+                raw = Ref{Any}(nothing)
+                keepq = QoI("keep", s -> s.id == first_sid ? missing : _qoi_sim(s);
+                            reduce = v -> (raw[] = collect(v); 1.0), skip_missing=false)
+                @test ModelManager._reduceOverMonad(keepq, mid) == 1.0
+                @test count(ismissing, raw[]) == 1
+                @test length(raw[]) == length(sids)
+
+                # `nothing` is refused on both paths, naming the QoI and saying to use `missing`.
+                nq = QoI("nothingq", s -> nothing)
+                err = try; ModelManager._reduceOverMonad(nq, mid); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("nothingq", err.msg)
+                @test occursin("`missing`", err.msg)
+                err = try; ModelManager._postProcess(ModelManager._validatePostProcessor([nq]),
+                                                     Simulation(first_sid)); nothing
+                      catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("nothingq", err.msg)
+
+                # The sink skips a `missing` rather than storing anything for that simulation.
+                @test isnothing(ModelManager._postProcess(
+                    ModelManager._validatePostProcessor([QoI("nv", _sim_never)]),
+                    Simulation(first_sid)))
+
+                # GSA cannot use a `missing` monad: there is no defensible number for that cell of
+                # the design matrix, so it refuses and says why. The message names BOTH ways a
+                # monad ends up with no value, because this code cannot tell which one happened --
+                # it used to assert "no replicate produced a value" at a user whose replicates were
+                # fine and whose reducer had said `missing`.
+                err = try
+                    ModelManager._qoiValueShape(QoI("gone", _sim_never), missing,
+                                                "`reduce` on monad $(mid)"); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("gone", err.msg)
+                @test occursin("has no value", err.msg)
+                @test occursin("`reduce` did", err.msg)
+
+                # A reducer returning `missing` is a supported answer -- "too few usable
+                # replicates" -- not a contract violation, so it is exempt from the shape check
+                # rather than dying in it.
+                shy = QoI("shy", _qoi_sim; reduce = per_sim -> length(per_sim) > 5 ? mean(per_sim) :
+                                                               missing)
+                @test ismissing(ModelManager._reduceOverMonad(shy, mid))
+            end
+
+            @testset "a vector of QoIs flattens into the user's own keys" begin
+                dv = DiscreteVariation(:config, xp_x, [1095.0])
+                m  = createTrial(inputs, [dv]; n_replicates=1, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+
+                # Every component is named (qoi name, key), in one SummaryValues, in the order the
+                # members were listed. A Real-valued QoI is (name, nothing).
+                flat = _summaryValue([QoI("scal", _sim_one),
+                                                      QoI("kv", _sim_keyed)], mid)
+                @test flat isa ModelManager.SummaryValues
+                @test collect(keys(flat)) == [("scal", nothing), ("kv", "a"), ("kv", "b")]
+                @test flat["scal"] == 1.0 && flat["kv.a"] == 1.0 && flat["b"] == 2.0
+
+                # A single QoI reports the same thing a vector of one does — the passthrough that
+                # handed a bare `Real` over is gone, so `q` and `[q]` are one contract.
+                @test _summaryValue(QoI("kv", _sim_keyed), mid) ==
+                      _summaryValue([QoI("kv", _sim_keyed)], mid)
+                @test _summaryValue(QoI("scal", _sim_one), mid) isa
+                      ModelManager.SummaryValues
+                # ...and a scalar `observed_data` still works, against a one-entry summary.
+                @test mseDistance(_summaryValue(QoI("scal", _sim_one), mid),
+                                  1.0) ≈ 0.0
+
+                # The case that used to MethodError inside mseDistance after a whole generation had
+                # been simulated: a NamedTuple-valued QoI, whose Symbol keys nothing could compare
+                # with a hand-written observation. Stringified into the key space, so it works end
+                # to end against String-keyed observed data.
+                nt_q = QoI("ntq", s -> (a = 1.0, b = 2.0))
+                nt_flat = _summaryValue(nt_q, mid)
+                @test collect(keys(nt_flat)) == [("ntq", "a"), ("ntq", "b")]
+                @test mseDistance(nt_flat, Dict("a" => 1.0, "b" => 2.0)) ≈ 0.0
+                @test mseDistance(nt_flat, Dict("ntq.a" => 1.0, "ntq.b" => 2.0)) ≈ 0.0
+                # ...and a Symbol-keyed Dict is normalised the same way, for the same reason.
+                sym_flat = _summaryValue(
+                    QoI("symq", s -> Dict(:a => 1.0, :b => 2.0)), mid)
+                @test mseDistance(sym_flat, Dict("a" => 1.0, "b" => 2.0)) ≈ 0.0
+                # A NamedTuple observation resolves through the same lookup.
+                @test mseDistance(sym_flat, (a = 1.0, b = 2.0)) ≈ 0.0
+
+                # Two QoIs reporting one key no longer collide — the key is theirs plus the QoI's
+                # name — but the bare spelling is then ambiguous, and says so with both labels.
+                shared = _summaryValue(
+                    [QoI("kv", _sim_keyed), QoI("solo", s -> Dict("a" => 5.0))], mid)
+                @test shared["kv.a"] == 1.0 && shared["solo.a"] == 5.0
+                err = try; shared["a"]; nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("\"kv.a\"", err.msg) && occursin("\"solo.a\"", err.msg)
+                # ...and an observation written with the bare key raises that same error.
+                @test_throws ArgumentError mseDistance(shared, Dict("a" => 1.0, "b" => 2.0))
+
+                # One QoI can still collide with ITSELF, since a component key is stringified: `1`
+                # and "1" are two keys the value contract accepts and one label here. Refused where
+                # the raw keys are in hand, so the message can show which two they were.
+                err = try
+                    _summaryValue(
+                        [QoI("selfclash", s -> Dict{Any,Any}(1 => 1.0, "1" => 2.0))], mid); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("all produce the label", err.msg)
+                @test occursin("selfclash", err.msg)
+                # ...and through the single-QoI path too, which goes the same route.
+                err = try
+                    _summaryValue(
+                        QoI("selfclash", s -> Dict{Any,Any}(1 => 1.0, "1" => 2.0)), mid); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("all produce the label", err.msg)
+
+                # One member with no value makes the whole summary missing, so the particle follows
+                # on_monad_failure instead of being compared on a partial key set -- and the name of
+                # the member that had none is kept, so `:error` can say which measurement it was.
+                @test ismissing(_summaryValue([QoI("scal", _sim_one),
+                                                               QoI("gone", _sim_never)], mid))
+                @test ModelManager._evaluateSummary([QoI("scal", _sim_one),
+                                                       QoI("gone", _sim_never)], mid)[2] == "gone"
+
+                # An observation that names only some of the summary compares only that part. The
+                # observed keys are the comparison, and a simulation is always known better than
+                # the data — requiring every component to be named forced a user to list every key
+                # of every summary QoI or drop QoIs from the summary. Here `scal` matches exactly,
+                # so the distance is 0 whatever the unnamed `kv` components hold.
+                @test mseDistance(flat, Dict("scal" => 1.0)) ≈ 0.0
+                @test mseDistance(flat, Dict("kv.b" => 4.0)) ≈ 4.0
+
+                # ...and either spelling of the observation compares the same quantities.
+                @test mseDistance(flat, Dict("scal" => 1.0, "a" => 1.0, "b" => 2.0)) ≈ 0.0
+                @test mseDistance(flat, Dict("scal" => 1.0, "kv.a" => 1.0, "kv.b" => 2.0)) ≈ 0.0
+                @test mseDistance(flat, Dict(("scal", nothing) => 1.0, ("kv", "a") => 1.0,
+                                             ("kv", "b") => 2.0)) ≈ 0.0
+            end
+
+            @testset "two keyed QoIs sharing component keys calibrate end to end" begin
+                # The pairing the bare-key scheme forbade: a `count` and a `speed`, both keyed by
+                # cell type. Qualified observation keys tell them apart; bare ones cannot.
+                dv = DiscreteVariation(:config, xp_x, [1097.0])
+                m  = createTrial(inputs, [dv]; n_replicates=1, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+
+                pair = [QoI("count", _qoi_count_by_type), QoI("speed", _qoi_speed_by_type)]
+                s = _summaryValue(pair, mid)
+                @test collect(keys(s)) == [("count", "immune"), ("count", "tumor"),
+                                           ("speed", "immune"), ("speed", "tumor")]
+                observed = Dict("count.tumor" => 10.0, "count.immune" => 20.0,
+                                "speed.tumor" => 1.0, "speed.immune" => 2.0)
+                @test mseDistance(s, observed) ≈ 0.0
+
+                # The bare spelling is ambiguous for every one of these keys, and the error names
+                # the two labels rather than picking one.
+                bare = Dict("tumor" => 10.0, "immune" => 20.0)
+                err = try; mseDistance(s, bare); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("more than one QoI", err.msg)
+
+                # Through a real calibration, since that is the workflow the maintainer named.
+                prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(0.5, 3.0))],
+                                          observed, pair, mseDistance)
+                result = runCalibration(ABCSMC(population_size=2, max_nr_populations=1,
+                                               minimum_epsilon=0.0), prob)
+                waitForDiagnostics()
+                @test result isa ABCResult
+                @test all(isfinite, result.generations[1].distances)
+
+                # The same two QoIs at the sink and in GSA: four columns, four analyses, and the
+                # names are the same ones calibration used.
+                sink_t = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1099.0])];
+                                     n_replicates=1, use_previous=false)
+                run(sink_t; post_processor=pair)
+                waitForDiagnostics()
+                tbl = postProcessingTable(simulationIDs(sink_t))
+                @test ["count.immune", "count.tumor", "speed.immune", "speed.tumor"] ⊆ names(tbl)
+                spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
+                                 n_replicates=1)
+                gsa = run(MOAT(3), spec; functions=pair)
+                waitForDiagnostics()
+                @test ModelManager.gsaLabels(gsa) == ["count.immune", "count.tumor",
+                                                      "speed.immune", "speed.tumor"]
+            end
+
+            @testset "calibration takes a value no other consumer would" begin
+                # The point of moving the value rule to the consumer: calibration constrains
+                # nothing, so a measurement the sink and GSA both refuse calibrates end to end.
+                dv = DiscreteVariation(:config, xp_x, [1151.0])
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid = first(ModelManager.monadIDs(m))
+                sids = ModelManager.constituentIDs(Monad, mid)
+
+                # A `Vector` `compute`, a `reduce` that stays a `Vector`, and a `distance` that
+                # knows what to do with one. No key anywhere, and nothing asks for one.
+                vq = QoI("vecq", _qoi_vector; reduce=_qoi_vector_reduce)
+                summary = _summaryValue(vq, mid)
+                expected = mean([_qoi_vector(Simulation(i)) for i in sids])
+                @test summary["vecq"] == expected
+                @test collect(keys(summary)) == [("vecq", nothing)]
+
+                # Through a real calibration, which is the claim that matters.
+                prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(0.5, 3.0))],
+                                          [1.0, 2.0], vq, _qoi_vector_distance)
+                result = runCalibration(ABCSMC(population_size=2, max_nr_populations=1,
+                                               minimum_epsilon=0.0), prob)
+                waitForDiagnostics()
+                @test result isa ABCResult
+                @test all(isfinite, result.generations[1].distances)
+
+                # A value reaches `distance` as the very object `reduce` returned, not a converted
+                # copy: the summary holds `Any`, and `_insertSummary!` no longer takes a `::Real`
+                # and calls `Float64` on it.
+                mq = QoI("matq", _qoi_sim; reduce=_qoi_matrix_reduce)
+                @test _summaryValue(mq, mid)["matq"] === _qoi_fixed_matrix
+
+                # Nothing constrains the values, so a `reduce` returning a keyed value with a
+                # `missing` component now gets all the way to `distance`. `mseDistance` names the
+                # label rather than letting it surface a frame later as "distance returned a
+                # Missing", which says nothing about which quantity was absent.
+                gapq = QoI("gapq", _qoi_sim;
+                           reduce = per_sim -> Dict("a" => mean(per_sim), "b" => missing))
+                gap = _summaryValue(gapq, mid)
+                @test ismissing(gap["gapq.b"])
+                @test mseDistance(gap, Dict("gapq.a" => gap["gapq.a"])) ≈ 0.0   # the good half
+                err = try; mseDistance(gap, Dict("gapq.b" => 1.0)); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("gapq.b", err.msg)
+                @test occursin("`missing`", err.msg)
+
+                # ...and the same QoIs are still refused by the two consumers that need numbers.
+                @test_throws ArgumentError ModelManager._postProcess(
+                    ModelManager._validatePostProcessor([QoI("vecq", _qoi_vector)]),
+                    Simulation(first(sids)))
+                gsa = run(MOAT(3), StudySpec(inputs, [DistributedVariation(:config, xp_x,
+                                                                           Uniform(0.5, 3.0))];
+                                             n_replicates=1); functions=Any[])
+                waitForDiagnostics()
+                @test_throws ArgumentError calculateGSA!(gsa, [mq])
+            end
+
+            @testset "a struct compute and a keyed series reduce calibrate end to end" begin
+                # The acceptance test, and the shape of PCMM's own `meanPopulationTimeSeriesQoI`:
+                # `compute` returns the simulator's object (a population time series read out of
+                # the output folder), `reduce` turns the replicates into one series per cell type,
+                # and `mseDistance` compares those against observed series. On the previous pass
+                # this could not evaluate a single monad — the seam refused the struct before
+                # `reduce` ran — although calibrating a time series against data is its purpose.
+                dv = DiscreteVariation(:config, xp_x, [1153.0])
+                m  = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                run(m)
+                waitForDiagnostics()
+                mid  = first(ModelManager.monadIDs(m))
+                sids = ModelManager.constituentIDs(Monad, mid)
+
+                q = QoI("series", _qoi_time_series; reduce=_qoi_time_series_reduce)
+                # `compute` hands over the struct untouched...
+                @test ModelManager._computeOn(q, Simulation(first(sids))) isa _TimeSeries
+                # ...and the reduced value spreads per cell type, one series each.
+                summary = _summaryValue(q, mid)
+                @test collect(keys(summary)) == [("series", "immune"), ("series", "tumor")]
+                @test summary["series.tumor"] isa Vector{Float64}
+                @test summary["series.immune"] == [0.5, 1.0, 1.5]
+
+                # `mseDistance` compares the observed series elementwise, ignores the cell type the
+                # observation does not name, and divides by the number of DIFFERENCES — so one
+                # array key gives exactly the mean squared error over that array.
+                expected = mean([_qoi_time_series(Simulation(i)).counts["tumor"] for i in sids])
+                observed = Dict("tumor" => expected .+ 1.0)
+                @test mseDistance(summary, observed) ≈ 1.0
+                @test mseDistance(summary, observed) ≈
+                      mseDistance(summary["series.tumor"], observed["tumor"])
+                @test mseDistance(summary, Dict("tumor" => expected)) ≈ 0.0
+
+                # End to end through a real calibration, with the built-in distance and no
+                # `Real` anywhere in the measurement.
+                prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(0.5, 3.0))],
+                                          observed, q, mseDistance)
+                result = runCalibration(ABCSMC(population_size=2, max_nr_populations=1,
+                                               minimum_epsilon=0.0), prob;
+                                        description="time series against data")
+                waitForDiagnostics()
+                @test result isa ABCResult
+                @test all(isfinite, result.generations[1].distances)
+            end
+
+            @testset "a QoI can carry its own data" begin
+                # The alternative to hiding an observation inside a callable struct: the QoI holds
+                # it, and `data !== nothing` switches both functions to their two-argument form.
+                # Explicit, so a `compute` that merely happens to accept two arguments is never
+                # called with data it was not written for.
+                dv   = DiscreteVariation(:config, xp_x, [1103.0])
+                obs  = Dict("target" => 1000.0)
+                q    = QoI("score", _qoi_with_data; reduce=_qoi_reduce_with_data, data=obs)
+                @test q.data === obs
+                m    = createTrial(inputs, [dv]; n_replicates=2, use_previous=false)
+                #! The sink write happens on this run, since a completed simulation is not
+                #! re-scheduled by a later one.
+                run(m; post_processor=q)
+                waitForDiagnostics()
+                mid  = first(ModelManager.monadIDs(m))
+                sids = ModelManager.constituentIDs(Monad, mid)
+
+                # `compute` receives it.
+                x1 = _qoi_sim(Simulation(first(sids)))
+                v  = ModelManager._computeOn(q, Simulation(first(sids)))
+                @test v["raw"] ≈ x1 && v["fit"] ≈ (x1 - 1000.0)^2
+
+                # `reduce` receives it too, which is what makes the post-averaging score possible:
+                # the score comes from the mean rather than being an average of scores.
+                raw_mean = mean(_qoi_sim(Simulation(i)) for i in sids)
+                reduced  = ModelManager._reduceOverMonad(q, mid)
+                @test reduced["raw"] ≈ raw_mean
+                @test reduced["fit"] ≈ (raw_mean - 1000.0)^2
+
+                # Without `data` the same functions are called with ONE argument, so the slot is
+                # what chooses the convention — not the method table.
+                @test_throws MethodError ModelManager._computeOn(QoI("score", _qoi_with_data),
+                                                                 Simulation(first(sids)))
+                @test_throws MethodError ModelManager._computeOn(QoI("plain", _qoi_sim; data=obs),
+                                                                 Simulation(first(sids)))
+
+                # The sink names the same components, so one `data`-carrying QoI feeds all three
+                # consumers.
+                tbl = postProcessingTable(simulationIDs(m))
+                @test ["score.raw", "score.fit"] ⊆ names(tbl)
+                # ...and `verifyStoredValues` recomputes through the same convention.
+                rep = verifyStoredValues(q, m)
+                @test rep.n_mismatched == 0 && rep.n_missing == 0
+                @test rep.n_agreed + rep.n_unverifiable == length(sids)
+
+                # It survives the problem.jld2 round trip, because it lives inside the QoI: the
+                # manifest needed no field for it, and restorability is still decided by the two
+                # functions, which are named here.
+                observed = Dict("score.raw" => 1000.0, "score.fit" => 0.0)
+                prob = CalibrationProblem(inputs, [DistributedVariation(:config, xp_x,
+                                                                        Uniform(0.5, 3.0))],
+                                          observed, q, mseDistance)
+                @test ModelManager._isCompleteManifest(ModelManager._ProblemManifest(prob))
+                result = runCalibration(ABCSMC(population_size=2, max_nr_populations=1,
+                                               minimum_epsilon=0.0), prob;
+                                        description="QoI with data")
+                waitForDiagnostics()
+                loaded = ModelManager._loadProblem(result.calibration)
+                @test loaded.summary_statistic isa QoI
+                @test loaded.summary_statistic.data == obs
+
+                # And a resume with nothing re-supplied uses it.
+                resumed = resumeABC(result.calibration; max_nr_populations=2)
+                waitForDiagnostics()
+                @test resumed isa ABCResult
+                @test length(resumed.generations) >= 2
+            end
+
+            @testset "post_processor plumbing: a validator and a function" begin
+                # `_asPostProcessor` returned a closure, so `run` held an opaque Function and the
+                # per-simulation body had no name. The two jobs are now separate: validate once,
+                # then call `_postProcess(qs, sim)` per simulation.
+                dv  = DiscreteVariation(:config, xp_x, [1109.0])
+                t   = createTrial(inputs, [dv]; n_replicates=1, use_previous=false)
+                run(t)
+                waitForDiagnostics()
+                sid = first(simulationIDs(t))
+
+                @test !isdefined(ModelManager, :_asPostProcessor)
+                # Every accepted shape normalises to a _PostProcessor holding a Vector{QoI}.
+                @test ModelManager._validatePostProcessor(_pp_named) isa ModelManager._PostProcessor
+                @test only(ModelManager._validatePostProcessor(_pp_named).qs).compute === _pp_named
+                qq = QoI("q", _qoi_sim)
+                @test ModelManager._validatePostProcessor(qq).qs == [qq]
+                @test ModelManager._validatePostProcessor([qq]).qs == [qq]
+                @test_throws ArgumentError ModelManager._validatePostProcessor(QoI[])
+                @test_throws ArgumentError ModelManager._validatePostProcessor(3)
+
+                # The body is a plain function returning the labelled values to store.
+                @test ModelManager._postProcess(ModelManager._validatePostProcessor([qq]),
+                                                Simulation(sid)) ==
+                      ["q" => _qoi_sim(Simulation(sid))]
+                @test ModelManager._postProcess(
+                          ModelManager._validatePostProcessor([QoI("kv", _sim_keyed)]),
+                          Simulation(sid)) ==
+                      ["kv.a" => 1.0, "kv.b" => 2.0]
+
+                # Whether a name was auto-derived from an anonymous `compute` is decided ONCE, at
+                # validation; whether that matters is decided per value, because a side-effects-only
+                # anonymous callback that returns `missing` names nothing and is legitimate.
+                @test ModelManager._validatePostProcessor(qq).auto_named == [false]
+                anon = ModelManager._validatePostProcessor(sim -> missing)
+                @test anon.auto_named == [true]
+                @test isnothing(ModelManager._postProcess(anon, Simulation(sid)))
+                @test_throws ArgumentError ModelManager._postProcess(
+                    ModelManager._validatePostProcessor(sim -> 1.0), Simulation(sid))
+
+                # And through `run`, whose keyword now accepts a QoI or a vector directly.
+                for (v, pp) in ((1201.0, _pp_named), (1213.0, QoI("direct", _qoi_sim)),
+                                (1217.0, [QoI("v1", _qoi_sim), QoI("v2", _sim_keyed)]))
+                    tt = createTrial(inputs, [DiscreteVariation(:config, xp_x, [v])];
+                                     n_replicates=1, use_previous=false)
+                    run(tt; post_processor=pp)
+                    waitForDiagnostics()
+                end
+                all_cols = names(postProcessingTable())
+                @test ["_pp_named.a", "direct", "v1", "v2.a", "v2.b"] ⊆ all_cols
             end
 
             @testset "a QoI can read a value the sink stored earlier" begin
@@ -4320,7 +5332,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                       mean([_qoi_sim(Simulation(i)) for i in sids])
 
                 # And through a real consumer, to show nothing about the seam needs changing.
-                @test ModelManager._evaluateSummary(readback, mid) ≈
+                @test _summaryValue(readback, mid)["stored_x"] ≈
                       mean([_qoi_sim(Simulation(i)) for i in sids])
             end
 
@@ -4360,9 +5372,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test_throws ArgumentError QoI(ModelManager._qoiLabel("a", "b"), _qoi_sim)
 
                 # :require before anything is stored names the fix rather than failing obscurely.
-                sid_probe = 1
+                sid_probe = simulationIDs(t)[1]
                 @test_throws ArgumentError ModelManager._computeOn(
-                    QoI("never_stored_anywhere", _qoi_sim; stored=:require), sid_probe)
+                    QoI("never_stored_anywhere", _qoi_sim; stored=:require), Simulation(sid_probe))
 
                 # Store, then read back through `stored`.
                 run(t; post_processor=QoI("stored_x", _qoi_sim))
@@ -4375,11 +5387,11 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # :prefer returns the stored number without calling compute. A compute that throws
                 # proves the stored path was taken rather than merely agreeing with it.
                 exploding = QoI("stored_x", s -> error("compute must not run"); stored=:prefer)
-                @test ModelManager._computeOn(exploding, first(sids)) ≈
+                @test ModelManager._computeOn(exploding, Simulation(first(sids))) ≈
                       ModelManager._storedValue("stored_x", first(sids))
                 # ...and falls back to compute when nothing is stored under that name.
                 fallback = QoI("no_such_column", _qoi_sim; stored=:prefer)
-                @test ModelManager._computeOn(fallback, first(sids)) ≈
+                @test ModelManager._computeOn(fallback, Simulation(first(sids))) ≈
                       _qoi_sim(Simulation(first(sids)))
 
                 # verifyStoredValues recomputes where the output survives.
@@ -4402,34 +5414,63 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test none.n_missing == length(sids)
                 @test none.n_agreed == 0
 
-                # The read side mirrors the write side. A String comes back as text rather than
-                # crashing in a Float64 conversion, and a keyed value -- which the sink spread into
-                # `<name>.<key>` columns -- is reassembled into a Dict with String keys.
-                t2 = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1451.0, 1457.0])];
-                                 n_replicates=2, use_previous=false)
-                run(t2; post_processor=[QoI("stored_label", _qoi_label), QoI("stored_pair", _qoi_pair)])
+                # A KEYED QoI is stored as "<name>.<key>" columns, so a lookup of the bare name
+                # found nothing: `stored=:prefer` silently recomputed every time and `:require`
+                # threw, telling the user to write a column the sink never writes. It is read back
+                # from those columns instead, as a Dict with String keys.
+                keyed_t = createTrial(inputs, [DiscreteVariation(:config, xp_x, [1427.0])];
+                                      n_replicates=2, use_previous=false)
+                keyed_q = QoI("stored_kv", _qoi_keyed_from_x)
+                run(keyed_t; post_processor=keyed_q)
                 waitForDiagnostics()
-                sid2 = first(simulationIDs(t2))
-                @test ModelManager._storedValue("stored_label", sid2) == _qoi_label(Simulation(sid2))
-                pair = _qoi_pair(Simulation(sid2))
-                @test ModelManager._storedValue("stored_pair", sid2) == Dict("a" => pair.a, "b" => pair.b)
-                # :require finds the spread value; before, it reported "no stored value".
-                @test ModelManager._computeOn(QoI("stored_pair", s -> error("compute must not run"); stored=:require), sid2) ==
-                      Dict("a" => pair.a, "b" => pair.b)
-                # verifyStoredValues compares text with isequal and keyed values key by key.
-                @test verifyStoredValues(QoI("stored_label", _qoi_label), t2).n_mismatched == 0
-                repk = verifyStoredValues(QoI("stored_pair", _qoi_pair), t2)
-                @test repk.n_mismatched == 0
-                @test repk.n_agreed + repk.n_unverifiable == length(simulationIDs(t2))
-                badk = verifyStoredValues(QoI("stored_pair", s -> (; a = 1e9, b = 1e9)), t2)
-                if badk.n_unverifiable < length(simulationIDs(t2))
-                    @test badk.n_mismatched > 0
-                    @test badk.mismatches[1].stored isa Dict
+                keyed_sids = simulationIDs(keyed_t)
+                keyed_tbl = postProcessingTable(keyed_sids)
+                @test ["stored_kv.raw", "stored_kv.twice"] ⊆ names(keyed_tbl)
+                @test "stored_kv" ∉ names(keyed_tbl)
+                back = ModelManager._storedValue("stored_kv", first(keyed_sids))
+                @test back == Dict("raw" => _qoi_sim(Simulation(first(keyed_sids))),
+                                   "twice" => 2 * _qoi_sim(Simulation(first(keyed_sids))))
+
+                # :require now resolves it without calling compute -- an exploding compute proves
+                # the stored path was taken -- and the value still satisfies the QoI contract, so
+                # it reduces over the monad like a freshly computed one.
+                keyed_boom = QoI("stored_kv", s -> error("compute must not run"); stored=:require)
+                @test ModelManager._computeOn(keyed_boom, Simulation(first(keyed_sids))) == back
+                keyed_mid = first(ModelManager.monadIDs(keyed_t))
+                @test ModelManager._reduceOverMonad(
+                    QoI("stored_kv", s -> error("compute must not run"); stored=:require),
+                    keyed_mid) == Dict("raw" => _qoi_sim(Simulation(first(keyed_sids))),
+                                       "twice" => 2 * _qoi_sim(Simulation(first(keyed_sids))))
+
+                # ...and verifyStoredValues compares it key by key rather than trying to make one
+                # number of it. The sink's keys are Strings, so a NamedTuple-returning compute is
+                # compared against its stringified keys.
+                krep = verifyStoredValues(keyed_q, keyed_t)
+                @test krep.n_agreed + krep.n_unverifiable == length(keyed_sids)
+                @test krep.n_mismatched == 0
+                @test krep.n_missing == 0
+                nt_rep = verifyStoredValues(QoI("stored_kv", _qoi_keyed_nt_from_x), keyed_t)
+                @test nt_rep.n_agreed == krep.n_agreed
+                @test nt_rep.n_mismatched == 0
+                # A disagreement in ONE key is a mismatch, not an average that hides it.
+                kbad = verifyStoredValues(
+                    QoI("stored_kv", s -> Dict("raw" => _qoi_sim(s), "twice" => 0.0)), keyed_t)
+                if kbad.n_unverifiable < length(keyed_sids)
+                    @test kbad.n_mismatched > 0
                 end
-                # A compute that cannot see the output any more is unverifiable, not a mismatch.
-                gone = verifyStoredValues(QoI("stored_pair", s -> missing), t2)
-                @test gone.n_mismatched == 0
-                @test gone.n_unverifiable == length(simulationIDs(t2))
+                # A compute with no value for a simulation cannot be checked against the stored
+                # one, and is counted as unverifiable rather than as a mismatch.
+                @test verifyStoredValues(QoI("stored_kv", _sim_never),
+                                         keyed_t).n_unverifiable == length(keyed_sids)
+
+                # The :require message names the columns a keyed QoI actually owns, rather than
+                # sending the user to write a bare "<name>" column that nothing ever writes.
+                err = try
+                    ModelManager._computeOn(QoI("no_such_column", _qoi_sim; stored=:require),
+                                            Simulation(first(keyed_sids))); nothing
+                catch e; e end
+                @test err isa ArgumentError
+                @test occursin("\"no_such_column.<key>\"", err.msg)
             end
 
             @testset "_loadProblem: an unreadable problem.jld2 names the way out" begin
@@ -4469,33 +5510,40 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # The workflow: a simulation yields several values; average each across replicates,
                 # THEN compare to data. Squaring is nonlinear, so mean-then-square is not
                 # square-then-mean, and a per-simulation compute cannot do it — it has no access to
-                # the mean. `reduce` is the monad-level step that can: it receives every replicate's
-                # value, so `compute` returns the raw per-simulation values and `reduce` averages and
-                # then squares.
+                # the mean. `reduce` is the monad-level step that can.
+                #
+                # `reduce` could return the score alone — nothing requires it to keep the shape it
+                # was given — but carrying it as one more KEY is what buys the other two consumers:
+                # `compute` reports the raw values plus its own per-simulation score, and `reduce`
+                # averages the raw values and recomputes the score from those means. The sink then
+                # gets a per-simulation score for free and GSA analyses it as "<name>.my_dist".
                 obs = Dict("x" => 2.0, "y" => 3.0)
+                _score(d) = sum((d[k] - obs[k])^2 for k in keys(obs))
                 function _both(s::Simulation)
-                    return Dict("x" => getParameterValue(s, :config, XMLPath(["data", "x"])),
-                                "y" => getParameterValue(s, :config, XMLPath(["data", "y"])))
+                    raw = Dict("x" => getParameterValue(s, :config, XMLPath(["data", "x"])),
+                               "y" => getParameterValue(s, :config, XMLPath(["data", "y"])))
+                    return merge(raw, Dict("my_dist" => _score(raw)))
                 end
-                # One scalar per monad: mean per key, squared difference, then summed.
-                mse_reduce = per_sim -> sum((mean(getindex.(per_sim, k)) - obs[k])^2 for k in keys(obs))
-                q = QoI("mse", _both; reduce=mse_reduce)
+                function _both_reduce(per_sim)
+                    means = Dict(k => mean(d[k] for d in per_sim) for k in ("x", "y"))
+                    return merge(means, Dict("my_dist" => _score(means)))
+                end
+                q = QoI("fit", _both; reduce=_both_reduce)
 
                 spec = StudySpec(inputs, [DistributedVariation(:config, xp_x, Uniform(0.5, 3.0))];
                                  n_replicates=3)
                 gsa = run(MOAT(), spec; functions=[q])
                 waitForDiagnostics()
                 @test gsa isa ModelManager.GSASampling
-                # A scalar reduce yields one analysis, filed under the QoI's own name.
-                @test haskey(gsa.results, "mse")
-                @test ModelManager.gsaLabels(gsa) == ["mse"]
+                # One analysis per key, the score among them.
+                @test ModelManager.gsaLabels(gsa) == ["fit.my_dist", "fit.x", "fit.y"]
 
                 # And the arithmetic the workflow depends on: averaging first is not the same as
                 # squaring first, so which side of `reduce` the nonlinearity sits on matters.
                 per_sim = [Dict("x" => 1.0, "y" => 2.0), Dict("x" => 3.0, "y" => 4.0)]
-                mean_then_sq = sum((mean(getindex.(per_sim, k)) - obs[k])^2 for k in keys(obs))
-                sq_then_mean = sum(mean((getindex.(per_sim, k) .- obs[k]).^2) for k in keys(obs))
-                @test mse_reduce(per_sim) ≈ mean_then_sq
+                mean_then_sq = _score(Dict(k => mean(d[k] for d in per_sim) for k in ("x", "y")))
+                sq_then_mean = mean(_score(d) for d in per_sim)
+                @test _both_reduce(per_sim)["my_dist"] ≈ mean_then_sq
                 @test !(mean_then_sq ≈ sq_then_mean)
             end
 
@@ -4621,36 +5669,61 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 gsa = run(MOAT(3), spec; functions=Any[])
                 waitForDiagnostics()
 
-                # A Vector reduce is refused, and the message says why per-index spreading is not
-                # offered rather than merely that it is unsupported.
+                # A Vector reduce is refused, and the message says why keys are required for now
+                # rather than merely that a Vector is unsupported — and that calibration will take
+                # the same value as it stands.
                 vec_q = QoI("series", _qoi_sim; reduce=per_sim -> collect(per_sim))
                 err = try; calculateGSA!(gsa, [vec_q]); nothing; catch e; e; end
                 @test err isa ArgumentError
-                @test occursin("equal length is not equal meaning", err.msg)
+                @test occursin("keys make the alignment explicit", err.msg)
                 @test occursin("series", err.msg)
+                @test occursin("Calibration asks for none of this", err.msg)
 
-                # A Dict of non-numbers passes the key check and is caught at the value.
-                str_q = QoI("labels", _qoi_sim; reduce=per_sim -> Dict("a" => "not a number"))
+                # A keyed value whose components are not numbers is caught at the component, by the
+                # ONE seam every consumer's values pass through, under the label that component
+                # would have carried and naming the function that produced it. GSA used to repeat
+                # the check on its own values; once everything came through the seam that copy
+                # could not fire, so this asserts the seam's own wording rather than a label the
+                # two messages happened to share.
+                str_q = QoI("labels", s -> Dict("a" => _qoi_sim(s));
+                            reduce=per_sim -> Dict("a" => "not a number"))
                 err = try; calculateGSA!(gsa, [str_q]); nothing; catch e; e; end
                 @test err isa ArgumentError
                 @test occursin("labels.a", err.msg)
+                @test occursin("every component of a keyed measurement must be a `Real`", err.msg)
+                @test occursin("`reduce` on monad", err.msg)
+
+                # A monad that actually reduces to `missing` -- not a hand-written `missing` handed
+                # to the internal -- is refused, since there is no cell of the design matrix to put
+                # it in. The reducer is what declines here, so the message must not blame the
+                # simulations: it names both causes.
+                shy = QoI("shy", _qoi_sim; reduce=per_sim -> missing)
+                err = try; calculateGSA!(gsa, [shy]); nothing; catch e; e; end
+                @test err isa ArgumentError
+                @test occursin("shy", err.msg)
+                @test occursin("has no value", err.msg)
+                @test occursin("`reduce` did", err.msg)
+                @test isempty(ModelManager._gsaLabelsOf(gsa, "shy"))
 
                 # Key sets must agree across monads: a hole in a design matrix has no defensible
-                # fill, so this refuses rather than imputing as `mseDistance` does.
-                ragged = QoI("ragged", _qoi_sim;
-                             reduce=per_sim -> first(per_sim) < 2.0 ? Dict("a" => 1.0) :
-                                                                      Dict("a" => 1.0, "b" => 2.0))
+                # fill, so this refuses rather than imputing. (Within one monad the QoI seam already
+                # requires the replicates to agree, so the way to differ is per monad — here by
+                # alternating on the first call for each distinct monad, n_replicates being 1.)
+                ragged_calls = Ref(0)
+                ragged = QoI("ragged", s -> (ragged_calls[] += 1) == 1 ? Dict("a" => 1.0) :
+                                                                         Dict("a" => 1.0, "b" => 2.0))
                 err = try; calculateGSA!(gsa, [ragged]); nothing; catch e; e; end
                 @test err isa ArgumentError
                 @test occursin("same keys", err.msg)
 
-                # A reducer that names no quantities is refused rather than silently storing
-                # nothing: it would also never count as evaluated, so every later call would re-read
-                # every simulation's output to store nothing again.
-                empty_q = QoI("empty", _qoi_sim; reduce=per_sim -> Dict{String,Float64}())
+                # A measurement that names no quantities is refused at the seam, so all three
+                # consumers refuse it identically -- GSA used to be the only one that did, while
+                # the sink stored nothing silently and calibration died inside `mseDistance`.
+                empty_q = QoI("empty", s -> Dict{String,Float64}())
                 err = try; calculateGSA!(gsa, [empty_q]); nothing; catch e; e; end
                 @test err isa ArgumentError
-                @test occursin("names no quantities", err.msg)
+                @test occursin("empty", err.msg)
+                @test occursin("names no quantity", err.msg)
                 @test isempty(ModelManager._gsaLabelsOf(gsa, "empty"))
 
                 # Two keys of ONE QoI that collide once written into a label are refused where the
@@ -4658,8 +5731,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # cross-QoI check would say "comes from both QoI \"…\" and QoI \"…\"" naming the
                 # same QoI twice, and the single-measurement method has no check at all and would
                 # let one analysis silently overwrite the other.
-                collide = QoI("collide", _qoi_sim;
-                              reduce=per_sim -> Dict{Any,Any}(1 => 1.0, "1" => 2.0))
+                collide = QoI("collide", s -> Dict{Any,Any}(1 => 1.0, "1" => 2.0))
                 err = try; calculateGSA!(gsa, [collide]); nothing; catch e; e; end
                 @test err isa ArgumentError
                 @test occursin("all produce the label", err.msg)
@@ -4696,8 +5768,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # not known until its reducer has run — the case a label-based check could not skip
                 # without first doing the work it was meant to avoid.
                 spread_calls = Ref(0)
-                spr = QoI("spr", s -> (spread_calls[] += 1; _qoi_sim(s));
-                          reduce=per_sim -> Dict("a" => mean(per_sim)))
+                spr = QoI("spr", s -> (spread_calls[] += 1; Dict("a" => _qoi_sim(s))))
                 calculateGSA!(gsa, [spr])
                 @test "spr.a" in ModelManager.gsaLabels(gsa)
                 after_first = spread_calls[]
@@ -4711,18 +5782,15 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # reducer that drops a key would otherwise leave the old label behind holding a
                 # number from a measurement that no longer exists — reported by `gsaLabels` as
                 # current and drawn as a series — which is exactly the case `recompute` is for.
-                calculateGSA!(gsa, [QoI("shrink", _qoi_sim;
-                                        reduce=per_sim -> Dict("a" => mean(per_sim),
-                                                               "b" => maximum(per_sim)))])
+                calculateGSA!(gsa, [QoI("shrink", s -> Dict("a" => _qoi_sim(s),
+                                                            "b" => 2 * _qoi_sim(s)))])
                 @test ["shrink.a", "shrink.b"] ⊆ ModelManager.gsaLabels(gsa)
-                calculateGSA!(gsa, [QoI("shrink", _qoi_sim;
-                                        reduce=per_sim -> Dict("a" => mean(per_sim)))];
+                calculateGSA!(gsa, [QoI("shrink", s -> Dict("a" => _qoi_sim(s)))];
                               recompute=true)
                 @test "shrink.a" in ModelManager.gsaLabels(gsa)
                 @test !("shrink.b" in ModelManager.gsaLabels(gsa))   # dropped, not left stale
                 # ...and through the single-measurement method too.
-                calculateGSA!(gsa, QoI("shrink", _qoi_sim;
-                                       reduce=per_sim -> Dict("c" => mean(per_sim)));
+                calculateGSA!(gsa, QoI("shrink", s -> Dict("c" => _qoi_sim(s)));
                               recompute=true)
                 @test "shrink.c" in ModelManager.gsaLabels(gsa)
                 @test !any(l -> l in ("shrink.a", "shrink.b"), ModelManager.gsaLabels(gsa))
@@ -4760,8 +5828,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test gsa.results["solo"] isa GlobalSensitivity.MorrisResult
                 # It spreads, skips and recomputes on the same terms as the vector method.
                 solo_calls = Ref(0)
-                solo_spread = QoI("duo", s -> (solo_calls[] += 1; _qoi_sim(s));
-                                  reduce=per_sim -> Dict("a" => mean(per_sim), "b" => maximum(per_sim)))
+                solo_spread = QoI("duo", s -> (solo_calls[] += 1;
+                                               Dict("a" => _qoi_sim(s), "b" => 2 * _qoi_sim(s))))
                 calculateGSA!(gsa, solo_spread)
                 @test ["duo.a", "duo.b"] ⊆ ModelManager.gsaLabels(gsa)
                 once = solo_calls[]
@@ -4769,6 +5837,39 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test solo_calls[] == once                               # skipped
                 calculateGSA!(gsa, solo_spread; recompute=true)
                 @test solo_calls[] > once
+
+                # The constraint is on `reduce`'s output ALONE. A `compute` returning a Vector is
+                # nothing to do with GSA: it never sees that value, and a reducer turning it into a
+                # number is all that is required. It used to be refused at the seam, before the
+                # reducer written to handle it had run.
+                vec_compute = QoI("vecin", s -> [_qoi_sim(s), 2 * _qoi_sim(s)];
+                                  reduce=per_sim -> mean(sum(v) for v in per_sim))
+                calculateGSA!(gsa, [vec_compute])
+                @test "vecin" in ModelManager.gsaLabels(gsa)
+                @test gsa.results["vecin"] isa GlobalSensitivity.MorrisResult
+
+                # ...while a non-`Real` `reduce` is still refused, so widening `compute` did not
+                # quietly widen the thing an index is actually computed from.
+                @test_throws ArgumentError calculateGSA!(
+                    gsa, [QoI("vecout", _qoi_sim; reduce=per_sim -> collect(per_sim))])
+                @test !("vecout" in ModelManager.gsaLabels(gsa))
+
+                # A `compute` the default reducer cannot average now throws from inside `_qoiMean`,
+                # which knows neither the QoI's name nor the monad — nothing checks the value ahead
+                # of it any more. So the reduction loop is wrapped the way `_evaluateParticle`
+                # wraps its calls to user code: `@error` naming both, then rethrow.
+                unaverageable = QoI("gsatext", s -> "not a number")
+                # (`Base.CoreLogging` rather than `using Logging`, which is not among the test
+                # dependencies and is not worth adding for one assertion.)
+                logger = Test.TestLogger()
+                err = Base.CoreLogging.with_logger(logger) do
+                    try; calculateGSA!(gsa, [unaverageable]); nothing; catch e; e; end
+                end
+                @test err isa ArgumentError                      # from `_qoiMean`, rethrown
+                @test any(r -> r.level == Base.CoreLogging.Error &&
+                               occursin("gsatext", string(r.message)) &&
+                               occursin("monad", string(r.message)), logger.logs)
+                @test !("gsatext" in ModelManager.gsaLabels(gsa))
             end
 
             @testset "run_kwargs is one channel with the loose splat" begin
@@ -5481,7 +6582,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     end
 
     @testset "post-processing sink created lazily" begin
-        # A post_processor that only ever returns nothing must not create the sink file.
+        # A post_processor that only ever returns `missing` must not create the sink file.
         mktempdir() do project_dir
             _make_test_project(project_dir)
             initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
@@ -5491,7 +6592,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             xp = XMLPath(["data", "x"])
 
             run(createTrial(inputs, [DiscreteVariation(:config, xp, 701.0)]; n_replicates=1);
-                post_processor = sp -> nothing)
+                post_processor = sp -> missing)
             @test !isfile(postProcessingDBPath())   # nothing stored ⇒ no sink file
 
             run(createTrial(inputs, [DiscreteVariation(:config, xp, 702.0)]; n_replicates=1);

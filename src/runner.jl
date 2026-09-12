@@ -402,8 +402,8 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   `on_progress(:finish, n_success)` once at the end. When `nothing` (default) the runner
   behaves exactly as before — this keeps the per-simulation completion loop framework-
   agnostic while letting callers (e.g. ABC-SMC calibration) render a live progress bar.
-- `post_processor::Union{Nothing,Function}=nothing`: optional user hook run once per
-  **successfully completed** simulation, after the simulator's non-destructive
+- `post_processor::Union{Nothing,Function,QoI,AbstractVector}=nothing`: optional user hook run
+  once per **successfully completed** simulation, after the simulator's non-destructive
   [`postSimulationProcessing`](@ref) and before its destructive [`postSimulationCleanup`](@ref)
   — so the callback always sees the intact (but processed) output folder.
   It is called as `post_processor(simulation::Simulation)` — the same argument a [`QoI`](@ref)'s
@@ -414,21 +414,29 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
   `only(monadIDs(simulation))` (which queries the database, and throws if the simulation is gone);
   reading the actual simulation output into usable data is the responsibility of the user
   or the simulator package (e.g. PhysiCellModelManager loaders keyed by `simulationID`).
-  Its return value determines storage:
-  - `nothing` → nothing is stored (pure side effects).
-  - a `NamedTuple` or `AbstractDict` of `name => scalar` → one row keyed by `simulation_id`
-    is upserted into the project's post-processing sink (`data/outputs/postprocessing.db`),
-    readable via [`postProcessingTable`](@ref). Each key becomes the column
-    `"<qoi name>.<key>"`, so two measurements that both report a `tumor` stay separate; a
-    scalar return uses the name alone. Columns grow dynamically; sims lacking a given
-    quantity have `NULL`.
-  - any other type → an `ArgumentError` is thrown.
+  Its return value determines storage, and the sink's own rule is what it must satisfy — every
+  component becomes a column, so a column's worth of value is what it may be (sensitivity analysis
+  asks the same of a [`QoI`](@ref)'s `reduce`; calibration asks nothing of either):
+  - `missing` → nothing is stored for that simulation. This is also how a callback whose only
+    job is a side effect says so; `nothing` is **refused**, because it is what a callback
+    returns by accident when a block falls through.
+  - a `Real` → one column named after the QoI.
+  - a `NamedTuple` or `AbstractDict` of `name => Real` → one column per key, named
+    `"<qoi name>.<key>"`, so two measurements that both report a `tumor` stay separate. Either
+    way one row keyed by `simulation_id` is upserted into the project's post-processing sink
+    (`data/outputs/postprocessing.db`), readable via [`postProcessingTable`](@ref). Columns grow
+    dynamically; sims lacking a given quantity have `NULL`.
+  - any other type — a `Vector`, a `String`, a nested value, a keyed value with no keys → refused
+    with an error naming the QoI and the offending type. The refusal happens inside the
+    per-simulation post-processing stage, so `run` reports it the way it reports any other
+    post-processor failure: as that stage failing for that simulation, wrapping the `ArgumentError`
+    (see "fails fast" below).
 
   Because every column is named after the [`QoI`](@ref) that wrote it, a **bare anonymous
   function that stores anything is refused**: its derived name is a gensym that changes
   between sessions, so the same script would write a fresh, half-empty set of columns each
   run. Wrap it — `QoI("counts", sim -> …)` — or pass a named function. A callback returning
-  `nothing` is unaffected.
+  `missing` is unaffected.
   The callback runs inside the per-simulation worker task (so heavy compute parallelizes),
   but all sink writes are serialized in the main completion loop; user code never touches the
   sink DB directly. `post_processor` is not forwarded to the simulator hooks. If the callback
@@ -446,13 +454,13 @@ Run all pending simulations in `T` and return an [`MMOutput`](@ref).
 """
 function run(T::AbstractTrial; quiet::Bool=false,
              on_progress::Union{Nothing,Function}=nothing,
-             post_processor=nothing, tags=(),
+             post_processor::Union{Nothing,Function,QoI,AbstractVector}=nothing, tags=(),
              run_kwargs::NamedTuple=(;), kwargs...)
     kwargs = _mergeRunKwargs(run_kwargs, kwargs)
-    #! A `QoI` (or a vector of them) is accepted here as well as a bare function; `_asPostProcessor`
-    #! is the identity on a function, so nothing already written changes. Note the annotation stays
-    #! off `post_processor`: a `QoI` is not a `Function`, so restoring it would reject one.
-    post_processor = isnothing(post_processor) ? nothing : _asPostProcessor(post_processor)
+    #! Converted ONCE here rather than per simulation: `_validatePostProcessor` is the validator, so a
+    #! bad `post_processor` is refused before anything is dispatched, and what travels to the worker
+    #! is a `_PostProcessor` that `processSimulationTask` can name in its own signature.
+    post_processor = isnothing(post_processor) ? nothing : _validatePostProcessor(post_processor)
     #! Applied before anything is dispatched, so tags survive an interrupted run and the
     #! trial is queryable by tag while its simulations are still in flight.
     refreshProvenance!()
@@ -724,7 +732,8 @@ A throwing stage surfaces as a `_SimulationStageError` naming the stage and
 simulation. The captured value (if any) is written to the post-processing sink by the
 caller's serial completion loop, not here, so this function never touches the sink DB.
 """
-function processSimulationTask(simulation_task; post_processor::Union{Nothing,Function}=nothing, kwargs...)
+function processSimulationTask(simulation_task; post_processor::Union{Nothing,_PostProcessor}=nothing,
+                               kwargs...)
     schedule(simulation_task)
     simulation_process = fetch(simulation_task)
     updateDatabaseOnCompletion(simulation_process.simulation.id,
@@ -739,10 +748,12 @@ function processSimulationTask(simulation_task; post_processor::Union{Nothing,Fu
               () -> postSimulationProcessing(mm_globals().simulator, simulation_process; kwargs...))
     qoi = nothing
     if !isnothing(post_processor) && simulation_process.success
-        #! The user's callback takes a `Simulation`; the adapter no longer re-wraps it back into
-        #! something that accepts a `SimulationProcess`, so the field is read here instead.
+        #! The user's `compute` takes a `Simulation`, never a `SimulationProcess`, so the field is
+        #! read here. Inside `_runStage` because everything `_postProcess` does on this simulation --
+        #! the user's `compute`, the value contract, the anonymous-name refusal — is a per-simulation
+        #! failure and belongs to the `:post_processor` stage.
         qoi = _runStage(:post_processor, sid,
-                        () -> post_processor(simulation_process.simulation))
+                        () -> _postProcess(post_processor, simulation_process.simulation))
     end
     _runStage(:postSimulationCleanup, sid,
               () -> postSimulationCleanup(mm_globals().simulator, simulation_process; kwargs...))
