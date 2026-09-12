@@ -1,5 +1,5 @@
 using LinearAlgebra: Symmetric, I, Diagonal, cholesky, Cholesky, dot, diag
-using Distributions: pdf
+using Distributions: pdf, Distribution, DiscreteDistribution
 using Statistics: mean
 using Sobol
 
@@ -530,8 +530,8 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
     sizehint!(proposals, N)
     for j in 1:N
         latent_cdfs = Dict(param_names[i] => pts[j][i] for i in 1:d)
-        push!(proposals, _lookupAndSnap(latent_cdfs, param_names, k_eff, radius, bank,
-                                         mid_gen_additions))
+        push!(proposals, _lookupAndSnap(latent_cdfs, param_names, priors, k_eff, radius,
+                                         bank, mid_gen_additions))
     end
 
     proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
@@ -649,8 +649,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                 isnothing(latent_cdfs) && continue
 
                 if snap_active
-                    push!(proposals, _lookupAndSnap(latent_cdfs, param_names, k_eff, radius,
-                                                     bank, mid_gen_additions))
+                    push!(proposals, _lookupAndSnap(latent_cdfs, param_names, priors, k_eff,
+                                                     radius, bank, mid_gen_additions))
                 else
                     push!(proposals, (latent_cdfs, nothing))
                 end
@@ -816,17 +816,32 @@ _effectiveK(k_base::Int, t::Int) = k_base + t - 1
 
 """
     _snapToCDFGrid(u, k_eff) → Float64
+    _snapToCDFGrid(u, k_eff, prior) → Float64
 
 Snap a scalar CDF value `u ∈ [0,1]` to the nearest interior grid point at resolution
 `k_eff`, i.e. the nearest value in `{j/2^k_eff : j=1,...,2^k_eff-1}`.
 
 Boundary clamping: `u=0` snaps to `1/2^k_eff`; `u=1` snaps to `(2^k_eff-1)/2^k_eff`.
+
+The three-argument form takes the coordinate's latent `prior` and returns `u` untouched when
+that prior is discrete; a continuous prior snaps exactly as the two-argument form does.
 """
 function _snapToCDFGrid(u::Float64, k_eff::Int)
     n = 2^k_eff
     j = clamp(round(Int, u * n), 1, n - 1)
     return j / n
 end
+
+#! A discrete coordinate is a `DiscreteUniform` over level indices, so its quantile already
+#! collapses each level's whole CDF bin to a single target value: the grid adds no deduplication
+#! that is not already there, and what actually stops a repeat simulation is `use_previous=true`
+#! in `_createMonadForParams`. Snapping it can only do harm. The dyadic grid points are spread
+#! evenly over [0,1], not over the L level bins, so unless L divides 2^k_eff the levels receive
+#! unequal numbers of grid points -- and when 2^k_eff < L some levels receive none at all and
+#! become unreachable. Either way the sampled prior over levels is no longer uniform, and
+#! generation 1 has no weighting step that could correct it.
+_snapToCDFGrid(u::Float64, ::Int, ::DiscreteDistribution) = u
+_snapToCDFGrid(u::Float64, k_eff::Int, ::Distribution) = _snapToCDFGrid(u, k_eff)
 
 """
     _bankBoxRadius(k_eff) → Float64
@@ -874,7 +889,7 @@ function _bankBoxCandidates(bank::SimulationBank, query_cdf::Vector{Float64},
 end
 
 """
-    _lookupAndSnap(latent_cdfs, param_names, k_eff, radius, bank, mid_gen_additions)
+    _lookupAndSnap(latent_cdfs, param_names, priors, k_eff, radius, bank, mid_gen_additions)
     → Tuple{Dict{String,Float64}, Union{Nothing,Int}}
 
 Core bank-lookup and fallback-snap step for a single proposed CDF vector.
@@ -885,12 +900,24 @@ one is chosen at random and its stored coordinates and monad ID are returned.
 Otherwise the proposal is snapped to the nearest interior grid point of `G(k_eff)` and
 `nothing` is returned for the monad ID (resolved later by `evaluate_batch`).
 
+`priors` runs parallel to `param_names` and decides the snap per coordinate: a coordinate
+whose latent prior is discrete passes through unsnapped, since the dyadic grid does not
+divide evenly into its levels. Lookup is unaffected — it works on the raw proposal in
+every dimension either way.
+
 Duplicate monad IDs are intentional — the same monad may appear as multiple particles
 within a generation, each receiving its own weight.
 """
 function _lookupAndSnap(latent_cdfs::Dict{String,Float64}, param_names::Vector{String},
-                         k_eff::Int, radius::Float64, bank::SimulationBank,
+                         priors::Vector{<:Distribution}, k_eff::Int, radius::Float64,
+                         bank::SimulationBank,
                          mid_gen_additions::Vector{Tuple{Vector{Float64},Int}})
+    #! `priors` is read positionally against `param_names` below, and the two are built by the
+    #! caller; checked here so a mismatch is a message naming both lengths rather than a
+    #! `BoundsError` from inside the snap.
+    length(priors) == length(param_names) || throw(ArgumentError(
+        "_lookupAndSnap: `priors` has $(length(priors)) entries but `param_names` has " *
+        "$(length(param_names)); the two must run parallel, one prior per parameter."))
     raw_cdf = [latent_cdfs[name] for name in param_names]
 
     # Concurrent lookup: KD-tree bank + mid-generation additions
@@ -913,7 +940,8 @@ function _lookupAndSnap(latent_cdfs::Dict{String,Float64}, param_names::Vector{S
     end
 
     # Fallback: snap to grid — monad ID resolved by evaluate_batch
-    snapped_cdfs = Dict(name => _snapToCDFGrid(latent_cdfs[name], k_eff) for name in param_names)
+    snapped_cdfs = Dict(name => _snapToCDFGrid(latent_cdfs[name], k_eff, priors[i])
+                        for (i, name) in enumerate(param_names))
     return (snapped_cdfs, nothing)
 end
 
