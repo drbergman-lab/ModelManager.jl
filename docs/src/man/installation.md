@@ -41,12 +41,13 @@ pkg> add ModelManager
 using ModelManager
 
 mutable struct MySimulator <: AbstractSimulator
+    # Whatever your backend needs; ModelManager requires no fields at all.
     dir::String
-    # ...simulator-specific fields
+    version::VersionNumber
 end
 
 function __init__()
-    ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = MySimulator("/path"))
+    ModelManager.registerSimulator!(MySimulator("/path", v"0.1.0"))
 end
 ```
 

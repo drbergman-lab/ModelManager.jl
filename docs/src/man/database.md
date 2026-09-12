@@ -22,7 +22,7 @@ exact columns depend on `inputs.toml`. The core tables are:
 - **`<simulator>_versions`** — the simulator's version table (name supplied by the backend
   via [`simulatorVersionTableName`](@ref)).
 - **`calibrations`** — calibration runs (see [Calibration](@ref calibration_man)).
-- a status-codes table with the values from [`recognizedStatusCodes`](@ref):
+- a status-codes table with the values from [`ModelManager.recognizedStatusCodes`](@ref):
   `"Not Started"`, `"Queued"`, `"Running"`, `"Completed"`, `"Failed"`.
 
 Per-folder **variations** are not stored in the central database. Each input folder that
@@ -35,7 +35,7 @@ Likewise, **post-processing quantities of interest** are kept in a separate data
 the first time a `post_processor` returns quantities to store. See
 [Post-processing and quantities of interest](@ref post_processing).
 
-[`initializeDatabase`](@ref) creates the schema if needed; [`createMMTable`](@ref) and
+[`ModelManager.initializeDatabase`](@ref) creates the schema if needed; [`createMMTable`](@ref) and
 [`insertFolder`](@ref) are the building blocks backends use to register tables and folders.
 
 ## Querying
@@ -58,7 +58,7 @@ df = stmtToDataFrame("SELECT * FROM simulations WHERE config_id = ?;", [3])
 Useful building blocks:
 
 - [`constructSelectQuery`](@ref) — assemble a `SELECT` with an optional `WHERE`/condition and column selection.
-- [`buildWhereClause`](@ref) — turn a vector of IDs plus a filter `Dict` into a `WHERE` clause.
+- [`ModelManager.buildWhereClause`](@ref) — turn a vector of IDs plus a filter `Dict` into a `WHERE` clause.
 - [`tableExists`](@ref), [`tableColumns`](@ref) — introspect the schema.
 - [`tableIDName`](@ref) — the primary-key column name for a table.
 
@@ -69,7 +69,7 @@ alongside them — use [`simulationsTable`](@ref) and its relatives, described i
 
 ## Consistency diagnostics
 
-After [`initializeModelManager`](@ref) succeeds, it launches [`databaseDiagnostics`](@ref)
+After [`initializeModelManager`](@ref) succeeds, it launches [`ModelManager.databaseDiagnostics`](@ref)
 in a background task. These are five read-only checks that verify the database and filesystem
 agree (DB↔filesystem sync, orphaned entries, constituent-ID integrity, and simulation
 status). Because they run in the background, their output may appear shortly after

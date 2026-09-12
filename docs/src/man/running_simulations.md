@@ -79,7 +79,7 @@ backend is in use.
 
 ## Status tracking
 
-Each simulation moves through the status codes from [`recognizedStatusCodes`](@ref) —
+Each simulation moves through the status codes from [`ModelManager.recognizedStatusCodes`](@ref) —
 `Not Started` → `Queued`/`Running` → `Completed` or `Failed`. The runner updates these as
 work progresses (`updateDatabaseOnCompletion`), so a query against the `simulations`
 table always reflects the current state of the campaign.

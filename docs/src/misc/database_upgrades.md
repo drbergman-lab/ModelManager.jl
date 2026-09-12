@@ -13,7 +13,8 @@ backend authors implement the hooks described in
 ## When migrations run
 
 Every project database records the package version it was last migrated to, in a version
-table named by the backend ([`dbVersionTableName`](@ref)). During
+table named by the backend ([`dbVersionTableName`](@ref), which defaults to the backend's own
+package name lowercased with `_version` appended). During
 [`initializeModelManager`](@ref), [`resolvePackageVersion`](@ref) compares that stored version
 to the version of the backend loaded into the running session, read from the package defining the
 simulator type:
@@ -37,6 +38,8 @@ session recorded when it loaded the package.
 
 Not every release changes the schema. A backend declares the versions that do via
 [`upgradeMilestones`](@ref) — a sorted list of [`VersionNumber`](https://docs.julialang.org/en/v1/base/base/#Base.VersionNumber)s.
+It defaults to empty, so a backend whose schema has never changed shape implements neither it nor
+[`upgradeToMilestone`](@ref); declaring a milestone is what makes `upgradeToMilestone` required.
 [`upgradePackage`](@ref) walks the milestones between the database's current version and the
 target version and, for each one, calls the backend's
 [`upgradeToMilestone`](@ref)`(sim, version, auto_upgrade)`.
