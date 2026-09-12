@@ -685,7 +685,19 @@ function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}
     locations = variationLocation(cv)
     maps = [Base.Fix1(getindex, variation.values) ∘ first for variation in cv.variations]
     first_values = cv.variations[1].values
-    inverse_maps = [tv -> _discreteValueIndex(first_values, tv[1])]
+    #! Recover the level index from the first target, then check the rest agree with it -- the same
+    #! guard the `DistributedVariation` co-variation below applies, and for the same reason: the
+    #! `SimulationBank` inverts speculatively over rows the database already holds, and a row whose
+    #! remaining co-varied columns do not lie on the curve must not be reused as if it did. `NaN` is
+    #! how an inverse map says "not on the curve"; `_bankCdfCoords` turns it into "not reusable".
+    #! `CoVariation` asserts every variation has the same number of values, so the index is in range.
+    inverse_maps = [tv -> begin
+        idx = _discreteValueIndex(first_values, tv[1])
+        for i in 2:length(cv.variations)
+            cv.variations[i].values[idx] == tv[i] || return NaN
+        end
+        idx
+    end]
     resolved_name = isnothing(name) ? variationName(cv) : String(name)
     tnames = [variationName(v) for v in cv.variations]
     return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
