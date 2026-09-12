@@ -29,18 +29,36 @@
 #!   sever the submitter from the job, which may start hours later. Writing a file needs only `>`.
 #! - It does not clean up with `rm_hpc_safe`. That exists for output directories a *running* job on
 #!   another node still holds open; a sentinel's writer has exited before the file is even readable.
-#!   It would also stage into `data/.trash/` -- a cross-mount move whenever `done_dir` is on another
-#!   filesystem -- and warn about the staged path, all for a few bytes.
+#!   It would also stage into `data/.trash/` and warn about the staged path, all for a few bytes.
+
+"""
+    _hpcDoneDirPath()
+
+Where SLURM jobs deposit their exit-code sentinels: `mm_globals().hpc_done_dir` when the session
+set one, else `<dataDir()>/outputs/.hpc_done`, a sibling of the simulation folders the sentinels
+are about.
+
+The default is on the same filesystem the jobs already write their output into, so it is somewhere
+the compute nodes can write by construction; what that costs on NFS is directory-attribute
+staleness, and latency is the lesser and the visible failure. The one way to move it is the
+`MODELMANAGER_HPC_DONE_DIR` environment variable, read once by
+[`initializeModelManager`](@ref) -- see [`ModelManagerGlobals`](@ref). It cannot move during a
+session, because diagnostics reads the directory at initialization and would otherwise be looking
+somewhere the sentinels are not.
+"""
+function _hpcDoneDirPath()
+    dir = mm_globals().hpc_done_dir
+    return isempty(dir) ? joinpath(dataDir(), "outputs", ".hpc_done") : dir
+end
 
 """
     _hpcDoneDir()
 
-Absolute path to the directory where SLURM jobs deposit their exit-code sentinels, creating it if
-needed. Defaults to `<dataDir()>/.hpc_done`; see `HPCCompletionOptions.done_dir` for when to move it.
+`_hpcDoneDirPath()`, created if it is not there yet. Read paths use the path helper instead, so
+that merely inspecting the directory does not bring it into existence.
 """
 function _hpcDoneDir()
-    configured = mm_globals().hpc_completion.done_dir
-    dir = isempty(configured) ? joinpath(dataDir(), ".hpc_done") : configured
+    dir = _hpcDoneDirPath()
     mkpath(dir)
     return dir
 end
@@ -322,8 +340,8 @@ end
     _SubmissionRefused <: Exception
 
 `sbatch` would not take the job: it could not be invoked, it exited non-zero, or its output held no
-job ID. Thrown by `_submitHPCJob` once its retry policy is exhausted; `run` turns it into a
-fail-fast error naming the simulation.
+job ID. Thrown by the runner once its retry policy is exhausted; `run` turns it into a fail-fast
+error naming the simulation.
 
 A refusal is not a simulation failure. The job never existed, so nothing is known about the
 simulation -- what is wrong is the environment: a per-user submit limit, a controller that is not
@@ -338,7 +356,7 @@ struct _SubmissionRefused <: Exception
 end
 
 Base.showerror(io::IO, e::_SubmissionRefused) =
-    print(io, "sbatch refused the job for simulation $(e.simulation_id): $(e.message)")
+    print(io, "sbatch refused the job for simulation $(e.simulation_id): ", e.message)
 
 #! Refusals that clear up on their own: a submit limit while earlier jobs drain, a controller too
 #! busy to answer. Matched on sbatch's own wording, because every refusal exits 1. Anything not
@@ -450,14 +468,145 @@ function _runHPCSimulation(cmd::Cmd, simulation::Simulation)
     #! The sentinel's name is chosen here, before submission, and baked into the job script. It has
     #! to be unique per submission, and neither ID on offer is: simulation IDs are recycled when a
     #! simulation is deleted, and SLURM job IDs wrap at `MaxJobId` and reset on a `slurmctld -c`.
-    #! So the name is `<simulation_id>.<time_ns>`, and the two parts split the work -- the simulation
-    #! ID separates *concurrent* workers (no two in-flight jobs share one), the monotonic timestamp
-    #! separates *sequential* submissions of the same ID. Nothing left behind by an earlier
-    #! submission can ever share a name with this one, so there is nothing to clean up first. (Naming
-    #! by job ID would need a "discard anything already there" step after submission, which races a
-    #! fast job's real sentinel.) The job ID is used only for the reaper's liveness check, where a
-    #! recycled ID can at worst delay a reap, never produce a wrong result.
-    sentinel = joinpath(done_dir, "$(simulation_id).$(string(time_ns(); base=16))")
+    #! So the name is `<simulation_id>.<wall-clock nanoseconds, hex>`, and the two parts split the
+    #! work -- the simulation ID separates *concurrent* workers (no two in-flight jobs share one),
+    #! the timestamp separates *sequential* submissions of the same ID. Nothing left behind by an
+    #! earlier submission can ever share a name with this one, so there is nothing to clean up
+    #! first. (Naming by job ID would need a "discard anything already there" step after submission,
+    #! which races a fast job's real sentinel.) The job ID is used only for the reaper's liveness
+    #! check, where a recycled ID can at worst delay a reap, never produce a wrong result.
+    #!
+    #! Wall clock (`time()`), not `time_ns()`, even though everything else here is monotonic: this
+    #! stamp is read back by `_sentinelsBySimulation` to order two sentinels for one simulation, and
+    #! `time_ns()`'s epoch is per-boot, so stamps written by two driver sessions -- the case that
+    #! ordering exists for -- are not comparable. Uniqueness per submission is unaffected.
+    sentinel = joinpath(done_dir, "$(simulation_id).$(string(round(UInt64, time() * 1e9); base=16))")
     job_id = _submitHPCJob(_prepareHPCSubmitCommand(cmd, simulation, sentinel), simulation_id)
     return _waitForHPCJob(job_id, sentinel, time_ns())
+end
+
+########### What a dead driver left behind ###########
+
+#! Everything below is read after the fact, by `databaseDiagnostics`, for a session whose driver
+#! process died before it could record what its jobs did. Nothing here is on the hot path, and
+#! nothing here throws: a diagnostic that fails must report less, never abort the session.
+
+"""
+    _sentinelsBySimulation() → Dict{Int,String}
+
+The last-submitted exit-code sentinel on disk for each simulation ID, from names of the form
+`<simulation_id>.<wall-clock nanoseconds, hex>`.
+
+Ordering is by the stamp in the name, not by `mtime`. Two things make the stamp the right one.
+It says when the job was *submitted*, and a row still at `Running` belongs to the last submission
+for that simulation -- while `mtime` says when the job *finished*, so an earlier-submitted job that
+outlived a later one would win and describe a run that has since been superseded. And it is a
+string this process wrote, where `mtime` on a network filesystem is subject to attribute caching,
+clock skew between nodes, and a resolution that can tie; reading it also costs no `stat`, and
+cannot throw on a file that has been swept away mid-scan.
+
+A name whose stamp does not parse is ignored rather than guessed at -- which is also what skips
+the staged `.tmp` writes a job killed between the `echo` and the `mv` leaves behind, whose contents
+may be half a number.
+"""
+function _sentinelsBySimulation()
+    latest = Dict{Int,String}()
+    stamps = Dict{Int,UInt64}()
+    done_dir = _hpcDoneDirPath()
+    isdir(done_dir) || return latest
+    for name in readdir(done_dir)
+        parts = split(name, '.')
+        length(parts) == 2 || continue
+        simulation_id = tryparse(Int, parts[1])
+        isnothing(simulation_id) && continue
+        stamp = tryparse(UInt64, parts[2]; base=16)
+        isnothing(stamp) && continue
+        if !haskey(stamps, simulation_id) || stamp > stamps[simulation_id]
+            stamps[simulation_id] = stamp
+            latest[simulation_id] = joinpath(done_dir, name)
+        end
+    end
+    return latest
+end
+
+"""
+    _jobIDFromSubmission(simulation_id::Int) → Union{Nothing,Int}
+
+The SLURM job ID in the simulation's `hpc.out`, or `nothing` if the file is absent or holds no
+single ID. With `--parsable` this file is the only record on disk of which job ran a simulation.
+"""
+function _jobIDFromSubmission(simulation_id::Int)
+    path = joinpath(trialFolder(Simulation, simulation_id), "hpc.out")
+    isfile(path) || return nothing
+    return _parseJobID(read(path, String))
+end
+
+#! Bounded like `_SQUEUE_TIMEOUT_S`, and for a sharper reason: `sacct` queries slurmdbd, which is a
+#! second daemon with a database behind it.
+const _SACCT_TIMEOUT_S = Ref(60.0)
+
+#! What a job state says about the simulation. These lists are not exhaustive and cannot be: SLURM
+#! adds states between releases and a site can define its own, so a state in none of them is
+#! reported by name and the simulation left alone, which is the only answer that is never wrong.
+#! The failure list is every state in which the job is over and did not succeed. The waiting list is
+#! every state in which it is still on its way to an outcome, including the ones that only look
+#! terminal -- `COMPLETING` and `STAGE_OUT` are the tail of a job that is about to report, and a
+#! `REQUEUE*` job is going around again. `SUSPENDED` waits for the same reason `_squeueUserJobs`
+#! passes `-t all`: a preempted job is alive and will resume.
+const _SACCT_SUCCESS_STATES = ("COMPLETED",)
+const _SACCT_FAILURE_STATES = ("FAILED", "TIMEOUT", "CANCELLED", "OUT_OF_MEMORY", "NODE_FAIL",
+                               "BOOT_FAIL", "DEADLINE", "PREEMPTED", "REVOKED")
+const _SACCT_WAITING_STATES = ("PENDING", "RUNNING", "SUSPENDED", "COMPLETING", "CONFIGURING",
+                               "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "RESIZING",
+                               "RESV_DEL_HOLD", "SIGNALING", "SPECIAL_EXIT", "STAGE_OUT",
+                               "STOPPED")
+
+"""
+    _sacctStates(job_ids::AbstractVector{Int}) → Union{Nothing,Dict{Int,String}}
+
+The state SLURM's accounting database records for each of `job_ids`, upper-cased, from **one**
+`sacct` call; `nothing` if `sacct` could not answer at all -- it is absent, or the query failed or
+hung. A job the database has no row for (it aged out, or never existed) is simply absent from the
+returned `Dict`. Never throws.
+
+One call, not one per job, because slurmdbd is a second daemon with a database behind it and a
+diagnostics pass can have hundreds of stranded simulations to ask about; `sacct -j` takes the whole
+comma-separated list in a single query.
+
+Each job contributes an allocation row plus a `.batch` and `.extern` step row describing pieces of
+it; only the allocation is kept, recognised by a `JobID` with no `.` in it. A cancelled job reports
+`CANCELLED by 1234`, so only the first word of the state is kept.
+"""
+function _sacctStates(job_ids::AbstractVector{Int})
+    isempty(job_ids) && return Dict{Int,String}()
+    try
+        out = IOBuffer()
+        joined = join(unique(job_ids), ",")
+        p = run(pipeline(ignorestatus(`sacct -j $(joined) -n -P --format=JobID,State`);
+                         stdout=out, stderr=devnull); wait=false)
+        if timedwait(() -> process_exited(p), _SACCT_TIMEOUT_S[]) === :timed_out
+            #! Kill and leave, for the reason spelled out in `_squeueUserJobs`: `wait` here would
+            #! block on a pipe a grandchild may still hold open.
+            kill(p)
+            return nothing
+        end
+        wait(p)
+        success(p) || return nothing
+        states = Dict{Int,String}()
+        for line in eachline(seekstart(out))
+            fields = split(strip(line), '|')
+            length(fields) >= 2 || continue
+            #! `12345.batch`, `12345.extern` and `12345.0` are steps of the allocation, not the
+            #! allocation; their states describe a piece of the job and can differ from its own.
+            occursin('.', fields[1]) && continue
+            job_id = tryparse(Int, fields[1])
+            isnothing(job_id) && continue
+            state = strip(fields[2])
+            isempty(state) && continue
+            states[job_id] = uppercase(String(first(split(state, ' '))))
+        end
+        return states
+    catch
+        return nothing
+    end
 end

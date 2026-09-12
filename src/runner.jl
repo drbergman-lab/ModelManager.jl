@@ -1,14 +1,16 @@
 import Base.run
 
 """
-    simulationFailed(simulation::Simulation, monad_id::Int)
-    simulationFailed(simulation_id::Int, monad_id::Int)
+    simulationFailed(simulation::Simulation, monad_id)
+    simulationFailed(simulation_id::Int, monad_id)
 
-Mark a simulation as failed and remove it from its monad's constituent list.
+Mark a simulation as failed and remove it from its monad's constituent list. `monad_id` may be
+`missing`, which makes `eraseSimulationIDFromConstituents` resolve the monad from the simulation's
+own parameterization -- the only option for a caller reconstructing an outcome after the fact.
 """
-simulationFailed(simulation::Simulation, monad_id::Int) = simulationFailed(simulation.id, monad_id)
+simulationFailed(simulation::Simulation, monad_id::Union{Missing,Int}) = simulationFailed(simulation.id, monad_id)
 
-function simulationFailed(simulation_id::Int, monad_id::Int)
+function simulationFailed(simulation_id::Int, monad_id::Union{Missing,Int})
     DBInterface.execute(centralDB(), "UPDATE simulations SET status_code_id=$(statusCodeID("Failed")) WHERE simulation_id=$(simulation_id);")
     eraseSimulationIDFromConstituents(simulation_id; monad_id=monad_id)
 end
@@ -114,9 +116,10 @@ per submission and the wait race-free.
 
 The path is bound to a shell variable, single-quoted, *before* the trap is installed, and the trap
 body then refers only to that variable. Interpolating the path into the trap body directly would
-put it inside double quotes in code that is re-parsed when the trap fires, so a `done_dir`
-containing `\$`, a backtick or a `"` would be expanded or would break the quoting -- and `done_dir`
-is user-settable. Binding it once means exactly one thing needs escaping, by exactly one rule.
+put it inside double quotes in code that is re-parsed when the trap fires, so a sentinel directory
+containing `\$`, a backtick or a `"` would be expanded or would break the quoting -- and it sits
+under the user's own `data/`. Binding it once means exactly one thing needs escaping, by exactly
+one rule.
 
 Only `EXIT` is trapped, not `TERM`. A job killed by the scheduler produces no sentinel at all, and
 that is already handled correctly: it leaves the queue, the reaper notices, and after the grace
@@ -251,6 +254,11 @@ A local process that fails to start (missing executable, unwritable folder) is r
 simulation, not raised: one broken simulation should not abort a campaign of thousands. A process
 killed by a signal is also a failure -- Julia reports `exitcode == 0` for those, so the check is
 `success(p)`, not the exit code.
+
+A submission `sbatch` *refuses* is the one launch problem that is raised rather than recorded: no
+job ran, so nothing is known about the simulation, and calling it failed would erase it from its
+monad. `run` leaves that simulation at `Not Started`, stops the campaign, and reports the
+submission stage and the simulation in its error.
 """
 function runSimulation(sim::AbstractSimulator, spec::SimulationSpec)
     cmd = simulationCommand(sim, spec)
@@ -761,11 +769,12 @@ function processSimulationTask(simulation_task; post_processor::Union{Nothing,_P
 end
 
 """
-    updateDatabaseOnCompletion(simulation_id::Int, monad_id::Int, success::Bool)
+    updateDatabaseOnCompletion(simulation_id::Int, monad_id, success::Bool)
 
-Update the simulation status in the database after it finishes.
+Update the simulation status in the database after it finishes. `monad_id` may be `missing` when
+the caller does not have it -- see `simulationFailed`.
 """
-function updateDatabaseOnCompletion(simulation_id::Int, monad_id::Int, success::Bool)
+function updateDatabaseOnCompletion(simulation_id::Int, monad_id::Union{Missing,Int}, success::Bool)
     if success
         DBInterface.execute(centralDB(), "UPDATE simulations SET status_code_id=$(statusCodeID("Completed")) WHERE simulation_id=$(simulation_id);")
     else
