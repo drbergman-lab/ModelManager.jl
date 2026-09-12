@@ -373,13 +373,14 @@ function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:fina
     #! Addressed by generation index, not by position in a sorted file list. The old form sorted names
     #! lexicographically and then used the list position as `t`, which is only correct while every name
     #! has the same width and no generation is missing.
-    indices = _generationIndices(gen_dir)
+    #! Complete generations only: a folder for a generation still running (or interrupted) holds
+    #! just its monad record, so `:final` would resolve to it and then fail for want of particles.
+    indices = _completeGenerationIndices(gen_dir)
     isempty(indices) && error(
         "No completed generations found for Calibration($(calibration.id)).")
 
     t = generation === :final ? last(indices) : Int(generation)
-    t in indices || throw(ArgumentError(
-        "Generation $t not found for Calibration($(calibration.id)). Available: $(indices)."))
+    t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, calibration.id, t, indices)))
 
     csv_path = _generationArtifact(gen_dir, t, :particles)
     isnothing(csv_path) && error(
@@ -451,8 +452,8 @@ end
 function ConvergenceSummary(cal::Calibration)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
-    indices = _generationIndices(gen_dir)
-    isempty(indices) && error("No generation metadata found for Calibration($(cal.id)).")
+    indices = _completeGenerationIndices(gen_dir)
+    isempty(indices) && error("No complete generation found for Calibration($(cal.id)).")
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
     thresholds = Union{Nothing,Float64}[]
@@ -463,9 +464,7 @@ function ConvergenceSummary(cal::Calibration)
     #! resolved on its own rather than by swapping the metadata file's extension — under the folder
     #! layout `metadata.toml` and `particles.csv` share no stem, so that trick no longer applies.
     for t in indices
-        toml_path = _generationArtifact(gen_dir, t, :metadata)
-        isnothing(toml_path) && continue
-        d = TOML.parsefile(toml_path)
+        d = TOML.parsefile(_generationArtifact(gen_dir, t, :metadata))
         csv_path = _generationArtifact(gen_dir, t, :particles)
         n_acc = isnothing(csv_path) ?
                 round(Int, d["acceptance_rate"] * d["n_evaluations"]) :

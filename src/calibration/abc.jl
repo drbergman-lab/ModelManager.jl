@@ -965,23 +965,31 @@ end
 
 ################## Resume — validation helpers ##################
 
-#! Ordered by index, never by name — `_generationIndices` parses it, so mixed padding widths and both
-#! layouts order alike. Sorting the names instead would put `generation_006.csv` before
-#! `generation_05.csv` and answer generation 5 for a run that reached 10.
+#! The last COMPLETE generation, by index. A resume targets an interrupted run, whose trailing
+#! folder is exactly the incomplete one, and `_completeGenerationIndices` already excludes it:
+#! `metadata.toml` is written last, as the commit marker, so a listed generation has both CSVs by
+#! construction. Asking that list rather than walking back over every folder testing for the CSVs
+#! keeps one definition of "complete" in the package.
 """
     _findLastGenerationCSVs(calibration) → Union{Nothing, Tuple{String,String}}
 
-Return `(cdf_csv_path, display_csv_path)` for the last saved generation, or `nothing`
-if no generations have been written yet.
+Return `(cdf_csv_path, display_csv_path)` for the last complete generation, or `nothing`
+if no generation has finished writing yet.
 """
 function _findLastGenerationCSVs(calibration::Calibration)
-    gen_dir = joinpath(calibrationFolder(calibration), "generations")
-    indices = _generationIndices(gen_dir)
-    isempty(indices) && return nothing
-    t = last(indices)
+    gen_dir  = joinpath(calibrationFolder(calibration), "generations")
+    complete = _completeGenerationIndices(gen_dir)
+    isempty(complete) && return nothing
+    t = last(complete)
     cdf_path     = _generationArtifact(gen_dir, t, :cdfs)
     display_path = _generationArtifact(gen_dir, t, :particles)
-    (isnothing(cdf_path) || isnothing(display_path)) && return nothing
+    #! A commit marker with a CSV missing is not an interrupted write -- the marker is written
+    #! after the CSVs -- but a folder altered afterwards, which walking back to an older generation
+    #! would paper over.
+    (isnothing(cdf_path) || isnothing(display_path)) && error(
+        "Generation $t of Calibration($(calibration.id)) has its metadata.toml but is missing " *
+        "$(isnothing(cdf_path) ? "cdfs.csv" : "particles.csv"); the folder was altered after the " *
+        "run wrote it.")
     return cdf_path, display_path
 end
 
@@ -1334,7 +1342,7 @@ function resumeCalibration(calibration::Calibration,
     #! that quietly falls back to the quantile rule. A schedule sized for the *remaining* generations
     #! instead of the whole run therefore runs out early without erroring.
     if !isnothing(m.epsilon_schedule)
-        n_done    = length(_generationIndices(joinpath(calibrationFolder(calibration), "generations")))
+        n_done    = length(_completeGenerationIndices(joinpath(calibrationFolder(calibration), "generations")))
         last_cov  = length(m.epsilon_schedule) + 1
         first_new = n_done + 1
         if last_cov < m.max_nr_populations
@@ -1662,18 +1670,21 @@ end
 
 function _loadGenerations(dir::String, param_names::Vector{String},
                           max_nr_populations::Int)
-    #! Discovered, never reconstructed: `_generationIndices` reports what is on disk across both the
-    #! folder layout and the historical flat one, at any padding width, and `_generationArtifact`
-    #! resolves each file the same way. A generation whose CDF file is missing is skipped rather than
-    #! erroring — that is an interrupted write, and the generations before it are still usable.
-    indices = _generationIndices(dir)
+    #! Discovered, never reconstructed: `_completeGenerationIndices` reports every generation on
+    #! disk that finished writing, across both the folder layout and the historical flat one, at any
+    #! padding width, and `_generationArtifact` resolves each file the same way. An interrupted write
+    #! has no `metadata.toml` -- it is written last, as the commit marker -- so it is simply not
+    #! listed and the generations before it are still usable. A listed generation whose CDF file is
+    #! missing is an altered folder, not an interrupted write, and is an error.
+    indices = _completeGenerationIndices(dir)
     isempty(indices) && return GenerationResult[]
 
     generations = GenerationResult[]
     n_upgraded = 0
     for t in indices
         csv_path = _generationArtifact(dir, t, :cdfs)
-        isnothing(csv_path) && continue
+        isnothing(csv_path) && error("Generation $t under $dir has its metadata.toml but no " *
+                                     "cdfs.csv; the folder was altered after the run wrote it.")
 
         df        = CSV.read(csv_path, DataFrame)
         weights   = df[!, :weight]
@@ -1682,7 +1693,6 @@ function _loadGenerations(dir::String, param_names::Vector{String},
         particles = select(df, param_names)
 
         toml_path = _generationArtifact(dir, t, :metadata)
-        isnothing(toml_path) && continue
         meta = TOML.parsefile(toml_path)
         #! Older runs recorded a single `epsilon`. Read it, and upgrade the file in place so the next
         #! read takes the current path — resuming already writes into this folder, so there is nothing
