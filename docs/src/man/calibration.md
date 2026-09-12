@@ -406,7 +406,8 @@ the likeliest reason otherwise-correct code trips.
 | ``Calibration failed while evaluating monad N: `summary_statistic` or `distance` raised`` | Your function threw on a monad that has output. | The original exception and backtrace follow the message. |
 | ``distance returned a T, but a `Real` is required`` | `distance` returned a `Dict`, `missing`, `nothing`, … | Return a real number. If you are guarding against missing output yourself, you no longer need to — see the table above. |
 | `simulation(s) X … have no row in the simulations table` | A monad's constituent record and the database disagree. | Run `ModelManager.databaseDiagnostics()`. This indicates corrupted bookkeeping, not a failed simulation. |
-| `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used anonymous functions, which JLD2 cannot serialize. | Pass the original problem: `resumeCalibration(cal; problem=my_problem)`. Define `summary_statistic`/`distance` as named functions to avoid it next time. |
+| `Cannot resume Calibration(N): problem.jld2 contains only a partial manifest` | The original problem used lambdas or closures — a named function defined *inside* another function counts — which JLD2 cannot restore by name. | Pass the original problem: `resumeCalibration(cal; problem=my_problem)`. Define `summary_statistic`/`distance` at the top level of a file or module to avoid it next time. |
+| `The saved problem in … could not be read back` | The file holds a closure this session cannot name (saved by a version that did not detect it). | `include` the file that defines your functions before resuming, or pass `problem=`, which is then used without being checked against the saved one. |
 
 ### The run isn't converging
 
