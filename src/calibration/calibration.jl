@@ -627,12 +627,44 @@ function deleteCalibration(calibration_ids::AbstractVector{<:Integer}; delete_su
     DBInterface.execute(centralDB(),
         "DELETE FROM calibrations WHERE calibration_id IN ($(join(ids, ",")));")
     deleteTagsFor(Calibration, ids)
+    _deleteCalibrationBatchTags(ids)
     for id in ids
         rm_hpc_safe(calibrationFolder(id); force=true, recursive=true)
     end
 
     isempty(monad_ids_to_delete) ||
         deleteMonad(monad_ids_to_delete; delete_subs=true, delete_supers=true)
+    return nothing
+end
+
+"""
+    _deleteCalibrationBatchTags(ids)
+
+Remove the `mm:calibration` / `mm:generation` tags a run left on its per-generation batch samplings.
+
+`deleteTagsFor(Calibration, ids)` cannot: those tags sit on *sampling* rows and name the run in
+their **value**, so nothing keyed on `(trial_class, trial_id)` reaches them. Left behind they
+would be re-attributed rather than merely stale, because `calibration_id` is an
+`INTEGER PRIMARY KEY` without `AUTOINCREMENT` and SQLite hands the deleted run's id to the next
+one -- so `findMonads(tags = ("mm:calibration" => "3",))`, which `tag!`'s docstring recommends as
+the route to a run's monads, would return the deleted run's monads mixed with the new run's.
+"""
+function _deleteCalibrationBatchTags(ids::AbstractVector{<:Integer})
+    isempty(ids) && return nothing
+    tableExists("tags") || return nothing
+    values_sql = join(("'$(id)'" for id in ids), ",")
+    #! The generation tag carries only a generation number, so it is identified by sitting on a
+    #! sampling this run tagged -- collected before the calibration tags are removed.
+    tagged = queryToDataFrame(
+        "SELECT DISTINCT trial_class, trial_id FROM tags " *
+        "WHERE tag_key='mm:calibration' AND tag_value IN ($(values_sql));")
+    for row in eachrow(tagged)
+        DBInterface.execute(centralDB(),
+            "DELETE FROM tags WHERE tag_key='mm:generation' AND trial_class=? AND trial_id=?;",
+            (row.trial_class, row.trial_id))
+    end
+    DBInterface.execute(centralDB(),
+        "DELETE FROM tags WHERE tag_key='mm:calibration' AND tag_value IN ($(values_sql));")
     return nothing
 end
 
