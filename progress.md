@@ -39,8 +39,16 @@ Gaussian KDE draw, unexposed and with a bandwidth tuned for proposals.
   Smoothed mode needs CDF coordinates *and* the quantile maps; sources round-trip through JLD2
   except a `LatentVariation` with anonymous maps, in which case the error points at
   `resumeABC(cal; problem=)`, which returns an `ABCResult` for a finished run without re-running.
-- **Lives in `problem.jl` beside `posterior`**, sharing a `_readGenerationParticles` helper so the
-  two disk readers cannot drift.
+- **One disk prelude for every reader.** `posterior(::Calibration)`, the corner-plot `:cdf` branch,
+  the ridgeline/transition recipe and `ConvergenceSummary(::Calibration)` each opened with their own
+  copy of "find `generations/`, list complete generations, resolve `:final`, validate `t`, read the
+  CSV, split off `weight`/`distance`/`monad_id`" -- which is why #64 had to patch the in-flight-folder
+  bug in several places. `samplePosterior` would have been a fifth copy. Instead `calibration.jl`
+  now holds `_completeGenerations`, `_resolveDiskGeneration` and `_readGenerationFrame` beside
+  `_completeGenerationIndices`, and every one of those sites calls them; the recipe's local
+  `_readGenCSV` closure is a one-line alias. Surfaced by the user asking whether the new helpers
+  overlapped the previous batch of PRs: they did not duplicate a helper, but they did add a parallel
+  CSV splitter, and the inline copies were the real duplication.
 - **A draw's frame is the parameter columns, plus `monad_id` in plain mode.** The two `posterior`
   methods disagree on this today: `posterior(::ABCResult)` returns `_buildDisplayDF`, which appends
   `weight`/`distance`/`monad_id`, while `posterior(::Calibration)` strips all three. Rather than

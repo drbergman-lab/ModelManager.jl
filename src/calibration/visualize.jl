@@ -281,19 +281,8 @@ end
     if space === :target
         df, w = posterior(cal; generation=generation)
     else
-        gen_dir = joinpath(calibrationFolder(cal), "generations")
-        indices = _completeGenerationIndices(gen_dir)
-        isempty(indices) && error("No CDF generation files for Calibration($(cal.id)).")
-        t = generation === :final ? last(indices) : Int(generation)
-        t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, cal.id, t, indices)))
-        cdf_path = _generationArtifact(gen_dir, t, :cdfs)
-        isnothing(cdf_path) && error(
-            "Generation $t of Calibration($(cal.id)) has no CDF file.")
-        df_cdf  = CSV.read(cdf_path, DataFrame)
-        weights_col = hasproperty(df_cdf, :weight) ? df_cdf[!, :weight] :
-                      fill(1.0 / nrow(df_cdf), nrow(df_cdf))
-        df = select(df_cdf, Not(intersect([:weight, :distance, :monad_id], Symbol.(names(df_cdf)))))
-        w  = Float64.(weights_col)
+        gen_dir, t = _resolveDiskGeneration(cal, generation)
+        df, w, _   = _readGenerationFrame(gen_dir, cal.id, t, :cdfs)
     end
     _CornerPlotData(df, w)
 end
@@ -881,25 +870,10 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
                    show_particles       = false,
                    aggregate_duplicates = true,
                    logscale             = false)
-    gen_dir = joinpath(calibrationFolder(cal), "generations")
-    isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
     #! Generations are addressed by index throughout, so both layouts and any padding width behave
     #! alike, and `t` never means "position in a sorted listing".
-    indices = _completeGenerationIndices(gen_dir)
-    isempty(indices) && error("No completed generations for Calibration($(cal.id)).")
-
-    # Helper: read generation t's display-format particles; return (param_df, weights, raw_df).
-    function _readGenCSV(t::Int)
-        path = _generationArtifact(gen_dir, t, :particles)
-        isnothing(path) && error(
-            "Generation $t of Calibration($(cal.id)) has no particle file.")
-        raw = CSV.read(path, DataFrame)
-        w   = hasproperty(raw, :weight) ? Float64.(raw[!, :weight]) :
-              fill(1.0 / nrow(raw), nrow(raw))
-        df  = select(raw, Not(intersect([:weight, :distance, :monad_id],
-                                        Symbol.(names(raw)))))
-        return df, w, raw
-    end
+    gen_dir, indices = _completeGenerations(cal)
+    _readGenCSV(t::Int) = _readGenerationFrame(gen_dir, cal.id, t, :particles)
 
     if style === :ridgeline
         dfs = Vector{DataFrame}()

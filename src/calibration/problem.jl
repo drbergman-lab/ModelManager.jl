@@ -383,56 +383,9 @@ df, weights = posterior(Calibration(42); generation=3)
 ```
 """
 function posterior(calibration::Calibration; generation::Union{Int,Symbol}=:final)
-    display_df, weights, _ = _readGenerationParticles(calibration, generation)
-    return display_df, weights
-end
-
-"""
-    _resolveDiskGeneration(calibration, generation) → (gen_dir, t)
-
-Locate a calibration's `generations/` directory and resolve `generation` to an index that is
-actually present on disk.
-
-`:final` is the highest *complete* generation, not the last entry of a listing: names are addressed
-by the index inside them, so a missing generation or a changed padding width cannot shift the answer,
-and an in-flight folder holding only its monad record is never chosen.
-"""
-function _resolveDiskGeneration(calibration::Calibration, generation::Union{Int,Symbol})
-    gen_dir = joinpath(calibrationFolder(calibration), "generations")
-    isdir(gen_dir) || error(
-        "No generations directory found for Calibration($(calibration.id)). " *
-        "Has the calibration been run?")
-
-    #! Complete generations only: a folder for a generation still running (or interrupted) holds
-    #! just its monad record, so `:final` would resolve to it and then fail for want of particles.
-    indices = _completeGenerationIndices(gen_dir)
-    isempty(indices) && error(
-        "No completed generations found for Calibration($(calibration.id)).")
-
-    t = generation === :final ? last(indices) : Int(generation)
-    t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, calibration.id, t, indices)))
-    return gen_dir, t
-end
-
-"""
-    _readGenerationParticles(calibration, generation) → (display_df, weights, monad_ids)
-
-Read one generation's `particles.csv`, splitting the parameter columns from the three bookkeeping
-ones (`weight`, `distance`, `monad_id`).
-
-The single disk reader behind both `posterior(::Calibration)` and `samplePosterior(::Calibration)`.
-"""
-function _readGenerationParticles(calibration::Calibration, generation::Union{Int,Symbol})
     gen_dir, t = _resolveDiskGeneration(calibration, generation)
-    csv_path = _generationArtifact(gen_dir, t, :particles)
-    isnothing(csv_path) && error(
-        "Generation $t of Calibration($(calibration.id)) has no particle file.")
-
-    df = CSV.read(csv_path, DataFrame)
-    weights    = df[!, :weight]
-    monad_ids  = df[!, :monad_id]
-    display_df = select(df, Not([:weight, :distance, :monad_id]))
-    return display_df, weights, monad_ids
+    display_df, weights, _ = _readGenerationFrame(gen_dir, calibration.id, t, :particles)
+    return display_df, weights
 end
 
 ################## samplePosterior ##################
@@ -497,22 +450,18 @@ function samplePosterior(calibration::Calibration, n::Int; generation::Union{Int
                          smooth::Bool=false, rng::AbstractRNG=Random.default_rng())
     _assertDrawCount(n)
 
+    gen_dir, t = _resolveDiskGeneration(calibration, generation)
+
     if !smooth
-        display_df, weights, monad_ids = _readGenerationParticles(calibration, generation)
-        return _plainPosteriorDraws(rng, display_df, weights, monad_ids, n)
+        display_df, weights, raw = _readGenerationFrame(gen_dir, calibration.id, t, :particles)
+        return _plainPosteriorDraws(rng, display_df, weights, raw[!, :monad_id], n)
     end
 
-    gen_dir, t = _resolveDiskGeneration(calibration, generation)
-    cdf_path   = _generationArtifact(gen_dir, t, :cdfs)
-    isnothing(cdf_path) && error(
-        "Generation $t of Calibration($(calibration.id)) has no cdfs.csv, which smoothed sampling " *
-        "needs for the particles' CDF coordinates.")
-
-    df          = CSV.read(cdf_path, DataFrame)
+    df, weights, _ = _readGenerationFrame(gen_dir, calibration.id, t, :cdfs)
     cps         = _diskCalibrationParameters(calibration)
     param_names = _cdfColumnNames(cps, names(df))
     X           = Matrix{Float64}(df[!, param_names])
-    Y           = _smoothedCDFDraws(rng, X, Vector{Float64}(df[!, :weight]), n)
+    Y           = _smoothedCDFDraws(rng, X, weights, n)
     return _cdfDrawsToDisplay(Y, cps, param_names)
 end
 
@@ -838,10 +787,7 @@ function ConvergenceSummary(result::ABCResult)
 end
 
 function ConvergenceSummary(cal::Calibration)
-    gen_dir = joinpath(calibrationFolder(cal), "generations")
-    isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
-    indices = _completeGenerationIndices(gen_dir)
-    isempty(indices) && error("No complete generation found for Calibration($(cal.id)).")
+    gen_dir, indices = _completeGenerations(cal)
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
     thresholds = Union{Missing,Float64}[]

@@ -157,6 +157,59 @@ function _generationUnavailable(gen_dir::AbstractString, calibration_id::Int, t:
     return "Generation $t not found for Calibration($(calibration_id)). Available: $(complete)."
 end
 
+#! Every reader that presents a run from disk -- `posterior`, `samplePosterior`, `ConvergenceSummary`,
+#! the plot recipes -- used to open with its own copy of the same eight lines, and #64 had to fix the
+#! in-flight-folder bug in each of them. These three are that prelude, written once.
+"""
+    _completeGenerations(calibration) → (gen_dir, indices)
+
+A run's `generations/` directory and the complete generations in it, ascending. Errors when the
+directory is absent or holds no finished generation.
+"""
+function _completeGenerations(calibration::Calibration)
+    gen_dir = joinpath(calibrationFolder(calibration), "generations")
+    isdir(gen_dir) || error(
+        "No generations directory found for Calibration($(calibration.id)). " *
+        "Has the calibration been run?")
+    indices = _completeGenerationIndices(gen_dir)
+    isempty(indices) && error(
+        "No completed generations found for Calibration($(calibration.id)).")
+    return gen_dir, indices
+end
+
+"""
+    _resolveDiskGeneration(calibration, generation) → (gen_dir, t)
+
+Resolve a `generation` keyword (`:final` or an index) against what is complete on disk.
+
+`:final` is the highest *complete* generation, so an in-flight folder holding only its monad record
+is never chosen; asking for such a generation by number, or for one that does not exist, throws an
+`ArgumentError` that says which.
+"""
+function _resolveDiskGeneration(calibration::Calibration, generation::Union{Int,Symbol})
+    gen_dir, indices = _completeGenerations(calibration)
+    t = generation === :final ? last(indices) : Int(generation)
+    t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, calibration.id, t, indices)))
+    return gen_dir, t
+end
+
+"""
+    _readGenerationFrame(gen_dir, calibration_id, t, role) → (params_df, weights, raw_df)
+
+Read generation `t`'s `:particles` (display values) or `:cdfs` (CDF coordinates) file, splitting the
+parameter columns from the bookkeeping ones (`weight`, `distance`, `monad_id`), which stay on `raw_df`.
+Weights fall back to uniform when the file has no `weight` column.
+"""
+function _readGenerationFrame(gen_dir::AbstractString, calibration_id::Int, t::Int, role::Symbol)
+    path = _generationArtifact(gen_dir, t, role)
+    isnothing(path) && error(
+        "Generation $t of Calibration($(calibration_id)) has no $(_GENERATION_ARTIFACTS[role]).")
+    raw = CSV.read(path, DataFrame)
+    w   = hasproperty(raw, :weight) ? Float64.(raw[!, :weight]) : fill(1.0 / nrow(raw), nrow(raw))
+    df  = select(raw, Not(intersect(Symbol.(_PARTICLE_BOOKKEEPING_COLUMNS), Symbol.(names(raw)))))
+    return df, w, raw
+end
+
 """
     _generationArtifact(gen_dir, t, role) → String or nothing
 
