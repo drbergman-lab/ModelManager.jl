@@ -214,6 +214,11 @@ end
 
 ################## Pairs / corner plot ##################
 
+#! These recipe docstrings are source documentation only. `@recipe` defines methods of
+#! `RecipesBase.apply_recipe`, so the binding they attach to is not public in ModelManager and the
+#! `Private = false` autodocs never render them; `?plot` looks up `Plots.plot` and misses them too.
+#! The manual page (`docs/src/man/calibration.md`, "Visualizing calibration results") is the user-facing
+#! home and must carry the substance; keep these terse and in step with it.
 """
     plot(result::ABCResult; generation=:final, space=:target, parameters=nothing)
     plot(cal::Calibration; generation=:final, space=:target, parameters=nothing)

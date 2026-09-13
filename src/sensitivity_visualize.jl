@@ -220,6 +220,9 @@ end
 
 ################## MOAT recipes ##################
 
+#! As in `calibration/visualize.jl`: recipe docstrings attach to `RecipesBase.apply_recipe`, which the
+#! autodocs do not render, so the manual page is the user-facing home and these stay terse.
+
 """
     plot(m::MOATSampling; show_sigma=false, parameters=nothing)
     plot(m::MOATSampling, style::Symbol; show_sigma=false, parameters=nothing)
