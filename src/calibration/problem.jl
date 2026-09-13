@@ -233,9 +233,13 @@ Result of a single ABC-SMC generation.
   which accepts every proposal it evaluates, and for generations recorded before this was stored.
   Distinct from `max_epsilon_accepted`: at the default `epsilon_quantile` of `0.5` the threshold is a
   *median* of the previous generation's distances while `max_epsilon_accepted` is a *maximum* of this
-  one's, so the two coincide only when `epsilon_quantile == 1.0`.
-- `proposal_distances::Union{Nothing,DataFrame}`: Reserved for the per-generation distance of every
-  evaluated proposal, accepted or not. Currently always `nothing` — nothing populates it yet.
+  one's. The constructor requires `epsilon_quantile < 1`, so the two coincide only when the previous
+  generation's distances are tied at the top.
+- `proposal_distances::Union{Nothing,DataFrame}`: The distance of every proposal this generation
+  evaluated, accepted or not — columns `monad_id`, `distance`, `accepted`. Populated every generation,
+  written to `generations/{t}/proposals.csv`, reloaded on resume, and plotted by
+  `plot(result, :distances)`. `nothing` only for a generation recorded before proposal distances were
+  kept.
 - `rejected_proposals::Union{Nothing,DataFrame}`: CDF-coordinate DataFrame of all
   rejected proposals in this generation (same column names as `particles`). Populated
   only when `ABCSMC(store_rejected=true)`; always `nothing` for generation 1 (all Sobol
@@ -677,12 +681,12 @@ struct _DrawTargetSpec
     types::Vector{DataType}
 end
 
-#! The target values are the trailing display columns: for every source but `LVSource` that is all of
-#! them, and `LVSource` prepends its latent samples.
 function _drawTargetSpec(cp::CalibrationParameter)
     lv   = cp.lv
-    cols = _displayColumns(cp)
-    return _DrawTargetSpec(cols[end-length(lv.targets)+1:end], lv.locations, lv.targets, lv.types)
+    cols = _targetColumns(cp)
+    length(cols) == length(lv.targets) || error(
+        "$(typeof(cp.source)) names $(length(cols)) target column(s) for $(length(lv.targets)) target(s).")
+    return _DrawTargetSpec(cols, lv.locations, lv.targets, lv.types)
 end
 _drawTargetSpec(s::_StrippedLVSource) = _DrawTargetSpec(s.target_names, s.locations, s.targets, s.types)
 _drawTargetSpec(s) = _drawTargetSpec(_sourceToCalibrationParameter(s))
