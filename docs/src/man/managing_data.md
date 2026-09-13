@@ -41,15 +41,21 @@ are covered too).
 [`deleteCalibration`](@ref) removes a calibration's record, its tags, and its output folder:
 
 ```julia
-deleteCalibration(3)                      # keep the simulations it evaluated
-deleteCalibration(3; delete_subs = true)  # remove them too
+deleteCalibration(3)                      # keep every monad it evaluated
+deleteCalibration(3; delete_subs = true)  # remove the ones no one else uses
 ```
 
 The default is the opposite of the levels above: `delete_subs` is `false`, because a
 calibration's monads are not its private property. The simulation bank reuses monads across runs,
-and a monad the calibration snapped onto may predate it entirely. Deleting the run does discard
-its posterior, since the generation CSVs and the serialized problem live in the folder — see
-[Calibration](@ref calibration_man).
+and a monad the calibration snapped onto may predate it entirely.
+
+`delete_subs = true` deletes the monads **only that run used**, and their simulations. A monad
+another calibration's generation record lists, or one belonging to any sampling other than the
+run's own per-generation batches, is kept. The batches themselves shrink to the monads that
+survive and disappear once empty.
+
+Deleting the run does discard its posterior, since the generation CSVs and the serialized problem
+live in the folder — see [Calibration](@ref calibration_man).
 
 ## Deleting by status
 
@@ -60,7 +66,7 @@ deleteSimulationsByStatus(["Failed"])           # prompts before deleting
 deleteSimulationsByStatus(["Failed"]; user_check=false)
 ```
 
-The status values are those from [`recognizedStatusCodes`](@ref).
+The status values are those from [`ModelManager.recognizedStatusCodes`](@ref).
 
 ## Resetting a project
 
@@ -75,7 +81,7 @@ resetDatabase(; force_reset=true)     # skip the prompt (scripts/CI)
 
 This is destructive and irreversible — every simulation, monad, sampling, and trial is
 deleted, and the post-processing sink (`data/outputs/postprocessing.db`) is removed. Use it
-deliberately. [`resetFolder`](@ref) resets a single input folder's variation state without
+deliberately. [`ModelManager.resetFolder`](@ref) resets a single input folder's variation state without
 touching the rest of the project.
 
 ## Safe removal on shared filesystems

@@ -172,18 +172,31 @@ postVariationXMLProcessing(::AbstractSimulator, ::Symbol, ::String) = nothing
 @compat public postVariationXMLProcessing
 
 """
+    variationFilePath(location::Symbol, M::AbstractMonad)
+
+Return the path [`createXMLFile`](@ref) writes for `location` in monad `M`:
+`<location folder>/<variations subfolder>/<location>_variation_<id>.xml`.
+
+The path is derived from `M`'s variation ID, not looked up on disk, so it is defined whether or
+not the file exists yet. A simulator backend that needs to read or copy a variation file should
+call this rather than rebuild the naming convention.
+"""
+variationFilePath(location::Symbol, M::AbstractMonad) =
+    joinpath(locationPath(location, M), locationVariationsFolder(location),
+             "$(location)_variation_$(M.variation_id[location]).xml")
+
+"""
     createXMLFile(location::Symbol, M::AbstractMonad)
 
 Create (if needed) the variation XML file for `location` in monad `M` and return its path.
 
-The file is written to `<location_folder>/<variations_subfolder>/<location>_variation_<id>.xml`.
-If the file already exists it is returned immediately. After writing, calls
-[`postVariationXMLProcessing`](@ref) to allow simulator-specific post-processing.
+The file is written to [`variationFilePath`](@ref)`(location, M)`. If it already exists it is
+returned immediately. After writing, calls [`postVariationXMLProcessing`](@ref) to allow
+simulator-specific post-processing.
 """
 function createXMLFile(location::Symbol, M::AbstractMonad)
     @assert M.inputs[location].varied "Folder $(locationPath(location, M)) is not varied and should not have an XML file created for it."
-    path_to_folder = locationPath(location, M)
-    path_to_xml = joinpath(path_to_folder, locationVariationsFolder(location), "$(location)_variation_$(M.variation_id[location]).xml")
+    path_to_xml = variationFilePath(location, M)
     if isfile(path_to_xml)
         return path_to_xml
     end
@@ -242,5 +255,5 @@ end
 #! are part of the XML layer a simulator backend builds on, not internals.
 #! See CLAUDE.md, "Docstring cross-references".
 @compat public getChildByAttribute, getChildByChildContent, retrieveElementError,
-               elementIsTerminal, setSimpleContent, createXMLFile, prepareBaseFile,
-               prepareVariedInputFolder
+               elementIsTerminal, setSimpleContent, createXMLFile, variationFilePath,
+               prepareBaseFile, prepareVariedInputFolder

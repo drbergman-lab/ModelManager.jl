@@ -1,5 +1,5 @@
 using LinearAlgebra: Symmetric, I, Diagonal, cholesky, Cholesky, dot, diag
-using Distributions: pdf
+using Distributions: pdf, Distribution, DiscreteDistribution
 using Statistics: mean
 using Sobol
 
@@ -291,8 +291,8 @@ unbiased prior sample while still avoiding redundant simulation work.
   caller to route provenance records to a per-generation file.
 
   A `missing` distance means no distance could be computed for that particle — for the
-  ModelManager implementation, that its monad had no successful simulation (see
-  `_buildEvaluateBatch`). Such particles are never accepted: generation 1 drops them
+  ModelManager implementation, that its monad had no successful simulation, or no summary value
+  (see `_buildEvaluateBatch`). Such particles are never accepted: generation 1 drops them
   before setting ε, and later generations reject them without comparing against ε. `missing`
   rather than a sentinel value keeps the signal distinct from any distance a user's `distance`
   function might legitimately return, `Inf` included.
@@ -389,6 +389,10 @@ function _runABCSMC(method::ABCSMC, param_names::Vector{String},
                                            k_base_eff=k_base_eff,
                                            mid_gen_additions=mid_gen_additions,
                                            budget=budget, budget_hit=budget_hit)
+            #! The generation accepted nothing and has already explained itself. It must not be
+            #! persisted — the next generation resamples from its particles — so the run ends here
+            #! with the generations that do have particles.
+            isnothing(gen) && break
         end
 
         # Absorb this generation's new grid evaluations into the bank before the next.
@@ -530,8 +534,8 @@ function _runFirstGeneration(method::ABCSMC, param_names::Vector{String},
     sizehint!(proposals, N)
     for j in 1:N
         latent_cdfs = Dict(param_names[i] => pts[j][i] for i in 1:d)
-        push!(proposals, _lookupAndSnap(latent_cdfs, param_names, k_eff, radius, bank,
-                                         mid_gen_additions))
+        push!(proposals, _lookupAndSnap(latent_cdfs, param_names, priors, k_eff, radius,
+                                         bank, mid_gen_additions))
     end
 
     proposals = _capBatchToBudget(proposals, budget, method.max_evaluations)   # budget check before dispatch
@@ -555,11 +559,12 @@ _firstGenerationProposals(results) =
 Build generation 1's accepted set. Generation 1 has no epsilon threshold and accepts every
 proposal — *except* those whose distance is `missing`, which are dropped here.
 
-`missing` means the particle has no distance at all: its monad had no successful simulation, so
-the summary statistic was never computed (see `_buildEvaluateBatch`). Such a particle
+`missing` means the particle has no distance at all: its monad had no successful simulation, so the
+summary statistic was never computed, or the summary has no value for it — every replicate's
+`compute` returned `missing`, or a QoI's `reduce` did (see `_buildEvaluateBatch`). Such a particle
 cannot be accepted, and keeping it would corrupt `epsilon = maximum(distances)` for the whole
-generation. Errors when no particle survives — a whole generation of failed monads is a broken
-model, not sampling noise.
+generation. Errors when no particle survives — a whole generation without a distance is a broken
+model or a broken measurement, not sampling noise.
 
 The generation therefore holds **fewer than `population_size` particles** when any monad failed;
 the uniform weights are renormalized over the survivors. Generation 1 proposes exactly
@@ -575,16 +580,19 @@ function _acceptFirstGeneration(proposals::Vector{Tuple{Dict{String,Float64},Uni
                                for i in eachindex(proposals) if !ismissing(results[i][1])]
     if isempty(accepted)
         error("""
-        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads had a successful \
-        simulation, so no particles could be accepted.
-        Check the generation's failure files and the failed simulations' output folders, and \
-        re-run with `on_monad_failure=:error` to stop at the first failure.
+        ABC-SMC generation 1: none of the $(length(proposals)) proposed monads produced a distance \
+        — no successful simulation, or a summary statistic with no value — so no particles could be \
+        accepted.
+        Check the generation's failure files (if any simulations failed) and those simulations' \
+        output folders, and the warnings above (for monads whose summary was `missing`, where \
+        nothing failed and so nothing was written). Re-run with `on_monad_failure=:error` to stop \
+        at the first one.
         """)
     end
     n_dropped = length(proposals) - length(accepted)
     n_dropped > 0 && @warn "ABC-SMC generation 1: dropped $n_dropped of " *
-                           "$(length(proposals)) proposals whose monads had no successful " *
-                           "simulation; ε and the particle weights are set from the " *
+                           "$(length(proposals)) proposals whose monads produced no distance; " *
+                           "ε and the particle weights are set from the " *
                            "$(length(accepted)) surviving particles."
     return accepted
 end
@@ -605,7 +613,10 @@ multiple particles, each receiving its own weight. `mid_gen_additions` accumulat
 grid evaluations within this generation and is shared between batches (growing throughout).
 
 Budget accounting is delegated to `_updateBudget!`. When `budget_hit` is set, the
-completed portion of the generation is returned (possibly fewer than `population_size`).
+completed portion of the generation is returned (possibly fewer than `population_size`) —
+or `nothing` when that portion is empty, meaning the budget ran out before any proposal
+passed ε. A generation with no particles is not a generation: `nothing` tells the caller to
+stop with what is already on disk rather than persist one.
 """
 function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                                   priors::Vector{<:Distribution}, evaluate_batch::Function,
@@ -630,6 +641,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                         k_eff=snap_active ? k_eff : nothing)
     radius      = snap_active ? _bankBoxRadius(k_eff)      : 0.0
 
+    best_distance = Inf
+
     proposal_rows = NamedTuple{(:monad_id, :distance, :accepted), Tuple{Int,Float64,Bool}}[]
     while length(accepted) < method.population_size
         n_needed     = method.population_size - length(accepted)
@@ -645,8 +658,8 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                 isnothing(latent_cdfs) && continue
 
                 if snap_active
-                    push!(proposals, _lookupAndSnap(latent_cdfs, param_names, k_eff, radius,
-                                                     bank, mid_gen_additions))
+                    push!(proposals, _lookupAndSnap(latent_cdfs, param_names, priors, k_eff,
+                                                     radius, bank, mid_gen_additions))
                 else
                     push!(proposals, (latent_cdfs, nothing))
                 end
@@ -671,8 +684,12 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
 
         n_accepted_this_round = 0
         for (i, (distance, metadata)) in enumerate(results)
-            #! A `missing` distance means the monad had no successful simulation, so there is
-            #! nothing to compare against ε — the particle is rejected outright.
+            #! Kept for the empty-`accepted` guard below, which has to say whether the budget ran
+            #! out or ε is simply out of reach. The closest distance the generation saw is the one
+            #! number that separates those, and it is gone once the loop ends.
+            ismissing(distance) || (best_distance = min(best_distance, Float64(distance)))
+            #! A `missing` distance means the monad had no successful simulation or no summary
+            #! value, so there is nothing to compare against ε — the particle is rejected outright.
             if !ismissing(distance) && distance <= epsilon
                 n_accepted_this_round += 1
                 push!(proposal_rows, _proposalRow(distance, metadata, true))
@@ -692,6 +709,29 @@ function _runSubsequentGeneration(method::ABCSMC, param_names::Vector{String},
                                     acceptance_rate_est / 2 :
                                     n_accepted_this_round / length(proposals))
         budget_hit[] && break
+    end
+
+    #! Guarded here rather than papered over downstream: `max_epsilon_accepted` is `maximum` over the
+    #! accepted distances, which throws on an empty collection, and an `init=` would only trade the
+    #! error for a zero-particle generation that the *next* generation would then resample from. Every
+    #! exit from the loop above is a budget break, so this is reachable exactly when the budget ran out
+    #! before anything passed ε — the run stops with the generations already on disk.
+    if isempty(accepted)
+        detail = isfinite(best_distance) ?
+            "the closest of the $(n_evaluations) proposals it evaluated was $(best_distance), " *
+            "against ε=$(epsilon)" :
+            "not one of the $(n_evaluations) proposals it evaluated produced a distance at all — " *
+            "every monad failed, so check the generation's failure files"
+        @warn """
+        ABC-SMC generation $t accepted no particles, so it is discarded and the run stops with \
+        generation $(t - 1) as its last: max_evaluations=$(method.max_evaluations) was reached and \
+        $(detail).
+        Raise the budget to continue — `resumeCalibration(cal; max_evaluations=N)` with N above \
+        $(budget[]), which counts every evaluation the run has made rather than only new ones. If \
+        the closest distance is far above ε, it is the threshold that is out of reach and not the \
+        budget: relax `epsilon_quantile` or `minimum_epsilon` as well.
+        """
+        return nothing
     end
 
     weights = _computeWeights(accepted, param_names, prev, fitted)
@@ -812,17 +852,32 @@ _effectiveK(k_base::Int, t::Int) = k_base + t - 1
 
 """
     _snapToCDFGrid(u, k_eff) → Float64
+    _snapToCDFGrid(u, k_eff, prior) → Float64
 
 Snap a scalar CDF value `u ∈ [0,1]` to the nearest interior grid point at resolution
 `k_eff`, i.e. the nearest value in `{j/2^k_eff : j=1,...,2^k_eff-1}`.
 
 Boundary clamping: `u=0` snaps to `1/2^k_eff`; `u=1` snaps to `(2^k_eff-1)/2^k_eff`.
+
+The three-argument form takes the coordinate's latent `prior` and returns `u` untouched when
+that prior is discrete; a continuous prior snaps exactly as the two-argument form does.
 """
 function _snapToCDFGrid(u::Float64, k_eff::Int)
     n = 2^k_eff
     j = clamp(round(Int, u * n), 1, n - 1)
     return j / n
 end
+
+#! A discrete coordinate is a `DiscreteUniform` over level indices, so its quantile already
+#! collapses each level's whole CDF bin to a single target value: the grid adds no deduplication
+#! that is not already there, and what actually stops a repeat simulation is `use_previous=true`
+#! in `_createMonadForParams`. Snapping it can only do harm. The dyadic grid points are spread
+#! evenly over [0,1], not over the L level bins, so unless L divides 2^k_eff the levels receive
+#! unequal numbers of grid points -- and when 2^k_eff < L some levels receive none at all and
+#! become unreachable. Either way the sampled prior over levels is no longer uniform, and
+#! generation 1 has no weighting step that could correct it.
+_snapToCDFGrid(u::Float64, ::Int, ::DiscreteDistribution) = u
+_snapToCDFGrid(u::Float64, k_eff::Int, ::Distribution) = _snapToCDFGrid(u, k_eff)
 
 """
     _bankBoxRadius(k_eff) → Float64
@@ -870,7 +925,7 @@ function _bankBoxCandidates(bank::SimulationBank, query_cdf::Vector{Float64},
 end
 
 """
-    _lookupAndSnap(latent_cdfs, param_names, k_eff, radius, bank, mid_gen_additions)
+    _lookupAndSnap(latent_cdfs, param_names, priors, k_eff, radius, bank, mid_gen_additions)
     → Tuple{Dict{String,Float64}, Union{Nothing,Int}}
 
 Core bank-lookup and fallback-snap step for a single proposed CDF vector.
@@ -881,12 +936,24 @@ one is chosen at random and its stored coordinates and monad ID are returned.
 Otherwise the proposal is snapped to the nearest interior grid point of `G(k_eff)` and
 `nothing` is returned for the monad ID (resolved later by `evaluate_batch`).
 
+`priors` runs parallel to `param_names` and decides the snap per coordinate: a coordinate
+whose latent prior is discrete passes through unsnapped, since the dyadic grid does not
+divide evenly into its levels. Lookup is unaffected — it works on the raw proposal in
+every dimension either way.
+
 Duplicate monad IDs are intentional — the same monad may appear as multiple particles
 within a generation, each receiving its own weight.
 """
 function _lookupAndSnap(latent_cdfs::Dict{String,Float64}, param_names::Vector{String},
-                         k_eff::Int, radius::Float64, bank::SimulationBank,
+                         priors::Vector{<:Distribution}, k_eff::Int, radius::Float64,
+                         bank::SimulationBank,
                          mid_gen_additions::Vector{Tuple{Vector{Float64},Int}})
+    #! `priors` is read positionally against `param_names` below, and the two are built by the
+    #! caller; checked here so a mismatch is a message naming both lengths rather than a
+    #! `BoundsError` from inside the snap.
+    length(priors) == length(param_names) || throw(ArgumentError(
+        "_lookupAndSnap: `priors` has $(length(priors)) entries but `param_names` has " *
+        "$(length(param_names)); the two must run parallel, one prior per parameter."))
     raw_cdf = [latent_cdfs[name] for name in param_names]
 
     # Concurrent lookup: KD-tree bank + mid-generation additions
@@ -909,7 +976,8 @@ function _lookupAndSnap(latent_cdfs::Dict{String,Float64}, param_names::Vector{S
     end
 
     # Fallback: snap to grid — monad ID resolved by evaluate_batch
-    snapped_cdfs = Dict(name => _snapToCDFGrid(latent_cdfs[name], k_eff) for name in param_names)
+    snapped_cdfs = Dict(name => _snapToCDFGrid(latent_cdfs[name], k_eff, priors[i])
+                        for (i, name) in enumerate(param_names))
     return (snapped_cdfs, nothing)
 end
 
@@ -1013,9 +1081,10 @@ function _adaptEpsilon(distances::Vector{Float64}, quantile_val::Float64,
 end
 
 #! Every proposal that produced a real distance, accepted or not. `missing` distances are left out:
-#! they mean the monad had no successful simulation, which is not a distance and cannot be binned —
-#! those monad IDs are already recorded in the generation's failed-monads file. Keeping them out also
-#! keeps `distance` a plain `Float64` column, so the reader needs no type hint.
+#! they mean the monad had no successful simulation, or no summary value, which is not a distance
+#! and cannot be binned — those monad IDs are recorded in the generation's failed-monads file, or,
+#! for a monad that ran but measured nothing, named in that generation's `@warn`. Keeping them out
+#! also keeps `distance` a plain `Float64` column, so the reader needs no type hint.
 #!
 #! `accepted` means "passed ε", not "ended up in the posterior". With `accept_overflow=false` a
 #! particle can pass ε and still be dropped because the batch overshot `population_size`; recording it

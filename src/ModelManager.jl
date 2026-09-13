@@ -13,7 +13,7 @@ export getInstalledVersion, getDBPackageVersion, resolvePackageVersion
 export queryToDataFrame, stmtToDataFrame, constructSelectQuery, tableIDName
 export tableExists, tableColumns
 export locationVariationsDatabase
-export ModelManagerGlobals, mm_globals_ref, mm_globals, assertInitialized
+export ModelManagerGlobals, mm_globals, assertInitialized
 export centralDB, dataDir, isInitialized, projectLocations, inputsDict
 export withTransaction
 export initializeModelManager
@@ -74,12 +74,15 @@ include("classes.jl")
 include("recorder.jl")
 include("database.jl")
 include("hpc_completion.jl")
+#! Ahead of `runner.jl` because `run` and `processSimulationTask` name `QoI` in a signature, and a
+#! signature is evaluated when the method is defined. Everything `qoi.jl` names at definition time
+#! (`Simulation`, `Monad`, `AbstractTrial`) comes from `classes.jl`, above.
+include("qoi.jl")
 include("runner.jl")
 include("deletion.jl")
 include("xml_utilities.jl")
 include("variations.jl")
 include("study.jl")
-include("qoi.jl")
 include("sensitivity.jl")
 include("sensitivity_visualize.jl")
 include("user_api.jl")

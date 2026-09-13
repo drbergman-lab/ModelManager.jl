@@ -147,10 +147,27 @@ _calibrationRejection(::LatentVariation{<:Distribution}) = nothing
 #! indices, so a particle coordinate stays a CDF value in [0,1] and the quantile does the quantising —
 #! the perturbation kernels never see a target value and need no discrete counterpart. What a discrete
 #! parameter costs is resolution, not correctness: the sampler explores within-bin variation that has
-#! no effect on the simulation, which `cdf_grid_k` snapping and the `SimulationBank` already mitigate
-#! by collapsing repeated grid points.
-_calibrationRejection(::DiscreteVariation) = nothing
-_calibrationRejection(::CoVariation{<:DiscreteVariation}) = nothing
+#! no effect on the simulation. `cdf_grid_k` snapping does not help with that and is deliberately not
+#! applied to a discrete coordinate — the dyadic grid is spread evenly over [0,1] rather than over the
+#! level bins, so snapping would skew the prior over levels and, at a coarse `k`, leave some
+#! unreachable. What does collapse the redundant work is `use_previous=true` in `_createMonadForParams`
+#! (an identical parameterization reuses the existing monad) and, across runs, the `SimulationBank`.
+#!
+#! A single level is the exception, and it is rejected rather than accepted as a degenerate case: the
+#! latent `DiscreteUniform(1, 1)` still costs a kernel dimension, one that every proposal draws and no
+#! proposal can move, diluting the covariance the kernel fits and adding a coordinate for the bank and
+#! the CDF grid to carry. Nothing about the run says so — the posterior column is simply constant — so
+#! a value list that lost its other entries used to look like a calibrated parameter.
+_singleLevelRejection(n::Int) =
+    "$(n == 1 ? "A single value" : "No values") means the parameter can never vary, so ABC-SMC would " *
+    "carry a particle coordinate that no proposal can move. Give it at least two levels, or — if the " *
+    "value is meant to be fixed — set it in the reference simulation or monad the problem is built " *
+    "from and leave it out of `parameters`."
+
+_calibrationRejection(dv::DiscreteVariation) =
+    length(dv) < 2 ? _singleLevelRejection(length(dv)) : nothing
+_calibrationRejection(cv::CoVariation{<:DiscreteVariation}) =
+    length(cv) < 2 ? _singleLevelRejection(length(cv)) : nothing
 
 #! Still rejected: a `LatentVariation` whose latent parameters are a raw value vector rather than a
 #! distribution. `variationValues` treats that branch's latent values as *indices* in the CDF path,
@@ -164,11 +181,23 @@ _calibrationRejection(::LatentVariation) =
 _calibrationRejection(av::AbstractVariation) =
     "Unsupported variation type for calibration: $(typeof(av))."
 
+#! `Any`, not `AbstractVariation`: `parameters` is an `AbstractVector` and nothing narrows it before
+#! this, so a stray number or `nothing` in the list reached `_calibrationRejection` and raised a
+#! `MethodError` on an internal — the one input that escaped the aggregated report built for exactly
+#! this kind of mistake.
+_calibrationRejection(av) =
+    "Not a variation: $(typeof(av)). Calibration parameters are DistributedVariation, " *
+    "CoVariation, DiscreteVariation, or LatentVariation with Distribution latent parameters."
+
 function _toCalibrationParameter(dv::DiscreteVariation)
+    reason = _calibrationRejection(dv)
+    isnothing(reason) || throw(ArgumentError(reason))
     return CalibrationParameter(DiscreteSource(dv), LatentVariation(dv))
 end
 
 function _toCalibrationParameter(cv::CoVariation{<:DiscreteVariation})
+    reason = _calibrationRejection(cv)
+    isnothing(reason) || throw(ArgumentError(reason))
     return CalibrationParameter(DiscreteCoSource(cv), LatentVariation(cv))
 end
 _toCalibrationParameter(av::LatentVariation) = throw(ArgumentError(_calibrationRejection(av)))
@@ -191,11 +220,13 @@ function _toCalibrationParameters(parameters::AbstractVector)
     end
     if !isempty(rejected)
         lines = ["  [$(i)] $(name): $(reason)" for (i, name, reason) in rejected]
+        #! No blanket explanation any more. It used to say ABC-SMC needs a continuous prior for every
+        #! parameter, which stopped being true when discrete variations became calibratable — and it
+        #! was the last line of the message, so it outranked the per-parameter reasons above it. Each
+        #! rejection now says what is wrong with that parameter and what to pass instead.
         throw(ArgumentError("""
         $(length(rejected)) of $(length(parameters)) parameters cannot be used for calibration:
         $(join(lines, "\n"))
-        These are usable for sensitivity analysis, which accepts discrete variations; ABC-SMC needs a
-        continuous prior for every parameter in order to weight and perturb particles.
         """))
     end
     return CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
@@ -281,18 +312,34 @@ function _StrippedLVSource(lv::LatentVariation{<:Distribution})
 end
 _StrippedLVSource(src::LVSource) = _StrippedLVSource(src.lv)
 
+#! This is JLD2's own test -- `T <: Function && isgensym(Symbol(T))` at
+#! JLD2/src/data/writing_datatypes.jl:446, where it warns that it "only stores functions by name" --
+#! spelled out rather than called, because `JLD2.isgensym` is internal and a one-line predicate is not
+#! worth coupling to a private name; a change there then shows up as a behaviour difference, not a
+#! load error. It asks about the *type*: a top-level function's singleton type prints as
+#! `typeof(sq)`, a closure's as `var"#f#make##0"{Int64}` and a lambda's as `var"#12#13"`, both
+#! carrying a `#`, while a callable struct's type is its own ordinary name. The earlier
+#! `nameof`-prefix test asked about the function instead, and `nameof` of a closure defined as
+#! `f(s) = k` inside `make(k)` is just `:f`.
 """
     _isAnonymousFunction(f::Function) → Bool
 
-Return `true` if `f` is an anonymous function or compiler-generated closure
-(i.e. `nameof(f)` starts with `#`). Named functions defined with
-`function foo(...) end` or `foo(...) = ...` return `false`.
+Whether `f` cannot be restored by name in a fresh Julia session -- which is what JLD2 needs to bring
+a saved `CalibrationProblem` back, and the same test JLD2 itself applies before warning that it only
+stores functions by name. `false` for a function defined at the top level of a module and for a
+callable struct (JLD2 stores those as a type plus fields); `true` for a lambda *and* for a named
+function defined inside another function, a `let` or a `@testset`, because those are closure types
+whose names exist only in the session that compiled them.
 """
-_isAnonymousFunction(f::Function) = startswith(string(nameof(f)), "#")
+_isAnonymousFunction(f::Function) = occursin('#', string(typeof(f)))
 
 #! A `QoI` is only as restorable as the two functions inside it, so it is anonymous if either is. Both
 #! are checked: a named `compute` with an anonymous `reduce` would round-trip as a QoI that silently
 #! averages instead of doing the monad-level step it was written for.
+#!
+#! `q.data` is deliberately NOT consulted. It is data, not code, and JLD2 stores it inside the `QoI`
+#! like any other field, so a `QoI` carrying an observation resumes with that observation — which is
+#! the whole point of the slot, and why `_ProblemManifest` needed no field for it.
 _isAnonymousFunction(q::QoI) = _isAnonymousFunction(q.compute) || _isAnonymousFunction(q.reduce)
 _isAnonymousFunction(qs::AbstractVector{QoI}) = any(_isAnonymousFunction, qs)
 

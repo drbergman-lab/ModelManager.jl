@@ -50,9 +50,897 @@ Gaussian KDE draw, unexposed and with a bandwidth tuned for proposals.
   particle's weight would be weighting an already-weighted sample twice. `posterior` itself is
   unchanged.
 
+- **`:final` means the last *complete* generation on disk.** `_resolveDiskGeneration` uses
+  `_completeGenerationIndices` (#64): an in-flight or interrupted generation folder holds only its
+  monad record, and the plain `_generationIndices` listing would hand it to `samplePosterior`,
+  which would then fail for want of `particles.csv`.
+
+- **Draws run through `createTrial(result_or_calibration, draws)`, returning a `Sampling`.**
+  Added when the user asked how to actually simulate the smoothed draws. The frame's target-value
+  columns are turned back into one `DiscreteVariation` per target and resolved against the run's
+  reference variation, the same path `_createMonadForParams` takes from CDF coordinates -- so plain
+  draws find their existing monads and smoothed draws get new ones, with no inverse maps needed.
+  Rejected: carrying CDF coordinates on the frame as metadata (a row subset would silently desync
+  it) and a new `PosteriorSample` type (the frame is what users already have in hand). Rejected:
+  returning a row-aligned `Vector{Monad}` to preserve multiplicities -- `createTrial` returns
+  trials, and plain draws already carry `monad_id` for anyone who needs the counts. Only
+  targets/locations/types are needed, which `_StrippedLVSource` keeps, so this works from disk for
+  anonymous-map runs where smoothed sampling cannot.
+- **Review follow-ups.** Copilot's `_multinomialDraw` BoundsError report was wrong (the
+  comprehension body never runs for `n == 0`), but the early return is harmless and was added.
+  The other session's read against the twelve then-open PRs found the one real dependency, #64,
+  handled above.
+
 ### Open questions
-- Turning draws back into runnable variations (a `createTrial` from a posterior sample) is the
-  natural next step for predictive checks at new parameter sets. Not in this change.
+- None.
+
+---
+
+## Session: one QoI contract across the sink, sensitivity analysis and calibration (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #52, from the 0.9 architecture review. The 0.9 seam unified the *input* side of a
+measurement — every consumer calls `compute(::Simulation)` and reduces through one
+`_reduceOverMonad` — but the *value* side was still three contracts wearing one struct. The sink
+accepted a `String`, sensitivity analysis demanded a `Real` or a keyed value of them, and
+calibration accepted anything its `distance` did, including a `Vector` and a nested `Dict`. So
+`QoI("mse", counts; reduce = discrepancy)` — the old docstring's own example — stored raw
+per-simulation counts as `mse.tumor` in the sink while GSA reported one scalar `mse`. Same name,
+two quantities.
+
+### Decisions
+- **One value: a `Real`, or a flat `Dict`/`NamedTuple` of `Real`s** — as the first two passes had
+  it, enforced at the seam for every consumer at once. The third pass moved it to the two consumers
+  that need it (see below); what survives unchanged is the *rule itself* wherever it still applies,
+  and the reasoning for `String` being out (tagging already covers per-simulation text, and it was
+  the one thing only the sink accepted, so dropping it drops the sink's TEXT branch).
+- **`reduce` was shape-preserving** in the first two passes, checked after it ran. Reversed in the
+  third pass (below). The *advice* it forced survives on its merits: carrying a post-aggregation
+  score as one more *key* — `compute` reports the raw quantities plus a per-simulation score,
+  `reduce` averages the raw ones and recomputes the score from those means — is what lets one QoI
+  serve all three consumers, gives the sink a per-simulation score for free, and gives GSA a
+  `<name>.my_dist` to analyse. It is now a recommendation rather than the only way through.
+- **Replicate key agreement lived in `_reduceOverMonad`** in the first two passes, before any
+  reducer ran. The third pass put it back in `_qoiMean`, where the issue had it: a reducer written
+  to reconcile ragged replicates never saw them otherwise. `_qoiMean` had kept its own copy all
+  along, so the move was a deletion rather than a port.
+- **Key sets compare stringified**, so `Dict("a" => …)` may reduce to `(a = …,)`, and a `Dict`
+  replicate sits beside a `NamedTuple` one. Every site that compares keys does it the same way,
+  including the default reducer, which averages through a stringified view and returns the first
+  replicate's container and keys — comparing raw keys there meant it refused, with a message
+  printing two identical lists, shapes the seam one line earlier had just accepted. Error messages
+  print the RAW keys with `repr`, so a `Symbol`-versus-`String` mismatch is visible. Sensitivity
+  analysis keeps its per-monad comparison unstringified for a different reason: a `Dict` on one
+  monad and a `NamedTuple` on another means one reducer doing two things.
+- **Calibration keys were the user's bare keys** in the first pass — `distance` saw exactly what
+  `compute`/`reduce` produced, unprefixed. The maintainer rejected that, and the second pass below
+  replaced it with `SummaryValues`. The reason it had to go is worth keeping: it made a QoI used
+  for calibration *narrower*, namespace-wise, than the same QoI used for the sink or GSA, so one
+  QoI could not serve both; and it forbade two keyed QoIs that share a component key — a `count`
+  and a `speed`, both per cell type — which is not a pathology but an ordinary way to measure.
+- **`missing` is the way to say "no value here"; `nothing` is refused.** `nothing` is what a
+  function returns when a block falls through, so accepting it would make a dropped measurement
+  indistinguishable from an intended skip. The consequence is a breaking one for the sink: a
+  side-effects-only `post_processor` must now end with `missing`, not `nothing`.
+- **`skip_missing=true` by default**, dropping missing replicates with `collect(skipmissing(...))`
+  so the element type narrows to what a numeric reducer expects — the subtlety PCMM's `_reduceKept`
+  existed for. Nothing left ⇒ the parameter set is `missing`, and `reduce` is not called.
+- **A `missing` summary is not a user-code fault.** It follows `on_monad_failure`, exactly as a
+  monad with no successful simulation does. The check sits *between* the summary and distance calls
+  so that a `missing` returned by the user's own `distance` still raises "a `Real` is required" —
+  different mistakes. `_acceptFirstGeneration`'s message widened from "had a successful simulation"
+  to "produced a distance" to cover both.
+- **`mseDistance` refuses a key mismatch**, rather than warning and zero-filling. Comparing every
+  key against 0 is a perfectly finite distance, so ABC-SMC accepted particles on it and returned the
+  prior, with one `maxlog=1` warning somewhere in the log; being told is better than being
+  defaulted. `_zeroLike` is gone. (The `AbstractVector` methods went too, on the reasoning that no
+  summary could be a `Vector`; the third pass brings a generic fallback back, for the opposite
+  reason.)
+- **`reduce` may return `missing` too**, and it is a supported answer — "the replicates I got are
+  not enough" — rather than an accident, so it is exempt from the shape check and documented as
+  part of the contract. Every message that reports a monad with no value now names both causes
+  instead of asserting the one the code never checked; `on_monad_failure=:error` names the QoI that
+  had none, which for a `Vector{QoI}` is the member that went missing rather than "every one of its
+  simulations".
+- **A particle rejected for a `missing` summary is now visible.** Nothing failed on that path, so
+  no failure file is written and `_warnFailuresRecorded` never fires; from generation 2 on the
+  particle did not even get a proposal row. A measurement that never has a value therefore looked
+  exactly like a model that never fits. It gets its own per-generation `@warn` — count, compressed
+  monad IDs, and that those particles were rejected — mirroring the failure warning and silent at
+  `progress=:none`.
+- **`stored=` works for a keyed QoI**, reassembling the value from the `"<name>.<key>"` columns the
+  sink wrote. `_storedValue`, `verifyStoredValues` and `_storedAgrees` are ported verbatim from
+  PR #56 so the two branches rebase cleanly; only the `:require` message, which now names those
+  columns, is new here.
+- **Cleared the 0.9 transitional apparatus** on schedule: `_declaresSimulation`, `_WARNED_SUMMARIES`
+  and the migration warning (it fired on every ordinary `sim -> measure(sim)` lambda once the
+  migration was over), plus `qoiName(::Function)` and `_computeOn(::QoI, ::Integer)`, both dead.
+
+### Rejected
+- **Keeping `String` as a sink-only value.** It is the last per-consumer exception, and tags are
+  the queryable, multi-valued, retroactive home for text about a simulation.
+
+### Second pass: the maintainer's review of PR #70
+Every decision here comes from a review comment; none was relitigated.
+
+- **`SummaryValues`, one key space for all three consumers.** The maintainer's own design, in
+  answer to "so a QoI used for calibration is restricted more (in terms of namespace) than one used
+  for the sink or for GSA?". A component is named `(qoi name, component key)` —
+  `const _SummaryKey = Tuple{String,Union{Nothing,String}}`, `nothing` for a `Real`-valued QoI —
+  and `SummaryValues <: AbstractDict{_SummaryKey,Float64}` is what `distance` receives. It carries
+  a `Dict` plus a `Vector` of keys in insertion order, so iteration and messages are deterministic
+  without acquiring an OrderedCollections dependency for one type. Lookup by `String` resolves in
+  the maintainer's order: the scalar name, then a split at the FIRST `.` (a QoI name cannot contain
+  one, so `"counts.a.b"` is unambiguous), then a bare component key, which resolves only when one
+  QoI reports it — several is an error listing the qualified labels to choose between. `haskey`
+  mirrors it, so an ambiguous key is `false` rather than a throw. Exported, since a user's
+  `distance` is handed one.
+- **`_evaluateSummary` always returns a `SummaryValues`, paired with the name of a member that had no value.** The first pass had a single QoI hand its
+  value over unwrapped, so `q` and `[q]` were two contracts for one measurement. A scalar
+  `observed_data` stays usable through `mseDistance(::SummaryValues, ::Real)`, which requires the
+  summary to hold exactly one value — the condition a bare number actually implies, rather than a
+  special case in the evaluator.
+- **One spreading function, `_keyedEntries`.** The maintainer: "I wonder why we need a separate
+  call for calibration from GSA." Calibration, GSA and the sink each spread a keyed value with
+  their own code, so "what is this component called" had three answers that agreed only by
+  inspection. Now one function produces `(qoi name, key) => Float64` entries and `summaryLabel`
+  turns a pair into the sink column and the GSA label. `_qoiDuplicateLabelMessage`,
+  `_addSummaryEntry!`, `_addSummaryValue!` and GSA's own `allunique(labels)` all go: the collision
+  they each checked is refused once, in `_keyedEntries`, where the raw keys are still in hand.
+- **Name uniqueness is replaced by key uniqueness, per consumer.** The maintainer: keyed QoIs
+  sharing a name "is not pathological, I think. Their individual keys would need to be disjoint."
+  So `_validateSummaryStatistic` and the post-processor validator no longer check names. What must
+  be unique is the `_SummaryKey` (calibration, checked when the components exist), the column name
+  (the sink's existing `allunique`) and the label (GSA's existing cross-QoI check). Two `Real` QoIs
+  with one name are still refused by all three, since their key is `(name, nothing)` both times.
+- **A `QoI` may carry its own `data`.** The maintainer, on the worked example that hid the
+  observation inside callable structs: "Should we just have a slot there to accept optional data?"
+  `data !== nothing` switches `compute` to `compute(sim, data)` and `reduce` to
+  `reduce(values, data)` — an explicit rule, not method sniffing, because a `compute` that merely
+  happens to accept two arguments would otherwise be called with data it was never written for and
+  fail somewhere inside itself. It answers the maintainer's follow-up too: `data` is serialised
+  inside the `QoI` in `problem.jld2`, so a resume needs nothing re-supplied and `_ProblemManifest`
+  needed no new field; `_isAnonymousFunction` still decides restorability, and still looks only at
+  the two functions.
+- **`mseDistance` widened.** Copilot and the maintainer both flagged the signature as too rigid.
+  Four methods: `SummaryValues` against a keyed observation (each observed key resolved through the
+  flexible lookup); `SummaryValues` against a `Real`; a generic keyed-vs-keyed method matching by
+  `string(k)`, so a `Dict` and a `NamedTuple` naming the same quantities agree; and scalar against
+  scalar. Two details of this pass did not survive the third: the comparison was symmetric — a
+  component no observed key named was an error — and `_mseContribution` was inlined on the grounds
+  that one squared difference at one call site is not a function. Both are revisited below.
+- **The post-processor is a validator plus a function.** The maintainer: `_asPostProcessor` "should
+  be just a validator on the QoIs passed in … the body of this returned function could just be a
+  standalone function that post_processor calls." `_validatePostProcessor(x) → _PostProcessor` runs once
+  in `run`; `_postProcess(pp, sim)` runs per simulation inside the `:post_processor` stage. That
+  also lets both keywords be typed — `run`'s as `Union{Nothing,Function,QoI,AbstractVector}` and
+  `processSimulationTask`'s as `Union{Nothing,Vector{QoI}}` — which the returned closure prevented,
+  and it is why `qoi.jl` is now included **before** `runner.jl`: a signature is evaluated when the
+  method is defined. The `nothing` refusal, the `missing` skip and the anonymous-name refusal stay
+  per value, because a side-effects-only anonymous callback returning `missing` names nothing and
+  is legitimate.
+- **The error says which of the two functions raised.** The maintainer: "Why would we not be
+  specific about which function (`summary_stat` or `distance`) it failed in?" `user_code_note` takes
+  the name; the two are diagnosed differently, a `summary_statistic` failure being in a `compute` or
+  a `reduce` and a `distance` failure usually a key mismatch against `observed_data`.
+- **Tone on the zero-fill.** The maintainer: "Don't say the part about a wrong posterior … it was a
+  reasonable default because we were conveying that there truly was nothing (0) to report." The
+  docstring, the `#!` comment, `calibration.md`'s error table and the PRD now say we used to impute
+  0, that being strict is better, and nothing about it having been wrong.
+- **`_reduceOverMonad`'s batched-constructor comment** says outright that `Simulation.(sim_ids)`
+  would issue one query per ID while `simulationsFromIDs` issues one for the monad, and that it
+  tolerates an ID with no row — which is why the length check follows it.
+
+### Third pass: value constraints move to the consumer that needs them
+The maintainer's review of the second pass, in four points, all of which the due diligence agreed
+with. The branch was not release-worthy as it stood, for two concrete reasons beyond the principle:
+a strict-both-ways `mseDistance` forced a user to list every component of every summary QoI in
+`observed_data` or drop QoIs from the summary; and PCMM's own `meanPopulationTimeSeriesQoI` — a
+struct-returning `compute`, a `Dict{String,Vector}` `reduce` — could not evaluate a single monad,
+because `_qoiInputShape` refused the struct before `reduce` ran, although calibrating a time series
+against data with `mseDistance` is its documented purpose.
+
+- **The seam interprets nothing; each consumer accepts what it can use.** `compute`'s value has one
+  reader (the sink) and `reduce`'s has two others (GSA, calibration), so one rule over both
+  constrained things that share no reader. `_qoiValueShape` stays, called by `_postProcess` and by
+  `evaluateFunctionOnSampling` — the two places that need a number per column and per monad — and
+  `_reduceOverMonad` now keeps only the empty/inconsistent-monad guards, the batched `Simulation`
+  construction, the `nothing` refusal, `skipmissing` narrowing, `missing` when nothing survives, and
+  the `data` calling convention. `_qoiInputShape`, `_qoiShapesAgree` and `_qoiShapeStr` are deleted.
+- **`reduce` need not return the shape it was given.** Tying them constrained nothing that shares a
+  reader, and the recommended workaround produced the very "same name, two quantities" the rule
+  existed to prevent: a score carried as a key is a per-simulation score at the sink and a
+  score-of-means in GSA, under one label.
+- **Replicate agreement is the default reducer's rule.** It is `_qoiMean` that averages key by key
+  and so has nowhere to put a key one replicate lacks. Its message now says whose rule it is and
+  points at `reduce=`. A live consequence in PCMM: `endpointPopulationCountQoI`'s reducer zero-fills
+  a cell type a replicate lacks, was written for ragged replicates, and was unreachable because the
+  seam refused them first. It becomes reachable — a behaviour change in PCMM's numbers, since such a
+  monad now yields a value where it used to raise.
+- **`_qoiMean` must not start requiring `Real` components.** A `Dict(key => Vector)` averaging
+  elementwise under the default reducer is exactly PCMM's time-series shape. The per-key `mean` is
+  wrapped instead, naming the key and the component type, because the nested keyed value that used
+  to be refused at the seam with a labelled message would otherwise die here as a bare
+  `MethodError`.
+- **`SummaryValues` holds `Any`.** One word — dropping `::Real` and the `Float64(...)` from
+  `_insertSummary!` — is what makes the feature work: a `Float64` element type forced every `reduce`
+  to produce numbers before `distance`, the reader that decides, had seen anything. `show` renders
+  each value under `:compact`/`:limit`, since a summary is printed mostly from inside an error
+  message and a 10,000-point series would bury it.
+- **Two spreaders, one naming rule.** `_qoiComponentLabels` holds the naming (and the `1`-vs-`"1"`
+  collision refusal); `_keyedEntries` stays as the strict `Float64`-producing spreader for the sink
+  and GSA, and the new `_summaryEntries` is calibration's permissive one. An empty keyed value
+  contributes zero entries there rather than landing whole under `(name, nothing)` — routing it to
+  the scalar slot would make the summary's key space depend on the value, so an `observed_data`
+  written against a full run would stop resolving on a run where one measurement came back empty.
+- **`mseDistance` computes over the OBSERVED keys.** Extra simulated components are ignored: we
+  always know more about a simulation than about the data. No zero-fill in the other direction — an
+  observed key that does not resolve is still an error. Opening that door reopens two silent zeros,
+  so two guards are added: an observation that names nothing is refused (with no terms the mean is
+  0/0, and 0.0 would make every particle perfect and hand ABC-SMC back the prior — the zero-fill
+  failure re-entering by the other door), and two observed spellings resolving to one entry are
+  refused naming both. A resolved value that is `missing` is refused naming its label, rather than
+  surfacing a frame later as "`distance` returned a Missing".
+- **Normalisation is one global mean.** The total is divided by the number of *differences*
+  computed, so a single array key gives exactly `mean(abs2, sim .- obs)` and `mseDistance(v1, v2)`
+  standalone agrees with the same arrays inside a one-key summary. Arithmetically identical to the
+  old number for all-scalar keys. The consequence is documented rather than hidden: a 100-point
+  series contributes 100 differences where a scalar key contributes one.
+- **`_mseTerms` exists, and `_mseContribution`'s epitaph was premature.** The second pass inlined
+  the per-term helper on the grounds that one squared difference at one call site is not a function.
+  With five methods and a value that may be an array, the arithmetic and its failure message have a
+  real body, and it returns a count as well as a sum so the caller divides once. Its error names
+  both types and, when both sides have a `length`, both lengths — a 101-point observation against a
+  100-point simulation is the commonest array mistake by a distance.
+- **`mseDistance(::SummaryValues, ::Any)` replaces the `::Real` method.** The exactly-one-entry rule
+  is kept verbatim; widening the second argument lets a one-entry summary holding an array be
+  compared with an array. It is also required by Julia: `Base.broadcastable(::AbstractDict)` throws,
+  so a `SummaryValues` must never reach the generic fallback.
+- **GSA wraps its reduction loop** the way `_evaluateParticle` wraps its calls to user code —
+  `@error` naming the QoI and the monad, then `rethrow()`. Without the seam's checks ahead of it, a
+  `compute` the default reducer cannot average now throws from inside `_qoiMean`, which knows
+  neither name nor monad.
+
+### Effect on PCMM (recorded for #232)
+Nothing to change for this PR, and two findings worth a follow-up:
+
+- `meanPopulationTimeSeriesQoI` becomes usable in calibration with `mseDistance`: its `reduce`'s
+  `Dict{String,Vector{Float64}}` spreads per cell type and the array term handles each. It could not
+  evaluate a single monad on the second-pass branch.
+- `endpointPopulationCountQoI`'s zero-filling reducer becomes reachable, changing that monad's
+  result from an error to a value.
+- Separately and pre-existing: `populationCountQoI` returns `nothing` for a pruned snapshot, which
+  the sink refuses.
+
+### Considered and (for now) rejected
+Recorded rather than filed as to-dos, at the maintainer's request: these are open questions, not
+planned work.
+
+- **`Vector`-valued QoIs.** May well come back. Keyed values are required *for now* because keys
+  make the alignment explicit — a component has a name every consumer can use, and two parameter
+  sets can be checked for the same components without anyone deciding what an index means — which
+  is simply the easier thing to build on first. What a vector would need settled: how it is
+  labelled at the sink and in GSA, how it is matched across monads, and how it is named in an
+  `observed_data`. The earlier framing (that a vector can only be reasoned about by its length) is
+  wrong and is gone from the docs and the error message: you can reason about a vector you wrote.
+- **Flattening a `Vector{QoI}` into one `Dict` keyed by the user's bare component names.** What the
+  first pass did; superseded by `SummaryValues`, which keeps the bare spelling available as a
+  *lookup* without making it the identity.
+- **Normalising a single QoI's value to `Dict{String,Float64}`.** Also the first pass; superseded
+  by the same change, which normalises to `SummaryValues` instead and so covers the `Real` case too.
+- **A more general seam than `QoI` — an `AbstractQoI` whose `reduce` may return a matrix or a
+  spread, or compute a standard deviation for `distance` to use.** Raised in review and set aside
+  for v0.10: the `QoI` machinery exists to make post-processor → sensitivity → calibration free of
+  changes, and it does that; a user who needs more can build it today, and a general seam is worth
+  designing against a concrete need rather than ahead of one.
+
+### Traps
+- **The empty-`Dict` and cross-monad-ragged GSA refusals are reachable through a widening reducer
+  again** — the third pass dropped the shape check that used to refuse it first, so a reducer
+  widening a `Real` into keys reaches GSA's own checks. The tests still exercise them through a
+  keyed `compute`, which is the shape a user actually writes.
+- **An empty keyed value now behaves differently in the three consumers, deliberately.** The sink
+  and GSA refuse it in `_qoiValueShape`; calibration takes it as zero entries. That is a place where
+  the old one-rule design was genuinely simpler, and it is paid for knowingly: an empty keyed value
+  cannot be a column or an index, while a summary that names nothing is a fact `distance` can be
+  told about — and `mseDistance` does refuse to score against one.
+- **Errors raised inside `_postProcess` are per-simulation stage errors**, so they surface as
+  `_SimulationStageError`, not the bare `ArgumentError` the sink's own writer raises from the
+  serial completion loop. Test assertions on the sink's refusals had to move to the stage wrapper.
+  The second pass moved one more refusal across that line: two keys colliding once stringified
+  (`1` and `"1"`) are now caught by `_keyedEntries` inside the stage, not by the sink's `allunique`
+  afterwards, so that test moved to the wrapper too.
+- **`_summaryEntries` and `_keyedEntries` must not drift.** They name components identically only
+  because both go through `_qoiComponentLabels`; the key-ordering rules (`NamedTuple` in declaration
+  order, `Dict` sorted by `string`) are spelled out in both, since `_summaryEntries` cannot call
+  `_qoiValueShape` — that is the function whose value rule it exists not to apply.
+- **A QoI-written sink column is now REAL, whatever `compute` returned.** `_keyedEntries` produces
+  `Float64` values, so the `Bool`/`Integer` branches of `_postProcessingColumnSpec` are no longer
+  reached through `post_processor`. They stay for a value written by another route (the direct
+  `_writePostProcessingRow` call the upsert test makes), but an `Int`-valued QoI that used to land
+  in an INTEGER column lands in a REAL one.
+- **`filter(!ismissing, v)` would not have narrowed the element type**, leaving `Missing` in every
+  downstream signature. `collect(skipmissing(v))` does, and only because the per-simulation values
+  are built by a comprehension whose eltype widens from the values themselves.
+- **The `QoI` struct gained a field, and the two shapes of `summary_statistic` fail differently.**
+  A single-`QoI` `problem.jld2` loads with a JLD2 reconstruction warning and resumes through
+  `problem=`. A `Vector{QoI}` one **cannot be read at all**: JLD2 fails converting the array's
+  element back to a `QoI`, so the whole `f["manifest"]` read throws a `MethodError` before any
+  `problem=` is consulted. That affects **released v0.9.1** files, whose `_ProblemManifest` is
+  field-identical, not only unreleased 0.10 main — and the suite's canonical summary statistic is
+  the vector form, so it is the common case rather than the exotic one. The `problem=` rescue works
+  for it only through PR #56's `_loadProblem(; required=)`, which catches the read failure and
+  falls back; **#56 must merge before or with this**. `_loadProblem` is deliberately untouched here
+  so the two changes do not collide.
+## Session: the MM/PCMM boundary — the half that needs no downstream companion (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #54, the architecture review of the ModelManager/PhysiCellModelManager split. This entry
+covers only the items the maintainer settled as needing no companion change downstream: publishing
+the variation-file path, making `quietRun` public, fixing the manual's unqualified public names,
+giving the three migration methods defaults, and `registerSimulator!`. The four that *do* change the
+interface — collapsing the five version-bookkeeping methods, the XML seam, an MM-owned schema
+version, and the `skip_missing` reducer default — are deliberately not started here.
+
+### Decisions
+- **`variationFilePath(location, M)` is a computation, not a lookup.** PCMM rebuilt
+  `<location>_variation_<id>.xml` at eight sites. The published version derives the path from the
+  monad's variation ID and never touches the filesystem, so it answers before the file is written —
+  which is what `createXMLFile` itself needs, and what lets a backend name a file it is about to
+  create. `createXMLFile` now calls it, so the two cannot drift.
+- **The unexported names stay unexported; the manual was the bug.** These are downstream-developer
+  contracts, and a downstream `@reexport using ModelManager` forwards only exports — so a name
+  documented here as a bare call is an `UndefVarError` for that package's users. The fix is to write
+  `ModelManager.name` wherever a manual page presents such a name as something the reader calls.
+  The dividing line: a name introduced in the third person as "the backend's `setupMonad` hook" is
+  describing machinery and stays bare; a name in a list of helpers, or in a code block, is qualified.
+  That caught five the issue's list missed — `getMonadIDDataFrame`, `methodString`,
+  `simulationsTableFromQuery`, `monadsTableFromQuery`, `buildWhereClause`.
+- **`upgradeToMilestone`'s default throws rather than no-opping.** `upgradeMilestones` defaulting to
+  empty already makes it unreachable for a fresh backend, so the only way to arrive there is to have
+  declared a milestone and not written the handler — and silently skipping that would leave the
+  version table stamped as migrated. The message names that inconsistency instead of reporting an
+  unimplemented required method.
+- **`dbVersionTableName` derives from the package, not from a new hook.** #30 already resolves
+  package identity from the module defining the simulator type (`_packageModule`), and both the
+  loaded and installed version lookups go through it. Reusing it keeps one answer to "which package
+  does this database track".
+- **`registerSimulator!` is idempotent by backend *type*.** A second call for the same type returns
+  the existing globals untouched rather than rebuilding them, so a package reload does not discard
+  an open project's data directory, DB handle, or provenance. It takes nothing but the simulator;
+  the one keyword it briefly accepted singled out a single global for no reason and was dropped in
+  review. (PR #65.)
+- **`mm_globals_ref` is internal, not merely unexported.** Its only outside reader was a backend's
+  `__init__` assigning to it, and `registerSimulator!` replaces that; a backend reads state through
+  `mm_globals()`. Making it `public` would have kept a second door open for no caller. (Review of
+  PR #65.)
+
+### Rejected
+- **Exporting the names in issue #54's item-4 list.** They are dev contracts, not end-user API, so
+  export would put `simulatorVersionIDName` and friends in every user's tab completion to fix a docs
+  problem. Qualifying the manual costs nothing at the API surface.
+- **Qualifying every `@compat public` mention in `docs/src/man/`.** A blanket sweep would put
+  `ModelManager.` in front of `postSimulationCleanup`, `simulationThreads` and `clearSimulatorArtifacts`
+  in sentences that already say "the backend's … hook" — noise, and misleading, since a reader is
+  meant to *implement* those rather than call them. The type names (`GSASampling`, `MOATSampling`,
+  `SimulationSpec`) are left bare for the same reason: they appear as descriptions of what a call
+  returns, not as code to type.
+- **Removing `mm_globals_ref` from the public surface entirely.** The test suite swaps the whole
+  globals object, and a backend may legitimately need the handle; un-exporting plus `@compat public`
+  keeps that possible while taking it out of end-user tab completion. PCMM already writes it fully
+  qualified, so nothing downstream breaks.
+
+### Traps
+- **A default whose signature is more specific than an existing override is an ambiguity, not an
+  override.** The first `upgradeToMilestone` default was written `(sim::AbstractSimulator, version, args...)`,
+  which is ambiguous against the test suite's `(::TestSimulator, args...)` — neither is strictly more
+  specific. Keeping the default at `(sim::AbstractSimulator, args...)`, exactly the shape of the
+  error stub it replaced, avoids it.
+- **`@compat public` on an already-exported name is a load-time error**, so `mm_globals_ref` had to
+  leave both `export` lists (`src/globals.jl` and `src/ModelManager.jl`) in the same change that
+  declared it public.
+- **The docstring-ref testset does not read manual pages.** It walks `Docs.meta` only, so an
+  `@ref` written in `docs/src/man/*.md` is caught by nothing but the docs build. Every change to a
+  manual `@ref` in this session was verified with `julia --project=docs docs/make.jl`.
+## Session: two holes found by a second review pass (2026-09-06)
+
+### The busy timeout covered the central database only
+`_openDB`'s docstring says "Every ModelManager database open goes through this". Two did not: the
+per-folder variations database created in `insertFolder` and the connection `locationVariationsDatabase`
+hands back. Those are written by `addVariations` while a campaign runs and read by the table and
+analysis functions — precisely the two-session case the timeout was added for — so a second session
+still failed at once with "database is locked". Both go through `_openDB` now, and the test asserts
+that `SQLite.DB(` appears exactly once in `database.jl` and nowhere else in `src/`, so the docstring
+stays true by construction rather than by inspection.
+
+### A deleted calibration left tags that were re-attributed, not merely stale
+Each generation's batch sampling carries `mm:calibration => "<id>"` and `mm:generation => "<t>"`.
+`deleteTagsFor(Calibration, ids)` cannot reach them: they sit on *sampling* rows and name the run in
+their **value**, while that function is keyed on `(trial_class, trial_id)`. Because `calibration_id`
+is an `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, SQLite hands the deleted run's id to the next
+one, so `findMonads(tags = ("mm:calibration" => …))` — the route `tag!`'s own docstring recommends —
+returned the deleted run's monads alongside the new run's, while `monadIDs(result)` (which reads the
+folder) disagreed.
+
+- **Decision: clean the value-references in `deleteCalibration`** rather than add `AUTOINCREMENT`.
+  The dangling rows are wrong on their own terms; a schema change would need a migration every
+  backend implements to fix a symptom.
+- **Trap for the test:** `mm:generation` values are generation numbers, so *every* run in a project
+  has a sampling tagged `"1"`. Assert on the samplings the run under test tagged, not on a
+  project-wide query.
+## Session: `deleteCalibration(delete_subs=true)` keeps monads other runs use (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #58, from the second review pass: `deleteSampling(delete_subs=true)` walks every other
+sampling and protects the monads they list, while `deleteCalibration(delete_subs=true)` handed its
+whole evaluated set to `deleteMonad(...; delete_supers=true)` with no cross-reference check. The
+`SimulationBank` is keyed on inputs and simulator version, not on the calibration, so two runs on
+one problem *routinely* share monads — deleting run 1 shrank `Sampling(result2)` and
+`simulationIDs(result2)` under run 2, and `delete_supers=true` rewrote any user sampling that
+happened to share a parameterization.
+
+### Decisions
+- **Protect shared monads (option 1 of the issue).** `delete_subs=true`
+  now means "the monads only this run used". The alternative on offer was to keep the cascade and
+  document it; the sibling function's semantics won, and the docstring's existing "may predate it
+  and outlive it" already implied monads are not the run's property.
+- **The run's own batch samplings are excluded from the guard, by tag.** A naive mirror of
+  `deleteSampling` protects *everything*, because each generation's batch sampling lists the monads
+  that generation evaluated. `_batchSamplingIDs` reads the `mm:calibration` tag `_buildEvaluateBatch`
+  already stamps on each batch. Nothing else can make the distinction: the generation records name
+  monads, never samplings, so a batch and a user sampling over the same monads are otherwise
+  indistinguishable.
+- **Other calibrations are guarded through `calibrationMonadIDs`, the raw on-disk record**, rather
+  than `monadIDs(Calibration(id))`. It is a superset — it names monads already deleted — and every
+  extra ID it carries is one that cannot be in the deletion list anyway, so the survival filter
+  would only cost a query.
+- **The default stays `delete_subs=false`.** Opting in is the only way simulation data should
+  disappear; the maintainer considered flipping it now that the cascade is narrow and rejected it.
+- **`delete_supers` stays `true`, against the issue's plan.** The plan said to drop it to `false`
+  "matching `deleteSampling`", but `deleteSampling` has already removed its own rows before it
+  cascades; `deleteCalibration` leaves the batch samplings in the table, and with `false` they kept
+  constituent lists naming deleted monads -- `Sampling(id)` threw on them, and so did any
+  `findTrials(Sampling; ...)` whose match included one. After the guard the upward walk can reach
+  only those batches, so it does exactly the right cleanup: rewrite each to its surviving monads,
+  remove it once empty. A `Trial` built over a batch is rewritten the same way, as for any sampling.
+
+### Rejected
+- **`findTrials(Sampling; tags=...)` for the batch lookup.** It materializes `Sampling` objects
+  (each reading its constituent CSV) and throws above `MAX_MATERIALIZED_TRIALS`, which would turn a
+  long run into a deletion failure. `_idsMatchingDirect` answers the same question in IDs.
+- **`delete_supers=false`, as the issue's plan said.** See Decisions: it leaves batch rows that
+  cannot be materialised.
+
+### Traps
+- **Everything is read before anything is deleted.** The generation records live inside the folder
+  `rm_hpc_safe` removes, and the `mm:calibration` tags that identify the batch samplings are one
+  obvious extension away from being deleted alongside the calibration's own tag rows (#60).
+- **A green suite did not catch the stale batch rows.** The first cut passed `delete_supers=false`
+  and every test passed, because nothing constructed a batch `Sampling` after a deletion. The
+  regression test now materialises each surviving batch of the deleted run.
+- **A test here proves nothing unless the two runs really do share.** The fixture asserts both
+  `!isempty(shared)` and `!isempty(only1)` before deleting. Sharing is arranged rather than hoped
+  for: generation 1 is a fresh `SobolSeq`, so the smaller run proposes a prefix of the larger run's
+  points, and `cdf_grid_k=4` is above `k_min` for both population sizes so the two snap to the same
+  grid instead of to grids of different resolutions.
+## Session: an in-flight generation folder is not a completed generation (2026-09-06)
+
+From the adversarial review of the calibration PRs (#33-#40); the last of that review's four
+high-severity findings with a mechanical fix.
+
+### What happened
+`_buildEvaluateBatch` writes a generation's monad record before launching any simulation, and that
+write `mkpath`s `generations/<t>/`. The artifacts that define the generation are written only by
+`_saveGeneration` at the end. So for the whole duration of generation t -- and permanently, if the
+run is interrupted -- the folder exists holding only `monads.csv`, and `_generationIndices`, which
+counts any all-digit subdirectory, reports one generation too many. `posterior(cal)` resolved
+`:final` to it and died "has no particle file"; all four disk-based plot styles failed the same way;
+`show` over-counted and dropped the final epsilon. A regression from #39: the flat layout enumerated
+particle files, so an in-flight generation was invisible.
+
+### Decisions
+- **Two enumerations, named for the question each answers.** `_generationIndices` keeps its
+  permissive scan, which migration and the monad-ID reader depend on; `_completeGenerationIndices`
+  is what anything presenting a run to a user calls. Rejected: making the single function strict,
+  which would break `_migrateGenerationLayout!` (it must see the folder it is migrating) and
+  `calibrationMonadIDs` (an interrupted generation's monads are real and were simulated).
+- **`metadata.toml` is the commit marker, not `particles.csv`.** `_saveGeneration` writes the CSVs
+  first and the TOML last, so the TOML is the only artifact whose presence implies the rest. A
+  `particles.csv` test would accept a generation whose write died between the two -- covered by a
+  test.
+- **`_findLastGenerationCSVs` walks backwards** to the newest generation holding both artifacts,
+  rather than testing only the last index and returning `nothing`. Same root cause, opposite
+  symptom: it silently skipped the particle-consistency and LVSource-map validations on exactly the
+  interrupted runs a resume targets.
+- The `epsilon_schedule` coverage warning counts finished generations too, so its "generations
+  N-M" range is no longer shifted by one on an interrupted run.
+
+### Not fixed here
+`posterior` still says "has no particle file" if a *named* generation is incomplete, rather than
+"generation N is incomplete". And a run that stopped on `max_evaluations` crashes on resume for an
+unrelated reason (ModelManager issue #62).
+## Session: two discrete-parameter defects from the calibration review (2026-09-06)
+
+An adversarial review of the calibration PRs (#33-#40), the part of the 0.9 range that had had no
+review. Twenty-five findings survived verification; these are the two highest that had a mechanical
+fix. The rest are ModelManager issues #61 (snapping bias, needs a decision) and #62 (triage).
+
+### Resume was dead for any discrete calibration, both routes
+#38 gave discrete parameters their own source types and let the default passthrough store them in
+`_ProblemManifest`, but neither resume path learned to read one back. `_sourceToCalibrationParameter`
+had methods for four source types and not these, so the automatic route reported the manifest
+*complete* and then died in `_manifestToProblem`; `_validateStructuralMatch` fell through to
+"Unexpected saved source type", so `problem=` died too. The second is the sharper failure: that
+branch keys off the **saved** source type, so nothing a user re-supplies can steer around it.
+
+- **Decision: reconstruct through the same constructor `_toCalibrationParameter` uses**, so the
+  rebuilt `LatentVariation` is the same `DiscreteUniform` over value indices the original run had.
+  Anything else risks a coordinate meaning a different level after resume.
+- **Decision: the structural check compares `values` element-wise** and drops the `flip` comparison
+  the DV/CV branches make, since `DiscreteVariation` has no such field. A saved coordinate *indexes*
+  the level list, so a reordered or resized list silently re-points every particle — the error says
+  so rather than just reporting a mismatch.
+- **Trap:** the test that looked like coverage asserted only `loaded.sources[1] isa DiscreteSource`
+  while its comment claimed "so a discrete run can resume". A comment is not an assertion; the
+  testset now actually resumes, by both routes, and checks that mismatched levels are refused.
+
+### A discrete co-variation's inverse map checked only the first target
+The `DistributedVariation` co-variation twenty lines below recovers `u` from the first target and
+then verifies the rest agree, returning `NaN` when they do not; `_bankCdfCoords` turns that into
+"not reusable". The discrete one never looked past `tv[1]`, so the `SimulationBank` would admit a
+database row whose remaining co-varied columns are paired with the wrong index — or are not levels
+at all — at the first column's coordinate. With `cdf_grid_k` set, `_lookupAndSnap` can then serve
+that monad to a particle whose reported parameters say otherwise: the distance comes from one
+parameter pair and `particles.csv` reports another.
+
+- **Decision: mirror the continuous guard exactly**, `NaN` for "off the curve", rather than throwing.
+  `_bankCdfCoords` already has both escape hatches (a `try` around the maps for the first target's
+  throw, and an `isnan` check); using the one that already exists keeps the two co-variation kinds
+  reading the same way.
+- **Rejected: a tolerance comparison.** The continuous branch needs one because it round-trips
+  through `quantile`; a discrete level is copied verbatim from the user's list, so `==` is right and
+  a tolerance would admit a neighbouring level for closely spaced values.
+- **Not fixed here:** Phase 2 of the bank tests a discrete column against `minimum`/`maximum` of its
+  levels rather than `insupport`, so an off-level value inside the range still clears that stage.
+  The inverse-map guard now catches it; tightening Phase 2 as well is in issue #62.
+## Session: a discrete coordinate is not snapped to the CDF grid (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #61, from the adversarial review of the calibration PRs. `_snapToCDFGrid` snapped every
+proposal coordinate to `{j/2^k_eff}` with no knowledge of what the coordinate meant. A discrete
+parameter is a `DiscreteUniform(1, L)` over value indices, and the dyadic grid is spread evenly
+over [0, 1] rather than over the `L` level bins, so the levels received unequal numbers of grid
+points -- and when `2^k_eff < L`, some received none. Measured for `L = 10` at `k_eff = 3`
+(which `k_min = ceil(log2(N^(1/d) + 1))` produces for `population_size=100` in three dimensions,
+so it is the *default* resolution rather than a contrived one): generation 1 reaches levels
+2-5 and 7-9 and never proposes 1, 6 or 10. Generation 1 weights every accepted particle equally
+and sets the next generation's epsilon from that population, so nothing downstream corrects it.
+
+### Decisions
+- **Do not snap a coordinate whose latent prior is discrete** (option 1 of the three in the
+  issue). `_snapToCDFGrid` gains a three-argument method taking that coordinate's prior and
+  dispatching on `DiscreteDistribution`; `_lookupAndSnap` takes `priors` -- already threaded into
+  both generation runners and previously ignored -- and applies it per coordinate. Snapping buys
+  a discrete coordinate nothing to begin with: the quantile already collapses each level's whole
+  CDF bin to one target value, and what actually prevents a repeat simulation is `use_previous=true`
+  in `_createMonadForParams`, where two proposals in the same level produce the same
+  `variation_id`, hit the `INSERT OR IGNORE` on `monads`, and resolve to the same monad with
+  `num_sims_to_add = 0`.
+- **Dispatch on the prior rather than a precomputed mask.** `_snapToCDFGrid(u, k_eff, ::DiscreteDistribution)`
+  reads as the rule it is, and puts the decision next to the arithmetic it is about. A `Vector{Bool}`
+  computed in the runners would have been another parallel array to keep aligned with `param_names`.
+- **Bank lookup is untouched, and needed to be.** `_lookupAndSnap` tests the box against `raw_cdf`,
+  the *unsnapped* proposal, in every dimension -- it always did, before and after this change -- so
+  the discrete axis's bank behaviour is bit-identical. The only second-order effect is on
+  `mid_gen_additions`, which now stores a discrete coordinate's raw value instead of its snapped
+  one, so two same-level proposals within a generation match each other less often; that costs one
+  extra `evaluate_batch` entry and no extra simulation, because the monad is the same one.
+
+### Rejected
+- **Snapping a discrete coordinate to its own level's midpoint `(2i-1)/(2L)`** (issue option 2).
+  It preserves the prior too, and would keep a canonical value per level, but the canonical value
+  only matters for `_cdfToGridKey`, which no production path calls. Paying for a second snap rule
+  to serve a helper that only the tests use is the wrong trade.
+- **Warning when `2^k_base_eff < L`** (issue option 3). A warning about a distortion we can simply
+  not create.
+- **Raising `k_base_eff`.** Explicitly ruled out in the issue and worth restating: a larger `k`
+  shrinks the relative imbalance but never removes it (`L = 3` divides no power of two, so it
+  persists at every `k`), and it inflates the number of distinct proposals in exchange for no extra
+  resolution on a parameter with `L` distinct values.
+
+### Traps
+- **`DiscreteDistribution` is not a `Distributions` name `abc_smc.jl` had in scope.** The file
+  imports selectively (`using Distributions: pdf`); it worked only because `variations.jl` does a
+  blanket `using Distributions` into the same module. Named explicitly in the import list rather
+  than left to that.
+- **The regression test needs the database** even though it is an algorithm-level test.
+  `_runFirstGeneration` calls `_updateMidGenAdditions!` after `evaluate_batch`, which queries
+  simulation statuses -- which is why the two existing snapping integration tests live inside the
+  DB-backed testset, and why this one joins them.
+- **Generation 1 is the clean place to assert this.** With an empty bank and an empty
+  `mid_gen_additions` (all `population_size` proposals are built before the single batch is
+  dispatched), no lookup can fire, so the proposals are exactly the snapped Sobol points and the
+  assertion is deterministic.
+## Session: the nineteen remaining calibration findings (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #62: what was left of the adversarial review of the calibration PRs (#33-#40) after the four
+highest findings were split off. Nineteen items in four groups, each naming a file and a line and a
+recommended fix. Every item was re-verified against the code before it was touched; the three that
+were design questions rather than defects were left for their own briefs, and one — the stale
+GSA-over-`CalibrationProblem` line in the PRD — was already being handled by the records-compaction
+PR. One commit per group, so the four can be reviewed apart.
+
+### Decisions
+- **A resume recomputes `budget_hit` rather than trusting the last generation.** Every other stopping
+  criterion is a property of the generation just finished; the budget spans the run, and nothing on
+  disk records that it was spent. Omitting it made `_stoppingReason`'s budget branch unreachable from
+  a resume, and the crash it produced (`maximum` over an empty vector) never named the budget. The
+  warning it now emits is unconditional, unlike the `@info` for the other reasons, because a resume
+  that was asked for more generations and could run none is a dead end the caller has to act on.
+- **A generation that accepts nothing is discarded, never persisted.** The issue's own words, and the
+  reason is structural: the next generation resamples from this one's particles, so a zero-particle
+  generation is not a smaller generation but a broken one. `_runSubsequentGeneration` returns
+  `nothing` and the loop stops with what is already on disk. Rejected: `maximum(...; init=0.0)`,
+  which trades the error for exactly that broken generation.
+- **The warning reports the closest distance seen against ε.** Only the budget can end that loop, so
+  "budget spent" and "ε unreachable" always arrive together and cannot be told apart automatically.
+  Naming the one number that discriminates is the honest form of "distinguish the two".
+- **`method.toml` is written only once the resume commits to running a generation.** It describes the
+  settings a run used; writing it before validation could throw, or before the stopping check, left
+  it describing a run that never happened.
+- **`_supportSize` uses `length(support(d))`.** The span `maximum - minimum + 1` is right only for a
+  contiguous unit-step support — which is what the discrete path builds for itself, hence the long
+  life of the bug — and the grid walk indexes `collect(support(d))` with the result, so a gappy
+  support did not merely mis-size, it ran off the end.
+- **A single-level discrete parameter is rejected.** It cannot vary, and its latent
+  `DiscreteUniform(1, 1)` still costs a kernel dimension that dilutes the fitted covariance. Nothing
+  in the output would say so: the posterior column is simply constant.
+- **The bank's interior filter became per latent dimension.** `0 < u < 1` is a statement about a
+  continuous prior; a discrete top level has `cdf` exactly 1. Checked that admitting 1.0 is safe
+  downstream — L∞ box comparison, `quantile(DiscreteUniform(1, k), 1.0) == k`, kernels confined to
+  [0,1], and a prior density of 1 everywhere in CDF space — before widening it.
+- **The negative-axis fix moved the axis, not the bins.** The recipe passes one `bar_width` for every
+  bar, so uniform bin width is load-bearing and an existing test asserts it. Clamping the first edge
+  was written, caught by that test, and reverted in favour of an `xlims` default that starts at the
+  data. Rejected: shrinking the bin width so the leftmost edge lands on the data — it keeps every
+  property but can explode the bin count when ε sits just above the smallest distance.
+- **A non-finite proposal distance is dropped and counted in the title, not clamped.** Clamping would
+  draw a distance the run never measured, in a plot whose whole subject is where the distances fell.
+- **`tags=` accepts a lone `Pair` in `runCalibration` only.** `_asTagCollection` lives in `tags.jl`
+  and would fix `run` and `createTrial` in a word each, but the issue scoped this to the calibration
+  entry point and a triage PR is not the place to change `run`'s keyword handling. Noted for a
+  follow-up.
+- **Calibration tag keys are validated before `createCalibration`.** They join `progress` and
+  `on_monad_failure` in the block of controls checked up front, for the same reason: a typo must not
+  leave a database row and an output folder behind for a run that never started.
+
+### Rejected
+- Erroring instead of stopping gracefully when a generation accepts nothing. The budget-exhausted
+  partial generation is already returned rather than thrown, and an exception would also throw away
+  the `ABCResult` for the generations that did succeed.
+- Making the empty-`accepted` message distinguish "budget already spent" (`n_evaluations == 0`) from
+  "spent mid-generation". With the resume-time check fixed, the first is unreachable: the first batch
+  of a generation is trimmed to empty only when the budget was spent before the generation started,
+  and the resume now stops before that.
+- Keeping `_DistanceData.max_epsilon_accepted` "for future use". It was written by two call sites,
+  one of which read a TOML key solely to supply it, and read by none.
+
+### Traps
+- **A `Pair` is iterable.** `tags = "a" => "b"` splatted into `tag!` arrives as two arguments and
+  becomes two valueless tags — silently, since both are legal keys. So is a `String`, one tag per
+  character, though that one at least fails on the charset.
+- **A recipe that declares keyword arguments cannot be applied without a plotting backend.**
+  RecipesBase's cleanup step calls `is_key_supported`, which only Plots defines, so
+  `apply_recipe(Dict(), result, :distances)` throws `MethodError` — which is why the `ABCResult` and
+  `Calibration` recipes had no direct coverage. The test suite now defines it as `true`; recipes
+  with no keywords (`_DistanceData`, `_RidgelineData`) never needed it.
+- **`normalizeTagPairs` returns tuples, not pairs.** Feeding its output straight back into `tag!`
+  hits `_tagPair`, which has no `Tuple` method.
+- **The generations a result holds are not indexed by generation number.** `_loadGenerations` skips a
+  generation whose CDF file is missing, so `generations[i].t == i` holds only until a resume follows
+  an interrupted write — which is exactly when a plot is being read.
+
+---
+## Session: assertions whose two arms coincided (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #59, from the second review pass: four places where the suite could not fail if the behaviour
+regressed, plus the fact that no `run()` had ever reached the SLURM branch. Tests only — no `src/`
+change, and the one source edit made during the session was a deliberate mutation, reverted after it
+confirmed the new assertion fails without the fix.
+
+### Decisions
+- **`TestSimulator.runSimulation` now creates the simulation's `output/` folder.** That absence was
+  the root cause of the dead `verifyStoredValues` branch: `!isdir(pathToOutputFolder(sid))` classed
+  every simulation unverifiable, so `n_agreed` was 0, `n_agreed + n_unverifiable == length(sids)`
+  held trivially, and the mismatch block was skipped by its own guard. Fixed in the stub rather than
+  in the one testset because a real backend leaves an output folder behind — the stub was
+  unfaithful, not the test. The assertions are now `n_agreed == 4`, `n_mismatched == 4` with each
+  mismatch checked against `stored + 1000`, and then one folder is pruned so `n_unverifiable == 1`
+  is a positive assertion rather than a residue.
+- **Reducer tests measure the simulation ID.** Every replicate of a monad shares its parameter
+  values, so `mean` and `maximum` of a measurement of those values are the same number; `_qoi_sim_id`
+  gives 107.5 against 108.0 where `_qoi_sim` gave 1051.0 against 1051.0.
+- **`run_kwargs` precedence is observed by a callback that counts itself.** Both arms were
+  `on_progress=nothing` before. The bundle now carries a counting callback, and the calibration's own
+  control winning means it is never called. Verified by reverting `_buildEvaluateBatch`'s splat order:
+  the counter reaches 2 and the test fails.
+- **The `StudySpec` override is counted in new simulation rows, not in a monad's constituents.**
+  MOAT's design is deterministic for a given set of variations, so a second sweep over the same
+  `StudySpec` lands on monads an earlier sweep already built and their constituent lists carry that
+  run's replicates too — 45 monads came back with 6, 5 and 3 simulations. What `use_previous=false`
+  guarantees is that each monad in the design takes on exactly `n_replicates` *new* simulations, so
+  the sweep adds 135 rows where the spec's own value would have added 45.
+- **A `run()` success case on the SLURM path sits beside the refusal test** and picks up the very
+  simulations that refusal left pending, which is also what makes the refusal test's claim worth
+  something. It asserts `n_success == 3`, every row `Completed`, and one `hpc.out` per simulation
+  folder — the first coverage of what `run`'s worker does with the
+  `SimulationProcess(process=nothing, success=true, cmd)` a submitted job returns.
+- **Timing-shaped SLURM assertions wait on `hpc.out` carrying the job id.** That file is written once
+  the submission completes, so it is the event the fixed sleeps stood in for, and `_await` bounds
+  every `fetch` so a worker that never notices its sentinel fails the suite instead of blocking it.
+
+### Rejected
+- **Capturing stdout to assert `quiet=true` also wins.** `redirect_stdout` takes no `IOBuffer` on
+  1.12, so this needs a `Pipe` plus a reader task wrapped around a whole calibration; the deadlock
+  and leak surface is not worth a second assertion about the same one-line precedence rule.
+- **Asserting a per-monad constituent count for the `StudySpec` override** — see above; it is not an
+  invariant, because monads are shared between sweeps.
+- **A `Vector{QoI}` whose elements are non-scalar.** The issue asks only that the
+  `Dict`-keyed-by-QoI-name path reach `mseDistance` with more than one element; two scalar QoIs do
+  that, and the distances come back as `((x - 1)² + 0)/2`, which pins both the second key and the
+  division by the key count.
+
+### Traps
+- **`GenerationResult.particles` holds CDF coordinates, not target values.** The first version of the
+  two-QoI test compared distances against the particle column directly and failed. `posterior(result;
+  generation=t)` is the display-value view, and it carries `distance` and `monad_id` alongside, so it
+  is the single source for both halves of that assertion.
+- **`stored=` was skipped deliberately.** PR #56 already adds keyed read-back tests; #59's bullet
+  about a `Dict`-valued QoI under `:prefer`/`:require` is covered there.
+## Session: recovering a campaign whose driver died (2026-09-06) — ships in v0.10.0
+
+### Trigger
+Issue #53, the remainder of the 0.9 HPC architecture review. The Julia process that calls `run` is
+the only thing that records outcomes; when it dies -- an SSH drop, a login-node reaper, a driver
+job hitting its own time limit -- the jobs finish, nothing writes their results, and the rows stay
+`Running` forever. `isStarted` counts everything but `Not Started` as started, so every later run
+skips them *and* prints "found matching simulations and will save you time by not re-running
+them", about simulations that never finished. The only recovery on offer was
+`deleteSimulationsByStatus`, which deletes rows and output folders and recycles the IDs.
+
+### Decisions
+- **Reconcile inside `databaseDiagnostics`, not as a standalone function.** Diagnostics already
+  runs at every `initializeModelManager` and already reports orphaned rows and staged `.trash`
+  paths, so a stranded `Running` row is the same kind of finding; a separate entry point would be
+  one the affected user has to know to call. It writes, which the file's own comment says a
+  function named "diagnostics" should not -- accepted deliberately, and said in its docstring,
+  because the alternative is a report about rows nothing will ever fix.
+- **Two sources, in that order: the sentinel, then `sacct`.** The sentinel is the same file the
+  worker would have read, so it gives the exit code directly. `sacct` reads slurmdbd rather than
+  the queue, which is what lets it answer for a job that left hours ago -- `squeue`, the runner's
+  reaper, cannot. `COMPLETED` is success; the failure and waiting lists cover every state SLURM
+  currently documents, split by whether the job is over; anything else is reported by name and left
+  at `Running`, because the lists cannot be exhaustive -- SLURM adds states between releases and a
+  site can define its own.
+- **One `sacct` call per pass, not one per simulation.** slurmdbd is a second daemon with a
+  database behind it and a stranded campaign can be hundreds of rows, so the reconciler makes two
+  passes: the first settles everything a sentinel can and collects the job IDs of the rest, then
+  one `sacct -j <all ids> -n -P --format=JobID,State` answers for all of them. `JobID` joins the
+  format because the reply has to be keyed back to a job; rows for `.batch`/`.extern` steps are
+  dropped, since a step's state can differ from its allocation's.
+- **Sentinels are ordered by the stamp in the name, and the stamp is wall clock.** Two submissions
+  of one simulation each leave a sentinel, and the row still at `Running` belongs to the *later
+  submission* -- which `mtime` gets backwards whenever the earlier-submitted job outlived the
+  later one, quite apart from `mtime` being unreliable on a network filesystem (attribute caching,
+  clock skew, tied resolution) and costing a `stat` that can throw on a file swept mid-scan. So the
+  stamp moved from `time_ns()` to `round(UInt64, time() * 1e9)`: `time_ns()`'s epoch is per-boot,
+  so stamps from two driver sessions were never comparable. Uniqueness per submission is unchanged;
+  a name whose stamp is not hex is ignored, which is also what skips staged `.tmp` writes.
+- **A reconciled sentinel is read, not consumed.** Deleting it would be closer to what the worker
+  does, but diagnostics cannot tell an abandoned simulation from one another live session is still
+  waiting on, and consuming that session's sentinel would leave its worker to be failed by the
+  reaper minutes later. The age-gated stray sweep already exists to reclaim these.
+- **The sentinel directory is fixed per session and moved only by an environment variable.**
+  `HPCCompletionOptions.done_dir` is gone -- a setter could move the directory mid-session, and
+  diagnostics reads it at initialization, so it has to be fixed by then. The replacement is
+  `MODELMANAGER_HPC_DONE_DIR`, read once by `initializeModelManager` onto the new
+  `ModelManagerGlobals.hpc_done_dir` (globals, not `HPCCompletionOptions`, which is the settable
+  bag). Default `data/outputs/.hpc_done`: on the filesystem the jobs already write into, so
+  writable by construction, and a sibling of `outputs/simulations` so nothing scanning those sees
+  it. A value that is given is `mkpath`ed and write-probed at init, throwing an `ArgumentError`
+  naming the variable, because a directory the compute nodes cannot write makes *every* successful
+  job look scheduler-killed, silently, and this is the one check a login node can make. Accepted
+  cost, stated in the manual: sentinels written under a previous value are not where diagnostics
+  looks, so a user who changes it between launches is forced to think about where the sentinels of
+  a campaign in flight are. Breaking, in an unreleased version.
+- **`useHPC` pins the flag for the session.** One extra `Bool`, `run_on_hpc_overridden`, consulted
+  by `initializeModelManager` before it re-seeds `run_on_hpc` from the probe. Without it a
+  downstream package's `__init__` -- which initializes a project on its own -- or any script that
+  re-initializes would put the probed value back, and a `useHPC(false)` at the top of a script
+  would be gone before its first `run`. Session state, not project state: a script that says
+  `useHPC(false)` means it for every project it opens.
+- **A template, not a `submitDriver` function.** Submission is one line of `sbatch`; what has to
+  go *above* that line is site knowledge ModelManager does not have -- a `module load julia`, a
+  specific version, an account -- and a generated command line cannot carry it. Loading Julia and a
+  whole downstream package just to do that string substitution is minutes of load time on a
+  cluster, for something the user can type. So `initializeModelManager` (whenever `run_on_hpc` ends
+  up `true`) and `useHPC(true)` (when a project is initialized) write `driver_template.sbatch` into
+  `<project root>/scripts/` if that folder exists -- PCMM's `createProject` makes one -- and into
+  the project root otherwise, `dirname(dataDir())` either way, so it sits beside the scripts a user
+  edits rather than inside the `data/` the deletion helpers sweep. Written once, never overwritten,
+  announced only on the write. It carries commented `#SBATCH` lines, a commented-out
+  `module load julia`, `echo` lines around the run, and `julia --project=<active project> "$@"` so
+  the campaign script is an argument. The `--time` comment names the trap: it must cover the whole
+  campaign *including* the queue waits of every simulation job the driver submits.
+- **Nested submission stays.** Inside the driver job, detection stays on and each simulation is
+  still its own job, which is the design -- it hands scheduling to SLURM. The review had proposed
+  hinting at `useHPC(false)` when `SLURM_JOB_ID` is set; that would have told users to undo the
+  design, so the template says so in a comment instead.
+- **`_SubmissionRefused` stays internal.** Publishing it was only ever in service of
+  `submitDriver`, whose refusal a user had to be able to catch; with the template there is no such
+  refusal, every throw again belongs to a simulation, and `simulation_id` goes back to `Int`.
+  `hpc_completion.jl` accordingly leaves the HPC reference page's `Pages` list: nothing in the file
+  is public, and a `Pages` entry that renders nothing is a claim that it does.
+- **`Queued` and `Running` mean what `run` sets them to.** `run` marks every simulation it is about
+  to run `Queued` up front, and the worker that claims one marks it `Running` before calling the
+  backend -- and so before any `sbatch`. The old reconciler had this backwards, and drew two wrong
+  conclusions from it. A `Queued` row was checked for an `hpc.out`, which it can only have from an
+  *earlier* run of the same simulation (a refused submission writes an empty one), and such a row
+  would have stayed `Queued` forever; every `Queued` row in the pass now returns to `Not Started`.
+  And a `Running` row with no sentinel and no job ID was left alone, when on HPC that is proof no
+  job exists -- the driver died between claiming the row and `sbatch` returning, possibly inside
+  the transient-refusal retry loop -- so those return to `Not Started` too. Off HPC they are left:
+  what a local process did after its session ended is not knowable.
+- **The stranded ID sets are taken synchronously at init.** Diagnostics runs in an `@async` task
+  after `initializeModelManager` returns, so a `run` on the next line of the script can have marked
+  this session's own simulations `Queued`/`Running` before the reconciler looks -- exactly the two
+  statuses it treats as evidence of a dead driver. Two cheap queries at init, when no `run` of this
+  session can have started, and the sets travel with `max_ids`. A hand call to
+  `databaseDiagnostics()` still queries live, which is safe mid-run and documented as such: a
+  `Running` row this session owns has a sentinel or a job ID and is at worst recorded with the
+  status its own worker is about to record, and a `Queued` row reset here is one its worker marks
+  `Running` when it claims it.
+
+### Rejected
+- **A hint at `SLURM_JOB_ID`.** See above: the nested submission is intended, so the hint would
+  have advised undoing it.
+- **A job array keyed by simulation ID.** Feasible (`--array=<ids>` with `SLURM_ARRAY_TASK_ID`
+  mapped back), and it keeps per-simulation logs, but every task shares one resource request --
+  right for a sampling, wrong for a mixed trial -- and the reaper would have to understand
+  `jobid_taskid`. Worth its own brief if per-job submission overhead ever becomes the bottleneck;
+  with the sentinel design it has not.
+- **A probe job to validate the sentinel directory on first submission.** A compute node is the
+  only thing that can prove the directory is writable *from a compute node*, but a probe job means
+  submitting and waiting on a job before the campaign starts, on every session. The login-node
+  `mkpath` plus one probe file at init catches the mistakes people actually make (a typo, a path on
+  a filesystem the nodes do not mount is not among them) and costs nothing.
+- **A `setHPCDoneDir` setter, or a `done_dir` back on `HPCCompletionOptions`.** Either would let
+  the directory move after diagnostics had already read the old one, which is the failure the fixed
+  location existed to prevent. An environment variable read once at init is the same expressiveness
+  with the mutation removed.
+- **Resolving the monad before recording a reconciled failure.** `updateDatabaseOnCompletion` and
+  `simulationFailed` now take `Union{Missing,Int}`, so `missing` reaches the lookup
+  `eraseSimulationIDFromConstituents` already does from the simulation's own parameterization.
+  Duplicating that lookup in the reconciler would have been a second place to keep in step.
+
+### Traps
+- **`useHPC` in the test suite is now sticky.** Every testset that flips it leaves the pin set, so
+  a later `initializeModelManager` keeps that value instead of re-probing. The SLURM testsets clear
+  `run_on_hpc_overridden` before initializing, since they need the `sbatch` shim on `PATH` to be
+  honoured; anything new that depends on the probe must do the same.
+- **`databaseDiagnostics` is `@compat public`, not exported.** A test calling it bare gets
+  `UndefVarError` in `Main`, with a hint naming the module.
+- **The `sacct` shim needs `sacct.out` cleared between subtests.** `_reset_hpc!` removes it along
+  with the other shim state; a leftover state string from an earlier subtest would otherwise
+  decide a later one's outcome.
+- **Test projects now nest their data directory.** `initializeModelManager` takes the *data*
+  directory, and the template is written to its parent. A test that passed `mktempdir()` itself as
+  the data directory would drop `driver_template.sbatch` into the system temp directory, so the
+  blocks that turn HPC on use `<mktempdir()>/data` and keep the write inside the temp tree.
+
+---
 
 ## Session: a refused `sbatch` submission is not a failed simulation (2026-09-05) — ships in v0.10.0
 
@@ -161,6 +1049,56 @@ and the sink never calls `reduce` at all. A `#!` comment says so, so the next re
 
 ---
 
+## Session: restorable means "JLD2 can name it"; stored values read back as written (2026-09-05) — ships in v0.10.0
+
+### Trigger
+An architecture review of the QoI seam, adversarially verified: four medium bugs, all in what the
+seam *promised* rather than in the reduction it performs.
+
+### Closures passed as restorable
+`_isAnonymousFunction` tested `startswith(string(nameof(f)), "#")`. A named function defined inside
+another function -- `f(s) = k` inside `make(k)`, exactly the shape `_saveProblem`'s own tip
+recommended -- answers `nameof` with `:f`, so it passed, the manifest was saved "complete", and a
+fresh session failed to load it with a raw JLD2 `ReconstructedMutable` MethodError. Worse, because
+`resumeCalibration` read the manifest *before* consulting `problem=`, the documented rescue failed
+the same way. Verified by the reviewer in a two-process probe on 1.12.7.
+
+Decision: the predicate asks the question that matters -- can a fresh session restore this by
+name? -- and it is JLD2's own answer, `occursin('#', string(typeof(f)))`, the test JLD2 applies at
+`writing_datatypes.jl:446` before warning that it only stores functions by name. Review asked
+whether JLD2 had already solved this rather than us guessing; it had, and the one-liner agrees with
+the hand-rolled three-step version on every case in the test (top-level, `Base`, lambda, inner
+named, `let`-scoped, capture-free inner, callable struct). Spelled locally rather than calling
+`JLD2.isgensym`, which is internal. `_loadProblem` takes `required=`, so with a `problem=` in hand
+an unreadable file -- absent, without a `manifest` entry, or unreconstructable -- is a warning and
+the supplied problem is used unvalidated; without one it is an error naming both ways out.
+Rejected: validating the supplied problem against `parameters.toml` instead of the manifest -- more
+machinery than the case warrants today.
+
+The same predicate now drives `_qoiNameFromFunction`: a closure's name comes from its type and is an
+`anon_…` form. Two closures from one factory still share it (same type, different captures), so the
+name is treated as saying nothing: the sink refuses to store under it (as before) and
+`calculateGSA!`'s name-based skip ignores it (`_isAutoNamedAnonymous`). Before, `run(...;
+functions=[countOf("tumor")])` followed by `calculateGSA!(gsa, [countOf("immune")])` was skipped and
+the tumor indices sat under the shared label `f`. A real name is kept in any alphabet; `μstar` used to
+become `anon_star` and collide with `σstar`.
+
+### `stored=` could not see what the sink wrote
+`_storedValue` looked for a column literally named after the QoI and coerced it to `Float64`. A
+`String` value crashed in the conversion; a keyed QoI -- whose columns the sink writes as
+`<name>.<key>` -- was reported as never stored, so `:prefer` recomputed from pruned output and
+`:require` threw with the row right there in `postProcessingTable`. `verifyStoredValues` had the
+same `Float64` coercion on both sides.
+
+Decision: read back the way the sink wrote. A bare column returns the value as held; otherwise every
+`<name>.<key>` column is reassembled into a `Dict{String,Any}`, with `String` keys because that is
+all a column name can carry (documented: a NamedTuple-keyed compute reads back string-keyed).
+`verifyStoredValues` compares numbers with `isapprox`, keyed values key by key with the fresh keys
+stringified, everything else with `isequal`, and counts a `missing`/`nothing` fresh value as
+unverifiable rather than as a mismatch.
+
+---
+
 ## Session: GSA spreads a keyed measurement (2026-09-04) — ships in v0.9.1
 
 ### Trigger
@@ -254,6 +1192,12 @@ same-length vectors whose entries mean different things, and the indices would c
 wrong. `mseDistance`'s permissive key handling is the in-repo precedent for that failure mode, already
 flagged as a hazard in `src/qoi.jl`. The error message carries this reasoning rather than saying
 "unsupported", since the user can always supply both the alignment and the names themselves.
+
+**Revised in the #70 review (2026-09-06).** The length argument is naive — a vector you wrote is
+perfectly reasonable to reason about — and the docs and the error message no longer make it. The
+refusal stands as a "for now": keys make the alignment explicit, which is easier to build on, and
+what a vector would need settled is recorded under "Considered and (for now) rejected" in the
+2026-09-06 entry.
 
 ### Decision: the skip stays, re-keyed on the QoI's name, with an explicit `recompute=`
 This one was got wrong first. The old `if f in keys(results); return; end` keyed on the function

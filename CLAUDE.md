@@ -321,31 +321,6 @@ When setting you off on a task, check this list and assess if any of these shoul
   semantics are Julia's and cannot be reconciled. Watch for `--export` quirks with values containing
   commas or `=`. Surfaced reviewing PR #47; PCMM only ever passed `env=ENV`, which is a no-op, so
   nothing needs this yet.
-- **Let diagnostics notice simulations abandoned by a dead session.** A simulation is marked
-  `"Running"` before the backend is called; if the *process* then dies — Ctrl-C, a kill, a reboot —
-  nothing in-process can record what happened, and the row stays `"Running"`. `isStarted`
-  (`src/database.jl:386`) counts everything except `"Not Started"` as started, so later runs skip it
-  *and* print "ModelManager found matching simulations and will save you time by not re-running
-  them", about a simulation that never ran. A *thrown* exception is already handled — `run()` wraps
-  the launch and records the simulation before rethrowing — so what is left is only the case no
-  try/catch can reach, which makes `databaseDiagnostics` the right home: it already runs at session
-  start and already reports staged `.trash` paths this way. Note it cannot distinguish "abandoned"
-  from "another live session is running this", so the wording has to be conditional; remediation can
-  point at the existing `deleteSimulations` rather than adding new API.
-
-- **Remove the `summary_statistic` migration warning in v0.10.** Added in 0.9 (PR #46), when a
-  measurement function's contract changed from "called once per *monad*, aggregates its own
-  replicates" to "called once per *simulation*, replicates combined by `reduce`". The two cannot be
-  told apart automatically — an untyped argument is `::Any`, so `hasmethod` answers `true` for every
-  candidate type — so a bare function whose argument is not declared `::Simulation` is accepted with a
-  warning. That warning is only meaningful while people still have pre-0.9 code; afterwards it fires
-  on perfectly ordinary lambdas (`sim -> measure(sim)`) and is pure noise. Delete
-  `_declaresSimulation` (nothing else uses it), `_WARNED_SUMMARIES`, and the warning block in
-  `_validateSummaryStatistic` (`src/qoi.jl`), leaving
-  `_validateSummaryStatistic(f::Function) = _asQoI(f)`. Also retire the two testsets that cover them
-  and the `_sim_where` / `_sim_varargs` / `_sim_unbounded` / `_sim_zeroarg` helpers. Note the
-  suppression set is deliberately unlocked and grows for the session — acceptable for a temporary
-  migration aid, and another reason not to keep it past 0.9.
 - Merge `DiscreteVariation` into `DistributedVariation`, with a discrete variation becoming the special case
   carrying a `DiscreteNonParametric` distribution over its value vector. Today the two are separate types with
   parallel machinery: `LatentVariation` has one branch per kind, calibration has `DVSource`/`CVSource` alongside

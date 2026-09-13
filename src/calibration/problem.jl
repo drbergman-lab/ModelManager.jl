@@ -22,22 +22,31 @@ and how to compare simulated to observed output.
   `LatentVariation{<:Distribution}` to the constructors — conversion is automatic.
 - `observed_data`: Observed summary statistic in whatever form the `distance` function
   expects as its second argument.
-- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function — ideally one that
-  **declares it takes a [`Simulation`](@ref)**, `f(s::Simulation)` or `(s::Simulation) -> …`, since
-  one that does not is warned about. In every case the
-  measurement is made once per *simulation* and the replicates are combined by `reduce` (`mean` for a
-  plain function; a `QoI` is how you choose otherwise, and its `reduce` receives every replicate's
-  value, so a step that must happen *after* averaging goes there). A single QoI or a plain function
-  reports its value directly; a vector of QoIs reports a `Dict` keyed by QoI name.
+- `summary_statistic`: a [`QoI`](@ref), a vector of them, or a plain function (wrapped into a `QoI`
+  with the default reducer). The measurement is made once per *simulation* and the replicates are
+  combined by `reduce`, which receives every replicate's value — so a step that must happen *after*
+  averaging goes there.
 
-  The annotation matters because the previous contract called a bare function once per *monad* and
-  let it aggregate however it liked. An unannotated argument is ambiguous between the two, and
-  reinterpreting one silently would change results without raising. It is warned about rather than
-  refused, since refusing every unannotated function would also reject `sim -> measure(sim)`, the
-  natural way to write a new-contract lambda. The warning is transitional and goes in v0.10.
-- `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the return value
-  of `summary_statistic`; `observed` is `observed_data`.
-  Built-in: [`mseDistance`](@ref) — handles `Dict`, `Vector`, and scalar inputs.
+  **`distance` receives a [`SummaryValues`](@ref)**, always — for one QoI as much as for a vector,
+  and for a `Real`-valued QoI as much as a keyed one. It is keyed by `(qoi name, component key)`
+  pairs, the same pairs the sink turns into columns and sensitivity analysis into labels, and
+  answers to three spellings: `"counts"` for a `Real`-valued QoI, `"counts.tumor"` for a component,
+  and the bare `"tumor"` when exactly one QoI reports that key. So two QoIs may share a name (with
+  disjoint keys) or a component key (under different names) without colliding.
+
+  **Calibration constrains the values themselves not at all.** Whatever `reduce` returned is what
+  arrives: a `Real` under `(name, nothing)`, a keyed value one entry per key, and anything else —
+  a `Vector`, a `Matrix`, your own struct — whole under `(name, nothing)`. Your `distance` is the
+  only reader, so it is the only thing that decides what can be compared. (The post-processing sink
+  and sensitivity analysis each need a number per column and per monad, and say so.)
+
+  A monad whose every replicate returned `missing` has no summary; its particle is handled by
+  `on_monad_failure` (see [`runCalibration`](@ref)) rather than reported as a bug in your functions.
+- `distance::Function`: `(simulated, observed) → Float64`. `simulated` is the
+  [`SummaryValues`](@ref) described above; `observed` is `observed_data`.
+  Built-in: [`mseDistance`](@ref) — a keyed observation resolved through those spellings (extra
+  simulated components are ignored), an unkeyed observation against a one-value summary, or two
+  values that broadcast, including two arrays.
 - `n_replicates::Int`: Number of replicate simulations to run per proposed particle
   (default 1). Values > 1 reduce stochastic noise in each particle evaluation at the cost
   of N× more compute.
@@ -58,7 +67,7 @@ function countDefaultCells(sim::Simulation)
     return Float64(only(counts[counts.cell_type .== "default", :count]))
 end
 
-# A vector of QoIs reports a `Dict` keyed by QoI name, so `observed` is keyed the same way.
+# A `Real`-valued QoI is named by the QoI itself, so `observed` is keyed by that name.
 observed = Dict("default" => 100.0)
 problem = CalibrationProblem(
     ref,
@@ -384,8 +393,9 @@ end
 Locate a calibration's `generations/` directory and resolve `generation` to an index that is
 actually present on disk.
 
-`:final` is the highest recorded generation, not the last entry of a listing: names are addressed by
-the index inside them, so a missing generation or a changed padding width cannot shift the answer.
+`:final` is the highest *complete* generation, not the last entry of a listing: names are addressed
+by the index inside them, so a missing generation or a changed padding width cannot shift the answer,
+and an in-flight folder holding only its monad record is never chosen.
 """
 function _resolveDiskGeneration(calibration::Calibration, generation::Union{Int,Symbol})
     gen_dir = joinpath(calibrationFolder(calibration), "generations")
@@ -393,13 +403,14 @@ function _resolveDiskGeneration(calibration::Calibration, generation::Union{Int,
         "No generations directory found for Calibration($(calibration.id)). " *
         "Has the calibration been run?")
 
-    indices = _generationIndices(gen_dir)
+    #! Complete generations only: a folder for a generation still running (or interrupted) holds
+    #! just its monad record, so `:final` would resolve to it and then fail for want of particles.
+    indices = _completeGenerationIndices(gen_dir)
     isempty(indices) && error(
         "No completed generations found for Calibration($(calibration.id)).")
 
     t = generation === :final ? last(indices) : Int(generation)
-    t in indices || throw(ArgumentError(
-        "Generation $t not found for Calibration($(calibration.id)). Available: $(indices)."))
+    t in indices || throw(ArgumentError(_generationUnavailable(gen_dir, calibration.id, t, indices)))
     return gen_dir, t
 end
 
@@ -452,8 +463,8 @@ over-dispersed for proposals.
 Sampling a [`Calibration`](@ref) reads from disk. Plain mode needs only the generation's
 `particles.csv`; smoothed mode additionally rebuilds the parameters from `problem.jld2`, so it fails
 for a run whose `LatentVariation` carried anonymous maps — those are not serializable, and the error
-names [`resumeABC`](@ref)`(cal; problem=my_problem)`, which returns an [`ABCResult`](@ref) for a
-finished run without re-running it, as the way to get them back.
+names [`resumeABC`](@ref) called as `resumeABC(cal; problem=my_problem)`, which returns an
+[`ABCResult`](@ref) for a finished run without re-running it, as the way to get them back.
 
 # Examples
 ```julia
@@ -533,9 +544,9 @@ depend on each other and on their order — a caller handed `n` draws expects an
 a valid sample. A zero-weight particle is never drawn.
 """
 function _multinomialDraw(rng::AbstractRNG, weights::AbstractVector{<:Real}, n::Int)
+    n == 0 && return Int[]
     N = length(weights)
-    (n > 0 && N == 0) &&
-        throw(ArgumentError("Cannot draw from a generation with no particles."))
+    N == 0 && throw(ArgumentError("Cannot draw from a generation with no particles."))
     c = cumsum(weights)
     return Int[clamp(searchsortedfirst(c, rand(rng) * c[end]), 1, N) for _ in 1:n]
 end
@@ -660,6 +671,110 @@ function _diskCalibrationParameters(calibration::Calibration)
     return CalibrationParameter[_sourceToCalibrationParameter(s) for s in manifest.sources]
 end
 
+################## createTrial from posterior draws ##################
+
+"""
+    createTrial(result::ABCResult, draws::DataFrame; n_replicates, use_previous=true) → Sampling
+    createTrial(calibration::Calibration, draws::DataFrame; n_replicates, use_previous=true) → Sampling
+
+Turn a frame of posterior draws from [`samplePosterior`](@ref) into a runnable [`Sampling`](@ref)
+over the run's inputs, one monad per distinct parameter set, ready for [`run`](@ref).
+
+Each row's target values become one `DiscreteVariation` per calibrated target, resolved against the
+run's reference variation exactly as the calibration created its own monads. A plain draw therefore
+resolves to the monad it came from and adds no simulations unless `n_replicates` exceeds the run's;
+a smoothed draw creates a new monad. `n_replicates` defaults to the run's. A `Sampling` is a set, so
+a parameter set drawn more than once appears once — to keep the multiplicities of plain draws, use
+their `monad_id` column directly.
+
+The inputs, reference variation and default `n_replicates` are read from the run's `problem.jld2`.
+Only each parameter's targets and types are needed, not its maps, so this also works for a
+`LatentVariation` saved with anonymous maps. `draws` must carry the parameter columns
+`samplePosterior` returned; other columns such as `monad_id` are ignored.
+
+# Examples
+```julia
+points = samplePosterior(result, 100; smooth=true)
+sampling = createTrial(result, points)
+run(sampling)
+```
+"""
+function createTrial(result::ABCResult, draws::DataFrame; kwargs...)
+    manifest = _loadProblem(result.calibration)
+    specs = _DrawTargetSpec[_drawTargetSpec(cp) for cp in result.parameters]
+    return _samplingFromDraws(manifest, specs, draws; kwargs...)
+end
+
+function createTrial(calibration::Calibration, draws::DataFrame; kwargs...)
+    manifest = _loadProblem(calibration)
+    specs = _DrawTargetSpec[_drawTargetSpec(src) for src in manifest.sources]
+    return _samplingFromDraws(manifest, specs, draws; kwargs...)
+end
+
+#! Only what turning a draw back into variations needs: which display columns hold target values,
+#! and where each value goes. A `_StrippedLVSource` still has all of it -- the maps are what was
+#! stripped, and a draw already holds the mapped values -- so a run saved with anonymous maps is
+#! runnable from its draws even though it cannot be smoothed from disk.
+"""
+    _DrawTargetSpec
+
+The display columns of one calibration parameter that hold target values, with each target's
+location, path and type.
+"""
+struct _DrawTargetSpec
+    columns::Vector{String}
+    locations::Vector{Symbol}
+    targets::Vector{XMLPath}
+    types::Vector{DataType}
+end
+
+#! The target values are the trailing display columns: for every source but `LVSource` that is all of
+#! them, and `LVSource` prepends its latent samples.
+function _drawTargetSpec(cp::CalibrationParameter)
+    lv   = cp.lv
+    cols = _displayColumns(cp)
+    return _DrawTargetSpec(cols[end-length(lv.targets)+1:end], lv.locations, lv.targets, lv.types)
+end
+_drawTargetSpec(s::_StrippedLVSource) = _DrawTargetSpec(s.target_names, s.locations, s.targets, s.types)
+_drawTargetSpec(s) = _drawTargetSpec(_sourceToCalibrationParameter(s))
+
+#! `manifest` is a `_ProblemManifest`, left untyped because that struct is defined in `abc.jl`, which
+#! is included after this file.
+"""
+    _samplingFromDraws(manifest, specs, draws; n_replicates, use_previous) → Sampling
+
+One monad per distinct variation the rows of `draws` resolve to, built as `_createMonadForParams`
+builds a calibration's monads but from target values rather than CDF coordinates.
+"""
+function _samplingFromDraws(manifest, specs::Vector{_DrawTargetSpec},
+                            draws::DataFrame;
+                            n_replicates::Integer=manifest.n_replicates, use_previous::Bool=true)
+    nrow(draws) > 0 || throw(ArgumentError("createTrial needs at least one draw; the frame is empty."))
+    needed  = unique(vcat(String[], (spec.columns for spec in specs)...))
+    lacking = setdiff(needed, names(draws))
+    isempty(lacking) || throw(ArgumentError(
+        "The draws frame lacks the parameter column(s) $(join(lacking, ", ")). " *
+        "Pass the frame `samplePosterior` returned."))
+
+    monads = Monad[]
+    seen   = Set{VariationID}()
+    for row in eachrow(draws)
+        avs = AbstractVariation[]
+        for spec in specs
+            for (col, loc, tar, typ) in zip(spec.columns, spec.locations, spec.targets, spec.types)
+                push!(avs, DiscreteVariation(loc, tar, typ(row[col])))
+            end
+        end
+        variation_id = addVariations(GridVariation(), manifest.inputs, avs,
+                                     manifest.reference_variation_id).variation_ids[1]
+        variation_id in seen && continue
+        push!(seen, variation_id)
+        push!(monads, Monad(manifest.inputs, variation_id;
+                            n_replicates=n_replicates, use_previous=use_previous))
+    end
+    return Sampling(monads; n_replicates=n_replicates, use_previous=use_previous)
+end
+
 ################## ConvergenceSummary ##################
 
 """
@@ -673,8 +788,9 @@ and behaves like a DataFrame for property access (`cs.max_epsilon_accepted`, etc
 # Columns
 - `t`: Generation index.
 - `max_epsilon_accepted`: The largest distance the generation accepted.
-- `epsilon_threshold`: The cutoff it was run against; `nothing` for generation 1 and for generations
-  recorded before this was stored.
+- `epsilon_threshold`: The cutoff it was run against; `missing` for generation 1 and for generations
+  recorded before this was stored. `missing` rather than `nothing` so the table stays writable —
+  `CSV.write` has no serialisation for a `nothing`.
 - `acceptance_rate`: Fraction of proposals accepted.
 - `n_accepted`: Number of accepted particles (equals `population_size` when
   `accept_overflow=false`; may be larger when `accept_overflow=true`).
@@ -707,7 +823,11 @@ function ConvergenceSummary(result::ABCResult)
     df = DataFrame(
         t               = [g.t                       for g in result.generations],
         max_epsilon_accepted = [g.max_epsilon_accepted for g in result.generations],
-        epsilon_threshold    = [g.epsilon_threshold    for g in result.generations],
+        #! `missing`, not the `nothing` a `GenerationResult` carries: this is a DataFrame a user
+        #! writes out, and `CSV.write` cannot serialise a `nothing` column. The field keeps
+        #! `nothing`, which is what a generation with no threshold means in code.
+        epsilon_threshold    = [something(g.epsilon_threshold, missing)
+                                for g in result.generations],
         acceptance_rate = [g.acceptance_rate         for g in result.generations],
         n_accepted      = [nrow(g.particles)         for g in result.generations],
         ess             = [g.ess                     for g in result.generations],
@@ -720,11 +840,11 @@ end
 function ConvergenceSummary(cal::Calibration)
     gen_dir = joinpath(calibrationFolder(cal), "generations")
     isdir(gen_dir) || error("No generations directory for Calibration($(cal.id)).")
-    indices = _generationIndices(gen_dir)
-    isempty(indices) && error("No generation metadata found for Calibration($(cal.id)).")
+    indices = _completeGenerationIndices(gen_dir)
+    isempty(indices) && error("No complete generation found for Calibration($(cal.id)).")
 
     ts = Int[]; epsilons = Float64[]; acceptance_rates = Float64[]
-    thresholds = Union{Nothing,Float64}[]
+    thresholds = Union{Missing,Float64}[]
     n_accepteds = Int[]; esss = Float64[]; ess_fractions = Float64[]
     n_evaluationss = Int[]
 
@@ -732,9 +852,7 @@ function ConvergenceSummary(cal::Calibration)
     #! resolved on its own rather than by swapping the metadata file's extension — under the folder
     #! layout `metadata.toml` and `particles.csv` share no stem, so that trick no longer applies.
     for t in indices
-        toml_path = _generationArtifact(gen_dir, t, :metadata)
-        isnothing(toml_path) && continue
-        d = TOML.parsefile(toml_path)
+        d = TOML.parsefile(_generationArtifact(gen_dir, t, :metadata))
         csv_path = _generationArtifact(gen_dir, t, :particles)
         n_acc = isnothing(csv_path) ?
                 round(Int, d["acceptance_rate"] * d["n_evaluations"]) :
@@ -742,7 +860,7 @@ function ConvergenceSummary(cal::Calibration)
         push!(ts, t)
         #! Pre-rename runs wrote this as "epsilon"; read either spelling so they still load.
         push!(epsilons, get(d, "max_epsilon_accepted", get(d, "epsilon", NaN)))
-        push!(thresholds, get(d, "epsilon_threshold", nothing))
+        push!(thresholds, get(d, "epsilon_threshold", missing))
         push!(acceptance_rates, d["acceptance_rate"]); push!(n_accepteds, n_acc)
         push!(esss, d["ess"]); push!(ess_fractions, d["ess"] / n_acc)
         push!(n_evaluationss, d["n_evaluations"])

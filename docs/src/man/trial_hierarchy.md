@@ -79,7 +79,7 @@ effect. By convention:
 - `-1` — the location is not in use,
 - a positive integer — a specific variation row in that location's variations database.
 
-You rarely construct a `VariationID` by hand; [`addVariations`](@ref) and
+You rarely construct a `VariationID` by hand; [`ModelManager.addVariations`](@ref) and
 [`createTrial`](@ref) produce them as a side effect of registering variations
 (see [Variations](@ref variations)).
 
