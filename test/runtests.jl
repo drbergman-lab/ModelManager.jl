@@ -1537,11 +1537,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test nrow(sm) == 2000
         @test names(sm) == ["x"]
         @test all(v -> 0.0 <= v <= 1.0, sm.x)
-        # Smoothing spreads: resampling {0.2, 0.8} would give sd exactly 0.3 and never a draw
-        # between the two particles.
+        # Smoothing spreads: resampling {0.2, 0.8} would give exactly two distinct values and never
+        # a draw between the particles. (Not a threshold on the sd -- reflection at [0, 1] folds
+        # mass inward, so the smoothed sd sits near the resampling value of 0.3 and which side it
+        # lands on depends on the RNG stream.)
         @test isapprox(mean(sm.x), 0.5; atol=0.05)
-        @test std(sm.x) > 0.3
-        @test count(v -> 0.4 < v < 0.6, sm.x) > 0
+        @test length(unique(sm.x)) > 1000
+        @test count(v -> 0.4 < v < 0.6, sm.x) > 100
         @test nrow(samplePosterior(cdf_res, 0; smooth=true)) == 0
         @test names(samplePosterior(cdf_res, 0; smooth=true)) == ["x"]
 
