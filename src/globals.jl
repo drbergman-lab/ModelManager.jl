@@ -23,10 +23,19 @@ by calling [`registerSimulator!`](@ref).
 - `db::SQLite.DB`: Connection to the central project database.
 - `run_on_hpc::Bool`: `true` to submit simulations as SLURM jobs and to route file removal
   through the staging path of [`rm_hpc_safe`](@ref). [`initializeModelManager`](@ref) sets it
-  from [`isRunningOnHPC`](@ref) on every call; override afterwards with [`useHPC`](@ref).
+  from [`isRunningOnHPC`](@ref) on every call *unless* it has been pinned; pin it with
+  [`useHPC`](@ref).
+- `run_on_hpc_overridden::Bool`: `true` once [`useHPC`](@ref) has set `run_on_hpc` by hand, which
+  stops [`initializeModelManager`](@ref) from overwriting it with the probe. Session state rather
+  than project state: a script that says `useHPC(false)` means it for every project it opens.
 - `sbatch_options::Dict{String,Any}`: Options forwarded to `sbatch`.
 - `hpc_completion::HPCCompletionOptions`: How the runner detects that a submitted SLURM job has
   finished. See [`setHPCCompletionOptions`](@ref).
+- `hpc_done_dir::String`: Where SLURM jobs write their exit-code sentinels, or `""` for the default
+  `data/outputs/.hpc_done`. Set only by [`initializeModelManager`](@ref), from the
+  `MODELMANAGER_HPC_DONE_DIR` environment variable, which is the single way to move the directory
+  and is read once per session: diagnostics reads the directory at initialization, so a location
+  that changed mid-session would have it looking where the sentinels are not.
 - `max_number_of_parallel_simulations::Int`: Concurrency limit.
 - `diagnostics_task::Union{Nothing,Task}`: The background `Task` running
   `databaseDiagnostics`, set by [`initializeModelManager`](@ref).
@@ -60,8 +69,10 @@ by calling [`registerSimulator!`](@ref).
     db::SQLite.DB = SQLite.DB()
 
     run_on_hpc::Bool = false
+    run_on_hpc_overridden::Bool = false
     sbatch_options::Dict{String,Any} = defaultJobOptions()
     hpc_completion::HPCCompletionOptions = HPCCompletionOptions()
+    hpc_done_dir::String = ""
 
     max_number_of_parallel_simulations::Int = 1
 
@@ -228,15 +239,23 @@ It performs all framework-agnostic initialization steps in order:
 4. Parse `inputs.toml`.
 5. Initialize the database schema (tables, folder registration).
 6. Detect whether SLURM is available via [`isRunningOnHPC`](@ref) and store the result in
-   `run_on_hpc`. Override it afterwards with [`useHPC`](@ref).
-7. Call [`postInitDisplay`](@ref) to print startup information.
-8. Launch a background `@async` task that retries the removal of anything
-   [`rm_hpc_safe`](@ref) had to stage in `data/.trash/`, then runs `databaseDiagnostics`.
+   `run_on_hpc`, unless [`useHPC`](@ref) has already pinned it in this session.
+7. Resolve where SLURM jobs write their exit-code sentinels, from `MODELMANAGER_HPC_DONE_DIR` if
+   that is set and non-empty and from the `data/outputs/.hpc_done` default otherwise.
+8. Call [`postInitDisplay`](@ref) to print startup information.
+9. Launch a background `@async` task that retries the removal of anything
+   [`rm_hpc_safe`](@ref) had to stage in `data/.trash/`, then runs `databaseDiagnostics` over the
+   stranded-simulation and maximum-ID snapshots taken synchronously just before it.
+10. Write the SLURM driver-job template, if HPC mode is on and it is not already there.
 
 Returns `true` on success, `false` on any initialization failure — including errors that
 would otherwise throw (e.g. an unwritable `data_dir`). All mutated globals are reset to
 a clean state before any `false` return, so [`isInitialized`](@ref) reports `false` and a
-subsequent retry starts fresh.
+subsequent retry starts fresh. The one exception is a `MODELMANAGER_HPC_DONE_DIR` naming a
+directory that cannot be created or written, which throws an `ArgumentError` before anything else
+is touched, so a project already open in the session is left as it was: a sentinel directory the
+compute nodes cannot write makes every successful job look scheduler-killed, and the only check
+that can be made from the login node is made here rather than discovered a campaign later.
 
 Simulator packages typically provide their own path-level overloads (e.g. accepting
 `path_to_physicell` and `path_to_data`) that validate paths, set simulator-specific
@@ -247,6 +266,12 @@ state, then delegate here.
     Call [`waitForDiagnostics`](@ref) if you need them to complete before proceeding.
 """
 function initializeModelManager(simulator::AbstractSimulator, data_dir::AbstractString; auto_upgrade::Bool=false)
+    #! First, before any global is touched: the variable names an absolute path and needs nothing
+    #! from the project, and it is the one initialization failure that throws rather than returning
+    #! `false`. Throwing here leaves the previous project -- if any -- exactly as it was, instead of
+    #! a new one half-initialized with its database already open.
+    hpc_done_dir = _resolveHPCDoneDir()
+
     # If a previous diagnostics task is still running, let it finish before we
     # mutate shared globals — otherwise it may observe a partially-updated state.
     waitForDiagnostics()
@@ -302,19 +327,29 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     end
     #! Detected here, after every failure path has returned, so that `_abortInitialization`
     #! need not know about this field. Still ahead of `postInitDisplay`, which prints it.
-    mm_globals().run_on_hpc = isRunningOnHPC()
+    #! A `useHPC` call wins over the probe and keeps winning: a downstream package's `__init__`
+    #! initializes a project on its own, and scripts re-initialize routinely, so without the pin
+    #! a `useHPC(false)` written at the top of a script would be undone before its first `run`.
+    mm_globals().run_on_hpc_overridden || (mm_globals().run_on_hpc = isRunningOnHPC())
+    mm_globals().hpc_done_dir = hpc_done_dir
     postInitDisplay(simulator)
     flush(stdout)
     # Snapshot max IDs now (before any simulations launch) so that diagnostics
     # only check entities that existed at init time and won't be confused by
     # in-progress runs started later in the same session.
     snapshot = _snapshotMaxIDs()
+    #! Taken here, synchronously, and not by the task itself: the task runs at the first yield
+    #! after this function returns, and a `run` started on the line after `initializeModelManager`
+    #! may by then have marked this session's own simulations `Queued` and `Running`. Those are
+    #! exactly the two statuses the reconciler treats as evidence of a dead driver. Querying now,
+    #! when no `run` of this session can have started, is what keeps it off them.
+    stranded = _strandedSimulationIDs()
     mm_globals().diagnostics_task = @async begin
         try
             #! Before the report, not after: `databaseDiagnostics` only warns about what is
             #! left in `data/.trash`, so the retry has to have had its turn first.
             _sweepTrash()
-            databaseDiagnostics(snapshot)
+            databaseDiagnostics(snapshot; stranded=stranded)
         catch e
             println("""
             Database diagnostics failed during initialization with error: $(e).
@@ -323,7 +358,51 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
             """)
         end
     end
+    #! Last, and only on HPC: the template is a convenience for a cluster user and has no business
+    #! appearing next to a laptop project's `data/`. Guarded because a project root that cannot be
+    #! written is a reason to skip a convenience, not to fail an initialization that has otherwise
+    #! succeeded and already opened the database.
+    if mm_globals().run_on_hpc
+        try
+            _writeDriverTemplate()
+        catch e
+            @warn "Could not write the SLURM driver-job template: $(e)"
+        end
+    end
     return isInitialized()
+end
+
+"""
+    _resolveHPCDoneDir() → String
+
+Where this session's SLURM jobs will write their exit-code sentinels: the value of
+`MODELMANAGER_HPC_DONE_DIR` if it is set and non-empty, else `""` for the `data/outputs/.hpc_done`
+default. Throws an `ArgumentError` naming the variable if a value it was given cannot be created
+and written.
+
+The check is the point. A sentinel directory the compute nodes cannot write makes *every*
+successful job look scheduler-killed, minutes at a time and with nothing said about why, and by
+then a campaign is in the queue. Creating the directory and writing one probe file is the only
+part of that a login node can verify, so it is verified once, here, where the answer is a message
+instead of a ruined run.
+"""
+function _resolveHPCDoneDir()
+    dir = get(ENV, "MODELMANAGER_HPC_DONE_DIR", "")
+    isempty(dir) && return ""
+    probe = joinpath(dir, ".mm_write_probe_$(getpid())")
+    try
+        mkpath(dir)
+        write(probe, "")
+        rm(probe; force=true)
+    catch e
+        throw(ArgumentError("MODELMANAGER_HPC_DONE_DIR is set to `$(dir)`, which ModelManager \
+                             could not create and write to: $(sprint(showerror, e)). SLURM jobs \
+                             record their exit codes there, so a directory they cannot write \
+                             makes every successful job look as though the scheduler killed it. \
+                             Point the variable somewhere writable, or unset it to use the \
+                             default `data/outputs/.hpc_done`."))
+    end
+    return abspath(dir)
 end
 
 """

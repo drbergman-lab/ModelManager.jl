@@ -21,7 +21,14 @@ isRunningOnHPC() = shellCommandExists(`sbatch`)
 """
     useHPC([use::Bool=true])
 
-Set the global `run_on_hpc` flag to `use`.
+Set the global `run_on_hpc` flag to `use`, and keep it set across later calls to
+[`initializeModelManager`](@ref).
+
+The pinning is what makes the call worth writing in a script. `initializeModelManager` seeds
+`run_on_hpc` from the SLURM probe every time it runs, and a downstream package's `__init__` may
+initialize a project before your script has said anything; without the pin, re-initializing would
+silently undo `useHPC(false)` on a machine that happens to have `sbatch` installed. The pin lasts
+for the session and applies to every project opened in it.
 
 # Examples
 ```julia
@@ -45,6 +52,99 @@ function useHPC(use::Bool=true)
         """ maxlog=1
     end
     mm_globals().run_on_hpc = use
+    mm_globals().run_on_hpc_overridden = true
+    #! Turning HPC mode on by hand is the other moment a user could want the driver template, and
+    #! it is the only one on a machine where the SLURM probe fails. It needs a project to write
+    #! into, so before initialization there is nothing to do and nothing worth saying: the flag is
+    #! what the caller asked for, and the next `initializeModelManager` writes the template.
+    use && isInitialized() && _writeDriverTemplate()
+    return use
+end
+
+"""
+    _driverTemplatePath() → String
+
+Where the driver batch-script template belongs: `scripts/driver_template.sbatch` under the project
+root if that folder exists (a downstream `createProject` makes one), else `driver_template.sbatch`
+in the project root itself.
+
+The project root is the parent of `dataDir()`, so the template lands beside the scripts a user
+actually edits and runs rather than inside the `data/` tree the campaign writes into and the
+deletion helpers sweep.
+"""
+function _driverTemplatePath()
+    root = dirname(dataDir())
+    scripts = joinpath(root, "scripts")
+    return joinpath(isdir(scripts) ? scripts : root, "driver_template.sbatch")
+end
+
+"""
+    _driverTemplateContents() → String
+
+The text of the driver-job template, with `--project` pinned to the environment active when it is
+written.
+
+The template runs `julia --project=… "\$@"`, so the script to drive a campaign with is an argument
+to `sbatch`, not part of the file: one template serves every campaign in the project.
+"""
+function _driverTemplateContents()
+    #! Quoted because a project path can contain spaces, and the line is re-read by bash.
+    project = _shQuote(string(Base.active_project()))
+    return """
+    #!/bin/bash
+    #SBATCH --job-name=mm-driver     # so `squeue --name=mm-driver` finds this job
+    #SBATCH --time=48:00:00          # must cover the WHOLE campaign -- including the queue wait of every simulation job this driver submits, since the driver sits blocked until the last one finishes
+    #SBATCH --cpus-per-task=1        # the driver only submits and waits; each simulation gets its own allocation
+    #SBATCH --mem=4G                 # Julia's own footprint, not a simulation's
+    #SBATCH --output=driver-%j.log   # the driver's stdout, %j being the job id
+    #SBATCH --error=driver-%j.err    # the driver's stderr
+
+    # Written by ModelManager because SLURM was detected on this machine. It is a starting point,
+    # not something ModelManager owns: edit it freely, it is written once and never overwritten.
+    #
+    #   submit:  sbatch driver_template.sbatch my_script.jl
+    #   watch:   squeue -j <jobid>
+    #   after:   sacct -j <jobid>
+    #
+    # Inside this job, HPC detection stays on and each simulation is still submitted as its own
+    # job. That is the design -- SLURM schedules the simulations, ModelManager does not -- so the
+    # driver itself needs no more than the single core and small memory request above.
+
+    # module load julia   # uncomment / adjust for your site
+
+    echo "ModelManager driver job \$SLURM_JOB_ID starting on \$(hostname) at \$(date)"
+
+    # "\$@" is whatever you passed after the script name -- see "submit:" above:
+    #     sbatch driver_template.sbatch my_script.jl
+    julia --project=$(project) "\$@"   # <-- LOOK AT HOW TO SUBMIT ABOVE
+
+    echo "ModelManager driver job \$SLURM_JOB_ID finished at \$(date)"
+    """
+end
+
+"""
+    _writeDriverTemplate() → String
+
+Write the driver-job template if it is not already there, and return its path. Announces the write
+on stdout the first time; says nothing on any later call.
+
+The Julia process that calls `run` is what records outcomes, so it should be a job itself rather
+than a login-node process an SSH drop or a reaper can kill. ModelManager writes a template instead
+of submitting the driver for the user: submission is a one-line `sbatch`, while what to put *above*
+that line is site knowledge ModelManager does not have -- a `module load julia`, a specific Julia
+version, an account or partition -- and starting Julia and a whole simulator package just to
+assemble that command line would be minutes of load time to do a string substitution.
+
+Never overwrites: after the first write the file is the user's, and the next session finding it
+already edited is the normal case.
+"""
+function _writeDriverTemplate()
+    path = _driverTemplatePath()
+    ispath(path) && return path
+    write(path, _driverTemplateContents())
+    println("Wrote a SLURM driver-job template to $(path) — submit a campaign with `sbatch $(basename(path)) my_script.jl`.")
+    flush(stdout)
+    return path
 end
 
 """
@@ -83,6 +183,13 @@ Jobs report their exit code by writing a sentinel file to a shared directory; th
 submitted each job waits for its file. `squeue` is consulted only as a reaper, for jobs that died
 without writing anything, through one answer shared by every waiting worker.
 
+*Where* that directory is is deliberately not one of these options. It is
+`data/outputs/.hpc_done` unless the `MODELMANAGER_HPC_DONE_DIR` environment variable says
+otherwise, and it is fixed for the session: [`initializeModelManager`](@ref) reads the variable
+once, checks that the directory can be created and written, and diagnostics reads the directory at
+that moment — a location that could move mid-session would leave it looking where the sentinels are
+not.
+
 # Fields
 - `submit_retry_period::Float64`: How long a worker keeps retrying a submission that `sbatch`
   refused for a reason that clears up on its own -- a per-user submit limit while earlier jobs
@@ -90,10 +197,6 @@ without writing anything, through one answer shared by every waiting worker.
   60 s. A refusal that does not look transient (a wrong partition, an invalid option, no
   `sbatch` at all) is not retried. Either way, giving up stops the run and puts the simulation
   back to `Not Started`; it is never recorded as failed, because no job ever ran.
-- `done_dir::String`: Where sentinels are written. Empty means `<dataDir()>/.hpc_done`. Point it
-  at a faster filesystem when the project lives on an NFS mount: NFS caches directory attributes
-  for `acdirmin`/`acdirmax` (30s/60s by default), which delays how quickly a sentinel written on a
-  compute node becomes visible here. Only this directory needs to move; `data/` stays where it is.
 - `poll_interval::Float64`: Seconds between each waiting worker's check for its own sentinel — one
   `stat` per in-flight job per interval. This is the completion path.
 - `reap_interval::Float64`: How long one `squeue` answer is shared by every waiting worker before
@@ -105,7 +208,6 @@ without writing anything, through one answer shared by every waiting worker.
 """
 @with_kw mutable struct HPCCompletionOptions
     submit_retry_period::Float64 = 900.0
-    done_dir::String = ""
     poll_interval::Float64 = 1.0
     reap_interval::Float64 = 300.0
     grace_period::Float64 = 270.0
@@ -116,11 +218,8 @@ end
 
 Set any of the [`HPCCompletionOptions`](@ref) fields on the active globals.
 
-The default worth knowing about is `done_dir`: on a project whose `data/` lives on an NFS mount,
-pointing it at a faster filesystem cuts completion latency without moving the project itself.
-
 ```julia
-setHPCCompletionOptions(done_dir="/scratch/\$(ENV["USER"])/mm_done")
+setHPCCompletionOptions(grace_period=600.0)   # a filesystem slower than the 270 s default assumes
 ```
 """
 function setHPCCompletionOptions(; kwargs...)

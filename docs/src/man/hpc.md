@@ -22,6 +22,10 @@ useHPC(true)    # force HPC mode on
 useHPC(false)   # force local execution even on a cluster login node
 ```
 
+The override sticks for the rest of the session, including across later calls to
+[`initializeModelManager`](@ref) — otherwise a re-initialization, which a simulator package may do
+on its own at load time, would silently put the probed value back.
+
 ## Job options
 
 SLURM job parameters are held in a `Dict` of `sbatch` options. [`ModelManager.defaultJobOptions`](@ref) sets
@@ -96,13 +100,51 @@ yourself -- each simulation's folder holds its job ID in `hpc.out`, and the defa
 
 The Julia process that called `run` is what waits for the jobs and records their outcomes; if it
 dies, the jobs still finish but nothing writes their results to the database, and the simulations
-they belonged to stay at `Running`. Run long campaigns from a session that survives your login
-shell -- `tmux`, `screen`, `nohup julia script.jl &`, or a batch job whose time limit covers the
-whole campaign (submitting jobs from inside a job is allowed on most clusters). If a driver does
-die, its simulations can be found with `simulationsTable` filtered on status, and reset with
-`deleteSimulationsByStatus("Running")` once their jobs have finished or been cancelled -- check
-`sacct --name=S<id>` first, since a job still running will otherwise write into a folder whose
-simulation ID has been reused.
+they belonged to stay at `Running`.
+
+The fix is to make the driver a job too, so it runs on a compute node under SLURM's clock rather
+than in an SSH session. `tmux`, `screen` and `nohup julia script.jl &` also survive a dropped
+connection, but not a login node that reaps long-running processes.
+
+If a driver does die anyway, the next `initializeModelManager` recovers what it left behind. Its
+statuses say how far each simulation got: `Queued` means a `run` scheduled it and no worker had
+claimed it yet, `Running` means a worker claimed it and was about to call the backend. So for every
+simulation still at `Running`, `databaseDiagnostics` reads the exit code its job recorded, or asks
+`sacct` about the job ID in that simulation's `hpc.out` — one `sacct` call for the whole pass,
+carrying every job ID it still needs an answer for — and marks the simulation `Completed` or
+`Failed` accordingly; every simulation at `Queued`, and on a cluster every `Running` one that never
+reached the scheduler, goes back to `Not Started`. It reports what it changed. A simulation whose
+job is still queued or running is left alone, so re-running the diagnostics after those jobs finish
+resolves them.
+
+### Running the driver as a job
+
+The first initialization on a machine with `sbatch` — or the first `useHPC(true)` after one —
+writes a template into your project, into `scripts/` if you have one and else next to `data/`:
+
+```
+driver_template.sbatch
+```
+
+Submit a campaign with it, passing the script to run as an argument:
+
+```bash
+sbatch driver_template.sbatch run_campaign.jl
+```
+
+The template is a starting point, not something ModelManager owns: it is written once, never
+overwritten, and the commented-out `module load julia` line near the top is there because loading
+Julia is site-specific and ModelManager cannot know your site's incantation. Edit the `#SBATCH`
+lines and that one to taste.
+
+Two things to get right:
+
+- **The driver's `--time` must cover the whole campaign**, including the time its simulation jobs
+  spend waiting in the queue — the driver sits blocked until the last of them finishes. It is the
+  one job whose wall clock is not about how long any computation takes.
+- The driver itself needs almost nothing: one core and a small memory request. Inside the driver
+  job, detection stays on and each simulation is still submitted as its own job, which is the
+  point — SLURM schedules them, not ModelManager.
 
 ## How completion is detected
 
@@ -126,7 +168,6 @@ Tune it with [`setHPCCompletionOptions`](@ref):
 
 ```julia
 setHPCCompletionOptions(
-    done_dir = "/scratch/\$(ENV["USER"])/mm_done",  # sentinels only — not your data/
     poll_interval = 1.0,     # seconds between a worker's checks for its own sentinel
     reap_interval = 300.0,   # how long one squeue answer is shared before it is refreshed
     grace_period  = 270.0,   # how long a vanished job may take to produce its sentinel
@@ -134,14 +175,30 @@ setHPCCompletionOptions(
 )
 ```
 
-The one setting worth knowing about is `done_dir`. NFS caches directory attributes for 30–60
-seconds by default, which delays how quickly a sentinel written on a compute node becomes visible
-to your driver. Lustre and GPFS have no such delay. If your project lives on NFS and you want
-faster turnaround, point `done_dir` at a faster filesystem — **only the sentinel directory needs to
-move; your `data/` can stay where it is.** It must be mounted at the same path on every compute
-node: a job that cannot write its sentinel there looks exactly like a job the scheduler killed.
-Sentinels live for seconds and are consumed and deleted, so a purge policy on scratch cannot harm
-them.
+Sentinels are written to `data/outputs/.hpc_done` by default. That default is on the same
+filesystem the jobs already write their output into, so it is somewhere the compute nodes can write
+by construction — which matters, because a sentinel directory the nodes cannot write makes every
+successful job look scheduler-killed and says nothing about why. What it costs is turnaround on
+NFS: it caches directory attributes for 30–60 seconds by default, so a sentinel written on a
+compute node can take that long to become visible to your driver, and that is then the floor on how
+quickly one simulation finishing frees a slot for the next. Lustre and GPFS have no such delay, and
+neither does a project on scratch.
+
+To put the sentinels somewhere else — scratch, say, to escape that NFS delay — set
+`MODELMANAGER_HPC_DONE_DIR` before starting Julia:
+
+```bash
+export MODELMANAGER_HPC_DONE_DIR=/scratch/$USER/mm_done
+```
+
+That environment variable is the only way to move the directory, and it is read once, by
+`initializeModelManager`: changing it mid-session does nothing until the next initialization. The
+directory is created and write-tested at that point, and an `ArgumentError` naming the variable
+says so if either fails, rather than leaving you to discover it a campaign later. The cost of
+moving it is the obvious one, and it is on you: sentinels written into the previous directory are
+not where diagnostics looks, so switching between launches means a campaign stranded under the old
+value cannot be reconciled from its sentinels. Changing the variable is deliberate, so it is worth
+a moment's thought about where the sentinels of any campaign still in flight are.
 
 ### Finding a job again
 

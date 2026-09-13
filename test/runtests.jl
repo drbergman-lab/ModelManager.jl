@@ -2830,7 +2830,11 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     end
 
     @testset "DB-backed integration" begin
-        mktempdir() do project_dir
+        mktempdir() do project_root
+            # ModelManager is handed the *data* directory, and a real project keeps that inside a
+            # project root -- which is where `useHPC`/`initializeModelManager` write the driver
+            # template. Nest it so that write lands in this temp tree, not the system temp dir.
+            project_dir = joinpath(project_root, "data")
             _make_test_project(project_dir)
 
             # ---------- initialisation ----------
@@ -2848,6 +2852,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @testset "run_on_hpc auto-detection" begin
                 detected = mm_globals().run_on_hpc
                 try
+                    @test !mm_globals().run_on_hpc_overridden   # nothing has pinned it yet
                     # The bug this guards: nothing ever called isRunningOnHPC(), so the flag
                     # sat at its `false` struct default even on a SLURM machine where
                     # isRunningOnHPC() returned true. Holds on a laptop and a cluster alike.
@@ -2866,9 +2871,21 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     useHPC()
                     @test mm_globals().run_on_hpc == true
 
-                    # Re-initializing re-detects unconditionally, discarding an override.
-                    # Set the field directly rather than via useHPC to avoid the warning.
-                    mm_globals().run_on_hpc = !detected
+                    # A useHPC override survives re-initialization. Without the pin, a downstream
+                    # package's __init__ (which initializes a project on its own) or any script
+                    # that re-initializes would put the probed value back, and a `useHPC(false)`
+                    # written at the top of a script would be gone before its first `run`.
+                    @test mm_globals().run_on_hpc_overridden
+                    # Off first, so a `useHPC(true)` never lands on an already-on flag and spends
+                    # the maxlog=1 redundancy warning on test output.
+                    useHPC(false)
+                    useHPC(!detected)
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                    @test mm_globals().run_on_hpc == !detected      # the pin held
+
+                    # Clearing the pin restores probing on the next initialization.
+                    mm_globals().run_on_hpc_overridden = false
                     @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                     waitForDiagnostics()
                     @test mm_globals().run_on_hpc == detected
@@ -2876,6 +2893,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     # A stale `true` would send every later deletion test's rm_hpc_safe down
                     # the .trash/ staging path instead of rm.
                     mm_globals().run_on_hpc = detected
+                    mm_globals().run_on_hpc_overridden = false
                 end
             end
 
@@ -7203,7 +7221,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     # `force` excuse covers only ENOENT), and a regular file where `.trash` should be, which makes
     # `mkpath` throw.
     @testset "rm_hpc_safe removes on HPC and stages only the residue" begin
-        mktempdir() do project_dir
+        mktempdir() do project_root
+            project_dir = joinpath(project_root, "data")
             _make_test_project(project_dir)
             initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
             waitForDiagnostics()
@@ -7287,7 +7306,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     end
 
     @testset "rm_hpc_safe reports but does not throw when it can stage nothing" begin
-        mktempdir() do project_dir
+        mktempdir() do project_root
+            project_dir = joinpath(project_root, "data")
             _make_test_project(project_dir)
             initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
             waitForDiagnostics()
@@ -7321,7 +7341,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     end
 
     @testset "trash sweep and diagnostics report" begin
-        mktempdir() do project_dir
+        mktempdir() do project_root
+            project_dir = joinpath(project_root, "data")
             _make_test_project(project_dir)
             initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
             waitForDiagnostics()
@@ -7411,7 +7432,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     @testset "trash warn-once latch resets per project" begin
         # The latch lives on globals, so a second project in the same session must warn again.
         for _ in 1:2
-            mktempdir() do project_dir
+            mktempdir() do project_root
+                project_dir = joinpath(project_root, "data")
                 _make_test_project(project_dir)
                 initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
                 waitForDiagnostics()
@@ -8712,9 +8734,24 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             [ -e "$shim/squeue.sleep" ] && sleep 5
             cat "$shim/squeue.out"
             """)
+        # `sacct` is the reconciler's source when no sentinel survives: it reads slurmdbd, so it
+        # answers for jobs that left the queue long ago, which `squeue` cannot. Same file-driven
+        # shape as the other two.
+        write(joinpath(shim, "sacct"), """
+            #!/bin/sh
+            echo "\$@" >> "$shim/sacct.log"
+            [ -e "$shim/sacct.fail" ] && exit 1
+            cat "$shim/sacct.out"
+            """)
         chmod(joinpath(shim, "sbatch"), 0o755)
         chmod(joinpath(shim, "squeue"), 0o755)
+        chmod(joinpath(shim, "sacct"), 0o755)
 
+        # `--format=JobID,State`: each job contributes its allocation row plus the .batch and
+        # .extern step rows describing pieces of it, which the reader has to drop -- a step's
+        # state can differ from the allocation's.
+        _sacct!(state, ids...) = write(joinpath(shim, "sacct.out"),
+            join("$(id)|$(state)\n$(id).batch|$(state)\n$(id).extern|$(state)\n" for id in ids))
         _next_job!(id) = write(joinpath(shim, "sbatch.next_id"), string(id))
         _queue!(ids...) = write(joinpath(shim, "squeue.out"), join(string.(ids), "\n") * "\n")
         _calls(log) = isfile(joinpath(shim, log)) ? count(!isempty, readlines(joinpath(shim, log))) : 0
@@ -8723,7 +8760,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             MM._queue_snapshot[] = MM._QueueSnapshot(0, nothing)
             MM._last_stray_sweep[] = 0
             MM._SUBMIT_BACKOFF_BASE_S[] = 2.0
-            for f in ("sbatch.fail", "sbatch.transient", "squeue.fail", "squeue.sleep", "sbatch.log", "squeue.log")
+            for f in ("sbatch.fail", "sbatch.transient", "squeue.fail", "squeue.sleep",
+                      "sbatch.log", "squeue.log", "sacct.fail", "sacct.log", "sacct.out")
                 rm(joinpath(shim, f); force=true)
             end
             _next_job!(1)
@@ -8734,12 +8772,17 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         # before squeue sees them: left in place, either would silently hide live jobs.
         withenv("PATH" => shim * ":" * ENV["PATH"], "USER" => "tester",
                 "SQUEUE_STATES" => "R", "SQUEUE_PARTITION" => "gpu") do
-        mktempdir() do project_dir
+        mktempdir() do project_root
+            project_dir = joinpath(project_root, "data")
             _make_test_project(project_dir)
+            # `useHPC` pins the flag across initialization, and earlier testsets left it pinned
+            # off. Clear the pin so this init honors the sbatch shim that PATH now provides.
+            mm_globals().run_on_hpc_overridden = false
             initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
             waitForDiagnostics()
 
             done_dir = MM._hpcDoneDir()
+            @test done_dir == joinpath(ModelManager.dataDir(), "outputs", ".hpc_done")
             # Fast cadences. grace 0 means the reaper fails a job as soon as a SECOND snapshot
             # (taken after the first absence) still lacks it -- so roughly two reap intervals.
             setHPCCompletionOptions(poll_interval=0.02, reap_interval=0.05, grace_period=0.0)
@@ -9234,9 +9277,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             end
 
             @testset "the sentinel path is shell-quoted, not interpolated" begin
-                # `done_dir` is user-settable and the trap body is re-parsed by the shell when it
-                # fires, so a path interpolated into double quotes there would expand `$VAR` and
-                # backticks and break on a `"`. Bind-once-single-quoted makes every path literal.
+                # The sentinel directory is the user's own -- their data/, or whatever
+                # MODELMANAGER_HPC_DONE_DIR names -- and the trap body is re-parsed by the shell
+                # when it fires, so a path interpolated into double quotes there would expand
+                # `$VAR` and backticks and break on a `"`. Bind-once-single-quoted keeps it literal.
                 @test MM._shQuote("/tmp/plain") == "'/tmp/plain'"
                 @test MM._shQuote("/a b") == "'/a b'"
                 @test MM._shQuote(raw"/a$USER") == raw"'/a$USER'"
@@ -9359,6 +9403,292 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             _reset_hpc!()
         end  # mktempdir
+
+        # A fresh project, so the planted rows below are the only ones the reconciler can see and
+        # the counts it reports are unambiguous.
+        mktempdir() do project_root
+            project_dir = joinpath(project_root, "data")
+            _make_test_project(project_dir)
+            mm_globals().run_on_hpc_overridden = false
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+            @test mm_globals().run_on_hpc              # the shim on PATH made init detect SLURM
+
+            done_dir = MM._hpcDoneDir()
+            _status(id) = MM.queryToDataFrame(
+                MM.constructSelectQuery("simulations", "WHERE simulation_id=$(id)";
+                                        selection="status_code_id"); is_row=true)[1, :status_code_id]
+            _set_status!(id, code) = MM.DBInterface.execute(MM.centralDB(),
+                "UPDATE simulations SET status_code_id=$(MM.statusCodeID(code)) WHERE simulation_id=$(id);")
+            function _write_hpc_out!(id, text)
+                mkpath(MM.trialFolder(Simulation, id))
+                write(joinpath(MM.trialFolder(Simulation, id), "hpc.out"), text)
+            end
+
+            @testset "diagnostics reconciles what a dead driver left behind" begin
+                # A driver killed mid-campaign (SSH drop, login-node reaper, a driver job hitting
+                # its own time limit) can record nothing: rows stay Running or Queued forever, and
+                # `isStarted` counts both as started, so every later run skips them while
+                # announcing that it saved you time by not re-running them.
+                _reset_hpc!()
+                monad = Monad(InputFolders(config="default"); n_replicates=6)
+                sentinel_done, sentinel_failed, never_submitted, stale_out,
+                    via_sacct, refused = simulationIDs(monad)
+
+                for id in (sentinel_done, sentinel_failed, via_sacct, refused)
+                    _set_status!(id, "Running")
+                end
+                # Queued means a `run` scheduled it and no worker has claimed it: no job, no
+                # process, whether or not an *earlier* run of the same simulation left an hpc.out.
+                _set_status!(never_submitted, "Queued")
+                _set_status!(stale_out, "Queued")
+                _write_hpc_out!(stale_out, "8500\n")
+                rm(joinpath(MM.trialFolder(Simulation, never_submitted), "hpc.out"); force=true)
+                # The sentinel name is `<simulation_id>.<wall-clock nanoseconds, hex>`, as a real
+                # job's trap wrote it.
+                write(joinpath(done_dir, "$(sentinel_done).a1"), "0")
+                write(joinpath(done_dir, "$(sentinel_failed).b2"), "1")
+                _write_hpc_out!(via_sacct, "8801\n")
+                _write_hpc_out!(refused, "8802\n")
+                _sacct!("COMPLETED", 8801, 8802)
+
+                @test (MM.databaseDiagnostics(); true)                 # never throws
+                @test _status(sentinel_done) == MM.statusCodeID("Completed")
+                @test _status(sentinel_failed) == MM.statusCodeID("Failed")
+                @test _status(via_sacct) == MM.statusCodeID("Completed")
+                @test _status(refused) == MM.statusCodeID("Completed")
+                @test _status(never_submitted) == MM.statusCodeID("Not Started")
+                @test _status(stale_out) == MM.statusCodeID("Not Started")
+                # One sacct call for the whole pass, carrying every job ID it still needs an
+                # answer for -- slurmdbd is a second daemon with a database behind it, and a
+                # stranded campaign can be hundreds of rows.
+                @test _calls("sacct.log") == 1
+                @test occursin("8801,8802", _last("sacct.log")) || occursin("8802,8801", _last("sacct.log"))
+                # Recorded Failed the way the runner would: erased from its monad.
+                @test !(sentinel_failed in constituentIDs(Monad, monad.id))
+                # The sentinel is read, not consumed. A worker in another live session may still be
+                # waiting on it; the age-gated sweep is what reclaims it.
+                @test isfile(joinpath(done_dir, "$(sentinel_done).a1"))
+                rm(joinpath(done_dir, "$(sentinel_done).a1"); force=true)
+                rm(joinpath(done_dir, "$(sentinel_failed).b2"); force=true)
+            end
+
+            @testset "a Running row that never reached the scheduler" begin
+                # `_recordSubmissionOutput` writes hpc.out on every attempt, refused ones included,
+                # so an hpc.out with no job ID in it is proof no job exists: the driver died
+                # between the worker claiming the row and sbatch returning, possibly inside the
+                # transient-refusal retry loop.
+                _reset_hpc!()
+                monad = Monad(InputFolders(config="default"); n_replicates=8)
+                empty_out, no_out = simulationIDs(monad)[end-1:end]
+                _set_status!(empty_out, "Running")
+                _set_status!(no_out, "Running")
+                _write_hpc_out!(empty_out, "")
+                rm(joinpath(MM.trialFolder(Simulation, no_out), "hpc.out"); force=true)
+
+                # Off HPC the same emptiness says nothing -- there was never going to be a job ID,
+                # and what a local process did after its session ended is not knowable. Set the
+                # flag directly rather than through `useHPC`, which also pins it for the session.
+                mm_globals().run_on_hpc = false
+                MM.databaseDiagnostics()
+                @test _status(empty_out) == MM.statusCodeID("Running")
+                @test _status(no_out) == MM.statusCodeID("Running")
+                @test _calls("sacct.log") == 0            # nothing to ask about
+
+                mm_globals().run_on_hpc = true
+                MM.databaseDiagnostics()
+                @test _status(empty_out) == MM.statusCodeID("Not Started")
+                @test _status(no_out) == MM.statusCodeID("Not Started")
+            end
+
+            @testset "the sentinel to read is the last submitted, by name not mtime" begin
+                # Two submissions of one simulation can each leave a sentinel. The row still at
+                # Running belongs to the LATER submission, and the stamp in the name says when
+                # each was submitted; mtime says when each job finished, which puts them in the
+                # wrong order whenever the earlier-submitted job outlived the later one.
+                _reset_hpc!()
+                monad = Monad(InputFolders(config="default"); n_replicates=10)
+                two_sentinels, malformed = simulationIDs(monad)[end-1:end]
+                _set_status!(two_sentinels, "Running")
+                _set_status!(malformed, "Running")
+
+                older_stamp = joinpath(done_dir, "$(two_sentinels).10")   # 0x10, submitted first
+                newer_stamp = joinpath(done_dir, "$(two_sentinels).20")   # 0x20, submitted second
+                write(newer_stamp, "0")
+                sleep(0.05)
+                write(older_stamp, "1")                                   # ...but finished last
+                @test mtime(older_stamp) >= mtime(newer_stamp)
+
+                # A name whose stamp is not hex is ignored rather than guessed at -- which is also
+                # what skips the staged `.tmp` write a job killed between the echo and the mv
+                # leaves behind. Neither of these may decide anything, so this simulation is left
+                # to sacct, which reports its job still running.
+                write(joinpath(done_dir, "$(malformed).zzz"), "0")
+                write(joinpath(done_dir, "$(malformed).a1.tmp"), "0")
+                _write_hpc_out!(malformed, "8950\n")
+                _sacct!("RUNNING", 8950)
+
+                MM.databaseDiagnostics()
+                @test _status(two_sentinels) == MM.statusCodeID("Completed")   # the larger stamp
+                @test _status(malformed) == MM.statusCodeID("Running")
+                for f in (older_stamp, newer_stamp, joinpath(done_dir, "$(malformed).zzz"),
+                          joinpath(done_dir, "$(malformed).a1.tmp"))
+                    rm(f; force=true)
+                end
+                _set_status!(malformed, "Completed")
+            end
+
+            @testset "a job still in the queue is left alone; an unknown state is reported" begin
+                _reset_hpc!()
+                monad = Monad(InputFolders(config="default"); n_replicates=12)
+                still_running, odd_state = simulationIDs(monad)[end-1:end]
+                for id in (still_running, odd_state)
+                    _set_status!(id, "Running")
+                    _write_hpc_out!(id, "8900\n")
+                end
+                _sacct!("RUNNING", 8900)
+                MM.databaseDiagnostics()
+                @test _status(still_running) == MM.statusCodeID("Running")
+
+                _set_status!(still_running, "Completed")     # take it out of the way
+                # A requeued job is going around again, not an outcome: it waits like a pending one.
+                _sacct!("REQUEUED", 8900)
+                MM.databaseDiagnostics()
+                @test _status(odd_state) == MM.statusCodeID("Running")
+
+                # The lists cannot be exhaustive -- SLURM adds states between releases and a site
+                # can define its own -- so anything unrecognised is reported by name and left.
+                _sacct!("MARINATING", 8900)
+                @test_logs (:warn, r"does not classify") match_mode=:any MM.databaseDiagnostics()
+                @test _status(odd_state) == MM.statusCodeID("Running")
+
+                # sacct absent or failing resolves nothing rather than guessing.
+                touch(joinpath(shim, "sacct.fail"))
+                MM.databaseDiagnostics()
+                @test _status(odd_state) == MM.statusCodeID("Running")
+                rm(joinpath(shim, "sacct.fail"))
+                _set_status!(odd_state, "Completed")
+            end
+
+            _reset_hpc!()
+        end  # mktempdir
+
+        # The driver-job template. ModelManager writes it rather than submitting the driver
+        # itself: what has to go above the `julia` line is site knowledge (a `module load julia`,
+        # a specific version) that a generated sbatch call cannot know, and loading Julia plus a
+        # whole simulator package to assemble one command line is minutes of load time.
+        @testset "the driver template is written once, where the project can see it" begin
+            mktempdir() do project_root
+                project_dir = joinpath(project_root, "data")
+                _make_test_project(project_dir)
+                mm_globals().run_on_hpc_overridden = false
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+
+                # No scripts/ folder here, so it lands in the project root -- beside data/, not
+                # inside it, where the deletion helpers would sweep it.
+                template = joinpath(project_root, "driver_template.sbatch")
+                @test isfile(template)
+                body = read(template, String)
+                @test startswith(body, "#!/bin/bash\n")
+                @test occursin("--job-name=mm-driver", body)
+                @test occursin("#SBATCH --time=", body)
+                @test occursin("WHOLE campaign", body)        # the trap the comment must name
+                @test occursin("# module load julia", body)   # commented out, for the site to set
+                @test occursin("\$SLURM_JOB_ID", body)
+                @test occursin("sbatch driver_template.sbatch my_script.jl", body)
+                @test occursin("julia --project=", body) && occursin("\"\$@\"", body)
+
+                # Never overwritten: after the first write the file is the user's.
+                write(template, "#!/bin/bash\n# mine now\n")
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                @test read(template, String) == "#!/bin/bash\n# mine now\n"
+            end
+
+            mktempdir() do project_root
+                # A downstream `createProject` makes a scripts/ folder; the template belongs with
+                # the scripts a user actually runs.
+                mkpath(joinpath(project_root, "scripts"))
+                project_dir = joinpath(project_root, "data")
+                _make_test_project(project_dir)
+                mm_globals().run_on_hpc_overridden = false
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                @test isfile(joinpath(project_root, "scripts", "driver_template.sbatch"))
+                @test !ispath(joinpath(project_root, "driver_template.sbatch"))
+
+                # Turning HPC on by hand writes it too -- that is the only moment it happens on a
+                # machine whose SLURM probe failed.
+                rm(joinpath(project_root, "scripts", "driver_template.sbatch"))
+                useHPC(false)
+                @test !ispath(joinpath(project_root, "scripts", "driver_template.sbatch"))
+                useHPC(true)
+                @test isfile(joinpath(project_root, "scripts", "driver_template.sbatch"))
+            end
+
+            mktempdir() do project_root
+                # Off HPC there is nothing to submit to, so the template would be clutter.
+                project_dir = joinpath(project_root, "data")
+                _make_test_project(project_dir)
+                useHPC(false)     # pinned, so init keeps it off despite the sbatch shim on PATH
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                @test !mm_globals().run_on_hpc
+                @test !ispath(joinpath(project_root, "driver_template.sbatch"))
+                mm_globals().run_on_hpc_overridden = false
+            end
+        end
+
+        @testset "MODELMANAGER_HPC_DONE_DIR moves the sentinel directory, once per session" begin
+            mktempdir() do project_root
+                project_dir = joinpath(project_root, "data")
+                _make_test_project(project_dir)
+                mm_globals().run_on_hpc_overridden = false
+
+                elsewhere = joinpath(project_root, "scratch", "mm_done")
+                withenv("MODELMANAGER_HPC_DONE_DIR" => elsewhere) do
+                    initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                    @test MM._hpcDoneDirPath() == abspath(elsewhere)
+                    @test isdir(elsewhere)                   # created and write-tested at init
+                    @test isempty(readdir(elsewhere))        # the probe file was cleaned up
+
+                    # Read once, at init. Changing it mid-session cannot move the directory: the
+                    # diagnostics that ran at init already looked in the old one.
+                    withenv("MODELMANAGER_HPC_DONE_DIR" => joinpath(project_root, "later")) do
+                        @test MM._hpcDoneDirPath() == abspath(elsewhere)
+                    end
+                end
+
+                # Unset, and the default is back: on the same filesystem the jobs already write
+                # their output into, so it is writable by construction.
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                @test MM._hpcDoneDirPath() == joinpath(ModelManager.dataDir(), "outputs", ".hpc_done")
+
+                # A directory the compute nodes cannot write makes every successful job look
+                # scheduler-killed, silently. Creating it and writing one probe file is the only
+                # part of that a login node can check, so it is checked at init rather than
+                # discovered a campaign later.
+                blocker = joinpath(project_root, "a-file")
+                write(blocker, "not a directory")
+                err = withenv("MODELMANAGER_HPC_DONE_DIR" => joinpath(blocker, "done")) do
+                    try
+                        initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                        nothing
+                    catch e
+                        e
+                    end
+                end
+                @test err isa ArgumentError
+                @test occursin("MODELMANAGER_HPC_DONE_DIR", err.msg)
+
+                # Leave the session on a project that initialized cleanly.
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+            end
+        end
         end  # withenv
     end
 
