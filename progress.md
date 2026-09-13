@@ -5,6 +5,85 @@
 
 ---
 
+## Session: drawing from the posterior (2026-09-10) — ships in v0.10.0
+
+### Trigger
+The user needs to *draw* parameter sets from a calibrated posterior, not only plot it, and asked
+whether that means "a KDE with some fixed parameters".
+
+### What existed
+`posterior` returns weighted particles and nothing samples them. The plot recipes use
+KernelDensity.jl, which is 1D/2D only and cannot give joint draws that keep correlations. The one
+place the package already draws from a posterior is `_runSubsequentGeneration`: systematic
+resampling, then a kernel perturbation in CDF space, then the prior quantile. That is a weighted
+Gaussian KDE draw, unexposed and with a bandwidth tuned for proposals.
+
+### Decisions
+- **One exported function, `samplePosterior`, two modes, plain by default.** Plain mode resamples
+  existing particles and returns their `monad_id`s, because the common downstream use is a posterior
+  predictive check and the monads' outputs already exist. Smoothed mode is opt-in.
+- **Bandwidth is data-driven, not fixed.** Scott's rule with ESS in place of N on the weighted
+  covariance. Rejected: reusing `perturbation_kernel`'s `scale × Σ_w` — that scale is deliberately
+  over-dispersed so proposals explore, and the importance weights that correct it in SMC do not
+  exist here. Rejected: a user-supplied bandwidth keyword — nothing to say what a good value is,
+  and it is exactly the "fixed parameters" the user was wary of. If someone needs it later it is
+  one keyword.
+- **In CDF space, with reflection.** Target space would leak outside prior support and is
+  meaningless for discrete parameters; CDF space gets both for free via the quantile map. Reflect
+  rather than reject at `[0, 1]`: rejection is fine for proposals (weights correct it) but here it
+  would thin the edges of the estimate.
+- **i.i.d. multinomial resampling, not `_systematicResample`.** Systematic resampling is lower
+  variance for propagating a population, but it makes the draws dependent on each other and on
+  their order. A user handing back `n` draws expects any subset to be a valid sample.
+- **`Calibration` smoothed mode needs `problem.jld2`.** Plain mode only needs `particles.csv`.
+  Smoothed mode needs CDF coordinates *and* the quantile maps; sources round-trip through JLD2
+  except a `LatentVariation` with anonymous maps, in which case the error points at
+  `resumeABC(cal; problem=)`, which returns an `ABCResult` for a finished run without re-running.
+- **One disk prelude for every reader.** `posterior(::Calibration)`, the corner-plot `:cdf` branch,
+  the ridgeline/transition recipe and `ConvergenceSummary(::Calibration)` each opened with their own
+  copy of "find `generations/`, list complete generations, resolve `:final`, validate `t`, read the
+  CSV, split off `weight`/`distance`/`monad_id`" -- which is why #64 had to patch the in-flight-folder
+  bug in several places. `samplePosterior` would have been a fifth copy. Instead `calibration.jl`
+  now holds `_completeGenerations`, `_resolveDiskGeneration` and `_readGenerationFrame` beside
+  `_completeGenerationIndices`, and every one of those sites calls them; the recipe's local
+  `_readGenCSV` closure is a one-line alias. Surfaced by the user asking whether the new helpers
+  overlapped the previous batch of PRs: they did not duplicate a helper, but they did add a parallel
+  CSV splitter, and the inline copies were the real duplication.
+- **A draw's frame is the parameter columns, plus `monad_id` in plain mode.** The two `posterior`
+  methods disagree on this today: `posterior(::ABCResult)` returns `_buildDisplayDF`, which appends
+  `weight`/`distance`/`monad_id`, while `posterior(::Calibration)` strips all three. Rather than
+  inherit that split, `samplePosterior` strips them on both paths and re-adds `monad_id` from the
+  drawn rows, so the two entry points return identical frames. A stale `weight` column on a
+  resampled frame is also a footgun -- a draw's weight is `1/n`, and a user averaging with the
+  particle's weight would be weighting an already-weighted sample twice. `posterior` itself is
+  unchanged.
+
+- **`:final` means the last *complete* generation on disk.** `_resolveDiskGeneration` uses
+  `_completeGenerationIndices` (#64): an in-flight or interrupted generation folder holds only its
+  monad record, and the plain `_generationIndices` listing would hand it to `samplePosterior`,
+  which would then fail for want of `particles.csv`.
+
+- **Draws run through `createTrial(result_or_calibration, draws)`, returning a `Sampling`.**
+  Added when the user asked how to actually simulate the smoothed draws. The frame's target-value
+  columns are turned back into one `DiscreteVariation` per target and resolved against the run's
+  reference variation, the same path `_createMonadForParams` takes from CDF coordinates -- so plain
+  draws find their existing monads and smoothed draws get new ones, with no inverse maps needed.
+  Rejected: carrying CDF coordinates on the frame as metadata (a row subset would silently desync
+  it) and a new `PosteriorSample` type (the frame is what users already have in hand). Rejected:
+  returning a row-aligned `Vector{Monad}` to preserve multiplicities -- `createTrial` returns
+  trials, and plain draws already carry `monad_id` for anyone who needs the counts. Only
+  targets/locations/types are needed, which `_StrippedLVSource` keeps, so this works from disk for
+  anonymous-map runs where smoothed sampling cannot.
+- **Review follow-ups.** Copilot's `_multinomialDraw` BoundsError report was wrong (the
+  comprehension body never runs for `n == 0`), but the early return is harmless and was added.
+  The other session's read against the twelve then-open PRs found the one real dependency, #64,
+  handled above.
+
+### Open questions
+- None.
+
+---
+
 ## Session: one QoI contract across the sink, sensitivity analysis and calibration (2026-09-06) — ships in v0.10.0
 
 ### Trigger
