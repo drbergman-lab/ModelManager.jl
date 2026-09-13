@@ -251,20 +251,39 @@ by `_writeParametersTOML`.
 """
 _displayColumns(cp::CalibrationParameter) = _displayColumns(cp.source, cp.lv)
 
-_displayColumns(s::DVSource, ::LatentVariation) =
-    [variationName(s.dv)]
-
-_displayColumns(s::CVSource, ::LatentVariation) =
-    [variationName(v) for v in s.cv.variations]
-
-_displayColumns(s::DiscreteSource, ::LatentVariation) =
-    [variationName(s.dv)]
-
-_displayColumns(s::DiscreteCoSource, ::LatentVariation) =
-    [variationName(v) for v in s.cv.variations]
+#! Every source's display columns are its target columns, except `LVSource`, which prepends the latent
+#! samples. Defining the display columns *through* `_targetColumns` is what lets a reader that needs
+#! only the targets -- `createTrial` from a draw frame -- ask for them by name instead of assuming they
+#! are the trailing columns.
+_displayColumns(s::AbstractCalibrationSource, lv::LatentVariation) = _targetColumns(s, lv)
 
 _displayColumns(::LVSource, lv::LatentVariation) =
-    [lv.latent_parameter_names..., lv.target_names...]
+    [lv.latent_parameter_names..., _targetColumns(LVSource, lv)...]
+
+"""
+    _targetColumns(cp::CalibrationParameter) → Vector{String}
+
+The display columns holding a parameter's target values, in `cp.lv.targets` order. A subset of
+`_displayColumns(cp)`: the whole of it for every source but `LVSource`, whose latent samples are
+displayed too.
+"""
+_targetColumns(cp::CalibrationParameter) = _targetColumns(cp.source, cp.lv)
+
+_targetColumns(s::DVSource, ::LatentVariation) =
+    [variationName(s.dv)]
+
+_targetColumns(s::CVSource, ::LatentVariation) =
+    [variationName(v) for v in s.cv.variations]
+
+_targetColumns(s::DiscreteSource, ::LatentVariation) =
+    [variationName(s.dv)]
+
+_targetColumns(s::DiscreteCoSource, ::LatentVariation) =
+    [variationName(v) for v in s.cv.variations]
+
+_targetColumns(::LVSource, lv::LatentVariation) = lv.target_names
+#! `LVSource` has no field the display method needs, so it may pass the type.
+_targetColumns(::Type{LVSource}, lv::LatentVariation) = lv.target_names
 
 ################## Distribution string representation ##################
 
