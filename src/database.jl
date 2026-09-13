@@ -329,7 +329,7 @@ function insertFolder(location::Symbol, folder::String, description::String="")
         initializeInputFolder(sim, InputFolder(location, folder))
         return
     end
-    db_variations = joinpath(path_to_folder, locationVariationsDBName(location)) |> SQLite.DB
+    db_variations = _openDB(joinpath(path_to_folder, locationVariationsDBName(location)))
     location_variation_id_name = locationVariationIDName(location)
     table_name = locationVariationsTableName(location)
     createMMTable(table_name, "$location_variation_id_name INTEGER PRIMARY KEY, par_key BLOB UNIQUE"; db=db_variations)
@@ -411,7 +411,10 @@ function locationVariationsDatabase(location::Symbol, folder::String)
     if !isfile(path_to_db)
         return missing
     end
-    return path_to_db |> SQLite.DB
+    #! Through `_openDB`, like every other open: these per-folder databases are written by
+    #! `addVariations` while a campaign runs and read by the table and analysis functions, which is
+    #! exactly the concurrent case the busy timeout exists for.
+    return _openDB(path_to_db)
 end
 
 function locationVariationsDatabase(location::Symbol, id::Int)
@@ -593,16 +596,209 @@ function _snapshotMaxIDs()
 end
 
 """
-    databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int} = Dict{Type{<:AbstractTrial},Int}())
+    _simulationIDsAtStatus(status_code::String, max_ids) → Vector{Int}
+
+The simulations currently recorded at `status_code`, capped by the diagnostics snapshot so a
+simulation created after `initializeModelManager` returned is left to the session running it.
+"""
+function _simulationIDsAtStatus(status_code::String, max_ids::Dict{Type{<:AbstractTrial},Int})
+    query = constructSelectQuery("simulations", "WHERE status_code_id=$(statusCodeID(status_code))";
+                                 selection="simulation_id")
+    ids = Int.(queryToDataFrame(query)[!, 1])
+    haskey(max_ids, Simulation) && filter!(id -> id ≤ max_ids[Simulation], ids)
+    return ids
+end
+
+"""
+    _strandedSimulationIDs() → Dict{String,Vector{Int}}
+
+The simulations sitting at `Running` and at `Queued` right now — the two statuses that, for a
+simulation no live session owns, mean a driver process died without recording what happened.
+
+Called by [`initializeModelManager`](@ref) *synchronously*, before it returns, and handed to the
+background diagnostics task. Diagnostics itself runs at the first yield after initialization, by
+which time a `run` on the very next line of the user's script may already have marked this
+session's own simulations `Queued` and `Running` — which is precisely what the reconciler reads as
+evidence of a dead driver. Taking the two lists at a moment when no `run` of this session can have
+started is what keeps it off them.
+"""
+_strandedSimulationIDs() =
+    Dict(code => _simulationIDsAtStatus(code, Dict{Type{<:AbstractTrial},Int}())
+         for code in ("Running", "Queued"))
+
+"""
+    _reconcileStrandedSimulations(max_ids; stranded=nothing)
+
+Record the outcomes of simulations whose driver process died before it could.
+
+`run` marks every simulation it is about to run `Queued` up front, and the worker that claims one
+marks it `Running` immediately before calling the backend -- and so before any `sbatch`. `Queued`
+therefore means *scheduled by a `run`, not yet claimed*, and `Running` means *claimed, backend
+about to be called or already running*. If the Julia process is then killed -- Ctrl-C twice, a
+login-node reaper, a driver job hitting its time limit -- nothing in-process can write what
+happened, and the row keeps that status forever. `isStarted` counts everything but `Not Started` as
+started, so every later run skips those simulations *and* announces that it found matching ones and
+will save you time by not re-running them, about simulations that never finished.
+
+A `Queued` row has no job and no process, by construction: nothing had claimed it. Every one in
+`stranded` therefore goes back to `Not Started`.
+
+A `Running` row is resolved from two sources, in order:
+
+- the exit-code sentinel the job's own shell trap wrote, which is the same file the worker would
+  have read; it is left in place rather than consumed, so a worker in another live session that is
+  still waiting on it is not robbed of its result. The age-gated stray sweep reclaims it.
+- failing that, `sacct` on the job ID in the simulation's `hpc.out`, in one query for every
+  simulation that got that far. `sacct` reads slurmdbd, so it answers for jobs that left the queue
+  long ago -- which `squeue`, the runner's reaper, cannot.
+
+A `Running` row with neither -- no sentinel, and an `hpc.out` that is absent or holds no job ID --
+never reached the scheduler at all: the driver died between claiming the row and `sbatch` returning,
+possibly inside the transient-refusal retry loop. On HPC that is proof no job exists, so the
+simulation returns to `Not Started`. Off HPC it is left alone: what a local process did after the
+session ended is not knowable after the fact.
+
+A job still `PENDING` or `RUNNING` is left alone, as is one whose state `sacct` reports but this
+does not classify.
+
+`stranded`, as returned by `_strandedSimulationIDs`, is the snapshot `initializeModelManager` takes
+before any `run` of this session could have started; without it the two statuses are queried live,
+which is what a user calling [`databaseDiagnostics`](@ref) by hand gets. Mid-run, live is still
+safe: a `Running` row this session owns has a sentinel or a job ID, so at worst it is recorded with
+the status its own worker is about to record, and a `Queued` row reset here is one the worker will
+mark `Running` when it claims it anyway.
+
+Nothing here throws: each simulation is guarded on its own, so one unreadable folder costs one
+simulation rather than the whole report.
+"""
+function _reconcileStrandedSimulations(max_ids::Dict{Type{<:AbstractTrial},Int};
+                                       stranded::Union{Nothing,Dict{String,Vector{Int}}}=nothing)
+    completed, failed, restarted = Int[], Int[], Int[]
+    unclassified = Tuple{Int,String}[]
+    atStatus(code) = isnothing(stranded) ? _simulationIDsAtStatus(code, max_ids) : get(stranded, code, Int[])
+
+    #! First pass: everything a sentinel can settle, plus the job IDs of everything it cannot. The
+    #! scheduler is asked once, after this loop, rather than once per simulation: slurmdbd is a
+    #! second daemon with a database behind it, and a stranded campaign can be hundreds of rows.
+    running = atStatus("Running")
+    sentinels = isempty(running) ? Dict{Int,String}() : _sentinelsBySimulation()
+    to_query = Tuple{Int,Int}[]
+    for simulation_id in running
+        try
+            #! `_readSentinel` answers `nothing` for a file that has vanished since the listing --
+            #! another session's worker consuming its own sentinel is exactly that -- so a race
+            #! here costs this simulation its sentinel, not the pass.
+            exit_code = haskey(sentinels, simulation_id) ?
+                        _readSentinel(sentinels[simulation_id]) : nothing
+            if !isnothing(exit_code)
+                updateDatabaseOnCompletion(simulation_id, missing, exit_code == 0)
+                push!(exit_code == 0 ? completed : failed, simulation_id)
+                continue
+            end
+            job_id = _jobIDFromSubmission(simulation_id)
+            if isnothing(job_id)
+                #! `_recordSubmissionOutput` writes `hpc.out` on every attempt, refused ones
+                #! included, so neither a missing file nor an empty one can belong to a job that
+                #! exists. Off HPC the same emptiness says nothing -- there was never going to be a
+                #! job ID -- and a local process's outcome is unknowable once its session is gone,
+                #! so the row is left for the status report to warn about.
+                if mm_globals().run_on_hpc
+                    _resetToNotStarted(simulation_id; from="Running")
+                    push!(restarted, simulation_id)
+                end
+                continue
+            end
+            push!(to_query, (simulation_id, job_id))
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
+
+    #! Probed rather than assumed. Without `sacct` the sentinel is the only source, which is the
+    #! ordinary case on a workstation and no reason to report anything.
+    states = isempty(to_query) || !shellCommandExists(`sacct`) ? nothing :
+             _sacctStates([job_id for (_, job_id) in to_query])
+    if !isnothing(states)
+        for (simulation_id, job_id) in to_query
+            try
+                state = get(states, job_id, nothing)
+                isnothing(state) && continue
+                if state in _SACCT_SUCCESS_STATES
+                    updateDatabaseOnCompletion(simulation_id, missing, true)
+                    push!(completed, simulation_id)
+                elseif state in _SACCT_FAILURE_STATES
+                    updateDatabaseOnCompletion(simulation_id, missing, false)
+                    push!(failed, simulation_id)
+                elseif !(state in _SACCT_WAITING_STATES)
+                    push!(unclassified, (simulation_id, state))
+                end
+            catch e
+                e isa InterruptException && rethrow()
+            end
+        end
+    end
+
+    for simulation_id in atStatus("Queued")
+        try
+            #! Unconditional: `Queued` is set by `run` before any worker takes the simulation, so
+            #! there is no job and no process to ask about. An `hpc.out` in the folder is a file an
+            #! *earlier* run of the same simulation left -- a refused submission writes an empty
+            #! one -- and treating it as evidence of a live job would leave the row `Queued` for
+            #! good.
+            _resetToNotStarted(simulation_id; from="Queued")
+            push!(restarted, simulation_id)
+        catch e
+            e isa InterruptException && rethrow()
+        end
+    end
+
+    n = length(completed) + length(failed) + length(restarted)
+    if n > 0
+        lines = String[]
+        isempty(completed) || push!(lines, "- $(length(completed)) recorded Completed: $(_compressedIDStr(completed))")
+        isempty(failed)    || push!(lines, "- $(length(failed)) recorded Failed: $(_compressedIDStr(failed))")
+        isempty(restarted) || push!(lines, "- $(length(restarted)) never submitted, returned to Not Started: $(_compressedIDStr(restarted))")
+        @info """
+        Reconciled $(n) simulation$(n == 1 ? "" : "s") left behind by a session that ended before it
+        could record them:
+        $(join(lines, "\n"))
+        A simulation recorded Failed here is erased from its monad, exactly as it would have been
+        had the failure been seen at the time.
+        """
+    end
+    if !isempty(unclassified)
+        @warn """
+        `sacct` reports a state ModelManager does not classify for \
+        $(length(unclassified)) simulation$(length(unclassified) == 1 ? "" : "s"), \
+        left at Running:
+        $(join(["- simulation $(id): $(state)" for (id, state) in unclassified], "\n"))
+        """
+    end
+    return nothing
+end
+
+"""
+    databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int} = Dict{Type{<:AbstractTrial},Int}();
+                        stranded = nothing)
 
 Check consistency between the database and the output folders.
 Prints warnings for any discrepancies found.
 
+Also recovers simulations a killed session left at `Running` or `Queued`, from the exit-code
+sentinels their SLURM jobs wrote and from `sacct` — see `_reconcileStrandedSimulations`. That is
+the one thing here that writes: without it those rows stay started forever and every later run
+skips them while reporting that it saved you time.
+
 When `max_ids` is provided (as returned by `_snapshotMaxIDs`), each check is
 restricted to IDs ≤ the snapshot value for that type. This prevents false positives from
-simulations that were created or started after `initializeModelManager` returned.
+simulations that were created or started after `initializeModelManager` returned. `stranded` is the
+matching snapshot of which simulations sat at `Running` and at `Queued`, taken at the same moment;
+called by hand, with neither, both are queried live, which is safe mid-run — a `Running` row this
+session owns is recorded with the status its own worker is about to record, and a `Queued` row
+reset here is one its worker sets `Running` when it claims it.
 """
-function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{<:AbstractTrial},Int}())
+function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{<:AbstractTrial},Int}();
+                             stranded::Union{Nothing,Dict{String,Vector{Int}}}=nothing)
     assertInitialized()
     consensus_ids = Dict{Type{<:AbstractTrial}, Set{Int}}()
 
@@ -684,6 +880,16 @@ function databaseDiagnostics(max_ids::Dict{Type{<:AbstractTrial},Int}=Dict{Type{
     if !isempty(msg)
         msg = "The following constituents are expected but not found:\n" * msg
         @error msg
+    end
+
+    #! Before the status report, not after: reconciling is what makes that report accurate for a
+    #! project whose last session was killed. Guarded whole, on top of the per-simulation guards
+    #! inside, because a diagnostic that cannot run must still let the session start.
+    try
+        _reconcileStrandedSimulations(max_ids; stranded=stranded)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "Could not check for simulations left behind by an earlier session." exception=(e, catch_backtrace())
     end
 
     #! check simulation status of all simulations; warn on concerning codes, info on Failed
@@ -1224,9 +1430,9 @@ end
     _postProcessingColumnSpec(name, value) -> (sqlite_type, db_value)
 
 Map a single quantity-of-interest `value` to its SQLite column type and stored value.
-Only scalar `Bool`, `Integer`, `Real`, and `AbstractString` values are supported; anything
-else throws an `ArgumentError` (richer outputs should be written to the simulation's output
-folder by the `post_processor` itself).
+Only scalar `Bool`, `Integer` and `Real` values are supported; anything else throws an
+`ArgumentError` (richer outputs should be written to the simulation's output folder by the
+`post_processor` itself).
 """
 function _postProcessingColumnSpec(name, value)
     if value isa Bool
@@ -1235,26 +1441,25 @@ function _postProcessingColumnSpec(name, value)
         return "INTEGER", value
     elseif value isa Real
         return "REAL", float(value)
-    elseif value isa AbstractString
-        return "TEXT", String(value)
     end
     throw(ArgumentError("post_processor returned an unsupported value for `$(name)`: a $(typeof(value)). " *
-        "Post-processing sink values must be a scalar Real, Bool, or String. " *
-        "For richer per-simulation outputs, write a file to the simulation's output folder instead."))
+        "Post-processing sink values must be a scalar `Real` (a `Bool` counts). " *
+        "Text belongs on a tag rather than in a measurement, and for richer per-simulation " *
+        "outputs write a file to the simulation's output folder instead."))
 end
 
 """
     _normalizePostProcessingQoI(qoi) -> Vector{Tuple{String,String,Any}}
 
 Normalize a `post_processor` return value into `(column_name, sqlite_type, db_value)` tuples.
-Accepts a `NamedTuple`, an `AbstractDict`, or an ordered vector of `name => scalar` pairs;
+Accepts a `NamedTuple`, an `AbstractDict`, or an ordered vector of `name => Real` pairs;
 throws an `ArgumentError`
 for any other type.
 """
 function _normalizePostProcessingQoI(qoi)
     named_pairs = if qoi isa NamedTuple
         [String(k) => v for (k, v) in pairs(qoi)]
-    #! Ordered pairs are what `_asPostProcessor` produces. They exist so a `NamedTuple`'s field order
+    #! Ordered pairs are what `_postProcess` produces. They exist so a `NamedTuple`'s field order
     #! survives to the columns: a `Dict` would reorder it, and the duplicate check below needs to see
     #! the collisions a `Dict` would already have swallowed.
     elseif qoi isa AbstractVector && all(x -> x isa Pair, qoi)
@@ -1262,8 +1467,12 @@ function _normalizePostProcessingQoI(qoi)
     elseif qoi isa AbstractDict
         [string(k) => v for (k, v) in qoi]
     else
-        throw(ArgumentError("post_processor must return `nothing`, a NamedTuple, or an AbstractDict " *
-            "of name => scalar; got a $(typeof(qoi))."))
+        #! The ordered-pair form is named because it is what the package's own post-processor path
+        #! hands in: a message listing only NamedTuple/AbstractDict reads as if that path were
+        #! invalid, which is the opposite of true.
+        throw(ArgumentError("post_processor must return `missing` to store nothing, a `Real`, a " *
+            "NamedTuple/AbstractDict of name => Real, or an ordered vector of `name => Real` " *
+            "pairs; got a $(typeof(qoi))."))
     end
     col_names = first.(named_pairs)
     if !allunique(col_names)

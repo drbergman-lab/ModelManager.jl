@@ -180,7 +180,10 @@ calibration (Toni et al. 2009, Beaumont et al. 2009).
   with all newly evaluated monads. Generation 1 uses a Sobol low-discrepancy sequence for
   good prior coverage. `nothing` (default) disables snapping. At runtime, the effective base
   resolution is raised to satisfy `(2^k-1)^d ≥ population_size`; an `@info` is emitted when
-  this correction fires.
+  this correction fires. A coordinate whose prior is discrete is never snapped — the dyadic
+  grid does not divide evenly into its levels, so snapping it would distort the prior over
+  those levels; bank reuse still applies to it, and repeat parameterizations are collapsed
+  when the monad is created.
 - `max_evaluations::Union{Nothing,Int}`: Maximum total number of evaluated particles
   (monads) across the entire calibration run. Each proposal sent to `evaluate_batch`
   counts as one evaluation, regardless of whether the monad was a fresh simulation or a

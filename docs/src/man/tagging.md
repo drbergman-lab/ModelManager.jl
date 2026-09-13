@@ -309,7 +309,7 @@ innerjoin(simulationsTable(ids; tags = true), postProcessingTable(ids), on = :Si
 
 Tag rows are removed automatically whenever the object they point at is deleted.
 [`orphanedTagCounts`](@ref) reports any left behind by an interrupted deletion, and
-`databaseDiagnostics` warns about them at startup. Orphans are harmless — queries filter
+`ModelManager.databaseDiagnostics` warns about them at startup. Orphans are harmless — queries filter
 them out.
 
 The hints ModelManager prints the first time you create a trial without tags can be turned

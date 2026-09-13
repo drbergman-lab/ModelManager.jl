@@ -122,13 +122,13 @@ consistent with the forward maps.
 ## Applying variations
 
 You normally hand variations to [`createTrial`](@ref) / [`run`](@ref), which call
-[`addVariations`](@ref) for you (see [The trial hierarchy](@ref trial_hierarchy) and [Running simulations](@ref running_simulations)):
+[`ModelManager.addVariations`](@ref) for you (see [The trial hierarchy](@ref trial_hierarchy) and [Running simulations](@ref running_simulations)):
 
 ```julia
 output = run(inputs, dv1, dv2; n_replicates=3)
 ```
 
-`addVariations` writes the variation rows into each varied location's variations database and
+`ModelManager.addVariations` writes the variation rows into each varied location's variations database and
 returns the resulting [`VariationID`](@ref)s. How those combinations are generated — full
 grid versus a space-filling design — is controlled by the *method* argument, covered next in
 [Space-filling designs](@ref space_filling).

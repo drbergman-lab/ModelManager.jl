@@ -111,8 +111,9 @@ Build the `evaluate_batch` callback expected by `_runABCSMC`. The returned funct
 5. Classifies the outcome (see `_batchOutcome`) and records any failed simulation and
    monad IDs to the generation's failure files (see `_recordBatchFailures`).
 6. Returns a `Vector{Tuple{Union{Float64,Missing},Int}}` (distance, monad_id) in proposal order.
-   A `missing` distance means the monad had no successful simulation, so no distance exists —
-   distinct from any value the user's `distance` function could return.
+   A `missing` distance means no distance exists for that monad — no successful simulation, or a
+   summary statistic with no value — which is distinct from any value the user's `distance`
+   function could return.
 
 `verbosity` is a resolved level (see `_resolveVerbosity`); a per-generation batch
 counter is maintained across calls so batch milestones can be numbered within each generation.
@@ -130,14 +131,25 @@ detected from the database *before* any user code runs, and `on_monad_failure` d
 Partially failed monads (at least one success) are evaluated normally from whatever succeeded;
 their failed simulations are still recorded. Re-running to "top off" the missing replicates is
 deliberately not attempted.
+
+A monad that *does* have output but whose summary statistic has no value — every replicate's
+`compute` returned `missing`, or a QoI's `reduce` did — is in the same position, no value to compare,
+and follows the same policy, from `_evaluateParticle`. Its recording differs, because nothing
+failed: no simulation or monad ID goes to the failure files, so those monads are named in a
+per-generation `@warn` of their own (see `_warnMissingSummaries`) instead. Under `:error`,
+`_evaluateParticle` names the QoI that had no value rather than pointing at failure files that were
+never written.
 """
 function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibration,
                               max_nr_populations::Int, run_kwargs::NamedTuple=(;);
                               verbosity::Symbol=:generation,
                               on_monad_failure::Symbol=:reject)
     _validateEvaluationFailurePolicy(on_monad_failure)
-    batch_counts       = Dict{Int,Int}()
-    warned_generations = Set{Int}()
+    batch_counts               = Dict{Int,Int}()
+    warned_generations         = Set{Int}()
+    #! A separate set from `warned_generations`: the two warnings report different things, so one
+    #! firing must not silence the other in the same generation.
+    warned_summary_generations = Set{Int}()
 
     function evaluate_batch(t::Int,
                              proposals::Vector{Tuple{Dict{String,Float64}, Union{Nothing,Int}}})
@@ -179,7 +191,7 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
         failed_set = Set(failed_simulations)
         no_success = Set(without_success)
 
-        return Tuple{Union{Float64,Missing},Int}[
+        results = Tuple{Union{Float64,Missing},Int}[
             if monad.id in no_success
                 on_monad_failure === :error &&
                     _throwNoSuccessfulSimulations(calibration, t, max_nr_populations, monad.id,
@@ -187,21 +199,45 @@ function _buildEvaluateBatch(problem::CalibrationProblem, calibration::Calibrati
                 (missing, monad.id)
             else
                 (_evaluateParticle(problem, monad.id,
-                                   count(in(failed_set), sim_ids_before[monad.id])),
+                                   count(in(failed_set), sim_ids_before[monad.id]),
+                                   on_monad_failure),
                  monad.id)
             end
             for monad in monads]
+
+        #! The other half of `on_monad_failure` leaves no trace of its own: a monad that HAD output
+        #! but no summary value contributes to neither failure vector, so no failure file is written
+        #! and `_warnFailuresRecorded` never fires; from generation 2 on it does not even get a
+        #! proposal row. Rejected silently, a measurement that never has a value looks exactly like a
+        #! model that never fits — so it is reported here, once per generation, like a failure.
+        _warnMissingSummaries(verbosity, t, warned_summary_generations,
+                              [mid for (d, mid) in results if ismissing(d) && !(mid in no_success)])
+        return results
     end
     return evaluate_batch
 end
 
+#! A `missing` summary is not a bug in the user's functions, so it does not go down the fail-fast
+#! path with them. A QoI says `missing` when a simulation produced no value, and a monad every one of
+#! whose replicates said so is in exactly the position of a monad with no successful simulation:
+#! there is no output to compare. So it follows `on_monad_failure` -- rejected under `:reject`, fatal
+#! under `:error` -- rather than being reported as a fault the user must fix in their code.
+#!
+#! Checked between the two calls rather than after them, so a `missing` returned by the user's own
+#! `distance` still raises "a `Real` is required". Those are different mistakes.
 """
-    _evaluateParticle(problem, monad_id, n_failed_simulations) → Float64
+    _evaluateParticle(problem, monad_id, n_failed_simulations, on_monad_failure) → Float64 or missing
 
 Compute one particle's distance by calling the user's `summary_statistic` and `distance` on a
 monad that has at least one successful simulation.
 
-Both calls are user code, so both are guarded — but neither failure is recoverable: the monad
+Returns `missing` when the summary statistic has no value for this monad — every replicate's
+`compute` returned `missing`, or the QoI's `reduce` did — under `on_monad_failure=:reject`; `:error`
+stops the run instead, naming the QoI that had no value.
+
+Both calls are user code, so both are guarded — and the error names *which* of the two raised,
+since a `summary_statistic` failure is a fault in a `compute` or a `reduce` while a `distance`
+failure is usually a key mismatch against `observed_data`. Neither is recoverable: the monad
 *does* have output, so an exception (or a `distance` return value that is not a `Real`) is a
 fault in the user's functions, not a simulation failure. Either way the run stops with the monad
 ID named, rather than propagating a `missing`/`nothing` into the ABC-SMC internals where it
@@ -209,19 +245,43 @@ surfaces much later as an unrelated `MethodError`. `n_failed_simulations` is rep
 non-zero, since a partially failed monad is the likeliest reason otherwise-correct user code
 trips here.
 """
-function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int)
+function _evaluateParticle(problem::CalibrationProblem, monad_id::Int, n_failed_simulations::Int,
+                           on_monad_failure::Symbol)
     partial_note = n_failed_simulations == 0 ? "" :
         "\nNote that $n_failed_simulations of this monad's simulations failed, so any output " *
         "they would have produced is missing."
+    #! Which of the two raised is known at each call site and nowhere else afterwards, so the note
+    #! takes it as an argument rather than naming both and leaving the reader to work it out from a
+    #! backtrace. The two are diagnosed differently: a `summary_statistic` failure is in a `compute`
+    #! or a `reduce`, while a `distance` failure is usually a key mismatch against `observed_data`.
+    user_code_note(which) = """
+    Calibration failed while evaluating monad $monad_id: `$(which)` raised. This monad has at \
+    least one successful simulation, so the fault is in that function rather than in the \
+    simulations.$partial_note
+    """
+    simulated, missing_source = try
+        _evaluateSummary(problem.summary_statistic, monad_id)
+    catch
+        @error user_code_note("summary_statistic")
+        rethrow()
+    end
+    if ismissing(simulated)
+        #! Names the QoI and BOTH causes rather than asserting one: the code cannot tell whether
+        #! every replicate's `compute` said `missing` or the reducer did, and a `Vector{QoI}` goes
+        #! missing as soon as its FIRST valueless member does, however healthy the others are. The
+        #! old message asserted "every one of its simulations returned `missing`" for all of that.
+        on_monad_failure === :error && error("""
+        Calibration stopped: the summary statistic has no value for monad $monad_id — QoI \
+        "$(missing_source)" has none for it, because every one of its simulations returned \
+        `missing` or its `reduce` did. There is nothing to compare with `observed_data`.$partial_note
+        Pass `on_monad_failure=:reject` to reject such particles and continue the run instead.
+        """)
+        return missing
+    end
     distance = try
-        simulated = _evaluateSummary(problem.summary_statistic, monad_id)
         problem.distance(simulated, problem.observed_data)
     catch
-        @error """
-        Calibration failed while evaluating monad $monad_id: `summary_statistic` or `distance` \
-        raised. This monad has at least one successful simulation, so the fault is in those \
-        functions rather than in the simulations.$partial_note
-        """
+        @error user_code_note("distance")
         rethrow()
     end
     distance isa Real || error("""
@@ -306,7 +366,7 @@ function _executeCalibration(problem::CalibrationProblem, calibration::Calibrati
 end
 
 """
-    runCalibration(method::ABCSMC, problem::CalibrationProblem; description="") → ABCResult
+    runCalibration(method::ABCSMC, problem::CalibrationProblem; kwargs...) → ABCResult
 
 Run ABC-SMC calibration. See [`ABCSMC`](@ref) for method settings.
 
@@ -317,14 +377,23 @@ saved in two forms:
 - `generations/{t}/cdfs.csv`: raw CDF coordinates for exact resume.
 
 # Arguments
+- `method::ABCSMC`: the method settings — population size, stopping criteria, kernel.
+- `problem::CalibrationProblem`: the model, parameters, observed data and distance to calibrate.
+
+# Keywords
+- `description::String=""`: free-text prose stored in the `calibrations` DB row and shown by
+  `calibrationsTable`. For labels you intend to search on, prefer `tags`.
+- `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
+  they survive an interrupted run. A lone `"key" => "value"` is one tag, as it is in [`tag!`](@ref);
+  the keys are validated before the run's database row and folder are created.
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; quiet=true, ...)` call.
-- `description::String=""`: stored in the `calibrations` DB row.
 - `progress::Symbol=:auto`: console-feedback verbosity. One of `:auto`, `:none`,
   `:generation`, `:batch`, `:bar`. `:auto` resolves to `:bar` on an interactive terminal
   and `:generation` otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful
-  simulation, so no distance can be computed for it. `:reject` records the distance as `missing`,
-  which ABC-SMC never accepts, and continues; `:error` stops the run. Either way the failed
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad yields no distance — no
+  successful simulation, or a summary statistic that is `missing` because every replicate's
+  `compute` was. `:reject` records the distance as `missing`, which ABC-SMC never accepts, and
+  continues; `:error` stops the run. Either way the failed
   simulation and monad IDs are recorded per generation in
   `generations/{t}/failed_simulations.csv` and
   `generations/{t}/failed_monads.csv`.
@@ -340,16 +409,18 @@ function runCalibration(method::ABCSMC, problem::CalibrationProblem;
                         description::String="", tags=(), run_kwargs::NamedTuple=(;),
                         progress::Symbol=:auto,
                         on_monad_failure::Symbol=:reject)
-    #! Both controls are validated before `createCalibration`, so a typo cannot leave behind a stray
-    #! DB row and output folder for a run that never starts.
+    #! Every control is validated before `createCalibration`, so a typo cannot leave behind a stray
+    #! DB row and output folder for a run that never starts. The tags belong in that list: a
+    #! malformed key throws from inside `tag!`, which used to run after the row and folder existed.
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
+    tag_pairs = [k => v for (k, v) in normalizeTagPairs(_asTagCollection(tags))]
     refreshProvenance!()
     calibration = createCalibration("ABC-SMC"; description=description)
     #! Applied before anything is dispatched, so the labels survive an interrupted run and the
     #! calibration is queryable by tag while its simulations are still in flight — the same
     #! reasoning, and the same order, as `run`'s `tags=` keyword.
-    tag!(calibration, tags...)
+    tag!(calibration, tag_pairs...)
     #! Labels the run itself, mirroring what a sensitivity sweep puts on its sampling. The value is
     #! the method *type*, as it is there, so `findTrials(Calibration; tags=("mm:method" => ...))`
     #! reads the same way across both; the `calibrations.method` column keeps its own
@@ -387,12 +458,15 @@ constructor, so every field it accepts is accepted here, with the same defaults.
 - `description::String=""`: free-text prose stored in the `calibrations` DB row and shown by
   `calibrationsTable`. For labels you intend to search on, prefer `tags`.
 - `tags=()`: `key => value` pairs applied to the calibration before any simulation is dispatched, so
-  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`.
+  they survive an interrupted run. Queryable with `findTrials(Calibration; tags=...)`. A lone
+  `"key" => "value"` is one tag, as it is in [`tag!`](@ref); the keys are validated before the run's
+  database row and folder are created, so a malformed one leaves nothing behind.
 - `run_kwargs::NamedTuple=(;)`: forwarded to each `run(sampling; ...)` call.
 - `progress::Symbol=:auto`: console-feedback verbosity (`:auto`, `:none`, `:generation`, `:batch`,
   `:bar`). `:auto` shows a live progress bar on an interactive terminal and per-generation
   milestones otherwise.
-- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad has no successful simulation.
+- `on_monad_failure::Symbol=:reject`: what to do when a proposed monad yields no distance — no
+  successful simulation, or a summary statistic that is `missing` because every replicate's was.
   `:reject` records its distance as `missing` (so the particle is never accepted) and continues;
   `:error` stops the run. Failed simulation and monad IDs are recorded per generation either way, in
   `generations/{t}/failed_simulations.csv` and
@@ -618,9 +692,10 @@ At resume time:
 struct _ProblemManifest
     inputs::InputFolders
     sources::Vector{Any}       # DVSource | CVSource | LVSource | _StrippedLVSource
-    #! Untyped to match `CalibrationProblem.observed_data`: `mseDistance` accepts a `Dict`, a
-    #! `Vector` or a scalar, and `_saveProblem` runs before generation 1, so a narrower type here
-    #! rejects two of the three documented shapes before a run can start.
+    #! Untyped to match `CalibrationProblem.observed_data`, which is whatever the problem's own
+    #! `distance` accepts as its second argument -- `mseDistance` alone takes a `Dict` or a scalar.
+    #! `_saveProblem` runs before generation 1, so a narrower type here would reject a shape before
+    #! the run could start.
     observed_data::Any
     n_replicates::Int
     reference_variation_id::VariationID
@@ -671,6 +746,11 @@ end
 
 _sourceToCalibrationParameter(src::DVSource) = CalibrationParameter(src, LatentVariation(src.dv))
 _sourceToCalibrationParameter(src::CVSource) = CalibrationParameter(src, LatentVariation(src.cv))
+#! Mirrors `_toCalibrationParameter` for the same variation, so the reconstructed `LatentVariation`
+#! is the same `DiscreteUniform` over value indices the original run used. Without these, a manifest
+#! holding a discrete source reports itself complete and then dies in `_manifestToProblem`.
+_sourceToCalibrationParameter(src::DiscreteSource) = CalibrationParameter(src, LatentVariation(src.dv))
+_sourceToCalibrationParameter(src::DiscreteCoSource) = CalibrationParameter(src, LatentVariation(src.cv))
 _sourceToCalibrationParameter(src::LVSource) = CalibrationParameter(src, src.lv)
 function _sourceToCalibrationParameter(src::_StrippedLVSource)
     error("Cannot reconstruct CalibrationProblem from _StrippedLVSource " *
@@ -762,29 +842,55 @@ function _saveProblem(calibration::Calibration, problem::CalibrationProblem)
 
         Anonymous fields detected: $(join(anon, ", "))
 
-        Tip: define functions with `function name(...) end` (or top-level named functions)
-        instead of anonymous lambdas to enable fully automatic resume.
+        Tip: define these functions at the top level of a file or module, `function name(...) end`,
+        rather than as lambdas or inside another function -- a closure has no name another session
+        can restore, however it was written.
         """
     end
     jldsave(path; manifest=manifest)
 end
 
 """
-    _loadProblem(calibration::Calibration) → _ProblemManifest
+    _loadProblem(calibration::Calibration; required::Bool=true) → Union{Nothing,_ProblemManifest}
 
-Load `problem.jld2` and return a `_ProblemManifest`.
+Load `problem.jld2` and return a `_ProblemManifest`. A file that exists but cannot be reconstructed
+-- what a closure that only the saving session could name looks like from a fresh one -- is an error
+naming the two ways out when `required`, and a warning plus `nothing` when the caller has a
+`problem=` to fall back on.
 """
-function _loadProblem(calibration::Calibration)
+function _loadProblem(calibration::Calibration; required::Bool=true)
     path = joinpath(calibrationFolder(calibration), "problem.jld2")
-    isfile(path) || error(
-        "Cannot resume: $path not found. " *
-        "The problem.jld2 file is written automatically by runABC/runCalibration.")
-    return jldopen(path) do f
-        haskey(f, "manifest") || error(
-            "Unrecognized problem.jld2 format in $path. " *
-            "Re-run with the original problem to regenerate.")
-        f["manifest"]::_ProblemManifest
+    rescue = "`resumeCalibration(Calibration($(calibration.id)); problem=my_problem)`"
+    #! Every way the saved problem can fail to read takes the same exit -- absent, unrecognised, or
+    #! unreconstructable -- because the caller's situation is the same in all three: with a
+    #! `problem=` in hand the file is advisory and a warning will do; without one it is the only
+    #! copy and the error must name both ways out.
+    function unreadable(msg::String)
+        required && error(msg)
+        @warn msg * "\nUsing the supplied `problem=` without checking it against the saved one."
+        return nothing
     end
+    isfile(path) || return unreadable(
+        "Cannot resume: $path not found. The problem.jld2 file is written automatically by " *
+        "runABC/runCalibration, so a run from before it existed can only be resumed by passing the " *
+        "original problem: $(rescue).")
+    manifest = try
+        jldopen(path) do f
+            haskey(f, "manifest") || return :unrecognized
+            f["manifest"]::_ProblemManifest
+        end
+    catch e
+        return unreadable(
+            "The saved problem in $path could not be read back: $(sprint(showerror, e))\n" *
+            "This is what a `summary_statistic`, `distance` or `LatentVariation` map that is a " *
+            "closure -- a lambda, or a named function defined inside another function -- looks like " *
+            "from a fresh session. Either `include` the file that defines those functions before " *
+            "resuming, or pass the original problem: $(rescue).")
+    end
+    manifest === :unrecognized && return unreadable(
+        "Unrecognized problem.jld2 format in $path: it has no `manifest` entry. Re-run with the " *
+        "original problem to regenerate it, or pass that problem to this resume: $(rescue).")
+    return manifest
 end
 
 """
@@ -797,13 +903,18 @@ to the underlying database column names (XML paths), along with the prior distri
 Complements `problem.jld2` (the machine-readable full serialization) for quick inspection
 without loading Julia.
 
-Each entry in the `[[parameters]]` array has a `source_type` field (`"DVSource"`,
-`"CVSource"`, or `"LVSource"`) and source-specific fields:
+Each entry in the `[[parameters]]` array has a `source_type` field and source-specific fields:
 
 - `DVSource`: `display_name`, `db_column`, `prior`
 - `CVSource`: `covariation_name`, `display_names`, `db_columns`, `priors`
+- `DiscreteSource`: `display_name`, `db_column`, `values`
+- `DiscreteCoSource`: `covariation_name`, `display_names`, `db_columns`, `values`
 - `LVSource`: `lv_name`, `latent_display_names`, `latent_priors`,
   `target_display_names`, `db_columns`
+
+A discrete source records `values` — the levels themselves — where a continuous one records a
+prior: the levels are what the CDF is quantised against, so they say which values the run could
+have visited, where the internal `DiscreteUniform` would say only how many.
 """
 function _writeParametersTOML(calibration::Calibration, cps::Vector{CalibrationParameter})
     path = joinpath(calibrationFolder(calibration), "parameters.toml")
@@ -876,23 +987,31 @@ end
 
 ################## Resume — validation helpers ##################
 
-#! Ordered by index, never by name — `_generationIndices` parses it, so mixed padding widths and both
-#! layouts order alike. Sorting the names instead would put `generation_006.csv` before
-#! `generation_05.csv` and answer generation 5 for a run that reached 10.
+#! The last COMPLETE generation, by index. A resume targets an interrupted run, whose trailing
+#! folder is exactly the incomplete one, and `_completeGenerationIndices` already excludes it:
+#! `metadata.toml` is written last, as the commit marker, so a listed generation has both CSVs by
+#! construction. Asking that list rather than walking back over every folder testing for the CSVs
+#! keeps one definition of "complete" in the package.
 """
     _findLastGenerationCSVs(calibration) → Union{Nothing, Tuple{String,String}}
 
-Return `(cdf_csv_path, display_csv_path)` for the last saved generation, or `nothing`
-if no generations have been written yet.
+Return `(cdf_csv_path, display_csv_path)` for the last complete generation, or `nothing`
+if no generation has finished writing yet.
 """
 function _findLastGenerationCSVs(calibration::Calibration)
-    gen_dir = joinpath(calibrationFolder(calibration), "generations")
-    indices = _generationIndices(gen_dir)
-    isempty(indices) && return nothing
-    t = last(indices)
+    gen_dir  = joinpath(calibrationFolder(calibration), "generations")
+    complete = _completeGenerationIndices(gen_dir)
+    isempty(complete) && return nothing
+    t = last(complete)
     cdf_path     = _generationArtifact(gen_dir, t, :cdfs)
     display_path = _generationArtifact(gen_dir, t, :particles)
-    (isnothing(cdf_path) || isnothing(display_path)) && return nothing
+    #! A commit marker with a CSV missing is not an interrupted write -- the marker is written
+    #! after the CSVs -- but a folder altered afterwards, which walking back to an older generation
+    #! would paper over.
+    (isnothing(cdf_path) || isnothing(display_path)) && error(
+        "Generation $t of Calibration($(calibration.id)) has its metadata.toml but is missing " *
+        "$(isnothing(cdf_path) ? "cdfs.csv" : "particles.csv"); the folder was altered after the " *
+        "run wrote it.")
     return cdf_path, display_path
 end
 
@@ -934,6 +1053,39 @@ function _validateStructuralMatch(cp::CalibrationParameter, src, i::Int)
                 "Parameter $i (CVSource) variation $k distribution mismatch.")
             v1.flip == v2.flip || error(
                 "Parameter $i (CVSource) variation $k flip mismatch.")
+        end
+
+    elseif src isa DiscreteSource
+        cp.source isa DiscreteSource || error(
+            "Parameter $i type mismatch: saved DiscreteSource, re-supplied $(typeof(cp.source)).")
+        dv_new, dv_saved = cp.source.dv, src.dv
+        dv_new.location == dv_saved.location || error(
+            "Parameter $i (DiscreteSource) location mismatch: " *
+            "saved :$(dv_saved.location), re-supplied :$(dv_new.location).")
+        columnName(dv_new.target) == columnName(dv_saved.target) || error(
+            "Parameter $i (DiscreteSource) target mismatch: " *
+            "saved \"$(columnName(dv_saved.target))\", re-supplied \"$(columnName(dv_new.target))\".")
+        #! The levels themselves, in order: a particle coordinate is a CDF over value *indices*, so a
+        #! reordered or resized list silently re-points every saved coordinate at a different level.
+        dv_new.values == dv_saved.values || error(
+            "Parameter $i (DiscreteSource) values mismatch: " *
+            "saved $(dv_saved.values), re-supplied $(dv_new.values). A saved particle coordinate " *
+            "indexes this list, so it cannot be reordered or resized on resume.")
+
+    elseif src isa DiscreteCoSource
+        cp.source isa DiscreteCoSource || error(
+            "Parameter $i type mismatch: saved DiscreteCoSource, re-supplied $(typeof(cp.source)).")
+        cv_new, cv_saved = cp.source.cv, src.cv
+        length(cv_new.variations) == length(cv_saved.variations) || error(
+            "Parameter $i (DiscreteCoSource) length mismatch.")
+        for (k, (v1, v2)) in enumerate(zip(cv_new.variations, cv_saved.variations))
+            v1.location == v2.location || error(
+                "Parameter $i (DiscreteCoSource) variation $k location mismatch.")
+            columnName(v1.target) == columnName(v2.target) || error(
+                "Parameter $i (DiscreteCoSource) variation $k target mismatch.")
+            v1.values == v2.values || error(
+                "Parameter $i (DiscreteCoSource) variation $k values mismatch: " *
+                "saved $(v2.values), re-supplied $(v1.values).")
         end
 
     elseif src isa _StrippedLVSource
@@ -1123,6 +1275,10 @@ function _resolveResumeProblem(manifest::_ProblemManifest, provided::Calibration
     return provided
 end
 
+#! The manifest could not be read back and the caller supplied a problem: use it. `_loadProblem`
+#! has already warned that it goes unvalidated.
+_resolveResumeProblem(::Nothing, provided::CalibrationProblem, ::Calibration) = provided
+
 ################## Resume — public API ##################
 
 """
@@ -1170,7 +1326,9 @@ new definition is used silently. Passing `problem=` in this case forces full val
   Passing both a method object and individual settings is an error.
 - Any `ABCSMC` field may be given as a keyword; it patches the saved value for that one field.
   Whenever the effective settings differ from `method.toml`, the file is rewritten to match and the
-  changed keys are reported, so a later resume does not revert to the original run's values.
+  changed keys are reported, so a later resume does not revert to the original run's values. The
+  rewrite happens only once the resume is going to run a generation: a resume that stops on its
+  own criteria, or fails validating the problem, leaves the file describing the run that did happen.
 
 # What a changed setting does to a resumed run
 
@@ -1182,7 +1340,8 @@ takes effect from the next generation onward. What that means in practice differ
 | `max_nr_populations` | New total cap. It counts *all* generations, not just new ones. |
 | `minimum_epsilon`, `min_acceptance_rate`, `min_epsilon_decrease`, `min_ess_fraction` | Checked after each new generation, as usual. |
 | `epsilon_quantile` | Sets the next threshold from the previous generation's accepted distances. |
-| `accept_overflow`, `max_evaluations`, `store_rejected` | Apply per generation; no interaction with what came before. |
+| `accept_overflow`, `store_rejected` | Apply per generation; no interaction with what came before. |
+| `max_evaluations` | New total budget. Like `max_nr_populations` it counts *all* evaluations, including those the completed generations made, so a resume that is to run anything needs an N above that total. A resume whose budget is already spent runs nothing and says so. |
 | `population_size` | New generations get the new size; earlier ones keep theirs. Legal — weights are normalised per generation, so resampling from a differently-sized parent is well defined — but the run ends up with generations of different sizes. |
 | `perturbation_kernel` | Refitted from the previous generation each time, so every generation stays internally consistent. The proposal simply changes from here on. |
 | `cdf_grid_k` | Resolved once when the loop starts, so turning snapping on or off applies only to new generations. Earlier particles were never snapped, so bank reuse differs either side of the resume. |
@@ -1220,7 +1379,7 @@ function resumeCalibration(calibration::Calibration,
                            kwargs...)
     verbosity = _resolveVerbosity(progress)
     _validateEvaluationFailurePolicy(on_monad_failure)
-    manifest = _loadProblem(calibration)
+    manifest = _loadProblem(calibration; required=isnothing(problem))
     active_problem = _resolveResumeProblem(manifest, problem, calibration)
 
     m = if isnothing(method)
@@ -1241,7 +1400,7 @@ function resumeCalibration(calibration::Calibration,
     #! that quietly falls back to the quantile rule. A schedule sized for the *remaining* generations
     #! instead of the whole run therefore runs out early without erroring.
     if !isnothing(m.epsilon_schedule)
-        n_done    = length(_generationIndices(joinpath(calibrationFolder(calibration), "generations")))
+        n_done    = length(_completeGenerationIndices(joinpath(calibrationFolder(calibration), "generations")))
         last_cov  = length(m.epsilon_schedule) + 1
         first_new = n_done + 1
         if last_cov < m.max_nr_populations
@@ -1254,11 +1413,6 @@ function resumeCalibration(calibration::Calibration,
                   "by absolute generation, so a schedule supplied on resume must cover the whole run."
         end
     end
-
-    changed = _persistEffectiveMethod(calibration, m)
-    isempty(changed) || @info "Updated method.toml to the settings this resume is running with: " *
-                              "$(join(sort(changed), ", ")). The file described the original run, " *
-                              "so a later resume would otherwise have reverted to it."
 
     #! Before anything reads or writes a generation file, bring the directory to the current layout:
     #! move any flat-layout generation into its own folder, and re-pad folder names if the cap changed.
@@ -1275,13 +1429,41 @@ function resumeCalibration(calibration::Calibration,
     start_generations = _loadGenerations(calibration, param_names, m.max_nr_populations)
 
     if !isempty(start_generations)
-        stop_reason = _stoppingReason(m, start_generations)
+        #! `budget_hit` has to be recomputed here. It is the one stopping criterion that is not a
+        #! property of the last generation — the budget counts evaluations across the whole run, and
+        #! nothing on disk records that it was spent — so omitting it left `_stoppingReason`'s budget
+        #! branch unreachable from a resume. The loop then started generation `t`, trimmed its first
+        #! batch to nothing, accepted nothing, and died in `maximum(distances)` without ever naming
+        #! the budget.
+        n_evals_done = sum(gen.n_evaluations for gen in start_generations)
+        budget_hit   = !isnothing(m.max_evaluations) && n_evals_done >= m.max_evaluations
+        stop_reason  = _stoppingReason(m, start_generations; budget_hit=budget_hit)
         if !isnothing(stop_reason)
-            _verbosityRank(verbosity) >= _verbosityRank(:generation) &&
-                @info "ABC-SMC (resume): $stop_reason — no new generations needed."
+            #! Warned unconditionally rather than logged at `:generation`, and alone among the
+            #! stopping reasons in that: the others describe a run that finished, while this one
+            #! describes a resume that was asked for more generations and could not run any. Same
+            #! reasoning as `_runABCSMC`'s warning about a `max_nr_populations` no-op.
+            if budget_hit
+                @warn "ABC-SMC (resume): $stop_reason after $(n_evals_done) evaluations, so no " *
+                      "new generations were run. Continue with " *
+                      "`resumeCalibration(cal; max_evaluations=N)` for an N above $(n_evals_done) " *
+                      "— the budget counts every evaluation the run has made, not only new ones."
+            else
+                _verbosityRank(verbosity) >= _verbosityRank(:generation) &&
+                    @info "ABC-SMC (resume): $stop_reason — no new generations needed."
+            end
             return ABCResult(calibration, start_generations, active_problem.parameters, m)
         end
     end
+
+    #! Written only once the resume is known to be running something. `method.toml` describes the
+    #! settings a run used, so rewriting it before the validation above could throw — or before
+    #! discovering that the stopping criteria leave nothing to do — left the file describing a run
+    #! that never happened.
+    changed = _persistEffectiveMethod(calibration, m)
+    isempty(changed) || @info "Updated method.toml to the settings this resume is running with: " *
+                              "$(join(sort(changed), ", ")). The file described the original run, " *
+                              "so a later resume would otherwise have reverted to it."
 
     return _executeCalibration(active_problem, calibration, m, run_kwargs;
                                verbosity=verbosity, on_monad_failure=on_monad_failure,
@@ -1540,7 +1722,8 @@ function _saveGeneration(dir::String, gen::GenerationResult, max_nr_populations:
     meta = Dict{String,Any}(
         #! Two distinct quantities, and only the first used to be recorded: `max_epsilon_accepted`
         #! is the worst distance actually accepted, while `epsilon_threshold` is the cutoff the
-        #! generation was run against. They coincide only when `epsilon_quantile == 1.0`.
+        #! generation was run against. They coincide only when the previous distances are tied at
+        #! the top: the constructor requires `epsilon_quantile < 1`.
         "t"                    => gen.t,
         "max_epsilon_accepted" => gen.max_epsilon_accepted,
         "n_evaluations"        => gen.n_evaluations,
@@ -1569,18 +1752,21 @@ end
 
 function _loadGenerations(dir::String, param_names::Vector{String},
                           max_nr_populations::Int)
-    #! Discovered, never reconstructed: `_generationIndices` reports what is on disk across both the
-    #! folder layout and the historical flat one, at any padding width, and `_generationArtifact`
-    #! resolves each file the same way. A generation whose CDF file is missing is skipped rather than
-    #! erroring — that is an interrupted write, and the generations before it are still usable.
-    indices = _generationIndices(dir)
+    #! Discovered, never reconstructed: `_completeGenerationIndices` reports every generation on
+    #! disk that finished writing, across both the folder layout and the historical flat one, at any
+    #! padding width, and `_generationArtifact` resolves each file the same way. An interrupted write
+    #! has no `metadata.toml` -- it is written last, as the commit marker -- so it is simply not
+    #! listed and the generations before it are still usable. A listed generation whose CDF file is
+    #! missing is an altered folder, not an interrupted write, and is an error.
+    indices = _completeGenerationIndices(dir)
     isempty(indices) && return GenerationResult[]
 
     generations = GenerationResult[]
     n_upgraded = 0
     for t in indices
         csv_path = _generationArtifact(dir, t, :cdfs)
-        isnothing(csv_path) && continue
+        isnothing(csv_path) && error("Generation $t under $dir has its metadata.toml but no " *
+                                     "cdfs.csv; the folder was altered after the run wrote it.")
 
         df        = CSV.read(csv_path, DataFrame)
         weights   = df[!, :weight]
@@ -1589,7 +1775,6 @@ function _loadGenerations(dir::String, param_names::Vector{String},
         particles = select(df, param_names)
 
         toml_path = _generationArtifact(dir, t, :metadata)
-        isnothing(toml_path) && continue
         meta = TOML.parsefile(toml_path)
         #! Older runs recorded a single `epsilon`. Read it, and upgrade the file in place so the next
         #! read takes the current path — resuming already writes into this folder, so there is nothing

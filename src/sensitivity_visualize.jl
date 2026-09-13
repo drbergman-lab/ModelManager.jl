@@ -221,8 +221,8 @@ end
 ################## MOAT recipes ##################
 
 """
-    plot(m::MOATSampling; show_sigma=false)
-    plot(m::MOATSampling, style::Symbol; show_sigma=false)
+    plot(m::MOATSampling; show_sigma=false, parameters=nothing)
+    plot(m::MOATSampling, style::Symbol; show_sigma=false, parameters=nothing)
 
 Visualize a Morris One-At-A-Time (MOAT) sensitivity analysis. One series is emitted per
 sensitivity quantity calculated on the sampling — see [`gsaLabels`](@ref), which is one per
@@ -297,7 +297,7 @@ function _sobolBarData(results::AbstractDict, monad_ids_df::DataFrame, show_ST::
 end
 
 """
-    plot(s::SobolSampling; show_ST=true)
+    plot(s::SobolSampling; show_ST=true, parameters=nothing)
 
 Grouped bar chart of Sobolʼ sensitivity indices. For each sensitivity quantity (see
 [`gsaLabels`](@ref)), the first-order index `S1` is shown per parameter; when `show_ST=true`
@@ -338,7 +338,7 @@ function _rbdBarData(results::AbstractDict, monad_ids_df::DataFrame; parameters=
 end
 
 """
-    plot(r::RBDSampling)
+    plot(r::RBDSampling; parameters=nothing)
 
 Grouped bar chart of Random Balance Design (RBD) first-order sensitivity indices, one
 bar series per sensitivity quantity (see [`gsaLabels`](@ref); labels include the quantity's
@@ -348,7 +348,7 @@ $_PARAMETERS_KW_DOC
 
 # Example
 ```julia
-using Plots
+using Plots, DataFrames
 plot(rbd_sampling)
 plot(rbd_sampling; parameters=Not("dt"))   # everything but the time step
 ```
