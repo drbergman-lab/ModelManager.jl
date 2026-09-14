@@ -12,6 +12,20 @@
 threw a `MethodError` at the first monad. Found when PhysiCellModelManager moved its builders'
 keyword arguments into `data` and then wanted to drop their bespoke reducers for the default.
 `_qoiMean(values, data)` now exists and ignores `data`, which is the measurement's, not the mean's.
+## Fail-fast leaked submissions (2026-09-14) — ships in v0.10.0
+
+`run`'s `finally` closed the worker queue believing a closed `Channel` ends a worker's `for` at
+once. It does not: a closed channel still hands out everything it buffered, so with `p` workers and
+`N` specs the worker that hit a refused submission went on to start the remaining specs after `run`
+had already thrown -- on a cluster, jobs submitted behind a `_SubmissionRefused`, against rows that
+`_resetUnclaimedSimulations` had just put back to "Not Started". Found because the SLURM `run()`
+test flaked on CI (#74's ubuntu job, and two runs on `main`): the refusal test's straggler submitted
+into the next testset's shim log, and the sentinel that test wrote for "submission 1" resolved the
+wrong job, so its own first job was never released and the third submission never came. The queue
+is now emptied right after it is closed, with no yield in between so `claimed` stays exact, and each
+worker yields after handing over a result, since otherwise it dequeued -- and started -- its next
+spec before the completion loop had woken to throw, one extra launch per worker. The refusal test
+asserts at most one attempt per worker and that lifting the refusal produces no further submission.
 
 ---
 

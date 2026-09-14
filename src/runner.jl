@@ -544,6 +544,11 @@ function run(T::AbstractTrial; quiet::Bool=false,
                 _stageError(e, CapturedException(e, catch_backtrace()))
             end
             put!(result_channel, result)
+            #! Hand the result over before taking more work. The completion loop reacts to a
+            #! failure by closing and emptying the queue; without this yield the worker would
+            #! dequeue -- and start -- its next spec before that loop had even woken, so a fail-fast
+            #! still launched one more simulation per worker.
+            yield()
         end
     end
 
@@ -569,13 +574,20 @@ function run(T::AbstractTrial; quiet::Bool=false,
     finally
         isnothing(sink_db) || close(sink_db)
         #! However this loop ended -- normally, by fail-fast, or by Ctrl-C -- no further simulation
-        #! may start. Closing the queue ends each worker's `for` once it has finished what it holds
-        #! (it also releases the workers, which used to block on the never-closed channel for the
-        #! rest of the session). A simulation no worker picked up was marked "Queued" up front by
-        #! `pendingSimulationSpecs`; put it back to "Not Started" so the next `run` sees it as
-        #! pending rather than as already claimed. Jobs already submitted keep running and are
-        #! recorded by their workers as they finish, for as long as this Julia session lives.
+        #! may start. Closing the queue releases the workers (which used to block on the
+        #! never-closed channel for the rest of the session), but a closed `Channel` still hands out
+        #! everything it buffered, so a worker that finished what it held would go on to START the
+        #! specs nobody had claimed -- on a cluster, submitting jobs behind a `_SubmissionRefused`
+        #! that `run` had already thrown. Empty it too. No yield sits between the close and the
+        #! last `take!`, so `claimed` is exact when the reset below reads it. A simulation no worker
+        #! picked up was marked "Queued" up front by `pendingSimulationSpecs`; put it back to
+        #! "Not Started" so the next `run` sees it as pending rather than as already claimed. Jobs
+        #! already submitted keep running and are recorded by their workers as they finish, for as
+        #! long as this Julia session lives.
         close(queue_channel)
+        while isready(queue_channel)
+            take!(queue_channel)
+        end
         _resetUnclaimedSimulations(claimed, specs)
     end
     isnothing(on_progress) || on_progress(:finish, n_success)
