@@ -9292,7 +9292,17 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 end
                 # Nothing was recorded as failed, so nothing was erased from the monad.
                 @test sort(constituentIDs(Monad, monad.id)) == sort(ids)
+                # Fail-fast means no further submission: a worker that hit the refusal must not go
+                # on to submit the specs it had not yet dequeued. A closed `Channel` still hands
+                # out what it buffered, and that is exactly what happened -- the straggler
+                # submitted into the NEXT testset's shim log once this one lifted the refusal, and
+                # the sentinel that test wrote for "submission 1" went to the wrong job. At most one
+                # attempt per worker, and nothing more once `sbatch` would accept.
+                n_after_run = _calls("sbatch.log")
+                @test n_after_run <= 1 + mm_globals().max_number_of_parallel_simulations
                 rm(joinpath(shim, "sbatch.fail"))
+                sleep(0.5)
+                @test _calls("sbatch.log") == n_after_run
             end
 
             @testset "a run() over the SLURM path completes every simulation" begin
