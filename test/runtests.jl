@@ -7727,8 +7727,11 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             bd = ModelManager._sobolBarData(res1, sobol_df, true)
             @test bd.param_names == pnames
-            @test [g.label for g in bd.groups] == ["S1", "ST"]
-            @test bd.groups[2].fillalpha == 0.45                     # ST de-emphasized
+            #! ST before S1: it is the taller bar (ST ≥ S1) and is drawn first, so it sits BEHIND
+            #! the opaque S1 and only its excess shows.
+            @test [g.label for g in bd.groups] == ["ST", "S1"]
+            @test bd.groups[1].fillalpha == 0.45                     # ST de-emphasized, behind
+            @test bd.groups[2].fillalpha == 1.0                      # S1 opaque, in front
 
             res2 = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol(), _GSA_LABEL_B => sobol())
             @test nseries(apply(ModelManager._sobolBarData(res2, sobol_df, true))) == 4   # 2 fns × (S1+ST)
@@ -7804,8 +7807,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             sres = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol())
             sb   = ModelManager._sobolBarData(sres, sobol_df, true; parameters="p2")
             @test sb.param_names == ["p2"]
-            @test sb.groups[1].values ≈ [0.5]
-            @test sb.groups[2].values ≈ [0.6]
+            @test sb.groups[1].values ≈ [0.6]   # ST, drawn first
+            @test sb.groups[2].values ≈ [0.5]   # S1
             @test nseries(apply(sb)) == 2
 
             # RBD: a plain vector result.

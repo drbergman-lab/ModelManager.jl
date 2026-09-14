@@ -26,6 +26,16 @@ is now emptied right after it is closed, with no yield in between so `claimed` s
 worker yields after handing over a result, since otherwise it dequeued -- and started -- its next
 spec before the completion loop had woken to throw, one extra launch per worker. The refusal test
 asserts at most one attempt per worker and that lifting the refusal produces no further submission.
+## Sobolʼ bar order (2026-09-14) — ships in v0.10.0
+
+Seen while rendering PhysiCellModelManager's manual figures: `plot(::SobolSampling)` drew `S1`
+opaque first and `ST` translucent on top, so `ST` — never below `S1` in exact arithmetic, hence the
+taller bar — covered `S1` entirely and every bar read as one blended colour; the legend's blue never
+appeared. `ST` is now pushed first, so it is drawn behind, and the only part of it visible is its
+excess over the opaque `S1`. The legend lists `ST` before `S1` as a consequence; a `z_order`
+attribute would keep the old legend order but is not honoured by every backend, so the series order
+carries it. Small-`n` estimates can still put `ST` below `S1`, in which case `ST` disappears behind
+`S1` — which is the honest picture of an estimate that says nothing.
 
 ---
 
