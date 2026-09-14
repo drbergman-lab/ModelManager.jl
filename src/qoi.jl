@@ -68,7 +68,9 @@ Two rules hold whatever the value is:
 - `data`: anything the measurement needs besides the simulation — an observation to score against,
   a set of cell types, a time grid. **It changes the calling convention, explicitly and without
   sniffing:** when `data !== nothing`, `compute` is called as `compute(simulation, data)` and
-  `reduce` as `reduce(values, data)`; otherwise both take one argument. It is serialised inside the
+  `reduce` as `reduce(values, data)`; otherwise both take one argument. The default `reduce`
+  accepts the second argument and ignores it, so `data` that only `compute` needs — a set of cell
+  types, a snapshot index — leaves `reduce` alone. It is serialised inside the
   `QoI` in a calibration's `problem.jld2`, so a resume needs nothing re-supplied as long as `data`
   itself is serialisable — a `Dict` of numbers is. (Restorability is decided by the two *functions*,
   which is unchanged: name them and the QoI round-trips.)
@@ -486,8 +488,14 @@ _qoiKeyListStr(ks) = "[" * join(repr.(sort(collect(ks); by=string)), ", ") * "]"
 #! failure to report well is the nested keyed value, which used to be refused at the seam with a
 #! labelled message and would otherwise die here as a bare `MethodError` naming neither the QoI nor
 #! the key.
+#! With `data`, ModelManager calls `reduce(values, data)`. The default reducer has no use for the
+#! data -- it is the measurement's, not the mean's -- so this is the one-argument form, and a QoI
+#! that needs `data` only in `compute` can leave `reduce` alone.
+_qoiMean(values, data) = _qoiMean(values)
+
 """
     _qoiMean(values) → value
+    _qoiMean(values, data) → value
 
 The default `reduce`: `mean` for `Real`s, and the per-key mean for keyed values, returned in the
 first replicate's kind of container and under its own keys. Every replicate must carry the same

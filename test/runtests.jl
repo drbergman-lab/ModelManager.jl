@@ -5870,6 +5870,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test_throws MethodError ModelManager._computeOn(QoI("plain", _qoi_sim; data=obs),
                                                                  Simulation(first(sids)))
 
+                # The default `reduce` takes the two-argument form too, so a measurement that needs
+                # `data` only in `compute` -- a set of cell types, a snapshot index -- can leave
+                # `reduce` alone and still round-trip by name. It used to be a `MethodError` at the
+                # first monad.
+                qd = QoI("plain", _qoi_with_data; data=obs)
+                @test ModelManager._reduceOverMonad(qd, mid)["raw"] ≈ raw_mean
+
                 # The sink names the same components, so one `data`-carrying QoI feeds all three
                 # consumers.
                 tbl = postProcessingTable(simulationIDs(m))

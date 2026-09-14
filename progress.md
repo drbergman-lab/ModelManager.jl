@@ -5,6 +5,16 @@
 
 ---
 
+## The default reducer and `data` (2026-09-14) — ships in v0.10.0
+
+`data !== nothing` switches both of a QoI's functions to their two-argument form, but the default
+`reduce` had only `_qoiMean(values)`, so `QoI(name, compute; data=…)` with no `reduce=` of its own
+threw a `MethodError` at the first monad. Found when PhysiCellModelManager moved its builders'
+keyword arguments into `data` and then wanted to drop their bespoke reducers for the default.
+`_qoiMean(values, data)` now exists and ignores `data`, which is the measurement's, not the mean's.
+
+---
+
 ## Session: drawing from the posterior (2026-09-10) — ships in v0.10.0
 
 ### Trigger
