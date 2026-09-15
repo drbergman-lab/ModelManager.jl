@@ -289,12 +289,16 @@ function _sobolBarData(results::AbstractDict, monad_ids_df::DataFrame, show_ST::
     groups = _GSABarGroup[]
     for name in labels
         res = results[name]
-        push!(groups, _GSABarGroup(multi ? "S1: $(name)" : "S1",
-                                   Float64.(res.S1)[idx], 1.0, nothing))
+        #! ST first, so it is drawn BEHIND S1. A total-order index is never below the first-order
+        #! one in exact arithmetic, so the translucent ST bar is the taller of the two: drawn behind,
+        #! its excess over S1 shows above an opaque S1; drawn in front (the earlier order) it covered
+        #! S1 entirely and every bar read as one blended colour.
         if show_ST && !isnothing(res.ST)
             push!(groups, _GSABarGroup(multi ? "ST: $(name)" : "ST",
                                        Float64.(res.ST)[idx], 0.45, nothing))
         end
+        push!(groups, _GSABarGroup(multi ? "S1: $(name)" : "S1",
+                                   Float64.(res.S1)[idx], 1.0, nothing))
     end
     return _GSABarData(pnames, groups)
 end
@@ -304,7 +308,8 @@ end
 
 Grouped bar chart of Sobolʼ sensitivity indices. For each sensitivity quantity (see
 [`gsaLabels`](@ref)), the first-order index `S1` is shown per parameter; when `show_ST=true`
-(default) the total-order index `ST` is overlaid at reduced opacity. Labels include the
+(default) the total-order index `ST` is drawn behind it at reduced opacity, so the part of `ST`
+that exceeds `S1` shows above the opaque `S1` bar. Labels include the
 quantity's own label when more than one is present.
 
 $_PARAMETERS_KW_DOC

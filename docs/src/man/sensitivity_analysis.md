@@ -157,7 +157,7 @@ plot(moat; show_sigma=true)      # add σ as ±whiskers on the µ* bars
 plot(moat, :scatter)             # classic µ*–σ screening scatter, points labeled
 plot(moat, :violin)              # full elementary-effect distribution per parameter
 
-# Sobol' — first-order (S1) bars, with total-order (ST) overlaid at reduced opacity
+# Sobol' — first-order (S1) bars in front of total-order (ST) bars at reduced opacity
 plot(sobol)                      # S1 + ST
 plot(sobol; show_ST=false)       # S1 only
 
