@@ -5,6 +5,70 @@
 
 ---
 
+## Same parameters, different input folder (2026-09-19) — ships in v0.11.0
+
+### Trigger
+A posterior draw from a calibration is a `Monad` whose `VariationID` fixes the parameter values.
+The next question is what that parameter point does under a *different* piece of the model — new
+`custom_code`, another initial condition — and the only route was to reach past the API: read
+`monad.inputs`, rebuild an `InputFolders` by hand, and pass `monad.variation_id` to the
+two-argument `Monad` constructor. That works, and a PhysiCellModelManager user did exactly it,
+but it needs two undocumented facts: that a `VariationID` is reusable at all, and which
+locations it is safe to change. Nothing here is simulator-specific, so it lands in ModelManager.
+
+### What was decided
+- **The safety rule keys on the variation ID's value, not on the location's name.** A first cut
+  said "only a non-varied location may change". Too coarse: swapping `rulesets_collection` is
+  perfectly safe while its ID is `0`, and `custom_code` is safe not because custom code is special
+  but because it never has a variations table. One predicate — a location may be replaced iff its
+  ID is `<= 0` — gets both right. A positive ID is a row in the *old* folder's table; the same
+  number in another folder's table is an unrelated parameter set, so that case throws
+  `ArgumentError` naming the location and the ID. A warning was rejected: for a calibration
+  workflow a plausible-looking wrong parameter set is the worst failure, and nothing downstream
+  would flag it.
+- **The tuple changes shape.** `monad.variation_id` cannot be passed through verbatim in general:
+  a location that was unused (`-1`) and now has a folder needs `0`, and the reverse needs `-1`.
+  `_carriedVariationID` starts from `VariationID(new_inputs)` and keeps the old ID only where the
+  folder is unchanged. The hand-rolled prototype got away with pass-through because
+  `custom_code` is not a varied location and never appears in the tuple at all.
+- **Copy constructors, not a verb.** `swapInputs(monad, :custom_code => "x")` was considered.
+  ModelManager's idiom for "the same thing with one field different" is already the copy
+  constructor (`Monad(simulation)`, `Sampling(monad)`, `Monad(monad; n_replicates)`), and the
+  primitive — `InputFolders(inputs; custom_code="x")` — is useful on its own. The cost is an
+  open-ended keyword list on the constructors, which makes the pair constructor's unknown-location
+  assertion load-bearing: without it `Monad(m; custom_codes="x")` would be a silent no-op.
+- **`Monad(simulation; custom_code=...)` does not enrol the simulation.** With no keyword it adds
+  the simulation to the monad's replicate list as before; with a replaced folder the simulation's
+  inputs are no longer the monad's, so it is left where it is. Decided by an inputs equality
+  check rather than by whether a keyword was passed, so a keyword naming the current folder is
+  an ordinary no-op.
+- **`Sampling` in, `Trial` out** (the user's call). A sampling has one `inputs` and many monads,
+  so the operation is well defined. A trial's samplings may already differ in inputs;
+  `Trial(Sampling.(trial.samplings; kwargs...))` at the call site says what is meant.
+- **v0.11.0**: `v0.10.0` is tagged at the current `main`, and this is new API.
+
+### Deferred: carrying a parameter set onto a new *varied* folder
+The refusal above forecloses "same parameter values, new base config". Direction from the user,
+recorded so the follow-up starts from it rather than from the brief's open question:
+
+- For each varied column of the source row, test whether the XML path exists in the new folder's
+  base file. Present: carry the value. Absent: skip it, and collect the skipped paths into one
+  warning, emitted by default and silenced by a keyword.
+- The real hazard is not the missing paths but the **shared, unvaried parameters whose base
+  values differ** between the two files. A rebase that carries only the varied columns silently
+  takes the new file's base value for every other parameter, so "the same parameter set" is not
+  what runs. `getAllParameterValues` on the source monad already yields its complete effective
+  parameter set (varied columns applied to the base file); the same walk over the new folder's
+  base gives the target's. Their difference is the set of values that must travel as explicit
+  variation columns for the new row to mean what the old one did — and a report of that
+  difference is worth showing even when the user declines to carry it.
+- Mechanically this is one call to `addVariationRows(new_inputs, VariationID(new_inputs),
+  loc_dicts)` with a single-sample values matrix per location, which yields a fresh ID in the new
+  folder's table; `columnNameToXMLPath` recovers the targets from the source row's column names.
+- Open: whether the shared-but-different base values are carried by default or on request. The
+  user's framing ("allow any values from the original config into the new config") reads as
+  opt-in with the diff always reported; not decided.
+
 ## The default reducer and `data` (2026-09-14) — ships in v0.10.0
 
 `data !== nothing` switches both of a QoI's functions to their two-argument form, but the default

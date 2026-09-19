@@ -7400,6 +7400,140 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
     end
 
+    ################## replacing an input folder ##################
+
+    # Three locations, so a swap has both kinds of neighbour: a varied required location (config),
+    # a non-varied required one (custom_code) and a varied optional one (ic_cell). Two folders
+    # each where a swap needs somewhere to go.
+    function _make_swap_project(dir::String)
+        inputs_dir = joinpath(dir, "inputs")
+        mkpath(joinpath(dir, "outputs"))
+        mkpath(inputs_dir)
+        open(joinpath(inputs_dir, "inputs.toml"), "w") do io
+            print(io, """
+            [config]
+            required = true
+            varied   = true
+            basename = "params.xml"
+
+            [custom_code]
+            required = true
+            varied   = false
+
+            [ic_cell]
+            required = false
+            varied   = true
+            basename = "cells.xml"
+            """)
+        end
+        for folder in ("default", "other")
+            mkpath(joinpath(inputs_dir, "configs", folder))
+            write(joinpath(inputs_dir, "configs", folder, "params.xml"),
+                  "<params>\n  <data>\n    <x>1.0</x>\n    <y>2.0</y>\n  </data>\n</params>\n")
+            mkpath(joinpath(inputs_dir, "custom_codes", folder))
+        end
+        mkpath(joinpath(inputs_dir, "ic_cells", "disc"))
+        write(joinpath(inputs_dir, "ic_cells", "disc", "cells.xml"),
+              "<cells>\n  <radius>10.0</radius>\n</cells>\n")
+    end
+
+    @testset "replacing an input folder keeps the parameter values" begin
+        mktempdir() do project_dir
+            _make_swap_project(project_dir)
+            initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+            waitForDiagnostics()
+
+            xp_x   = XMLPath(["data", "x"])
+            inputs = InputFolders(config="default", custom_code="default")
+
+            # InputFolders: a copy keeps every location, a keyword replaces one, an unused
+            # location stays unused, and a mistyped location is an error rather than a no-op.
+            @test InputFolders(inputs) == inputs
+            swapped = InputFolders(inputs; custom_code="other")
+            @test swapped[:custom_code].folder == "other"
+            @test swapped[:config] == inputs[:config]
+            @test swapped[:ic_cell].id == -1
+            @test_throws AssertionError InputFolders(inputs; custom_codes="other")
+
+            # A monad holding a real config variation -- the posterior-draw shape.
+            res = ModelManager.addVariations(GridVariation(), inputs,
+                                             [DiscreteVariation(:config, xp_x, [3.0, 4.0])])
+            vid = res.variation_ids[2]
+            m   = Monad(inputs, vid; n_replicates=2)
+            @test m.variation_id[:config] > 0
+
+            # Replace the non-varied location: same VariationID, new folder, new monad row, and
+            # the parameter value reads back from the folder that still holds it.
+            m2 = Monad(m; custom_code="other", n_replicates=2)
+            @test m2.id != m.id
+            @test m2.variation_id == m.variation_id
+            @test m2.inputs[:custom_code].folder == "other"
+            @test m2.inputs[:config].folder == "default"
+            @test length(m2) == 2
+            @test getParameterValue(m2, :config, xp_x) ≈ 4.0
+            # Find-or-insert: the same replacement is the same row; a no-op keyword is the monad.
+            @test Monad(m; custom_code="other").id == m2.id
+            @test Monad(m; custom_code="default").id == m.id
+            # No keyword at all is the existing copy constructor, untouched.
+            @test Monad(m).id == m.id
+
+            # Into a location that was unused: the ID tuple changes shape (-1 -> 0) while the
+            # config ID is untouched. And back out again: -1 once more, and the original row.
+            m3 = Monad(m; ic_cell="disc")
+            @test m3.inputs[:ic_cell].folder == "disc"
+            @test m3.variation_id[:ic_cell] == 0
+            @test m3.variation_id[:config] == m.variation_id[:config]
+            m4 = Monad(m3; ic_cell="")
+            @test m4.variation_id[:ic_cell] == -1
+            @test m4.id == m.id
+
+            # The folder a positive variation ID lives in cannot be replaced -- the error names
+            # the location and the ID -- but with the base row in effect there is nothing to carry.
+            err = try
+                Monad(m; config="other")
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test occursin("config", err.msg)
+            @test occursin("variation ID $(vid[:config])", err.msg)
+            m_base  = Monad(inputs)
+            m_base2 = Monad(m_base; config="other")
+            @test m_base2.inputs[:config].folder == "other"
+            @test m_base2.variation_id[:config] == 0
+
+            # Simulation: a new simulation with the monad's parameters in the new folders, which
+            # resolves to the replaced monad's parameterization.
+            s = Simulation(m; custom_code="other")
+            @test s.inputs == m2.inputs
+            @test s.variation_id == m.variation_id
+            @test monadIDs(s) == [m2.id]
+            # Simulation -> Monad with a replacement builds the monad but does not enrol the
+            # simulation, whose inputs now differ from the monad's; without a keyword it still does.
+            s0 = Simulation(m)
+            m5 = Monad(s0; custom_code="other")
+            @test m5.id == m2.id
+            @test !(s0.id in simulationIDs(m5))
+            @test s0.id in simulationIDs(Monad(s0))
+
+            # Sampling: every monad's VariationID survives; the inputs are new; the same refusal
+            # applies; and no keyword is the existing sampling.
+            sampling  = Sampling(inputs, res.variation_ids; n_replicates=1)
+            sampling2 = Sampling(sampling; custom_code="other", n_replicates=1)
+            @test sampling2.id != sampling.id
+            @test sampling2.inputs[:custom_code].folder == "other"
+            @test [mm.variation_id for mm in sampling2.monads] == [mm.variation_id for mm in sampling.monads]
+            @test all(mm.inputs == sampling2.inputs for mm in sampling2.monads)
+            @test_throws ArgumentError Sampling(sampling; config="other")
+            @test Sampling(sampling).id == sampling.id
+
+            # The replaced monad runs.
+            out = run(m2)
+            @test out.n_success == 2
+        end
+    end
+
     ################## rm_hpc_safe / .trash staging ##################
 
     # `initializeModelManager` resets the flag to `isRunningOnHPC()`, but nothing else does, and a

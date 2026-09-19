@@ -158,6 +158,10 @@ InputFolders(; config="default", custom_code="default")
 ```julia
 InputFolders("default", "default"; ic_cell="cells_in_disc")
 ```
+3. An existing `InputFolders` with the named locations replaced and every other one kept:
+```julia
+InputFolders(inputs; custom_code="other")
+```
 
 # Fields
 - `input_folders::NamedTuple`: Keys are location symbols; values are [`InputFolder`](@ref)s.
@@ -196,6 +200,17 @@ function InputFolders(req_loc_folders::Vararg{String}; opt_loc_folders...)
         push!(location_pairs, loc => val)
     end
     return InputFolders(location_pairs)
+end
+
+#! Copy-with-replacement. Rebuilding through the pair constructor keeps its validation: an
+#! unknown location name is refused there, so a mistyped keyword cannot come back as an
+#! unchanged copy.
+function InputFolders(inputs::InputFolders; kwargs...)
+    d = Dict{Symbol,Union{String,Int}}(loc => input_folder.folder for (loc, input_folder) in pairs(inputs.input_folders))
+    for (loc, val) in pairs(kwargs)
+        d[loc] = val
+    end
+    return InputFolders(collect(d))
 end
 
 Base.getindex(input_folders::InputFolders, loc::Symbol)::InputFolder = input_folders.input_folders[loc]
@@ -250,6 +265,29 @@ end
 
 Base.getindex(variation_id::VariationID, loc::Symbol)::Int = variation_id.ids[loc]
 
+#! The variation IDs a copy of `M` keeps when its input folders become `inputs`. A variation ID
+#! is a row in one folder's variations table, so it survives only where the folder did not
+#! change. Where it did, the new folder starts from its own base row (`0`), or `-1` if the
+#! location is no longer in use -- which is also what lets the ID tuple change *shape*: a
+#! location that was unused (`-1`) and now has a folder needs a `0`, not the old `-1`. A changed
+#! location that carried a real variation (`> 0`) is refused rather than remapped, because the
+#! same number in the new folder's table is an unrelated parameter set.
+function _carriedVariationID(M::AbstractMonad, inputs::InputFolders)
+    base = VariationID(inputs)
+    ids = Pair{Symbol,Int}[]
+    for loc in projectLocations().varied
+        old_id = M.variation_id[loc]
+        if M.inputs[loc].folder == inputs[loc].folder
+            push!(ids, loc => old_id)
+        elseif old_id > 0
+            throw(ArgumentError("Cannot replace the $(loc) folder $(repr(M.inputs[loc].folder)) with $(repr(inputs[loc].folder)): its variation ID $(old_id) is a row in the old folder's variations table and does not carry over. A location can be replaced only while its variation ID is 0 (base file) or -1 (unused)."))
+        else
+            push!(ids, loc => base[loc])
+        end
+    end
+    return VariationID(ids)
+end
+
 function Base.show(io::IO, variation_id::VariationID)
     printVariationID(io, variation_id)
 end
@@ -282,6 +320,7 @@ A single run of the model.
 Simulation(simulation_id)          # retrieve existing
 Simulation(inputs, variation_id)   # create new (inserts into DB)
 Simulation(monad)                  # new sim with same params as monad
+Simulation(monad; custom_code="other")   # same params, one input folder replaced (see Monad)
 ```
 
 # Fields
@@ -422,12 +461,26 @@ A group of identical-up-to-randomness simulations.
 Monad(inputs, variation_id; n_replicates=0, use_previous=true)
 Monad(monad_id; n_replicates=0, use_previous=true)
 Monad(simulation)
+Monad(monad; custom_code="other")     # same parameter values, one input folder replaced
 ```
 
 # Fields
 - `id::Int`
 - `inputs::InputFolders`
 - `variation_id::VariationID`
+
+# Replacing an input folder
+
+`Monad(monad; custom_code="other")` — and likewise `Simulation(monad; ...)`,
+`Monad(simulation; ...)` and `Sampling(sampling; ...)` — builds the same parameterization over
+different input folders. Any location keyword [`InputFolders`](@ref) accepts may be given, and
+every other folder is kept. The [`VariationID`](@ref) carries over, which is how a calibrated
+parameter set is re-run under a new version of the model code.
+
+A location can be replaced only while its variation ID is `0` (base file) or `-1` (unused). A
+positive ID is a row in the *old* folder's variations table and means nothing in another, so
+replacing that folder throws rather than silently pointing at an unrelated parameter set. A
+location brought into use this way starts at `0`; one taken out of use goes to `-1`.
 """
 struct Monad <: AbstractMonad
     id::Int
@@ -491,14 +544,21 @@ function Monad(monad_id::Integer; n_replicates::Integer=0, use_previous::Bool=tr
     return Monad(monad_id, inputs, variation_id, n_replicates, use_previous)
 end
 
-function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bool=true)
-    monad = Monad(simulation.inputs, simulation.variation_id; n_replicates=n_replicates, use_previous=use_previous)
-    addSimulationID(monad, simulation.id)
+function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bool=true, kwargs...)
+    inputs = isempty(kwargs) ? simulation.inputs : InputFolders(simulation.inputs; kwargs...)
+    monad = Monad(inputs, _carriedVariationID(simulation, inputs); n_replicates=n_replicates, use_previous=use_previous)
+    #! The simulation is one of this monad's replicates only if it shares the monad's inputs. A
+    #! replaced folder makes it a different parameterization, so it is left where it is.
+    if inputs == simulation.inputs
+        addSimulationID(monad, simulation.id)
+    end
     return monad
 end
 
-function Monad(monad::Monad; n_replicates::Integer=0, use_previous::Bool=true)
-    return Monad(monad.id, monad.inputs, monad.variation_id, n_replicates, use_previous)
+function Monad(monad::Monad; n_replicates::Integer=0, use_previous::Bool=true, kwargs...)
+    isempty(kwargs) && return Monad(monad.id, monad.inputs, monad.variation_id, n_replicates, use_previous)
+    inputs = InputFolders(monad.inputs; kwargs...)
+    return Monad(inputs, _carriedVariationID(monad, inputs); n_replicates=n_replicates, use_previous=use_previous)
 end
 
 """
@@ -515,7 +575,10 @@ function addSimulationID(monad::Monad, simulation_id::Int)
     recordConstituentIDs(monad, simulation_ids)
 end
 
-Simulation(monad::Monad) = Simulation(monad.inputs, monad.variation_id)
+function Simulation(M::AbstractMonad; kwargs...)
+    inputs = isempty(kwargs) ? M.inputs : InputFolders(M.inputs; kwargs...)
+    return Simulation(inputs, _carriedVariationID(M, inputs))
+end
 
 function Base.show(io::IO, monad::Monad)
     println(io, "Monad (ID=$(monad.id)):")
@@ -538,6 +601,9 @@ end
     Sampling
 
 A group of monads sharing the same input folders but differing in parameter values.
+
+`Sampling(sampling; custom_code="other")` rebuilds one over different input folders, keeping
+every monad's parameter values — see [`Monad`](@ref) for which locations may change.
 
 # Fields
 - `id::Int`
@@ -660,7 +726,12 @@ function Sampling(sampling_id::Int; n_replicates::Integer=0, use_previous::Bool=
     return Sampling(sampling_id, inputs, monads)
 end
 
-Sampling(sampling::Sampling; kwargs...) = Sampling(sampling.id; kwargs...)
+function Sampling(sampling::Sampling; n_replicates::Integer=0, use_previous::Bool=true, kwargs...)
+    isempty(kwargs) && return Sampling(sampling.id; n_replicates=n_replicates, use_previous=use_previous)
+    inputs = InputFolders(sampling.inputs; kwargs...)
+    monads = [Monad(inputs, _carriedVariationID(monad, inputs); n_replicates=n_replicates, use_previous=use_previous) for monad in sampling.monads]
+    return Sampling(monads, inputs)
+end
 
 function Base.show(io::IO, sampling::Sampling)
     println(io, "Sampling (ID=$(sampling.id)):")

@@ -111,6 +111,26 @@ You can also start from an existing reference monad to inherit its fixed paramet
 new_trial = createTrial(reference_monad, more_variations...)
 ```
 
+## Same parameters, different input folders
+
+A calibrated parameter set is worth re-running under a changed model — revised custom code, a
+different initial condition — and its values live in the [`VariationID`](@ref), not in the
+folder being swapped. Every constructor that takes an existing trial accepts the location
+keywords [`InputFolders`](@ref) does and carries the variation across:
+
+```julia
+posterior_monad = Monad(42)
+new_monad = Monad(posterior_monad; custom_code="revised_code", n_replicates=10)
+run(new_monad)
+
+Sampling(sampling; ic_cell="dense_disc")   # every monad's parameters, a new initial condition
+```
+
+A variation ID is a row in one folder's variations table, so it cannot follow a location whose
+folder changes. A location can be replaced while its variation ID is `0` or `-1`; replacing one
+that holds a positive ID throws. Moving a *varied* parameter set onto a new base file is a
+different operation and is not yet supported.
+
 ## Asking what a trial contains
 
 | Function | Returns | Levels |

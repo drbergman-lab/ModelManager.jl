@@ -121,6 +121,12 @@ as a hook the backend implements is left bare.
 - `InputFolders` — named tuple of `InputFolder` objects, one per location.
 - `VariationID` — named tuple mapping location symbols to their current variation row IDs.
 
+*Replacing an input folder*
+- `InputFolders(inputs; location=folder, ...)` copies `inputs` with the named locations replaced and every other location, used or not, kept. An unknown location name is refused, as in the other constructors, so a mistyped keyword cannot come back as an unchanged copy.
+- `Simulation(M; ...)`, `Monad(monad; ...)`, `Monad(simulation; ...)` and `Sampling(sampling; ...)` accept the same location keywords alongside `n_replicates`/`use_previous` and build the same parameterization over the new folders. The `VariationID` is carried, not copied: a location whose folder did not change keeps its ID; one whose folder did starts at the new folder's base row (`0`), or `-1` if it is no longer in use — so the tuple can change shape. A location may be replaced only while its variation ID is `0` or `-1`. A positive ID is a row in the old folder's variations table, and the constructor throws `ArgumentError` rather than reuse the number against another table.
+- `Monad(simulation; ...)` enrols the simulation in the monad only when the inputs are unchanged; with a replaced folder the simulation's parameterization is no longer the monad's.
+- `Trial` has no such form. Its samplings may already differ in inputs, so `Trial(Sampling.(trial.samplings; ...))` at the call site says what is meant.
+
 *Accessors*
 - `simulationIDs` and `monadIDs` accept any level of the hierarchy, an array of levels, the `MMOutput` returned by `run`, a `GSASampling`, or no argument (everything in the database). They descend the full hierarchy; `constituentIDs` stops one level down and also accepts an `MMOutput`, but throws for a `Simulation`, which has no constituents.
 - `monadIDs(simulation)` resolves the monad for that simulation's parameterization by matching the `monads` key tuple that `monadsSchema` declares `UNIQUE` — simulator version, input folders and variation IDs. It is a pure `SELECT`: an accessor never creates a row.
@@ -140,6 +146,10 @@ as a hook the backend implements is left bare.
 - Calling `monadIDs` on a monad-less simulation leaves the `monads` row count unchanged; calling `trialID` on an unmatched sampling set leaves the `trials` row count unchanged.
 - `trialID(samplings)` returns `missing` before `Trial(samplings)` is called and that trial's ID afterwards; a second `Trial(samplings)` reuses the row.
 - `monadIDs(simulation)` still finds the simulation's monad after the project's simulator version changes.
+- `Monad(monad; custom_code="other")` on a monad with a positive `config` variation ID yields a new monad whose `VariationID` equals the original's and whose `custom_code` folder is `"other"`; repeating it returns the same row, and a keyword naming the current folder returns the original monad.
+- Replacing a location that was unused gives it variation ID `0`; replacing it back to `""` gives `-1`.
+- `Monad(monad; config="other")` throws `ArgumentError` while the `config` variation ID is positive and succeeds when it is `0`.
+- `Sampling(sampling; custom_code="other")` preserves every monad's `VariationID`.
 
 ---
 
