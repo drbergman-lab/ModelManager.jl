@@ -776,8 +776,11 @@ function Sampling(sampling::Sampling; n_replicates::Integer=0, use_previous::Boo
     isempty(kwargs) && return Sampling(sampling.id; n_replicates=n_replicates, use_previous=use_previous)
     inputs = InputFolders(sampling.inputs; kwargs...)
     ctx = _CarryContext(carry)
-    monads = [Monad(inputs, _carriedVariationID(monad, inputs, ctx); n_replicates=n_replicates, use_previous=use_previous) for monad in sampling.monads]
+    #! Every carry completes before any monad is inserted, so a carry that fails part-way
+    #! leaves no monads behind -- only variation rows, which are content-addressed and harmless.
+    variation_ids = [_carriedVariationID(monad, inputs, ctx) for monad in sampling.monads]
     warn_uncarried && _warnUncarried(ctx)
+    monads = [Monad(inputs, variation_id; n_replicates=n_replicates, use_previous=use_previous) for variation_id in variation_ids]
     return Sampling(monads, inputs)
 end
 

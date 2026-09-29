@@ -7460,6 +7460,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             xp_x   = XMLPath(["data", "x"])
             inputs = InputFolders(config="default", custom_code="default")
 
+            # Warn-level records only. CI runs with JULIA_DEBUG=ModelManager, whose env override
+            # carries the row writer's @debug records past any logger's min_level, so @test_logs
+            # cannot be told to ignore them.
+            function _warnings(f)
+                logs, value = Test.collect_test_logs(f)
+                return [string(l.message) for l in logs if l.level == Base.CoreLogging.Warn], value
+            end
+
             # InputFolders: a copy keeps every location, a keyword replaces one, an unused
             # location stays unused, and a mistyped location is an error rather than a no-op.
             @test InputFolders(inputs) == inputs
@@ -7506,7 +7514,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             # dropped w, added z=9 and relabelled. The default carry keeps every value the old
             # monad ran with wherever the new file has the parameter, and reports the rest.
             xp_y, xp_z, xp_label = XMLPath(["data", "y"]), XMLPath(["data", "z"]), XMLPath(["data", "label"])
-            r = @test_logs (:warn, r"(?s)only in \"default\" \(dropped\): data/w.*only in \"other\" \(taking its values\): data/z.*not carried.*: data/label") min_level=Base.CoreLogging.Warn Monad(m; config="other", n_replicates=1)
+            warns, r = _warnings(() -> Monad(m; config="other", n_replicates=1))
+            @test length(warns) == 1 && occursin(r"(?s)only in \"default\" \(dropped\): data/w.*only in \"other\" \(taking its values\): data/z.*not carried.*: data/label", warns[1])
             @test r.inputs[:config].folder == "other"
             @test r.variation_id[:config] > 0
             @test getParameterValue(r, :config, xp_x) ≈ 4.0        # the varied value
@@ -7518,14 +7527,17 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                                                      db=ModelManager.locationVariationsDatabase(:config, r))
             @test Set(other_columns) == Set(["config_variation_id", "par_key", "data/x", "data/y"])
             # The same carry is the same row and the same monad; silenced, it says nothing.
-            r_again = @test_logs min_level=Base.CoreLogging.Warn Monad(m; config="other", warn_uncarried=false)
+            warns, r_again = _warnings(() -> Monad(m; config="other", warn_uncarried=false))
+            @test isempty(warns)
             @test r_again.id == r.id
             # Onto an identical file there is nothing to say: from the base monad no row is
             # written, and from m the row holds x alone.
             m_base = Monad(inputs)
-            twin = @test_logs min_level=Base.CoreLogging.Warn Monad(m_base; config="twin")
+            warns, twin = _warnings(() -> Monad(m_base; config="twin"))
+            @test isempty(warns)
             @test twin.variation_id[:config] == 0
-            twin_m = @test_logs min_level=Base.CoreLogging.Warn Monad(m; config="twin")
+            warns, twin_m = _warnings(() -> Monad(m; config="twin"))
+            @test isempty(warns)
             @test getParameterValue(twin_m, :config, xp_x) ≈ 4.0
             @test getParameterValue(twin_m, :config, xp_y) ≈ 2.0
             # :varied carries only the old row's deviations from its own base; :none carries nothing.
@@ -7547,7 +7559,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             # Siblings the walker can only tell apart by position cannot be addressed, so a
             # differing value there is reported and the new file's stands.
             mi = Monad(InputFolders(config="items_a", custom_code="default"))
-            ri = @test_logs (:warn, r"not carried.*: data/item:temp_id:1, data/item:temp_id:2") match_mode=:any Monad(mi; config="items_b")
+            warns, ri = _warnings(() -> Monad(mi; config="items_b"))
+            @test any(occursin(r"not carried.*: data/item:temp_id:1, data/item:temp_id:2", w) for w in warns)
             @test ri.variation_id[:config] == 0
             # A target with no parameter file is an empty parameter set: every old parameter is
             # reported as removed and the base row is used; with carry=:none there is no report.
@@ -7555,10 +7568,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             ic_res = ModelManager.addVariations(GridVariation(), ic_inputs, [DiscreteVariation(:ic_cell, XMLPath(["radius"]), [20.0])])
             mic = Monad(ic_inputs, ic_res.variation_ids[1])
             @test mic.variation_id[:ic_cell] > 0
-            mcsv = @test_logs (:warn, r"ic_cell \"disc\" -> \"csvdisc\", only in \"disc\" \(dropped\): radius") min_level=Base.CoreLogging.Warn Monad(mic; ic_cell="csvdisc")
+            warns, mcsv = _warnings(() -> Monad(mic; ic_cell="csvdisc"))
+            @test length(warns) == 1 && occursin(r"ic_cell \"disc\" -> \"csvdisc\", only in \"disc\" \(dropped\): radius", warns[1])
             @test mcsv.variation_id[:ic_cell] == 0
             @test !mcsv.inputs[:ic_cell].varied
-            mcsv_none = @test_logs min_level=Base.CoreLogging.Warn Monad(mic; ic_cell="csvdisc", carry=:none)
+            warns, mcsv_none = _warnings(() -> Monad(mic; ic_cell="csvdisc", carry=:none))
+            @test isempty(warns)
             @test mcsv_none.id == mcsv.id
 
             # Simulation: a new simulation with the monad's parameters in the new folders, which
@@ -7584,7 +7599,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test sampling2.inputs[:custom_code].folder == "other"
             @test [mm.variation_id for mm in sampling2.monads] == [mm.variation_id for mm in sampling.monads]
             @test all(mm.inputs == sampling2.inputs for mm in sampling2.monads)
-            sc2 = @test_logs (:warn, r"data/w") min_level=Base.CoreLogging.Warn Sampling(sampling; config="other")
+            warns, sc2 = _warnings(() -> Sampling(sampling; config="other"))
+            @test length(warns) == 1 && occursin("data/w", warns[1])
             @test [getParameterValue(mm, :config, xp_x) for mm in sc2.monads] ≈ [3.0, 4.0]
             @test all(getParameterValue(mm, :config, xp_y) ≈ 2.0 for mm in sc2.monads)
             @test Sampling(sampling).id == sampling.id
