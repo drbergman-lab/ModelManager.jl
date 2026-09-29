@@ -7403,8 +7403,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     ################## replacing an input folder ##################
 
     # Three locations, so a swap has both kinds of neighbour: a varied required location (config),
-    # a non-varied required one (custom_code) and a varied optional one (ic_cell). Two folders
-    # each where a swap needs somewhere to go.
+    # a non-varied required one (custom_code) and a varied optional one (ic_cell), each with
+    # somewhere for a swap to go.
     function _make_swap_project(dir::String)
         inputs_dir = joinpath(dir, "inputs")
         mkpath(joinpath(dir, "outputs"))
@@ -7422,19 +7422,36 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             [ic_cell]
             required = false
-            varied   = true
-            basename = "cells.xml"
+            varied   = [true, false]
+            basename = ["cells.xml", "cells.csv"]
             """)
         end
-        for folder in ("default", "other")
+        # "twin" is "default" again; "other" retunes y, drops w, adds z, changes the string label,
+        # turns the numeric mode into a word, and moves the seed by one -- past the whole numbers
+        # Float64 holds exactly, so parsed the two seeds are equal and only the text tells; the
+        # "items" pair differ only in siblings the walker can tell apart by position alone.
+        params(body) = "<params>\n  <data>\n" * body * "  </data>\n</params>\n"
+        shared = "    <seed>9007199254740993</seed>\n    <mode>3</mode>\n"
+        configs = Dict(
+            "default" => params("    <x>1.0</x>\n    <y>2.0</y>\n    <w>7.0</w>\n    <label>a</label>\n" * shared),
+            "twin"    => params("    <x>1.0</x>\n    <y>2.0</y>\n    <w>7.0</w>\n    <label>a</label>\n" * shared),
+            "other"   => params("    <x>1.0</x>\n    <y>5.0</y>\n    <z>9.0</z>\n    <label>b</label>\n    <seed>9007199254740992</seed>\n    <mode>fast</mode>\n"),
+            "items_a" => params("    <x>1.0</x>\n    <item>1</item>\n    <item>2</item>\n"),
+            "items_b" => params("    <x>1.0</x>\n    <item>3</item>\n    <item>4</item>\n"),
+        )
+        for (folder, xml) in configs
             mkpath(joinpath(inputs_dir, "configs", folder))
-            write(joinpath(inputs_dir, "configs", folder, "params.xml"),
-                  "<params>\n  <data>\n    <x>1.0</x>\n    <y>2.0</y>\n  </data>\n</params>\n")
+            write(joinpath(inputs_dir, "configs", folder, "params.xml"), xml)
+        end
+        for folder in ("default", "other")
             mkpath(joinpath(inputs_dir, "custom_codes", folder))
         end
         mkpath(joinpath(inputs_dir, "ic_cells", "disc"))
         write(joinpath(inputs_dir, "ic_cells", "disc", "cells.xml"),
               "<cells>\n  <radius>10.0</radius>\n</cells>\n")
+        # An initial condition with no parameter file: nothing for a carry to land on.
+        mkpath(joinpath(inputs_dir, "ic_cells", "csvdisc"))
+        write(joinpath(inputs_dir, "ic_cells", "csvdisc", "cells.csv"), "x,y,z,type\n0,0,0,default\n")
     end
 
     @testset "replacing an input folder keeps the parameter values" begin
@@ -7445,6 +7462,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             xp_x   = XMLPath(["data", "x"])
             inputs = InputFolders(config="default", custom_code="default")
+
+            # Warn-level records only. CI runs with JULIA_DEBUG=ModelManager, whose env override
+            # carries the row writer's @debug records past any logger's min_level, so @test_logs
+            # cannot be told to ignore them.
+            function _warnings(f)
+                logs, value = Test.collect_test_logs(f)
+                return [string(l.message) for l in logs if l.level == Base.CoreLogging.Warn], value
+            end
 
             # InputFolders: a copy keeps every location, a keyword replaces one, an unused
             # location stays unused, and a mistyped location is an error rather than a no-op.
@@ -7487,21 +7512,75 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test m4.variation_id[:ic_cell] == -1
             @test m4.id == m.id
 
-            # The folder a positive variation ID lives in cannot be replaced -- the error names
-            # the location and the ID -- but with the base row in effect there is nothing to carry.
-            err = try
-                Monad(m; config="other")
-                nothing
-            catch e
-                e
-            end
-            @test err isa ArgumentError
-            @test occursin("config", err.msg)
-            @test occursin("variation ID $(vid[:config])", err.msg)
-            m_base  = Monad(inputs)
-            m_base2 = Monad(m_base; config="other")
-            @test m_base2.inputs[:config].folder == "other"
-            @test m_base2.variation_id[:config] == 0
+            # --- carrying the values onto a restructured base file ---
+            # m varies x to 4.0 over "default" (x=1, y=2, w=7, label=a); "other" retuned y to 5,
+            # dropped w, added z=9 and relabelled. The default carry keeps every value the old
+            # monad ran with wherever the new file has the parameter, and reports the rest.
+            xp_y, xp_z, xp_label = XMLPath(["data", "y"]), XMLPath(["data", "z"]), XMLPath(["data", "label"])
+            xp_seed, xp_mode = XMLPath(["data", "seed"]), XMLPath(["data", "mode"])
+            warns, r = _warnings(() -> Monad(m; config="other", n_replicates=1))
+            @test length(warns) == 1 && occursin(r"(?s)only in \"default\" \(dropped\): data/w.*only in \"other\" \(taking its values\): data/z.*not carried.*: data/label, data/mode, data/seed", warns[1])
+            @test r.inputs[:config].folder == "other"
+            @test r.variation_id[:config] > 0
+            @test getParameterValue(r, :config, xp_x) ≈ 4.0        # the varied value
+            @test getParameterValue(r, :config, xp_y) ≈ 2.0        # the old base value, not the retuned 5.0
+            @test getParameterValue(r, :config, xp_z) ≈ 9.0        # only in "other": its own value
+            @test getParameterValue(r, :config, xp_label) == "b"   # a string cannot be carried...
+            @test getParameterValue(r, :config, xp_mode) == "fast" # ...on either side...
+            @test getParameterValue(r, :config, xp_seed) == 9007199254740992.0   # ...nor a whole number Float64 would round
+            # The row holds exactly the differences.
+            other_columns = ModelManager.tableColumns(ModelManager.locationVariationsTableName(:config);
+                                                     db=ModelManager.locationVariationsDatabase(:config, r))
+            @test Set(other_columns) == Set(["config_variation_id", "par_key", "data/x", "data/y"])
+            # The same carry is the same row and the same monad; silenced, it says nothing.
+            warns, r_again = _warnings(() -> Monad(m; config="other", warn_uncarried=false))
+            @test isempty(warns)
+            @test r_again.id == r.id
+            # Onto an identical file there is nothing to say: from the base monad no row is
+            # written, and from m the row holds x alone.
+            m_base = Monad(inputs)
+            warns, twin = _warnings(() -> Monad(m_base; config="twin"))
+            @test isempty(warns)
+            @test twin.variation_id[:config] == 0
+            warns, twin_m = _warnings(() -> Monad(m; config="twin"))
+            @test isempty(warns)
+            @test getParameterValue(twin_m, :config, xp_x) ≈ 4.0
+            @test getParameterValue(twin_m, :config, xp_y) ≈ 2.0
+            # :varied carries only the old row's deviations from its own base; :none carries nothing.
+            rv = Monad(m; config="other", carry=:varied, warn_uncarried=false)
+            @test getParameterValue(rv, :config, xp_x) ≈ 4.0
+            @test getParameterValue(rv, :config, xp_y) ≈ 5.0
+            @test rv.id != r.id
+            rn = Monad(m; config="other", carry=:none)
+            @test rn.variation_id[:config] == 0
+            @test getParameterValue(rn, :config, xp_x) ≈ 1.0
+            @test_throws ArgumentError Monad(m; config="other", carry=:some)
+            # A base monad moved onto retuned defaults keeps its own.
+            mb = Monad(m_base; config="other", warn_uncarried=false)
+            @test mb.variation_id[:config] > 0
+            @test getParameterValue(mb, :config, xp_y) ≈ 2.0
+            # Simulation goes through the same carry.
+            sc = Simulation(m; config="other", warn_uncarried=false)
+            @test sc.variation_id == r.variation_id
+            # Siblings the walker can only tell apart by position cannot be addressed, so a
+            # differing value there is reported and the new file's stands.
+            mi = Monad(InputFolders(config="items_a", custom_code="default"))
+            warns, ri = _warnings(() -> Monad(mi; config="items_b"))
+            @test length(warns) == 1 && occursin(r"not carried.*: data/item:temp_id:1, data/item:temp_id:2", warns[1])
+            @test ri.variation_id[:config] == 0
+            # A target with no parameter file is an empty parameter set: every old parameter is
+            # reported as removed and the base row is used; with carry=:none there is no report.
+            ic_inputs = InputFolders(config="default", custom_code="default", ic_cell="disc")
+            ic_res = ModelManager.addVariations(GridVariation(), ic_inputs, [DiscreteVariation(:ic_cell, XMLPath(["radius"]), [20.0])])
+            mic = Monad(ic_inputs, ic_res.variation_ids[1])
+            @test mic.variation_id[:ic_cell] > 0
+            warns, mcsv = _warnings(() -> Monad(mic; ic_cell="csvdisc"))
+            @test length(warns) == 1 && occursin(r"ic_cell \"disc\" -> \"csvdisc\", only in \"disc\" \(dropped\): radius", warns[1])
+            @test mcsv.variation_id[:ic_cell] == 0
+            @test !mcsv.inputs[:ic_cell].varied
+            warns, mcsv_none = _warnings(() -> Monad(mic; ic_cell="csvdisc", carry=:none))
+            @test isempty(warns)
+            @test mcsv_none.id == mcsv.id
 
             # Simulation: a new simulation with the monad's parameters in the new folders, which
             # resolves to the replaced monad's parameterization.
@@ -7517,15 +7596,22 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test !(s0.id in simulationIDs(m5))
             @test s0.id in simulationIDs(Monad(s0))
 
-            # Sampling: every monad's VariationID survives; the inputs are new; the same refusal
-            # applies; and no keyword is the existing sampling.
+            # Sampling: a change of non-varied folder keeps every monad's VariationID; a change of
+            # varied folder carries every monad's values, with one report; no keyword is the
+            # existing sampling.
             sampling  = Sampling(inputs, res.variation_ids; n_replicates=1)
             sampling2 = Sampling(sampling; custom_code="other", n_replicates=1)
             @test sampling2.id != sampling.id
             @test sampling2.inputs[:custom_code].folder == "other"
             @test [mm.variation_id for mm in sampling2.monads] == [mm.variation_id for mm in sampling.monads]
             @test all(mm.inputs == sampling2.inputs for mm in sampling2.monads)
-            @test_throws ArgumentError Sampling(sampling; config="other")
+            warns, sc2 = _warnings(() -> Sampling(sampling; config="other"))
+            @test length(warns) == 1 && occursin("data/w", warns[1])
+            @test [getParameterValue(mm, :config, xp_x) for mm in sc2.monads] ≈ [3.0, 4.0]
+            @test all(getParameterValue(mm, :config, xp_y) ≈ 2.0 for mm in sc2.monads)
+            sc3 = Sampling(sampling; config="other", carry=:varied, warn_uncarried=false)
+            @test [getParameterValue(mm, :config, xp_x) for mm in sc3.monads] ≈ [3.0, 4.0]
+            @test all(getParameterValue(mm, :config, xp_y) ≈ 5.0 for mm in sc3.monads)
             @test Sampling(sampling).id == sampling.id
 
             # The replaced monad runs.
