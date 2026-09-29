@@ -1671,9 +1671,7 @@ end
 function getAllParameterValues(M::AbstractMonad)
     D = Dict{String,Any}()
     for (loc, input_folder) in pairs(M.inputs.input_folders)
-        if !input_folder.varied || isempty(input_folder.folder)
-            continue
-        end
+        input_folder.varied || continue
         merge!(D, _xmlParameterValues(createXMLFile(loc, M)))
     end
     return DataFrame(D)
@@ -1685,11 +1683,13 @@ function getAllParameterValues(simulation_id::Int)
 end
 
 #! Every terminal element of one XML file, keyed by the column name its path would have in a
-#! variations table: the walk `getAllParameterValues` does, on a file rather than a monad.
-function _xmlParameterValues(path_to_xml::AbstractString)
+#! variations table: the walk `getAllParameterValues` does, on a file rather than a monad. The
+#! carry reads the text as written (`parsed=false`), since parsing rounds a whole number beyond
+#! what `Float64` holds exactly, and reports ambiguous paths through its own warning.
+function _xmlParameterValues(path_to_xml::AbstractString; parsed::Bool=true, warn_ambiguous::Bool=true)
     D = Dict{String,Any}()
     xml_doc = parse_file(path_to_xml)
-    recurseToGetParameterValues!(D, String[], root(xml_doc))
+    recurseToGetParameterValues!(D, String[], root(xml_doc); parsed=parsed, warn_ambiguous=warn_ambiguous)
     free(xml_doc)
     return D
 end
@@ -1699,16 +1699,14 @@ end
 #! target's from its base file, walked once per folder and cached on the context. What differs
 #! and can be written becomes one row through `addVariations`, so column creation, typing and
 #! `par_key` dedup are the usual ones and an identical carry finds the row it made before. A
-#! difference that cannot be written -- a string value, since a row's key is built from `Float64`
-#! bytes, or a `temp_id` path, which `setSimpleContent` has no way to address -- is reported and
-#! the new file's value stands. A target folder holding no parameter file (a CSV initial
-#! condition, say) is an empty parameter set: every old parameter is reported as removed and the
-#! base row is used.
+#! difference that cannot be written (see `_carriedValue`) is reported and the new file's value
+#! stands. A target folder holding no parameter file (a CSV initial condition, say) is an empty
+#! parameter set: every old parameter is reported as removed and the base row is used.
 function _carryLocation!(ctx::_CarryContext, M::AbstractMonad, loc::Symbol, inputs::InputFolders)
     new_folder = inputs[loc]
-    new_base = new_folder.varied ? get!(() -> _xmlParameterValues(prepareBaseFile(new_folder)), ctx.new_bases, loc) :
+    new_base = new_folder.varied ? get!(() -> _xmlParameterValues(prepareBaseFile(new_folder); parsed=false, warn_ambiguous=false), ctx.new_bases, loc) :
                                    Dict{String,Any}()
-    old = _xmlParameterValues(createXMLFile(loc, M))
+    old = _xmlParameterValues(createXMLFile(loc, M); parsed=false, warn_ambiguous=false)
     ctx.folders[loc] = (M.inputs[loc].folder, new_folder.folder)
     for path in setdiff(keys(old), keys(new_base))
         push!(ctx.removed, (loc, path))
@@ -1719,30 +1717,52 @@ function _carryLocation!(ctx::_CarryContext, M::AbstractMonad, loc::Symbol, inpu
 
     candidates = collect(keys(old))
     if ctx.carry == :varied
-        old_base = _xmlParameterValues(prepareBaseFile(M.inputs[loc]))
+        old_folder = M.inputs[loc]
+        old_base = get!(() -> _xmlParameterValues(prepareBaseFile(old_folder); parsed=false, warn_ambiguous=false),
+                        ctx.old_bases, (loc, old_folder.folder))
         filter!(path -> !_sameValue(old[path], get(old_base, path, nothing)), candidates)
     end
     dvs = DiscreteVariation[]
     for path in sort!(candidates)
         haskey(new_base, path) || continue
-        value = old[path]
-        _sameValue(value, new_base[path]) && continue
-        if value isa AbstractString || occursin(":temp_id:", path)
+        _sameValue(old[path], new_base[path]) && continue
+        value = _carriedValue(path, old[path], new_base[path])
+        if isnothing(value)
             push!(ctx.uncarriable, (loc, path))
             continue
         end
-        push!(dvs, DiscreteVariation(loc, XMLPath(columnNameToXMLPath(path)), [_carriedValue(value)]))
+        push!(dvs, DiscreteVariation(loc, XMLPath(columnNameToXMLPath(path)), [value]))
     end
     isempty(dvs) && return 0
     return addVariations(GridVariation(), inputs, dvs, VariationID(inputs)).variation_ids[1][loc]
 end
 
-#! Parsed values, so "1" and "1.0" agree; typed, so `1.0` and `true` do not.
-_sameValue(a, b) = typeof(a) == typeof(b) && a == b
+#! Two values as written in their files, compared parsed, so "1" and "1.0" agree and `1.0` and
+#! `true` do not -- except beyond the whole numbers `Float64` holds exactly, where parsing rounds
+#! and only the text can tell two values apart.
+function _sameValue(a::AbstractString, b::AbstractString)
+    pa, pb = parseValueFromString(String(a)), parseValueFromString(String(b))
+    typeof(pa) == typeof(pb) || return false
+    _beyondExactInteger(pa) && return strip(a) == strip(b)
+    return pa == pb
+end
+_sameValue(::AbstractString, ::Nothing) = false
 
-#! A whole number read from the file is written back as one, so `<n>100</n>` does not become `100.0`.
-_carriedValue(v::Float64) = isinteger(v) && abs(v) < 2.0^53 ? Int(v) : v
-_carriedValue(v) = v
+_beyondExactInteger(v) = v isa Float64 && isinteger(v) && abs(v) >= 2.0^53
+
+#! The value to write for a carried difference, or `nothing` when it cannot be written: a string
+#! on either side (only numeric and Bool columns exist, and `addColumns` parses the target's
+#! default as a number), a `temp_id` path (`setSimpleContent` cannot address it), or a whole
+#! number beyond what `Float64` holds exactly, which the row key would round. A whole number
+#! within that range is written as an `Int`, so `<n>100</n>` does not become `100.0`.
+function _carriedValue(path::AbstractString, old_text::AbstractString, new_text::AbstractString)
+    occursin(":temp_id:", path) && return nothing
+    old_value, new_value = parseValueFromString(String(old_text)), parseValueFromString(String(new_text))
+    (old_value isa AbstractString || new_value isa AbstractString) && return nothing
+    _beyondExactInteger(old_value) && return nothing
+    old_value isa Float64 && isinteger(old_value) && return Int(old_value)
+    return old_value
+end
 
 function _warnUncarried(ctx::_CarryContext)
     lines = String[]
@@ -1750,7 +1770,7 @@ function _warnUncarried(ctx::_CarryContext)
         old_folder, new_folder = ctx.folders[loc]
         for (paths, what) in ((ctx.removed, "only in $(repr(old_folder)) (dropped)"),
                               (ctx.added, "only in $(repr(new_folder)) (taking its values)"),
-                              (ctx.uncarriable, "not carried (string-valued or ambiguous path; taking $(repr(new_folder))'s values)"))
+                              (ctx.uncarriable, "not carried (string-valued, too large a whole number, or ambiguous path; taking $(repr(new_folder))'s values)"))
             these = sort!([path for (l, path) in paths if l == loc])
             isempty(these) || push!(lines, "  $(loc) $(repr(old_folder)) -> $(repr(new_folder)), $(what): $(join(these, ", "))")
         end
@@ -1760,16 +1780,18 @@ function _warnUncarried(ctx::_CarryContext)
 end
 
 """
-    recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{String}, element::XMLElement)
+    recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{String}, element::XMLElement; parsed=true, warn_ambiguous=true)
 
 Recursively traverse the XML element tree to extract parameter values into `D`.
-Used by [`getAllParameterValues`](@ref).
+Used by [`getAllParameterValues`](@ref). With `parsed=false` the values are the elements' text
+as written; `warn_ambiguous=false` silences the warning about siblings told apart by position.
 """
-function recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{String}, element::XMLElement)
+function recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{String}, element::XMLElement;
+                                      parsed::Bool=true, warn_ambiguous::Bool=true)
     if elementIsTerminal(element)
         v = content(element)
         key = columnName(XMLPath(current_path))
-        D[key] = parseValueFromString(v)
+        D[key] = parsed ? parseValueFromString(v) : v
         return
     end
     child_tags = [name(c) for c in child_elements(element)]
@@ -1782,12 +1804,12 @@ function recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{
             for attr in priority_attributes
                 if attr in common_attributes
                     priority_attribute_found = true
-                    recurseToGetParameterValues!(D, [current_path; "$tag:$attr:$(attribute(these_children[1], attr))"], these_children[1])
+                    recurseToGetParameterValues!(D, [current_path; "$tag:$attr:$(attribute(these_children[1], attr))"], these_children[1]; parsed=parsed, warn_ambiguous=warn_ambiguous)
                     break
                 end
             end
             if !priority_attribute_found
-                recurseToGetParameterValues!(D, [current_path; tag], these_children[1])
+                recurseToGetParameterValues!(D, [current_path; tag], these_children[1]; parsed=parsed, warn_ambiguous=warn_ambiguous)
             end
             continue
         end
@@ -1812,13 +1834,13 @@ function recurseToGetParameterValues!(D::Dict{String,Any}, current_path::Vector{
             end
         end
         if isnothing(unique_attribute)
-            @warn "Could not find unique attribute to distinguish between multiple children with tag $(tag) under path $(columnName(current_path)). Adding artificial IDs to make unique keys."
+            warn_ambiguous && @warn "Could not find unique attribute to distinguish between multiple children with tag $(tag) under path $(columnName(current_path)). Adding artificial IDs to make unique keys."
             for (i, c) in enumerate(these_children)
-                recurseToGetParameterValues!(D, [current_path; "$tag:temp_id:$i"], c)
+                recurseToGetParameterValues!(D, [current_path; "$tag:temp_id:$i"], c; parsed=parsed, warn_ambiguous=warn_ambiguous)
             end
         else
             for c in these_children
-                recurseToGetParameterValues!(D, [current_path; "$tag:$unique_attribute:$(attribute(c, unique_attribute))"], c)
+                recurseToGetParameterValues!(D, [current_path; "$tag:$unique_attribute:$(attribute(c, unique_attribute))"], c; parsed=parsed, warn_ambiguous=warn_ambiguous)
             end
         end
     end

@@ -134,8 +134,8 @@ present in both files keeps the value the old monad ran with, so the change of s
 only change. `carry=:varied` carries only what the old variation row set, and `carry=:none`
 takes the new file as it is. Whatever differs from the new file becomes one variation row in the
 new folder. Parameters present in only one of the two files, and values that cannot be carried
-(strings, or a path the file gives no way to address), are listed in a warning that
-`warn_uncarried=false` silences.
+(strings, whole numbers too large for `Float64` to hold exactly, or a path the file gives no
+way to address), are listed in a warning that `warn_uncarried=false` silences.
 
 ## Asking what a trial contains
 

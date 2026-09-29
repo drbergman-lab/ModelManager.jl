@@ -272,6 +272,7 @@ Base.getindex(variation_id::VariationID, loc::Symbol)::Int = variation_id.ids[lo
 struct _CarryContext
     carry::Symbol
     new_bases::Dict{Symbol,Dict{String,Any}}
+    old_bases::Dict{Tuple{Symbol,String},Dict{String,Any}}
     folders::Dict{Symbol,Tuple{String,String}}
     removed::Set{Tuple{Symbol,String}}
     added::Set{Tuple{Symbol,String}}
@@ -280,7 +281,8 @@ end
 
 function _CarryContext(carry::Symbol)
     carry in (:all, :varied, :none) || throw(ArgumentError("carry must be :all, :varied or :none. Got $(repr(carry))."))
-    return _CarryContext(carry, Dict{Symbol,Dict{String,Any}}(), Dict{Symbol,Tuple{String,String}}(),
+    return _CarryContext(carry, Dict{Symbol,Dict{String,Any}}(), Dict{Tuple{Symbol,String},Dict{String,Any}}(),
+                         Dict{Symbol,Tuple{String,String}}(),
                          Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}())
 end
 
@@ -510,8 +512,9 @@ another's — and `carry` chooses what travels:
 
 What differs is written as one variation row in the new folder (none if nothing differs), so
 the same carry twice is the same row. Parameters present in only one of the two files, and
-differing values that cannot be carried (string-valued, or under a path the file gives no way to
-address), are listed in one warning; `warn_uncarried=false` silences it. A location taken out of
+differing values that cannot be carried (a string on either side, a whole number too large for
+`Float64` to hold exactly, or a path the file gives no way to address), are listed in one
+warning; `warn_uncarried=false` silences it. A location taken out of
 use goes to `-1`; one brought into use starts at `0`.
 """
 struct Monad <: AbstractMonad

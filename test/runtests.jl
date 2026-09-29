@@ -7426,13 +7426,16 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             basename = ["cells.xml", "cells.csv"]
             """)
         end
-        # "twin" is "default" again; "other" retunes y, drops w, adds z and changes the string
-        # label; the "items" pair differ only in siblings the walker can tell apart by position alone.
+        # "twin" is "default" again; "other" retunes y, drops w, adds z, changes the string label,
+        # turns the numeric mode into a word, and moves the seed by one -- past the whole numbers
+        # Float64 holds exactly, so parsed the two seeds are equal and only the text tells; the
+        # "items" pair differ only in siblings the walker can tell apart by position alone.
         params(body) = "<params>\n  <data>\n" * body * "  </data>\n</params>\n"
+        shared = "    <seed>9007199254740993</seed>\n    <mode>3</mode>\n"
         configs = Dict(
-            "default" => params("    <x>1.0</x>\n    <y>2.0</y>\n    <w>7.0</w>\n    <label>a</label>\n"),
-            "twin"    => params("    <x>1.0</x>\n    <y>2.0</y>\n    <w>7.0</w>\n    <label>a</label>\n"),
-            "other"   => params("    <x>1.0</x>\n    <y>5.0</y>\n    <z>9.0</z>\n    <label>b</label>\n"),
+            "default" => params("    <x>1.0</x>\n    <y>2.0</y>\n    <w>7.0</w>\n    <label>a</label>\n" * shared),
+            "twin"    => params("    <x>1.0</x>\n    <y>2.0</y>\n    <w>7.0</w>\n    <label>a</label>\n" * shared),
+            "other"   => params("    <x>1.0</x>\n    <y>5.0</y>\n    <z>9.0</z>\n    <label>b</label>\n    <seed>9007199254740992</seed>\n    <mode>fast</mode>\n"),
             "items_a" => params("    <x>1.0</x>\n    <item>1</item>\n    <item>2</item>\n"),
             "items_b" => params("    <x>1.0</x>\n    <item>3</item>\n    <item>4</item>\n"),
         )
@@ -7514,14 +7517,17 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             # dropped w, added z=9 and relabelled. The default carry keeps every value the old
             # monad ran with wherever the new file has the parameter, and reports the rest.
             xp_y, xp_z, xp_label = XMLPath(["data", "y"]), XMLPath(["data", "z"]), XMLPath(["data", "label"])
+            xp_seed, xp_mode = XMLPath(["data", "seed"]), XMLPath(["data", "mode"])
             warns, r = _warnings(() -> Monad(m; config="other", n_replicates=1))
-            @test length(warns) == 1 && occursin(r"(?s)only in \"default\" \(dropped\): data/w.*only in \"other\" \(taking its values\): data/z.*not carried.*: data/label", warns[1])
+            @test length(warns) == 1 && occursin(r"(?s)only in \"default\" \(dropped\): data/w.*only in \"other\" \(taking its values\): data/z.*not carried.*: data/label, data/mode, data/seed", warns[1])
             @test r.inputs[:config].folder == "other"
             @test r.variation_id[:config] > 0
             @test getParameterValue(r, :config, xp_x) ≈ 4.0        # the varied value
             @test getParameterValue(r, :config, xp_y) ≈ 2.0        # the old base value, not the retuned 5.0
             @test getParameterValue(r, :config, xp_z) ≈ 9.0        # only in "other": its own value
-            @test getParameterValue(r, :config, xp_label) == "b"   # a string cannot be carried
+            @test getParameterValue(r, :config, xp_label) == "b"   # a string cannot be carried...
+            @test getParameterValue(r, :config, xp_mode) == "fast" # ...on either side...
+            @test getParameterValue(r, :config, xp_seed) == 9007199254740992.0   # ...nor a whole number Float64 would round
             # The row holds exactly the differences.
             other_columns = ModelManager.tableColumns(ModelManager.locationVariationsTableName(:config);
                                                      db=ModelManager.locationVariationsDatabase(:config, r))
@@ -7560,7 +7566,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             # differing value there is reported and the new file's stands.
             mi = Monad(InputFolders(config="items_a", custom_code="default"))
             warns, ri = _warnings(() -> Monad(mi; config="items_b"))
-            @test any(occursin(r"not carried.*: data/item:temp_id:1, data/item:temp_id:2", w) for w in warns)
+            @test length(warns) == 1 && occursin(r"not carried.*: data/item:temp_id:1, data/item:temp_id:2", warns[1])
             @test ri.variation_id[:config] == 0
             # A target with no parameter file is an empty parameter set: every old parameter is
             # reported as removed and the base row is used; with carry=:none there is no report.
@@ -7603,6 +7609,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test length(warns) == 1 && occursin("data/w", warns[1])
             @test [getParameterValue(mm, :config, xp_x) for mm in sc2.monads] ≈ [3.0, 4.0]
             @test all(getParameterValue(mm, :config, xp_y) ≈ 2.0 for mm in sc2.monads)
+            sc3 = Sampling(sampling; config="other", carry=:varied, warn_uncarried=false)
+            @test [getParameterValue(mm, :config, xp_x) for mm in sc3.monads] ≈ [3.0, 4.0]
+            @test all(getParameterValue(mm, :config, xp_y) ≈ 5.0 for mm in sc3.monads)
             @test Sampling(sampling).id == sampling.id
 
             # The replaced monad runs.

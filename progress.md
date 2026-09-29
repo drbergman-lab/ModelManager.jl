@@ -58,6 +58,17 @@ simulator-specific, so it lands in ModelManager.
   draft that threw here). Moving a varied `cells.xml` initial condition onto a CSV one has nothing
   to carry onto: every old parameter is reported as removed and the base row is used. No throw is
   left in the copy constructors except an invalid `carry`.
+- **Review pass (Copilot on #79).** Four findings taken: a whole number beyond what `Float64`
+  holds exactly was rounded by the walker's parse before the carry ever saw it, so two seeds one
+  apart compared equal and a differing one was written rounded -- the carry now reads the text
+  as written, compares parsed except in that range, and reports such values rather than writing
+  them; a value that is a string in the *new* file only made `addColumns` throw on the target's
+  default, so a string on either side is uncarriable; the walker's per-sibling ambiguity warning
+  fired once per walk during a carry and `warn_uncarried=false` could not reach it, so the walker
+  takes `warn_ambiguous` and the aggregated warning is the one report; the old base file is
+  cached on the context for `:varied` over a sampling. Two declined by the user: recording paths
+  for the XML-to-unused and CSV-to-XML transitions (the user already knows every path went or
+  came), and validating `carry` on the no-keyword fast paths (no carry happens there).
 - **`Monad(simulation; custom_code=...)` does not enrol the simulation.** With no keyword it adds
   the simulation to the monad's replicate list as before; with a replaced folder the simulation's
   inputs are no longer the monad's, so it is left where it is. Decided by an inputs equality
