@@ -111,6 +111,32 @@ You can also start from an existing reference monad to inherit its fixed paramet
 new_trial = createTrial(reference_monad, more_variations...)
 ```
 
+## Same parameters, different input folders
+
+A calibrated parameter set is worth re-running under a changed model — revised custom code, a
+config with a cell type added or a rule removed, a different initial condition — with the
+parameter values it was calibrated to. Every constructor that takes an existing trial accepts the
+location keywords [`InputFolders`](@ref) does and keeps the values:
+
+```julia
+posterior_monad = Monad(42)
+new_monad = Monad(posterior_monad; custom_code="revised_code", n_replicates=10)
+run(new_monad)
+
+Monad(posterior_monad; config="with_extra_substrate")   # same values, restructured config
+Sampling(sampling; ic_cell="dense_disc")                 # every monad's values, a new initial condition
+```
+
+A location holding no parameter file, like `custom_code`, keeps its [`VariationID`](@ref) as it
+is. For a varied location the *values* are carried instead — a variation ID is a row in one
+folder's table and means nothing in another's — and by default all of them: every parameter
+present in both files keeps the value the old monad ran with, so the change of structure is the
+only change. `carry=:varied` carries only what the old variation row set, and `carry=:none`
+takes the new file as it is. Whatever differs from the new file becomes one variation row in the
+new folder. Parameters present in only one of the two files, and values that cannot be carried
+(strings, whole numbers too large for `Float64` to hold exactly, or a path the file gives no
+way to address), are listed in a warning that `warn_uncarried=false` silences.
+
 ## Asking what a trial contains
 
 | Function | Returns | Levels |
