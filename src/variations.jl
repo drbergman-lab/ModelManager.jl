@@ -1671,21 +1671,10 @@ end
 function getAllParameterValues(M::AbstractMonad)
     D = Dict{String,Any}()
     for (loc, input_folder) in pairs(M.inputs.input_folders)
-        if !input_folder.varied
+        if !input_folder.varied || isempty(input_folder.folder)
             continue
         end
-
-        if isempty(input_folder.folder)
-            continue
-        end
-
-        path_to_xml = createXMLFile(loc, M)
-        xml_doc = parse_file(path_to_xml)
-        xml_root = root(xml_doc)
-        current_path = String[]
-
-        recurseToGetParameterValues!(D, current_path, xml_root)
-        free(xml_doc)
+        merge!(D, _xmlParameterValues(createXMLFile(loc, M)))
     end
     return DataFrame(D)
 end
@@ -1693,6 +1682,81 @@ end
 function getAllParameterValues(simulation_id::Int)
     simulation = Simulation(simulation_id)
     return getAllParameterValues(simulation)
+end
+
+#! Every terminal element of one XML file, keyed by the column name its path would have in a
+#! variations table: the walk `getAllParameterValues` does, on a file rather than a monad.
+function _xmlParameterValues(path_to_xml::AbstractString)
+    D = Dict{String,Any}()
+    xml_doc = parse_file(path_to_xml)
+    recurseToGetParameterValues!(D, String[], root(xml_doc))
+    free(xml_doc)
+    return D
+end
+
+#! Carry `M`'s `loc` parameters onto the folder `inputs[loc]` and return the variation ID they
+#! land on. The old monad's effective values come from its variation file (base plus row); the
+#! target's from its base file, walked once per folder and cached on the context. What differs
+#! and can be written becomes one row through `addVariations`, so column creation, typing and
+#! `par_key` dedup are the usual ones and an identical carry finds the row it made before. A
+#! difference that cannot be written -- a string value, since a row's key is built from `Float64`
+#! bytes, or a `temp_id` path, which `setSimpleContent` has no way to address -- is reported and
+#! the new file's value stands. A target folder holding no parameter file (a CSV initial
+#! condition, say) is an empty parameter set: every old parameter is reported as removed and the
+#! base row is used.
+function _carryLocation!(ctx::_CarryContext, M::AbstractMonad, loc::Symbol, inputs::InputFolders)
+    new_folder = inputs[loc]
+    new_base = new_folder.varied ? get!(() -> _xmlParameterValues(prepareBaseFile(new_folder)), ctx.new_bases, loc) :
+                                   Dict{String,Any}()
+    old = _xmlParameterValues(createXMLFile(loc, M))
+    ctx.folders[loc] = (M.inputs[loc].folder, new_folder.folder)
+    for path in setdiff(keys(old), keys(new_base))
+        push!(ctx.removed, (loc, path))
+    end
+    for path in setdiff(keys(new_base), keys(old))
+        push!(ctx.added, (loc, path))
+    end
+
+    candidates = collect(keys(old))
+    if ctx.carry == :varied
+        old_base = _xmlParameterValues(prepareBaseFile(M.inputs[loc]))
+        filter!(path -> !_sameValue(old[path], get(old_base, path, nothing)), candidates)
+    end
+    dvs = DiscreteVariation[]
+    for path in sort!(candidates)
+        haskey(new_base, path) || continue
+        value = old[path]
+        _sameValue(value, new_base[path]) && continue
+        if value isa AbstractString || occursin(":temp_id:", path)
+            push!(ctx.uncarriable, (loc, path))
+            continue
+        end
+        push!(dvs, DiscreteVariation(loc, XMLPath(columnNameToXMLPath(path)), [_carriedValue(value)]))
+    end
+    isempty(dvs) && return 0
+    return addVariations(GridVariation(), inputs, dvs, VariationID(inputs)).variation_ids[1][loc]
+end
+
+#! Parsed values, so "1" and "1.0" agree; typed, so `1.0` and `true` do not.
+_sameValue(a, b) = typeof(a) == typeof(b) && a == b
+
+#! A whole number read from the file is written back as one, so `<n>100</n>` does not become `100.0`.
+_carriedValue(v::Float64) = isinteger(v) && abs(v) < 2.0^53 ? Int(v) : v
+_carriedValue(v) = v
+
+function _warnUncarried(ctx::_CarryContext)
+    lines = String[]
+    for loc in sort!(collect(keys(ctx.folders)))
+        old_folder, new_folder = ctx.folders[loc]
+        for (paths, what) in ((ctx.removed, "only in $(repr(old_folder)) (dropped)"),
+                              (ctx.added, "only in $(repr(new_folder)) (taking its values)"),
+                              (ctx.uncarriable, "not carried (string-valued or ambiguous path; taking $(repr(new_folder))'s values)"))
+            these = sort!([path for (l, path) in paths if l == loc])
+            isempty(these) || push!(lines, "  $(loc) $(repr(old_folder)) -> $(repr(new_folder)), $(what): $(join(these, ", "))")
+        end
+    end
+    isempty(lines) || @warn "Carrying parameter values onto a different base file:\n" * join(lines, "\n")
+    return nothing
 end
 
 """

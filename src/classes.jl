@@ -265,24 +265,44 @@ end
 
 Base.getindex(variation_id::VariationID, loc::Symbol)::Int = variation_id.ids[loc]
 
+#! Everything one copy needs to carry parameter values across a change of varied folder, and
+#! what it could not carry, accumulated so a `Sampling` reports once for all of its monads.
+#! `carry` is `:all` (the old monad's whole effective parameter set), `:varied` (only where the
+#! old variation row deviates from its own base file) or `:none` (the new folder's base row).
+struct _CarryContext
+    carry::Symbol
+    new_bases::Dict{Symbol,Dict{String,Any}}
+    folders::Dict{Symbol,Tuple{String,String}}
+    removed::Set{Tuple{Symbol,String}}
+    added::Set{Tuple{Symbol,String}}
+    uncarriable::Set{Tuple{Symbol,String}}
+end
+
+function _CarryContext(carry::Symbol)
+    carry in (:all, :varied, :none) || throw(ArgumentError("carry must be :all, :varied or :none. Got $(repr(carry))."))
+    return _CarryContext(carry, Dict{Symbol,Dict{String,Any}}(), Dict{Symbol,Tuple{String,String}}(),
+                         Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}())
+end
+
 #! The variation IDs a copy of `M` keeps when its input folders become `inputs`. A variation ID
-#! is a row in one folder's variations table, so it survives only where the folder did not
-#! change. Where it did, the new folder starts from its own base row (`0`), or `-1` if the
-#! location is no longer in use -- which is also what lets the ID tuple change *shape*: a
-#! location that was unused (`-1`) and now has a folder needs a `0`, not the old `-1`. A changed
-#! location that carried a real variation (`> 0`) is refused rather than remapped, because the
-#! same number in the new folder's table is an unrelated parameter set.
-function _carriedVariationID(M::AbstractMonad, inputs::InputFolders)
-    base = VariationID(inputs)
+#! is a row in one folder's variations table, so it survives verbatim only where the folder did
+#! not change. A location leaving use gets `-1`; one entering use, or whose old folder holds no
+#! parameter file, starts at the new folder's base row -- which is also what lets the ID tuple
+#! change *shape*. Where the old folder holds a parameter file, the old monad's values are
+#! carried onto the new folder by `_carryLocation!`, as a fresh row when anything differs;
+#! `carry=:none` skips that and takes the new base row.
+function _carriedVariationID(M::AbstractMonad, inputs::InputFolders, ctx::_CarryContext)
     ids = Pair{Symbol,Int}[]
     for loc in projectLocations().varied
-        old_id = M.variation_id[loc]
-        if M.inputs[loc].folder == inputs[loc].folder
-            push!(ids, loc => old_id)
-        elseif old_id > 0
-            throw(ArgumentError("Cannot replace the $(loc) folder $(repr(M.inputs[loc].folder)) with $(repr(inputs[loc].folder)): its variation ID $(old_id) is a row in the old folder's variations table and does not carry over. A location can be replaced only while its variation ID is 0 (base file) or -1 (unused)."))
+        old_folder, new_folder = M.inputs[loc], inputs[loc]
+        if old_folder.folder == new_folder.folder
+            push!(ids, loc => M.variation_id[loc])
+        elseif new_folder.id == -1
+            push!(ids, loc => -1)
+        elseif old_folder.id == -1 || !old_folder.varied || ctx.carry == :none
+            push!(ids, loc => 0)
         else
-            push!(ids, loc => base[loc])
+            push!(ids, loc => _carryLocation!(ctx, M, loc, inputs))
         end
     end
     return VariationID(ids)
@@ -474,13 +494,25 @@ Monad(monad; custom_code="other")     # same parameter values, one input folder 
 `Monad(monad; custom_code="other")` — and likewise `Simulation(monad; ...)`,
 `Monad(simulation; ...)` and `Sampling(sampling; ...)` — builds the same parameterization over
 different input folders. Any location keyword [`InputFolders`](@ref) accepts may be given, and
-every other folder is kept. The [`VariationID`](@ref) carries over, which is how a calibrated
-parameter set is re-run under a new version of the model code.
+every other folder is kept. This is how a calibrated parameter set is re-run under a new
+version of the model.
 
-A location can be replaced only while its variation ID is `0` (base file) or `-1` (unused). A
-positive ID is a row in the *old* folder's variations table and means nothing in another, so
-replacing that folder throws rather than silently pointing at an unrelated parameter set. A
-location brought into use this way starts at `0`; one taken out of use goes to `-1`.
+For a location whose folder holds no parameter file, like `custom_code`, the
+[`VariationID`](@ref) simply carries over. For a *varied* location the values are carried onto
+the new file instead — a variation ID is a row in one folder's table and means nothing in
+another's — and `carry` chooses what travels:
+
+- `:all` (default) — the monad's whole effective parameter set: every parameter present in both
+  files keeps the old value, so the change of structure is the only change.
+- `:varied` — only where the old variation row deviates from its own base file; everything else
+  takes the new file's values.
+- `:none` — nothing; the new folder's base row.
+
+What differs is written as one variation row in the new folder (none if nothing differs), so
+the same carry twice is the same row. Parameters present in only one of the two files, and
+differing values that cannot be carried (string-valued, or under a path the file gives no way to
+address), are listed in one warning; `warn_uncarried=false` silences it. A location taken out of
+use goes to `-1`; one brought into use starts at `0`.
 """
 struct Monad <: AbstractMonad
     id::Int
@@ -544,9 +576,16 @@ function Monad(monad_id::Integer; n_replicates::Integer=0, use_previous::Bool=tr
     return Monad(monad_id, inputs, variation_id, n_replicates, use_previous)
 end
 
-function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bool=true, kwargs...)
-    inputs = isempty(kwargs) ? simulation.inputs : InputFolders(simulation.inputs; kwargs...)
-    monad = Monad(inputs, _carriedVariationID(simulation, inputs); n_replicates=n_replicates, use_previous=use_previous)
+function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bool=true, carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
+    if isempty(kwargs)
+        inputs, variation_id = simulation.inputs, simulation.variation_id
+    else
+        inputs = InputFolders(simulation.inputs; kwargs...)
+        ctx = _CarryContext(carry)
+        variation_id = _carriedVariationID(simulation, inputs, ctx)
+        warn_uncarried && _warnUncarried(ctx)
+    end
+    monad = Monad(inputs, variation_id; n_replicates=n_replicates, use_previous=use_previous)
     #! The simulation is one of this monad's replicates only if it shares the monad's inputs. A
     #! replaced folder makes it a different parameterization, so it is left where it is.
     if inputs == simulation.inputs
@@ -555,10 +594,13 @@ function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bo
     return monad
 end
 
-function Monad(monad::Monad; n_replicates::Integer=0, use_previous::Bool=true, kwargs...)
+function Monad(monad::Monad; n_replicates::Integer=0, use_previous::Bool=true, carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
     isempty(kwargs) && return Monad(monad.id, monad.inputs, monad.variation_id, n_replicates, use_previous)
     inputs = InputFolders(monad.inputs; kwargs...)
-    return Monad(inputs, _carriedVariationID(monad, inputs); n_replicates=n_replicates, use_previous=use_previous)
+    ctx = _CarryContext(carry)
+    variation_id = _carriedVariationID(monad, inputs, ctx)
+    warn_uncarried && _warnUncarried(ctx)
+    return Monad(inputs, variation_id; n_replicates=n_replicates, use_previous=use_previous)
 end
 
 """
@@ -575,9 +617,13 @@ function addSimulationID(monad::Monad, simulation_id::Int)
     recordConstituentIDs(monad, simulation_ids)
 end
 
-function Simulation(M::AbstractMonad; kwargs...)
-    inputs = isempty(kwargs) ? M.inputs : InputFolders(M.inputs; kwargs...)
-    return Simulation(inputs, _carriedVariationID(M, inputs))
+function Simulation(M::AbstractMonad; carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
+    isempty(kwargs) && return Simulation(M.inputs, M.variation_id)
+    inputs = InputFolders(M.inputs; kwargs...)
+    ctx = _CarryContext(carry)
+    variation_id = _carriedVariationID(M, inputs, ctx)
+    warn_uncarried && _warnUncarried(ctx)
+    return Simulation(inputs, variation_id)
 end
 
 function Base.show(io::IO, monad::Monad)
@@ -726,10 +772,12 @@ function Sampling(sampling_id::Int; n_replicates::Integer=0, use_previous::Bool=
     return Sampling(sampling_id, inputs, monads)
 end
 
-function Sampling(sampling::Sampling; n_replicates::Integer=0, use_previous::Bool=true, kwargs...)
+function Sampling(sampling::Sampling; n_replicates::Integer=0, use_previous::Bool=true, carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
     isempty(kwargs) && return Sampling(sampling.id; n_replicates=n_replicates, use_previous=use_previous)
     inputs = InputFolders(sampling.inputs; kwargs...)
-    monads = [Monad(inputs, _carriedVariationID(monad, inputs); n_replicates=n_replicates, use_previous=use_previous) for monad in sampling.monads]
+    ctx = _CarryContext(carry)
+    monads = [Monad(inputs, _carriedVariationID(monad, inputs, ctx); n_replicates=n_replicates, use_previous=use_previous) for monad in sampling.monads]
+    warn_uncarried && _warnUncarried(ctx)
     return Sampling(monads, inputs)
 end
 
