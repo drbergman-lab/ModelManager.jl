@@ -1716,12 +1716,6 @@ function _carryLocation!(ctx::_CarryContext, M::AbstractMonad, loc::Symbol, inpu
     end
 
     candidates = collect(keys(old))
-    if ctx.carry == :varied
-        old_folder = M.inputs[loc]
-        old_base = get!(() -> _xmlParameterValues(prepareBaseFile(old_folder); parsed=false, warn_ambiguous=false),
-                        ctx.old_bases, (loc, old_folder.folder))
-        filter!(path -> !_sameValue(old[path], get(old_base, path, nothing)), candidates)
-    end
     dvs = DiscreteVariation[]
     for path in sort!(candidates)
         haskey(new_base, path) || continue
@@ -1746,7 +1740,6 @@ function _sameValue(a::AbstractString, b::AbstractString)
     _beyondExactInteger(pa) && return strip(a) == strip(b)
     return pa == pb
 end
-_sameValue(::AbstractString, ::Nothing) = false
 
 _beyondExactInteger(v) = v isa Float64 && isinteger(v) && abs(v) >= 2.0^53
 

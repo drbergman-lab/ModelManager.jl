@@ -7546,15 +7546,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test isempty(warns)
             @test getParameterValue(twin_m, :config, xp_x) ≈ 4.0
             @test getParameterValue(twin_m, :config, xp_y) ≈ 2.0
-            # :varied carries only the old row's deviations from its own base; :none carries nothing.
-            rv = Monad(m; config="other", carry=:varied, warn_uncarried=false)
-            @test getParameterValue(rv, :config, xp_x) ≈ 4.0
-            @test getParameterValue(rv, :config, xp_y) ≈ 5.0
-            @test rv.id != r.id
-            rn = Monad(m; config="other", carry=:none)
+            # carry=false carries nothing; the old Symbol spellings are a type error now.
+            rn = Monad(m; config="other", carry=false)
             @test rn.variation_id[:config] == 0
             @test getParameterValue(rn, :config, xp_x) ≈ 1.0
-            @test_throws ArgumentError Monad(m; config="other", carry=:some)
+            @test_throws TypeError Monad(m; config="other", carry=:all)
+            @test_throws TypeError Monad(m; config="other", carry=:varied)
             # A base monad moved onto retuned defaults keeps its own.
             mb = Monad(m_base; config="other", warn_uncarried=false)
             @test mb.variation_id[:config] > 0
@@ -7569,7 +7566,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test length(warns) == 1 && occursin(r"not carried.*: data/item:temp_id:1, data/item:temp_id:2", warns[1])
             @test ri.variation_id[:config] == 0
             # A target with no parameter file is an empty parameter set: every old parameter is
-            # reported as removed and the base row is used; with carry=:none there is no report.
+            # reported as removed and the base row is used; with carry=false there is no report,
+            # whatever warn_uncarried says.
             ic_inputs = InputFolders(config="default", custom_code="default", ic_cell="disc")
             ic_res = ModelManager.addVariations(GridVariation(), ic_inputs, [DiscreteVariation(:ic_cell, XMLPath(["radius"]), [20.0])])
             mic = Monad(ic_inputs, ic_res.variation_ids[1])
@@ -7578,7 +7576,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test length(warns) == 1 && occursin(r"ic_cell \"disc\" -> \"csvdisc\", only in \"disc\" \(dropped\): radius", warns[1])
             @test mcsv.variation_id[:ic_cell] == 0
             @test !mcsv.inputs[:ic_cell].varied
-            warns, mcsv_none = _warnings(() -> Monad(mic; ic_cell="csvdisc", carry=:none))
+            warns, mcsv_none = _warnings(() -> Monad(mic; ic_cell="csvdisc", carry=false, warn_uncarried=true))
             @test isempty(warns)
             @test mcsv_none.id == mcsv.id
 
@@ -7609,9 +7607,6 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test length(warns) == 1 && occursin("data/w", warns[1])
             @test [getParameterValue(mm, :config, xp_x) for mm in sc2.monads] ≈ [3.0, 4.0]
             @test all(getParameterValue(mm, :config, xp_y) ≈ 2.0 for mm in sc2.monads)
-            sc3 = Sampling(sampling; config="other", carry=:varied, warn_uncarried=false)
-            @test [getParameterValue(mm, :config, xp_x) for mm in sc3.monads] ≈ [3.0, 4.0]
-            @test all(getParameterValue(mm, :config, xp_y) ≈ 5.0 for mm in sc3.monads)
             @test Sampling(sampling).id == sampling.id
 
             # The replaced monad runs.
