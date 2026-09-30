@@ -1,5 +1,8 @@
 using DataFrames, Dates
 
+#! CSV 1.0 replaced `silencewarnings=true` with `on_error=:collect`; 0.10 only knows the former.
+_quietCSVKwargs() = pkgversion(CSV) >= v"1" ? (; on_error=:collect) : (; silencewarnings=true)
+
 export Simulation, Monad, Sampling, Trial, InputFolders
 
 ########################################################
@@ -788,7 +791,7 @@ function constituentIDs(path_to_csv::String)
     if !isfile(path_to_csv)
         return Int[]
     end
-    df = CSV.read(path_to_csv, DataFrame; header=false, on_error=:collect, types=String, delim=",")
+    df = CSV.read(path_to_csv, DataFrame; header=false, types=String, delim=",", _quietCSVKwargs()...)
     ids = Int[]
     for i in axes(df, 1)
         s = df.Column1[i]
