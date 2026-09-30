@@ -267,10 +267,10 @@ Base.getindex(variation_id::VariationID, loc::Symbol)::Int = variation_id.ids[lo
 
 #! Everything one copy needs to carry parameter values across a change of varied folder, and
 #! what it could not carry, accumulated so a `Sampling` reports once for all of its monads.
-#! `carry` is `:all` (the old monad's whole effective parameter set) or `:none` (the new
-#! folder's base row).
+#! `carry` says whether the old monad's values travel (its whole effective parameter set) or the
+#! new folder's base row is taken instead.
 struct _CarryContext
-    carry::Symbol
+    carry::Bool
     new_bases::Dict{Symbol,Dict{String,Any}}
     folders::Dict{Symbol,Tuple{String,String}}
     removed::Set{Tuple{Symbol,String}}
@@ -278,8 +278,7 @@ struct _CarryContext
     uncarriable::Set{Tuple{Symbol,String}}
 end
 
-function _CarryContext(carry::Symbol)
-    carry in (:all, :none) || throw(ArgumentError("carry must be :all or :none. Got $(repr(carry))."))
+function _CarryContext(carry::Bool)
     return _CarryContext(carry, Dict{Symbol,Dict{String,Any}}(), Dict{Symbol,Tuple{String,String}}(),
                          Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}())
 end
@@ -290,7 +289,7 @@ end
 #! parameter file, starts at the new folder's base row -- which is also what lets the ID tuple
 #! change *shape*. Where the old folder holds a parameter file, the old monad's values are
 #! carried onto the new folder by `_carryLocation!`, as a fresh row when anything differs;
-#! `carry=:none` skips that and takes the new base row.
+#! `carry=false` skips that and takes the new base row.
 function _carriedVariationID(M::AbstractMonad, inputs::InputFolders, ctx::_CarryContext)
     ids = Pair{Symbol,Int}[]
     for loc in projectLocations().varied
@@ -299,7 +298,7 @@ function _carriedVariationID(M::AbstractMonad, inputs::InputFolders, ctx::_Carry
             push!(ids, loc => M.variation_id[loc])
         elseif new_folder.id == -1
             push!(ids, loc => -1)
-        elseif old_folder.id == -1 || !old_folder.varied || ctx.carry == :none
+        elseif old_folder.id == -1 || !old_folder.varied || !ctx.carry
             push!(ids, loc => 0)
         else
             push!(ids, loc => _carryLocation!(ctx, M, loc, inputs))
@@ -500,18 +499,16 @@ version of the model.
 For a location whose folder holds no parameter file, like `custom_code`, the
 [`VariationID`](@ref) simply carries over. For a *varied* location the values are carried onto
 the new file instead — a variation ID is a row in one folder's table and means nothing in
-another's — and `carry` chooses what travels:
-
-- `:all` (default) — the monad's whole effective parameter set: every parameter present in both
-  files keeps the old value, so the change of structure is the only change.
-- `:none` — nothing; the new folder's base row.
+another's. With `carry=true` (the default) every parameter present in both files keeps the old
+value, so the change of structure is the only change; `carry=false` takes the new folder's base
+row instead.
 
 What differs is written as one variation row in the new folder (none if nothing differs), so
 the same carry twice is the same row. Parameters present in only one of the two files, and
 differing values that cannot be carried (a string on either side, a whole number too large for
 `Float64` to hold exactly, or a path the file gives no way to address), are listed in one
-warning; `warn_uncarried=false` silences it. A location taken out of
-use goes to `-1`; one brought into use starts at `0`.
+warning; `warn_uncarried=false` silences it. A location taken out of use goes to `-1`; one
+brought into use starts at `0`.
 """
 struct Monad <: AbstractMonad
     id::Int
@@ -575,7 +572,7 @@ function Monad(monad_id::Integer; n_replicates::Integer=0, use_previous::Bool=tr
     return Monad(monad_id, inputs, variation_id, n_replicates, use_previous)
 end
 
-function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bool=true, carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
+function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bool=true, carry::Bool=true, warn_uncarried::Bool=true, kwargs...)
     if isempty(kwargs)
         inputs, variation_id = simulation.inputs, simulation.variation_id
     else
@@ -593,7 +590,7 @@ function Monad(simulation::Simulation; n_replicates::Integer=0, use_previous::Bo
     return monad
 end
 
-function Monad(monad::Monad; n_replicates::Integer=0, use_previous::Bool=true, carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
+function Monad(monad::Monad; n_replicates::Integer=0, use_previous::Bool=true, carry::Bool=true, warn_uncarried::Bool=true, kwargs...)
     isempty(kwargs) && return Monad(monad.id, monad.inputs, monad.variation_id, n_replicates, use_previous)
     inputs = InputFolders(monad.inputs; kwargs...)
     ctx = _CarryContext(carry)
@@ -616,7 +613,7 @@ function addSimulationID(monad::Monad, simulation_id::Int)
     recordConstituentIDs(monad, simulation_ids)
 end
 
-function Simulation(M::AbstractMonad; carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
+function Simulation(M::AbstractMonad; carry::Bool=true, warn_uncarried::Bool=true, kwargs...)
     isempty(kwargs) && return Simulation(M.inputs, M.variation_id)
     inputs = InputFolders(M.inputs; kwargs...)
     ctx = _CarryContext(carry)
@@ -771,7 +768,7 @@ function Sampling(sampling_id::Int; n_replicates::Integer=0, use_previous::Bool=
     return Sampling(sampling_id, inputs, monads)
 end
 
-function Sampling(sampling::Sampling; n_replicates::Integer=0, use_previous::Bool=true, carry::Symbol=:all, warn_uncarried::Bool=true, kwargs...)
+function Sampling(sampling::Sampling; n_replicates::Integer=0, use_previous::Bool=true, carry::Bool=true, warn_uncarried::Bool=true, kwargs...)
     isempty(kwargs) && return Sampling(sampling.id; n_replicates=n_replicates, use_previous=use_previous)
     inputs = InputFolders(sampling.inputs; kwargs...)
     ctx = _CarryContext(carry)

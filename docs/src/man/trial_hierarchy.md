@@ -131,7 +131,7 @@ A location holding no parameter file, like `custom_code`, keeps its [`VariationI
 is. For a varied location the *values* are carried instead — a variation ID is a row in one
 folder's table and means nothing in another's — and by default all of them: every parameter
 present in both files keeps the value the old monad ran with, so the change of structure is the
-only change; `carry=:none` takes the new file as it is. Whatever differs from the new file becomes one variation row in the
+only change; `carry=false` takes the new file as it is. Whatever differs from the new file becomes one variation row in the
 new folder. Parameters present in only one of the two files, and values that cannot be carried
 (strings, whole numbers too large for `Float64` to hold exactly, or a path the file gives no
 way to address), are listed in a warning that `warn_uncarried=false` silences.

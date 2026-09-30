@@ -15,8 +15,10 @@ implemented; stable over time, but a parameter explicitly varied *to* its base v
 unset) or the folder's columns (what a reader of "in the database" expects; carries that case, but
 every column added to the folder later joins the carried set for all of its monads, so `:varied`
 drifts toward `:all`) — and a keyword whose meaning needs that paragraph is not earning its place.
-`carry` is `:all` (default) or `:none`; `:varied` is refused like any other value. Nothing else
-changes: the by-value diff, the report and the `:none` switch are as they were.
+With two values left, `carry` becomes a `Bool`, `true` by default; a Symbol is a `TypeError`.
+With `carry=false` nothing is carried, so nothing is reported whatever `warn_uncarried` says; that
+is a consequence, deliberately not made structural. Nothing else changes: the by-value diff, the
+report and the `carry=false` switch are as they were.
 
 ## Same parameters, different input folder (2026-09-19, carry added 2026-09-29) — ships in v0.11.0
 
@@ -48,7 +50,7 @@ simulator-specific, so it lands in ModelManager.
   default carries the monad's whole effective parameter set — base file plus row — and every
   parameter present in both files keeps the value the old monad ran with. Taking the new file's
   base values by default was rejected: it makes a structural change and a re-parameterization in
-  one step, possibly many large ones. It remains available as `carry=:none`. `carry=:varied`,
+  one step, possibly many large ones. It remains available as `carry=false`. `carry=:varied`,
   only the old row's deviations from its own base, was added as a middle and withdrawn on
   2026-09-30 (entry above).
 - **Diff-only rows, written through `addVariations`.** The carried row holds what differs from
