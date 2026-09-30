@@ -267,12 +267,11 @@ Base.getindex(variation_id::VariationID, loc::Symbol)::Int = variation_id.ids[lo
 
 #! Everything one copy needs to carry parameter values across a change of varied folder, and
 #! what it could not carry, accumulated so a `Sampling` reports once for all of its monads.
-#! `carry` is `:all` (the old monad's whole effective parameter set), `:varied` (only where the
-#! old variation row deviates from its own base file) or `:none` (the new folder's base row).
+#! `carry` is `:all` (the old monad's whole effective parameter set) or `:none` (the new
+#! folder's base row).
 struct _CarryContext
     carry::Symbol
     new_bases::Dict{Symbol,Dict{String,Any}}
-    old_bases::Dict{Tuple{Symbol,String},Dict{String,Any}}
     folders::Dict{Symbol,Tuple{String,String}}
     removed::Set{Tuple{Symbol,String}}
     added::Set{Tuple{Symbol,String}}
@@ -280,9 +279,8 @@ struct _CarryContext
 end
 
 function _CarryContext(carry::Symbol)
-    carry in (:all, :varied, :none) || throw(ArgumentError("carry must be :all, :varied or :none. Got $(repr(carry))."))
-    return _CarryContext(carry, Dict{Symbol,Dict{String,Any}}(), Dict{Tuple{Symbol,String},Dict{String,Any}}(),
-                         Dict{Symbol,Tuple{String,String}}(),
+    carry in (:all, :none) || throw(ArgumentError("carry must be :all or :none. Got $(repr(carry))."))
+    return _CarryContext(carry, Dict{Symbol,Dict{String,Any}}(), Dict{Symbol,Tuple{String,String}}(),
                          Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}(), Set{Tuple{Symbol,String}}())
 end
 
@@ -506,8 +504,6 @@ another's — and `carry` chooses what travels:
 
 - `:all` (default) — the monad's whole effective parameter set: every parameter present in both
   files keeps the old value, so the change of structure is the only change.
-- `:varied` — only where the old variation row deviates from its own base file; everything else
-  takes the new file's values.
 - `:none` — nothing; the new folder's base row.
 
 What differs is written as one variation row in the new folder (none if nothing differs), so

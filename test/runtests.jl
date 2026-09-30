@@ -7546,15 +7546,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test isempty(warns)
             @test getParameterValue(twin_m, :config, xp_x) ≈ 4.0
             @test getParameterValue(twin_m, :config, xp_y) ≈ 2.0
-            # :varied carries only the old row's deviations from its own base; :none carries nothing.
-            rv = Monad(m; config="other", carry=:varied, warn_uncarried=false)
-            @test getParameterValue(rv, :config, xp_x) ≈ 4.0
-            @test getParameterValue(rv, :config, xp_y) ≈ 5.0
-            @test rv.id != r.id
+            # :none carries nothing; anything but :all and :none is refused, :varied included.
             rn = Monad(m; config="other", carry=:none)
             @test rn.variation_id[:config] == 0
             @test getParameterValue(rn, :config, xp_x) ≈ 1.0
             @test_throws ArgumentError Monad(m; config="other", carry=:some)
+            @test_throws ArgumentError Monad(m; config="other", carry=:varied)
             # A base monad moved onto retuned defaults keeps its own.
             mb = Monad(m_base; config="other", warn_uncarried=false)
             @test mb.variation_id[:config] > 0
@@ -7609,9 +7606,6 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test length(warns) == 1 && occursin("data/w", warns[1])
             @test [getParameterValue(mm, :config, xp_x) for mm in sc2.monads] ≈ [3.0, 4.0]
             @test all(getParameterValue(mm, :config, xp_y) ≈ 2.0 for mm in sc2.monads)
-            sc3 = Sampling(sampling; config="other", carry=:varied, warn_uncarried=false)
-            @test [getParameterValue(mm, :config, xp_x) for mm in sc3.monads] ≈ [3.0, 4.0]
-            @test all(getParameterValue(mm, :config, xp_y) ≈ 5.0 for mm in sc3.monads)
             @test Sampling(sampling).id == sampling.id
 
             # The replaced monad runs.

@@ -5,6 +5,19 @@
 
 ---
 
+## `carry=:varied` withdrawn (2026-09-30) — ships in v0.11.0
+
+The three-way `carry` shipped in #79 with `:varied` as the middle: only what the old variation row
+set, everything else from the new file. The maintainer pulled it before the 0.11.0 tag: it takes
+too much explaining, and no workflow was found that wants it. The explaining is the tell. "What
+the row set" has two readings — the row's deviations from its own base file (what was
+implemented; stable over time, but a parameter explicitly varied *to* its base value reads as
+unset) or the folder's columns (what a reader of "in the database" expects; carries that case, but
+every column added to the folder later joins the carried set for all of its monads, so `:varied`
+drifts toward `:all`) — and a keyword whose meaning needs that paragraph is not earning its place.
+`carry` is `:all` (default) or `:none`; `:varied` is refused like any other value. Nothing else
+changes: the by-value diff, the report and the `:none` switch are as they were.
+
 ## Same parameters, different input folder (2026-09-19, carry added 2026-09-29) — ships in v0.11.0
 
 ### Trigger
@@ -36,8 +49,8 @@ simulator-specific, so it lands in ModelManager.
   parameter present in both files keeps the value the old monad ran with. Taking the new file's
   base values by default was rejected: it makes a structural change and a re-parameterization in
   one step, possibly many large ones. It remains available as `carry=:none`. `carry=:varied`,
-  only the old row's deviations from its own base, is the middle for someone who retuned the
-  defaults deliberately; it is the same code with a filter.
+  only the old row's deviations from its own base, was added as a middle and withdrawn on
+  2026-09-30 (entry above).
 - **Diff-only rows, written through `addVariations`.** The carried row holds what differs from
   the new base, not the whole parameter set, which is also what a row *means*. Going through
   `addVariations(GridVariation(), …)` with one single-valued `DiscreteVariation` per difference
@@ -45,7 +58,7 @@ simulator-specific, so it lands in ModelManager.
   nothing written, and the same carry twice is the same row and hence the same monad. A whole
   number read from XML is carried as an `Int` so a new column is integer-typed and `<n>100</n>`
   is not rewritten as `100.0`.
-- **`:varied` is decided from files, not table bookkeeping.** A row holds every column, so which
+- **`:varied` (since withdrawn) was decided from files, not table bookkeeping.** A row holds every column, so which
   columns a row *set* is not recorded; comparing the old variation file with the old base file
   answers it without touching the database.
 - **Report both directions alike.** Paths only in the old file and paths only in the new one are
@@ -65,8 +78,8 @@ simulator-specific, so it lands in ModelManager.
   them; a value that is a string in the *new* file only made `addColumns` throw on the target's
   default, so a string on either side is uncarriable; the walker's per-sibling ambiguity warning
   fired once per walk during a carry and `warn_uncarried=false` could not reach it, so the walker
-  takes `warn_ambiguous` and the aggregated warning is the one report; the old base file is
-  cached on the context for `:varied` over a sampling. Two declined by the user: recording paths
+  takes `warn_ambiguous` and the aggregated warning is the one report; the old base file was
+  cached on the context for `:varied` over a sampling (gone with `:varied`). Two declined by the user: recording paths
   for the XML-to-unused and CSV-to-XML transitions (the user already knows every path went or
   came), and validating `carry` on the no-keyword fast paths (no carry happens there).
 - **`Monad(simulation; custom_code=...)` does not enrol the simulation.** With no keyword it adds
