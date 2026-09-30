@@ -788,7 +788,7 @@ function constituentIDs(path_to_csv::String)
     if !isfile(path_to_csv)
         return Int[]
     end
-    df = CSV.read(path_to_csv, DataFrame; header=false, silencewarnings=true, types=String, delim=",")
+    df = CSV.read(path_to_csv, DataFrame; header=false, on_error=:collect, types=String, delim=",")
     ids = Int[]
     for i in axes(df, 1)
         s = df.Column1[i]
