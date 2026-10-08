@@ -5,6 +5,38 @@
 
 ---
 
+## One `parameters` keyword for the calibration and GSA plots (2026-10-08)
+
+The calibration recipes took `space` (`:target`/`:cdf`) and `parameters` (a DataFrames selector
+applied within that space). The maintainer wanted a single keyword that says which set of
+parameters to work with. `space` turned out to do more than pick columns — it picked the units, the
+file (`particles.csv` vs `cdfs.csv`), and whether `:ridgeline` drew a prior — so the merge had to
+let one keyword carry the coordinates too.
+
+### What was decided
+- **Groups are Symbols, columns are Strings.** `:latent` (default), `:target`, `:cdf`, `:all`; a
+  String or `Vector{String}` names columns from any group. Requiring Strings for columns is what
+  keeps a variation named `latent` from colliding with the group, so Regex, `Not(...)` and positions
+  were dropped rather than kept beside the presets. Leaving one out means listing the rest; the
+  maintainer judged the selector vocabulary over-engineering for that.
+- **`:latent` means one column per sampled dimension, in value units** (option (a)). For a
+  `DistributedVariation` that is its value, so its latent and target are one column and `:all`
+  draws it twice (CDF and value), not three times. The alternative (b), only `LatentVariation`
+  latents, would leave `:latent` empty on most problems. The name was kept although a non-LV user
+  may not know it: with no `LatentVariation`s, `:latent == :target`, and the manual says so.
+- **A co-variation's latent is its first variation**, the one its inverse map recovers the CDF
+  from. The other honest choice, the bare shared `u`, has no units and duplicates `:cdf`. This is the
+  one judgement call the maintainer did not make directly.
+- **CDF columns are renamed `cdf(name)` at display time only.** `cdfs.csv`, `particles` and the
+  resume path keep the raw latent names, so existing runs need no migration.
+- **`space` stays declared, to throw.** RecipesBase consumes declared keywords, and the `Calibration`
+  style recipe never declared `space`, so `plot(cal, :ridgeline; space=:cdf)` silently drew values.
+- **The GSA recipes follow**, Strings only, so `parameters` means one thing package-wide.
+
+### Also corrected
+PRD.md claimed the `:transition` lazy lookup inverted rejected values to CDF coordinates for
+`space=:cdf`. It never did; it returned nothing for CDF space. The PRD now says what happens.
+
 ## `carry=:varied` withdrawn (2026-09-30) — ships in v0.11.0
 
 The three-way `carry` shipped in #79 with `:varied` as the middle: only what the old variation row

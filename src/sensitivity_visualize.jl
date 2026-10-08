@@ -19,40 +19,42 @@ const _NO_FUNCTIONS_MSG =
 
 ################## Parameter selection (shared with the calibration recipes) ##################
 
-#! Delegated to DataFrames' column-selector machinery rather than hand-rolled: `parameters` then
-#! accepts exactly what `select` does — a name, a vector of names (honoured in the order given, which
-#! is how panels are reordered), positions, a `Regex`, `Not(...)` — and one vocabulary serves every
-#! recipe in the package. The frame is a header only; nothing is copied.
+#! Strings only, deliberately. A DataFrames selector (`Regex`, `Not`, positions, Symbols) was accepted
+#! here once; it bought little over writing out the list, and a Symbol column name could not coexist
+#! with the calibration recipes' Symbol presets (`:latent`, `:cdf`, ...). Naming the columns outright
+#! is one rule for every recipe in the package.
 """
     _selectParameters(available::Vector{String}, parameters) → Vector{String}
 
-Resolve a recipe's `parameters` keyword against the names it could draw. `nothing` keeps them all;
-anything else is a DataFrames column selector over `available`. An unknown name is an `ArgumentError`
-that also lists what was available.
+Resolve a recipe's `parameters` keyword against the names it could draw: `nothing` keeps them all, a
+String or a vector of Strings names them, in that order. Anything else, an unknown name, a repeated
+name or an empty vector is an `ArgumentError` that lists what was available.
 """
 _selectParameters(available::Vector{String}, ::Nothing) = available
-function _selectParameters(available::Vector{String}, parameters)
-    header   = DataFrame([name => Float64[] for name in available]...)
-    selected = try
-        names(header, parameters)
-    catch e
-        e isa ArgumentError || rethrow()
-        throw(ArgumentError("Cannot resolve `parameters = $(repr(parameters))`: $(e.msg). " *
-                            "Available parameters: $(available)."))
-    end
-    isempty(selected) && throw(ArgumentError(
-        "`parameters = $(repr(parameters))` selects no parameters. Available: $(available)."))
-    return selected
+_selectParameters(available::Vector{String}, name::AbstractString) = _selectParameters(available, [name])
+function _selectParameters(available::Vector{String}, parameters::AbstractVector{<:AbstractString})
+    isempty(parameters) && throw(ArgumentError(
+        "`parameters` is empty, so there is nothing to draw. Available parameters: $(available)."))
+    allunique(parameters) || throw(ArgumentError(
+        "`parameters = $(repr(parameters))` names a parameter more than once."))
+    unknown = setdiff(parameters, available)
+    isempty(unknown) || throw(ArgumentError(
+        "Unknown parameter$(length(unknown) == 1 ? "" : "s") $(unknown). " *
+        "Available parameters: $(available)."))
+    return String.(parameters)
 end
+_selectParameters(available::Vector{String}, parameters) = throw(ArgumentError(
+    "`parameters` names the parameters to draw with a String or a vector of Strings; got " *
+    "$(repr(parameters)). Available parameters: $(available)."))
 
 # Positions of `selected` within `available`, for slicing index vectors alongside the names.
 _parameterIndices(available::Vector{String}, selected::Vector{String}) =
     Int[findfirst(==(s), available) for s in selected]
 
 const _PARAMETERS_KW_DOC = """
-`parameters` restricts and orders the parameters shown: a name, a vector of names (drawn in that
-order), positions, a `Regex`, or `Not(...)` over the x-axis names, which are the columns of the
-sampling's `monad_ids_df` after the method's bookkeeping columns. The default draws all of them."""
+`parameters` restricts and orders the parameters shown: a String or a vector of Strings (drawn in
+that order) naming x-axis names, which are the columns of the sampling's `monad_ids_df` after the
+method's bookkeeping columns. The default draws all of them."""
 
 ################## Bar recipe (shared) ##################
 
@@ -319,7 +321,7 @@ $_PARAMETERS_KW_DOC
 using Plots
 plot(sobol_sampling)                 # S1 + ST
 plot(sobol_sampling; show_ST=false)  # S1 only
-plot(sobol_sampling; parameters=r"^k_")   # only the rate constants
+plot(sobol_sampling; parameters=["k_on", "k_off"])   # only these, in this order
 ```
 """
 @recipe function f(s::SobolSampling)
@@ -356,9 +358,9 @@ $_PARAMETERS_KW_DOC
 
 # Example
 ```julia
-using Plots, DataFrames
+using Plots
 plot(rbd_sampling)
-plot(rbd_sampling; parameters=Not("dt"))   # everything but the time step
+plot(rbd_sampling; parameters=["k_on", "k_off"])   # only these, in this order
 ```
 """
 @recipe function f(r::RBDSampling)

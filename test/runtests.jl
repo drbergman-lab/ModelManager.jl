@@ -3913,7 +3913,20 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # `parameters` on the recipes, in memory and from disk, by the display name the
                 # posterior frame uses.
                 pname = "$(columnName(xp_x))"
+                cname = ModelManager._cdfColumnName(pname)
                 for target in (result, result.calibration)
+                    # A single DistributedVariation: :latent and :target are its value column, :cdf
+                    # its CDF column, and :all the two of them, not three.
+                    corner_df(kw...) = RecipesBase.apply_recipe(Dict{Symbol,Any}(kw...), target)[1].args[1].df
+                    @test names(corner_df()) == [pname]
+                    @test names(corner_df(:parameters => :target)) == [pname]
+                    @test names(corner_df(:parameters => :all)) == [cname, pname]
+                    cdf_df = corner_df(:parameters => :cdf)
+                    @test names(cdf_df) == [cname]
+                    @test all(0 .<= cdf_df[!, cname] .<= 1)
+                    @test corner_df(:parameters => pname)[!, pname] ≈ posterior(target)[1][!, pname]
+                    @test_throws ArgumentError RecipesBase.apply_recipe(Dict{Symbol,Any}(:space => :cdf), target)
+                    @test_throws ArgumentError RecipesBase.apply_recipe(Dict{Symbol,Any}(:space => :cdf), target, :ridgeline)
                     corner = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => pname), target)
                     @test names(corner[1].args[1].df) == [pname]
                     ridge = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => [pname]), target, :ridgeline)
@@ -7979,22 +7992,24 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
 
         @testset "parameters selection" begin
-            # The resolver is shared with the calibration recipes: DataFrames' selector vocabulary,
-            # a vector honoured in the order given, and an error that names what was available.
+            # The resolver is shared with the calibration recipes: Strings only, a vector honoured
+            # in the order given, and an error that names what was available.
             sel = ModelManager._selectParameters
             @test sel(pnames, nothing) === pnames
             @test sel(pnames, ["p3", "p1"]) == ["p3", "p1"]
             @test sel(pnames, "p2") == ["p2"]
-            @test sel(pnames, :p2) == ["p2"]
-            @test sel(pnames, [3, 1]) == ["p3", "p1"]
-            @test sel(pnames, r"^p[12]") == ["p1", "p2"]
-            @test sel(pnames, Not("p2")) == ["p1", "p3"]
             err = try sel(pnames, "nope"); nothing catch e; e end
             @test err isa ArgumentError
             @test occursin("Available parameters", err.msg)
             @test occursin("p1", err.msg)
             @test_throws ArgumentError sel(pnames, ["p1", "p1"])
             @test_throws ArgumentError sel(pnames, String[])
+            # Selectors other than names are refused, each with the list of available names.
+            for bad in (:p2, [:p2], [3, 1], r"^p[12]", Not("p2"))
+                err = try sel(pnames, bad); nothing catch e; e end
+                @test err isa ArgumentError
+                @test occursin("Available parameters", err.msg)
+            end
             @test ModelManager._parameterIndices(pnames, ["p3", "p1"]) == [3, 1]
 
             res1 = Dict{String,GlobalSensitivity.MorrisResult}(_GSA_LABEL_A => morris(11))
@@ -8008,12 +8023,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test nseries(apply(bd)) == 1
 
             # MOAT violin: the elementary-effect matrix keeps its rows and reorders its columns.
-            vd = ModelManager._moatViolinData(res1, moat_df; parameters=Not("p2"))
+            vd = ModelManager._moatViolinData(res1, moat_df; parameters=["p1", "p3"])
             @test vd.param_names == ["p1", "p3"]
             @test vd.groups[1][2] == mres.elementary_effects[:, [1, 3]]
 
             # MOAT scatter: µ* and σ move together.
-            sd = ModelManager._moatScatterData(res1, moat_df; parameters=r"^p[23]")
+            sd = ModelManager._moatScatterData(res1, moat_df; parameters=["p2", "p3"])
             @test sd.param_names == ["p2", "p3"]
             @test sd.groups[1][2] ≈ [0.5, 0.2]
             @test sd.groups[1][3] ≈ sqrt.([0.04, 0.02])
@@ -8028,7 +8043,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             # RBD: a plain vector result.
             rres = Dict{String,Vector{Float64}}(_GSA_LABEL_A => [0.1, 0.2, 0.7])
-            rb   = ModelManager._rbdBarData(rres, rbd_df; parameters=[3, 1])
+            rb   = ModelManager._rbdBarData(rres, rbd_df; parameters=["p3", "p1"])
             @test rb.param_names == ["p3", "p1"]
             @test rb.groups[1].values ≈ [0.7, 0.1]
 
@@ -8205,8 +8220,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
 
         @testset "parameters keyword on the calibration recipes" begin
-            # An in-memory result with no CalibrationParameters: display columns are the particle
-            # columns themselves, which is all the selection logic needs.
+            # An in-memory result with no CalibrationParameters: every particle column is treated
+            # as a value column that is both latent and target, which is all the selection logic needs.
             applyk(kw, args...) = RecipesBase.apply_recipe(Dict{Symbol,Any}(kw), args...)
             data(rd) = rd[1].args[1]
 
@@ -8220,8 +8235,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             g2 = GenerationResult(2, p2, w, [0.2, 0.1, 0.1], 0.2, 6, [4, 5, 6], 0.5, 1 / sum(w .^ 2), rej)
             res = ABCResult(Calibration(1), [g1, g2], CalibrationParameter[], ABCSMC(population_size=3))
 
-            # Corner plot: default keeps every column; a vector selects and reorders; the wrapper
-            # still draws (one diagonal panel per parameter, one panel below the diagonal).
+            # Corner plot: the default is :latent, here every column; a vector selects and reorders;
+            # the wrapper still draws (one diagonal panel per parameter, one panel below the diagonal).
             @test names(data(applyk(Dict(), res)).df) == ["alpha", "beta", "gamma"]
             cpd = data(applyk(Dict(:parameters => ["gamma", "alpha"]), res))
             @test cpd isa ModelManager._CornerPlotData
@@ -8232,14 +8247,25 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             one = data(applyk(Dict(:parameters => "beta"), res))
             @test names(one.df) == ["beta"]
             @test nseries(apply(one)) == 1
-            @test names(data(applyk(Dict(:parameters => r"^[ab]"), res)).df) == ["alpha", "beta"]
-            @test names(data(applyk(Dict(:parameters => Not("beta")), res)).df) == ["alpha", "gamma"]
-            @test names(data(applyk(Dict(:parameters => [2, 1]), res)).df) == ["beta", "alpha"]
-            # `space=:cdf` resolves against the CDF column names — here the same names.
-            @test names(data(applyk(Dict(:parameters => "gamma", :space => :cdf), res)).df) == ["gamma"]
+            # CDF columns are named apart from the value columns, so one String says which is meant
+            # and the two can be mixed.
+            @test names(data(applyk(Dict(:parameters => :cdf), res)).df) ==
+                  ["cdf(alpha)", "cdf(beta)", "cdf(gamma)"]
+            mixed = data(applyk(Dict(:parameters => ["cdf(gamma)", "alpha"]), res)).df
+            @test names(mixed) == ["cdf(gamma)", "alpha"]
+            @test mixed[!, "cdf(gamma)"] == p2.gamma
             # Selection applies to the requested generation.
             @test data(applyk(Dict(:parameters => "alpha", :generation => 1), res)).df.alpha == p1.alpha
             @test_throws ArgumentError applyk(Dict(:parameters => "delta"), res)
+            # Only the four groups are Symbols; columns are named by Strings, and the DataFrames
+            # selectors the keyword used to accept are refused.
+            for bad in (:alpha, :nope, [:alpha], r"^[ab]", Not("beta"), [2, 1])
+                @test_throws ArgumentError applyk(Dict(:parameters => bad), res)
+            end
+            # `space` is gone, and says so rather than being swallowed.
+            err = try applyk(Dict(:space => :cdf), res); nothing catch e; e end
+            @test err isa ArgumentError
+            @test occursin("parameters = :cdf", err.msg)
 
             # Ridgeline: every generation is filtered to the same columns, in the given order.
             rd = data(applyk(Dict(:parameters => ["beta", "alpha"]), res, :ridgeline))
@@ -8248,8 +8274,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test all(names(d) == ["beta", "alpha"] for d in rd.dfs)
             @test nseries(apply(rd)) == 4        # 2 parameters × 2 generations
             @test_throws ArgumentError applyk(Dict(:parameters => "delta"), res, :ridgeline)
+            @test_throws ArgumentError applyk(Dict(:space => :cdf), res, :ridgeline)
 
-            # Transition: the KDE frame drives the names; accepted proposals follow.
+            # Transition: the KDE frame drives the names; accepted and rejected proposals follow.
             td = data(applyk(Dict(:parameters => "gamma"), res, :transition))
             @test td isa ModelManager._TransitionData
             @test td.param_names == ["gamma"]
@@ -8258,9 +8285,86 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test names(td.rej_df) == ["gamma"]
             @test td.kde_df.gamma == p1.gamma
             @test nseries(apply(td)) > 0
+            td_cdf = data(applyk(Dict(:parameters => ["cdf(gamma)"]), res, :transition))
+            @test td_cdf.rej_df[!, "cdf(gamma)"] == rej.gamma
 
             # No parameter axis: the keyword is refused, not swallowed.
             @test_throws ArgumentError applyk(Dict(:parameters => "alpha"), res, :distances)
+        end
+
+        @testset "parameter groups of the calibration recipes" begin
+            applyk(kw, args...) = RecipesBase.apply_recipe(Dict{Symbol,Any}(kw), args...)
+            data(rd) = rd[1].args[1]
+            xa, xb, xc, xd, xe = (XMLPath(["g", s]) for s in ("a", "b", "c", "d", "e"))
+            a, b, c, d, e = columnName.((xa, xb, xc, xd, xe))
+
+            dv_a = DistributedVariation(:config, xa, Uniform(0.0, 2.0))
+            cv   = CoVariation(DistributedVariation(:config, xb, Uniform(0.0, 1.0)),
+                               DistributedVariation(:config, xc, Uniform(1.0, 3.0)))
+            #! A latent prior that is not Uniform(0, 1), so the latent value and its CDF differ.
+            lv   = LatentVariation([Uniform(0.0, 4.0)], XMLPath[xd], Function[us -> 10.0 * us[1]],
+                                   ["u"], Symbol[:config])
+            cps  = ModelManager._toCalibrationParameters([dv_a, cv, lv])
+            cvn  = variationName(cv)
+
+            g = ModelManager._parameterGroups(cps)
+            @test g.latent == [a, b, "u"]                     # a co-variation through its first variation
+            @test g.target == [a, b, c, d]
+            @test g.cdf    == ["cdf($a)", "cdf($cvn)", "cdf(u)"]
+            @test ModelManager._allColumns(g) == ["cdf($a)", "cdf($cvn)", "cdf(u)", a, b, c, "u", d]
+
+            # parameters.toml carries enough to classify the same way, for a plot from disk.
+            toml_path = joinpath(mktempdir(), "parameters.toml")
+            open(toml_path, "w") do io
+                TOML.print(io, Dict("parameters" => [ModelManager._parameterTOMLEntry(cp) for cp in cps]))
+            end
+            gt = ModelManager._parameterGroupsFromTOML(toml_path)
+            @test (gt.cdf_raw, gt.latent, gt.target, gt.values) == (g.cdf_raw, g.latent, g.target, g.values)
+
+            cdfs = [0.25, 0.5, 0.75]
+            particles(off) = DataFrame(a => cdfs .+ off, cvn => cdfs .+ off, "u" => cdfs .+ off)
+            w  = fill(1 / 3, 3)
+            rej = DataFrame(a => [0.1], cvn => [0.2], "u" => [0.3])
+            g1 = GenerationResult(1, particles(0.0), w, [0.5, 0.4, 0.3], 0.5, 3, [1, 2, 3], 1.0, 3.0, nothing)
+            g2 = GenerationResult(2, particles(0.1), w, [0.2, 0.1, 0.1], 0.2, 6, [4, 5, 6], 0.5, 3.0, rej)
+            res = ABCResult(Calibration(1), [g1, g2], cps, ABCSMC(population_size=3))
+
+            # Each group, and the coordinates each column is drawn in.
+            frame(p) = data(applyk(Dict(:parameters => p), res)).df
+            @test names(data(applyk(Dict(), res)).df) == [a, b, "u"]
+            @test names(frame(:target)) == [a, b, c, d]
+            all_df = frame(:all)
+            @test names(all_df) == ModelManager._allColumns(g)
+            @test all_df[!, "cdf(u)"] == g2.particles.u                    # the raw CDF
+            @test all_df[!, "u"] ≈ 4.0 .* g2.particles.u                   # the latent, in its units
+            @test all_df[!, d] ≈ 40.0 .* g2.particles.u                    # the target, through the map
+            @test all_df[!, c] ≈ quantile.(Uniform(1.0, 3.0), g2.particles[!, cvn])
+
+            # Without LatentVariations, :latent and :target are the same columns, and :all draws each
+            # DistributedVariation twice — its CDF and its value — never a third time for the latent.
+            dv_e = DistributedVariation(:config, xe, Uniform(0.0, 1.0))
+            dv_cps = ModelManager._toCalibrationParameters([dv_a, dv_e])
+            dv_res = ABCResult(Calibration(1),
+                               [GenerationResult(1, DataFrame(a => cdfs, e => cdfs), w, [0.5, 0.4, 0.3],
+                                                 0.5, 3, [1, 2, 3], 1.0, 3.0, nothing)],
+                               dv_cps, ABCSMC(population_size=3))
+            dv_frame(p) = names(data(applyk(Dict(:parameters => p), dv_res)).df)
+            @test dv_frame(:latent) == dv_frame(:target) == [a, e]
+            @test dv_frame(:all) == ["cdf($a)", "cdf($e)", a, e]
+            @test length(dv_frame(:all)) == 2 * length(dv_cps)
+
+            # Ridgeline: the prior is built per column, flat for a CDF column.
+            rd = data(applyk(Dict(:parameters => ["cdf(u)", "u"]), res, :ridgeline))
+            @test names(rd.prior_df) == ["cdf(u)", "u"]
+            @test extrema(rd.prior_df[!, "cdf(u)"]) == (1 / 501, 500 / 501)
+            @test rd.prior_df[!, "u"] ≈ 4.0 .* rd.prior_df[!, "cdf(u)"]
+
+            # Transition: rejected proposals held in memory are CDF coordinates, so every column,
+            # CDF or value, gets its rejected points.
+            td = data(applyk(Dict(:parameters => :all), res, :transition))
+            @test names(td.rej_df) == ModelManager._allColumns(g)
+            @test td.rej_df[!, "cdf(u)"] == rej.u
+            @test td.rej_df[!, "u"] ≈ 4.0 .* rej.u
         end
     end
 

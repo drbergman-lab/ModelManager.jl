@@ -3,26 +3,170 @@ using RecipesBase
 
 ################## Private helpers ##################
 
-# Return (df, weights) in the requested space for generation t.
-# df contains only parameter columns (metadata stripped).
-function _vizParticles(result::ABCResult, t::Int, space::Symbol)
-    if space === :target
-        df, w = posterior(result; generation=t)
-        meta = intersect([:weight, :distance, :monad_id], Symbol.(names(df)))
-        return isempty(meta) ? df : select(df, Not(meta)), w
-    elseif space === :cdf
-        gen = result.generations[t]
-        return copy(gen.particles), gen.weights
-    else
-        throw(ArgumentError("Unknown space :$space; use :target or :cdf"))
+################## Parameter groups ##################
+
+#! One keyword, `parameters`, picks both the columns and their coordinates. A column is either a CDF
+#! coordinate (drawn in [0, 1]) or a value (drawn in its own units), and its name says which, so no
+#! second keyword is needed to say what space a column lives in. That requires the CDF columns to be
+#! named apart: the CDF frame names its columns after the latent parameters, which for a
+#! `DistributedVariation` is also the name of its value column.
+_cdfColumnName(name::AbstractString) = "cdf($name)"
+
+#! `latent` holds one column per dimension the sampler draws, in value units: a `LatentVariation`'s
+#! latent parameters, and for every other variation its value. A co-variation's single dimension is
+#! shown through its first variation, which is also the one its inverse map recovers the CDF from.
+#! A `DistributedVariation`'s latent and target are therefore one and the same column, which is why
+#! `values` is deduplicated per parameter rather than being `latent` followed by `target`.
+"""
+    _ParameterGroups
+
+The columns a calibration plot can draw, by group. `cdf_raw[i]` is the CDF frame's name for the
+column displayed as `cdf[i]`; `values` is the union of `latent` and `target` in `posterior`'s order.
+"""
+struct _ParameterGroups
+    cdf_raw::Vector{String}
+    cdf::Vector{String}
+    latent::Vector{String}
+    target::Vector{String}
+    values::Vector{String}
+    function _ParameterGroups(cdf_raw, latent, target, values)
+        cdf = _cdfColumnName.(cdf_raw)
+        all_names = vcat(cdf, values)
+        dup = [n for n in unique(all_names) if count(==(n), all_names) > 1]
+        isempty(dup) || throw(ArgumentError(
+            "Calibration columns $(dup) are each both a CDF column and a value column, so a name " *
+            "cannot say which one to draw. Rename the variation(s) so no value column is called " *
+            "`cdf(...)`."))
+        return new(cdf_raw, cdf, latent, target, values)
     end
 end
 
-# Restrict a particle frame to the recipe's `parameters` selection, in the selected order. The
-# resolver is the one the GSA recipes use, so both families accept the same selectors.
-_selectParameterColumns(df::DataFrame, ::Nothing) = df
-_selectParameterColumns(df::DataFrame, parameters) =
-    select(df, _selectParameters(names(df), parameters))
+_allColumns(g::_ParameterGroups) = vcat(g.cdf, g.values)
+
+function _parameterGroups(cps::Vector{CalibrationParameter})
+    cdf_raw, latent, target, values = String[], String[], String[], String[]
+    for cp in cps
+        targets = _targetColumns(cp)
+        lat     = cp.source isa LVSource ? cp.lv.latent_parameter_names : targets[1:1]
+        append!(cdf_raw, cp.lv.latent_parameter_names)
+        append!(latent, lat)
+        append!(target, targets)
+        append!(values, unique(vcat(lat, targets)))
+    end
+    return _ParameterGroups(cdf_raw, latent, target, values)
+end
+
+#! The same classification read back from `parameters.toml`, so a calibration plotted from disk needs
+#! neither `problem.jld2` nor the user's maps. `nothing` when the file has no entries to classify by.
+function _parameterGroupsFromTOML(toml_path::String)
+    isfile(toml_path) || return nothing
+    entries = get(TOML.parsefile(toml_path), "parameters", nothing)
+    (isnothing(entries) || isempty(entries)) && return nothing
+    cdf_raw, latent, target, values = String[], String[], String[], String[]
+    for entry in entries
+        st = get(entry, "source_type", "")
+        if st == "DVSource" || st == "DiscreteSource"
+            raw, lat, targets = [entry["display_name"]], [entry["display_name"]], [entry["display_name"]]
+        elseif st == "CVSource" || st == "DiscreteCoSource"
+            raw, lat, targets = [entry["covariation_name"]], entry["display_names"][1:1], entry["display_names"]
+        elseif st == "LVSource"
+            raw = lat = entry["latent_display_names"]
+            targets = entry["target_display_names"]
+        else
+            return nothing
+        end
+        append!(cdf_raw, raw)
+        append!(latent, lat)
+        append!(target, targets)
+        append!(values, unique(vcat(lat, targets)))
+    end
+    return _ParameterGroups(String.(cdf_raw), String.(latent), String.(target), String.(values))
+end
+
+#! With nothing to classify by — a result built without `CalibrationParameter`s, or a run whose
+#! `parameters.toml` is gone — every value column is treated as both latent and target, which is what
+#! it is for the `DistributedVariation`s such a result almost always holds.
+_parameterGroups(cdf_names::Vector{String}, value_names::Vector{String}) =
+    _ParameterGroups(cdf_names, value_names, value_names, value_names)
+
+_stripBookkeeping(df::DataFrame) =
+    select(df, Not(intersect(Symbol.(_PARTICLE_BOOKKEEPING_COLUMNS), Symbol.(names(df)))))
+
+function _parameterGroups(result::ABCResult)
+    isempty(result.parameters) || return _parameterGroups(result.parameters)
+    gen = first(result.generations)
+    return _parameterGroups(names(gen.particles), names(_stripBookkeeping(posterior(result; generation=1)[1])))
+end
+
+function _parameterGroups(cal::Calibration, gen_dir::AbstractString, t::Int)
+    g = _parameterGroupsFromTOML(joinpath(calibrationFolder(cal), "parameters.toml"))
+    isnothing(g) || return g
+    value_names = names(_readGenerationFrame(gen_dir, cal.id, t, :particles)[1])
+    cdf_names   = isnothing(_generationArtifact(gen_dir, t, :cdfs)) ? String[] :
+                  names(_readGenerationFrame(gen_dir, cal.id, t, :cdfs)[1])
+    return _parameterGroups(cdf_names, value_names)
+end
+
+#! Only the four groups are Symbols; a column is always named by a String. That keeps a column that
+#! happens to be called `latent` from ever being drawn when the group was meant, and the reverse.
+"""
+    _resolveCalibrationParameters(g::_ParameterGroups, parameters) → Vector{String}
+
+Resolve a calibration recipe's `parameters` keyword: `nothing` (the default) is `:latent`; `:latent`,
+`:target`, `:cdf` or `:all` is that group; a String or vector of Strings names columns from any group.
+"""
+_resolveCalibrationParameters(g::_ParameterGroups, ::Nothing) = _nonEmptyGroup(g.latent, :latent)
+function _resolveCalibrationParameters(g::_ParameterGroups, parameters::Symbol)
+    parameters === :latent && return _nonEmptyGroup(g.latent, :latent)
+    parameters === :target && return _nonEmptyGroup(g.target, :target)
+    parameters === :cdf    && return _nonEmptyGroup(g.cdf, :cdf)
+    parameters === :all    && return _nonEmptyGroup(_allColumns(g), :all)
+    throw(ArgumentError(
+        "`parameters = :$parameters` is not a parameter group. Use :latent (the default), :target, " *
+        ":cdf or :all, or name columns with a String or a vector of Strings: $(_allColumns(g))."))
+end
+_resolveCalibrationParameters(g::_ParameterGroups, parameters) =
+    _selectParameters(_allColumns(g), parameters)
+
+function _nonEmptyGroup(cols::Vector{String}, group::Symbol)
+    isempty(cols) && throw(ArgumentError("`parameters = :$group` has no columns to draw."))
+    return cols
+end
+
+#! RecipesBase consumes every keyword a recipe's signature declares, so `space` stays declared only so
+#! that passing it is an error that says what replaced it, rather than a silent no-op.
+_rejectSpaceKeyword(::Nothing) = nothing
+_rejectSpaceKeyword(space) = throw(ArgumentError(
+    "`space` was removed; `parameters` now chooses the columns and their coordinates. Pass " *
+    "`parameters = :cdf` for CDF coordinates, or :latent (the default), :target or :all."))
+
+#! Each column comes from whichever frame holds it, and a frame is loaded only if a selected column
+#! needs it — so a selection with no CDF column never reads `cdfs.csv`. The loaders return
+#! `(df, weights)`; both frames describe the same particles, so either's weights will do.
+function _parameterFrame(cols::Vector{String}, g::_ParameterGroups, load_values, load_cdfs)
+    cdf_index = Dict(zip(g.cdf, g.cdf_raw))
+    values_df, w = any(c -> !haskey(cdf_index, c), cols) ? load_values() : (nothing, nothing)
+    cdf_df, w_cdf = any(c -> haskey(cdf_index, c), cols) ? load_cdfs() : (nothing, nothing)
+    df = DataFrame()
+    for c in cols
+        df[!, c] = haskey(cdf_index, c) ? cdf_df[!, cdf_index[c]] : values_df[!, c]
+    end
+    return df, isnothing(w) ? w_cdf : w
+end
+
+function _vizFrame(result::ABCResult, t::Int, cols::Vector{String}, g::_ParameterGroups)
+    gen = result.generations[t]
+    return _parameterFrame(cols, g,
+                           () -> (_stripBookkeeping(posterior(result; generation=t)[1]), gen.weights),
+                           () -> (gen.particles, gen.weights))
+end
+
+function _vizFrame(cal::Calibration, gen_dir::AbstractString, t::Int, cols::Vector{String},
+                   g::_ParameterGroups)
+    return _parameterFrame(cols, g,
+                           () -> _readGenerationFrame(gen_dir, cal.id, t, :particles)[1:2],
+                           () -> _readGenerationFrame(gen_dir, cal.id, t, :cdfs)[1:2])
+end
 
 # Convert a CDF-space DataFrame to target-parameter space, stripping metadata columns.
 function _cdfDFToTarget(cdf_df::DataFrame, params::Vector{CalibrationParameter})
@@ -158,24 +302,25 @@ function _lazyLoadRejected(result::ABCResult, t_next::Int)
     return select(sim_df, available)
 end
 
-# Get rejected proposals in the requested space; returns (df_or_nothing, note_string).
-function _getRejected(result::ABCResult, t_next::Int, space::Symbol)
-    gen_next = result.generations[t_next]
-
-    if !isnothing(gen_next.rejected_proposals)
-        rej = gen_next.rejected_proposals
-        if space === :cdf
-            return rej, ""
-        else
-            return _cdfDFToTarget(rej, result.parameters), ""
-        end
+#! Rejected proposals for the selected columns; returns `(df_or_nothing, note)`. Held in memory
+#! (`store_rejected=true`) they are CDF coordinates, so every column can be built from them. Looked up
+#! from the database instead they are values, and a CDF column has no rejected points — the panel
+#! still draws, and the note says why its red marks are missing.
+function _getRejected(result::ABCResult, t_next::Int, cols::Vector{String}, g::_ParameterGroups)
+    rej = result.generations[t_next].rejected_proposals
+    if !isnothing(rej)
+        df, _ = _parameterFrame(cols, g, () -> (_cdfDFToTarget(rej, result.parameters), nothing),
+                                () -> (rej, nothing))
+        return df, ""
     end
 
-    space === :cdf && return nothing, " (set store_rejected=true for CDF-space rejected proposals)"
-
+    wants_cdf = any(in(g.cdf), cols)
+    cdf_note  = " (set store_rejected=true for rejected proposals in CDF columns)"
     df = _lazyLoadRejected(result, t_next)
     isnothing(df) && return nothing, " (rejected proposals unavailable)"
-    return df, ""
+    value_cols = [c for c in cols if c ∉ g.cdf && c in names(df)]
+    isempty(value_cols) && return nothing, wants_cdf ? cdf_note : " (rejected proposals unavailable)"
+    return select(df, value_cols), wants_cdf ? cdf_note : ""
 end
 
 # Aggregate rows of df by exact match; return (unique_df, aggregated_values).
@@ -220,21 +365,24 @@ end
 #! The manual page (`docs/src/man/calibration.md`, "Visualizing calibration results") is the user-facing
 #! home and must carry the substance; keep these terse and in step with it.
 """
-    plot(result::ABCResult; generation=:final, space=:target, parameters=nothing)
-    plot(cal::Calibration; generation=:final, space=:target, parameters=nothing)
+    plot(result::ABCResult; generation=:final, parameters=:latent)
+    plot(cal::Calibration; generation=:final, parameters=:latent)
 
 Corner plot of an ABC-SMC posterior generation. Diagonal panels show weighted 1D KDE
 marginals; off-diagonal lower-triangle panels show weighted 2D KDE contours overlaid
 with a weighted scatter (opacity ∝ weight).
 
 `generation` is an integer index (1-based) or `:final` (default).
-`space=:target` (default) shows biological-unit parameter values;
-`space=:cdf` shows ABC internal CDF coordinates.
 
-`parameters` restricts and orders the panels. It is a DataFrames column selector — a name, a vector
-of names (drawn in that order), positions, a `Regex`, or `Not(...)` — applied to the columns
-[`posterior`](@ref) returns, or to the latent names when `space=:cdf`. The default draws every
-parameter.
+`parameters` picks the columns, and with them their coordinates:
+
+- `:latent` (default) — one column per dimension the sampler draws, in value units: a
+  `LatentVariation`'s latent parameters and every other variation's value. Without
+  `LatentVariation`s this is the same set as `:target`.
+- `:target` — the values written to the model.
+- `:cdf` — the sampler's CDF coordinates in [0, 1], named `cdf(name)`.
+- `:all` — every column above, each once.
+- a String or vector of Strings — exactly those columns, from any group, in that order.
 """
 @recipe function f(cpd::_CornerPlotData)
     df      = cpd.df
@@ -286,21 +434,20 @@ parameter.
     end
 end
 
-@recipe function f(result::ABCResult; generation=:final, space=:target, parameters=nothing)
-    isempty(result.generations) && error("No generations in ABCResult.")
-    t = generation === :final ? length(result.generations) : Int(generation)
-    df, w = _vizParticles(result, t, space)
-    _CornerPlotData(_selectParameterColumns(df, parameters), w)
+@recipe function f(result::ABCResult; generation=:final, parameters=nothing, space=nothing)
+    _rejectSpaceKeyword(space)
+    t    = _resolveGeneration(result, generation)
+    g    = _parameterGroups(result)
+    cols = _resolveCalibrationParameters(g, parameters)
+    _CornerPlotData(_vizFrame(result, t, cols, g)...)
 end
 
-@recipe function f(cal::Calibration; generation=:final, space=:target, parameters=nothing)
-    if space === :target
-        df, w = posterior(cal; generation=generation)
-    else
-        gen_dir, t = _resolveDiskGeneration(cal, generation)
-        df, w, _   = _readGenerationFrame(gen_dir, cal.id, t, :cdfs)
-    end
-    _CornerPlotData(_selectParameterColumns(df, parameters), w)
+@recipe function f(cal::Calibration; generation=:final, parameters=nothing, space=nothing)
+    _rejectSpaceKeyword(space)
+    gen_dir, t = _resolveDiskGeneration(cal, generation)
+    g    = _parameterGroups(cal, gen_dir, t)
+    cols = _resolveCalibrationParameters(g, parameters)
+    _CornerPlotData(_vizFrame(cal, gen_dir, t, cols, g)...)
 end
 
 ################## Posterior narrowing / ridgeline plot ##################
@@ -788,7 +935,7 @@ end
 Dispatch to specialized visualization recipes for `ABCResult`:
 
 - `:ridgeline` — posterior narrowing plot: stacked 1D KDE curves per generation per
-  parameter. `space` keyword: `:target` (default) or `:cdf`.
+  parameter, with the prior as generation 0.
 
 - `:transition` — generation transition plot: gen-t KDE overlaid with gen-(t+1) proposal
   points (accepted in green, rejected in red). Keywords:
@@ -796,22 +943,22 @@ Dispatch to specialized visualization recipes for `ABCResult`:
     Default: `length(result.generations) - 1` (the last complete gen→gen+1 transition).
     For `:ridgeline` and other non-transition styles the default is `length(result.generations)`.
   - `show_particles::Bool` — overlay gen-t particles beneath the KDE (default `false`).
-  - `space::Symbol` — `:target` (default) or `:cdf`.
   - `aggregate_duplicates::Bool` — group coincident proposals into bubbles (default `true`).
 
 - `:distances` — proposal-distance histogram for one generation; `logscale=true` bins in log10.
 
-`parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: a name, a
-vector of names (drawn in that order), positions, a `Regex`, or `Not(...)` over the parameter
-columns. `:distances` has no parameter axis and rejects it.
+`parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: `:latent`
+(default), `:target`, `:cdf`, `:all`, or a String or vector of Strings naming columns.
+`:distances` has no parameter axis and rejects it.
 """
 @recipe function f(result::ABCResult, style::Symbol;
-                   space               = :target,
                    generation          = nothing,
                    show_particles      = false,
                    aggregate_duplicates = true,
                    logscale            = false,
-                   parameters          = nothing)
+                   parameters          = nothing,
+                   space               = nothing)
+    _rejectSpaceKeyword(space)
     isempty(result.generations) && error("No generations in ABCResult.")
     T = length(result.generations)
     resolved_gen = if isnothing(generation)
@@ -819,30 +966,32 @@ columns. `:distances` has no parameter axis and rejects it.
     else
         Int(generation)
     end
+    #! Resolved only for the styles with a parameter axis, so `:distances` can still refuse the keyword.
+    g    = style === :distances ? nothing : _parameterGroups(result)
+    cols = style === :distances ? nothing : _resolveCalibrationParameters(g, parameters)
 
     if style === :ridgeline
         dfs = Vector{DataFrame}(undef, T)
         wts = Vector{Vector{Float64}}(undef, T)
         for t in 1:T
-            df_t, wts[t] = _vizParticles(result, t, space)
-            dfs[t] = _selectParameterColumns(df_t, parameters)
+            dfs[t], wts[t] = _vizFrame(result, t, cols, g)
         end
-        pnames = names(dfs[1])
 
-        # Build prior (gen 0) by sampling uniform CDF coords and converting to target space.
+        #! The prior (gen 0) is a grid of uniform CDF quantiles mapped through each parameter, so a
+        #! CDF column's prior ridge is flat and a value column's is its prior density.
         prior_df  = nothing
         prior_wts = nothing
-        if space === :target && !isempty(result.parameters)
+        if !isempty(result.parameters)
             N_prior   = 500
             cdf_vals  = collect((1:N_prior) ./ (N_prior + 1))   # uniform quantiles, avoids endpoints
-            cdf_names = [n for cp in result.parameters for n in cp.lv.latent_parameter_names]
-            prior_cdf = DataFrame([n => cdf_vals for n in cdf_names]...)
-            prior_df  = _selectParameterColumns(_cdfDFToTarget(prior_cdf, result.parameters),
-                                                parameters)
+            prior_cdf = DataFrame([n => cdf_vals for n in g.cdf_raw]...)
+            prior_df, _ = _parameterFrame(cols, g,
+                                          () -> (_cdfDFToTarget(prior_cdf, result.parameters), nothing),
+                                          () -> (prior_cdf, nothing))
             prior_wts = fill(1.0 / N_prior, N_prior)
         end
 
-        _RidgelineData(dfs, wts, prior_df, prior_wts, pnames)
+        _RidgelineData(dfs, wts, prior_df, prior_wts, cols)
 
     elseif style === :transition
         T < 2 && error(":transition plot requires at least 2 generations.")
@@ -851,19 +1000,11 @@ columns. `:distances` has no parameter axis and rejects it.
         (1 <= t && t_next <= T) || throw(ArgumentError(
             "generation must be in [1, $(T-1)] for :transition, got $t"))
 
-        kde_df, kde_w = _vizParticles(result, t, space)
-        kde_df        = _selectParameterColumns(kde_df, parameters)
-        acc_df, acc_w = _vizParticles(result, t_next, space)
-        rej_df, note  = _getRejected(result, t_next, space)
+        kde_df, kde_w = _vizFrame(result, t, cols, g)
+        acc_df, acc_w = _vizFrame(result, t_next, cols, g)
+        rej_df, note  = _getRejected(result, t_next, cols, g)
 
-        pnames = names(kde_df)
-        # Filter proposal DataFrames to common columns
-        acc_df_filt = select(acc_df, intersect(pnames, names(acc_df)))
-        rej_df_filt = isnothing(rej_df) ? nothing :
-                      select(rej_df, intersect(pnames, names(rej_df)))
-
-        _TransitionData(kde_df, kde_w, acc_df_filt, acc_w,
-                        rej_df_filt, pnames,
+        _TransitionData(kde_df, kde_w, acc_df, acc_w, rej_df, cols,
                         result.method.population_size, note,
                         show_particles, aggregate_duplicates)
 
@@ -900,31 +1041,34 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
 
 - `:distances` — proposal-distance histogram for one generation; `logscale=true` bins in log10.
 
-`parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: a name, a
-vector of names (drawn in that order), positions, a `Regex`, or `Not(...)` over the parameter
-columns. `:distances` has no parameter axis and rejects it.
+`parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: `:latent`
+(default), `:target`, `:cdf`, `:all`, or a String or vector of Strings naming columns.
+`:distances` has no parameter axis and rejects it.
 """
 @recipe function f(cal::Calibration, style::Symbol;
                    generation           = nothing,
                    show_particles       = false,
                    aggregate_duplicates = true,
                    logscale             = false,
-                   parameters           = nothing)
+                   parameters           = nothing,
+                   space                = nothing)
+    _rejectSpaceKeyword(space)
     #! Generations are addressed by index throughout, so both layouts and any padding width behave
     #! alike, and `t` never means "position in a sorted listing".
     gen_dir, indices = _completeGenerations(cal)
     _readGenCSV(t::Int) = _readGenerationFrame(gen_dir, cal.id, t, :particles)
+    g    = style === :distances ? nothing : _parameterGroups(cal, gen_dir, last(indices))
+    cols = style === :distances ? nothing : _resolveCalibrationParameters(g, parameters)
 
     if style === :ridgeline
         dfs = Vector{DataFrame}()
         wts = Vector{Vector{Float64}}()
         for t in indices
-            df, w, _ = _readGenCSV(t)
-            push!(dfs, _selectParameterColumns(df, parameters))
+            df, w = _vizFrame(cal, gen_dir, t, cols, g)
+            push!(dfs, df)
             push!(wts, w)
         end
-        pnames = names(dfs[1])
-        _RidgelineData(dfs, wts, nothing, nothing, pnames)
+        _RidgelineData(dfs, wts, nothing, nothing, cols)
 
     elseif style === :transition
         T = last(indices)
@@ -933,11 +1077,9 @@ columns. `:distances` has no parameter axis and rejects it.
         (t in indices && t_next in indices) || throw(ArgumentError(
             "generation must be one with a successor; got $t, available $(indices)"))
 
-        kde_df, kde_w, _        = _readGenCSV(t)
-        kde_df                  = _selectParameterColumns(kde_df, parameters)
-        acc_df, acc_w, acc_raw  = _readGenCSV(t_next)
-
-        pnames = names(kde_df)
+        kde_df, kde_w = _vizFrame(cal, gen_dir, t, cols, g)
+        acc_df, acc_w = _vizFrame(cal, gen_dir, t_next, cols, g)
+        _, _, acc_raw = _readGenCSV(t_next)
 
         # Accepted monad IDs for rejected-proposal detection
         accepted_monad_ids = hasproperty(acc_raw, :monad_id) ?
@@ -952,21 +1094,17 @@ columns. `:distances` has no parameter axis and rejects it.
             length(accepted_monad_ids), T
         end
 
-        # Attempt to load rejected proposals via simulationsTable + TOML mapping
+        #! Rejected proposals are read back from the database, which holds values only: a CDF column,
+        #! and a `LatentVariation`'s latent parameters, have no rejected points from disk.
+        value_cols  = [c for c in cols if c ∉ g.cdf]
         params_toml = joinpath(calibrationFolder(cal), "parameters.toml")
         mapping     = _buildDbToDisplayMappingFromTOML(params_toml)
-        rej_df = _lazyLoadRejectedFromDisk(cal, t_next, max_nr_pop,
-                                            accepted_monad_ids, pnames, mapping)
+        rej_df = isempty(value_cols) ? nothing :
+                 _lazyLoadRejectedFromDisk(cal, t_next, max_nr_pop,
+                                           accepted_monad_ids, value_cols, mapping)
         note = isnothing(rej_df) ? " (rejected proposals unavailable)" : ""
 
-        acc_df_filt = select(acc_df, intersect(pnames, names(acc_df)))
-        rej_df_filt = isnothing(rej_df) ? nothing :
-                      let common = intersect(pnames, names(rej_df))
-                          isempty(common) ? nothing : select(rej_df, common)
-                      end
-
-        _TransitionData(kde_df, kde_w, acc_df_filt, acc_w,
-                        rej_df_filt, pnames,
+        _TransitionData(kde_df, kde_w, acc_df, acc_w, rej_df, cols,
                         pop_size, note,
                         show_particles, aggregate_duplicates)
     elseif style === :distances
