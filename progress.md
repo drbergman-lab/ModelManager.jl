@@ -33,6 +33,21 @@ let one keyword carry the coordinates too.
   style recipe never declared `space`, so `plot(cal, :ridgeline; space=:cdf)` silently drew values.
 - **The GSA recipes follow**, Strings only, so `parameters` means one thing package-wide.
 
+### Review: a latent named like its target (2026-10-08)
+Copilot found that a `DistributedVariation`'s latent and target can share a name while holding
+different numbers: `LatentVariation(dv)` passed as a calibration parameter is an `LVSource` whose
+Uniform(0,1) latent and value both take the variation's name. This predates the keyword change;
+`_buildDisplayDF` already wrote the target over the latent, so `posterior` and `particles.csv` never
+had the latent. Decided: **refuse it in `CalibrationProblem`** rather than rename it. Renaming would
+change `posterior`'s columns behind the user's back, and the user loses nothing by the refusal: the
+`DistributedVariation` itself samples identically, and `name=` gives the latent its own name. The same
+check refuses any column name repeated across parameters, since one would overwrite the other; the
+existing conversion test calibrated `path/a` through both a co-variation and a discrete variation, and
+was moved to its own path. Old runs still plot: the shared name is treated as the target, which is
+what its column holds. The two smaller findings were taken as given: a CDF-only `:transition` no
+longer queries the database, and a mixed selection always says that its CDF panels lack rejected
+points.
+
 ### Also corrected
 PRD.md claimed the `:transition` lazy lookup inverted rejected values to CDF coordinates for
 `space=:cdf`. It never did; it returned nothing for CDF space. The PRD now says what happens.

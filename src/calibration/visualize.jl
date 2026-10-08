@@ -47,7 +47,8 @@ function _parameterGroups(cps::Vector{CalibrationParameter})
     cdf_raw, latent, target, values = String[], String[], String[], String[]
     for cp in cps
         targets = _targetColumns(cp)
-        lat     = cp.source isa LVSource ? cp.lv.latent_parameter_names : targets[1:1]
+        lat     = cp.source isa LVSource ? _distinctLatents(cp.lv.latent_parameter_names, targets) :
+                  targets[1:1]
         append!(cdf_raw, cp.lv.latent_parameter_names)
         append!(latent, lat)
         append!(target, targets)
@@ -70,8 +71,9 @@ function _parameterGroupsFromTOML(toml_path::String)
         elseif st == "CVSource" || st == "DiscreteCoSource"
             raw, lat, targets = [entry["covariation_name"]], entry["display_names"][1:1], entry["display_names"]
         elseif st == "LVSource"
-            raw = lat = entry["latent_display_names"]
+            raw     = entry["latent_display_names"]
             targets = entry["target_display_names"]
+            lat     = _distinctLatents(raw, targets)
         else
             return nothing
         end
@@ -82,6 +84,12 @@ function _parameterGroupsFromTOML(toml_path::String)
     end
     return _ParameterGroups(String.(cdf_raw), String.(latent), String.(target), String.(values))
 end
+
+#! `CalibrationProblem` now refuses a latent named like one of its targets, but a run recorded before
+#! that — or a problem restored from `problem.jld2` — can still carry one. Its display frame holds only
+#! the target under that name (`_buildDisplayDF` wrote the target over the latent), so the name is a
+#! target, and the latent is left to its CDF column rather than drawn as values it does not have.
+_distinctLatents(latents, targets) = [n for n in latents if n ∉ targets]
 
 #! With nothing to classify by — a result built without `CalibrationParameter`s, or a run whose
 #! `parameters.toml` is gone — every value column is treated as both latent and target, which is what
@@ -314,13 +322,23 @@ function _getRejected(result::ABCResult, t_next::Int, cols::Vector{String}, g::_
         return df, ""
     end
 
-    wants_cdf = any(in(g.cdf), cols)
-    cdf_note  = " (set store_rejected=true for rejected proposals in CDF columns)"
-    df = _lazyLoadRejected(result, t_next)
-    isnothing(df) && return nothing, " (rejected proposals unavailable)"
-    value_cols = [c for c in cols if c ∉ g.cdf && c in names(df)]
-    isempty(value_cols) && return nothing, wants_cdf ? cdf_note : " (rejected proposals unavailable)"
-    return select(df, value_cols), wants_cdf ? cdf_note : ""
+    #! A selection of CDF columns alone has nothing to gain from the database, and the lookup is not
+    #! free: it can throw on a rejected monad deleted after all its simulations failed.
+    value_cols = [c for c in cols if c ∉ g.cdf]
+    df = isempty(value_cols) ? nothing : _lazyLoadRejected(result, t_next)
+    available  = isnothing(df) ? String[] : [c for c in value_cols if c in names(df)]
+    note = _rejectedNote(cols, g, !isempty(available) || isempty(value_cols))
+    return isempty(available) ? nothing : select(df, available), note
+end
+
+#! The title note for rejected proposals read back from the database. A CDF column never has them that
+#! way, which is worth saying even when the value columns did get theirs — otherwise its empty panels
+#! read as "nothing was rejected".
+function _rejectedNote(cols::Vector{String}, g::_ParameterGroups, values_found::Bool)
+    notes = String[]
+    values_found || push!(notes, "rejected proposals unavailable")
+    any(in(g.cdf), cols) && push!(notes, "set store_rejected=true for rejected proposals in CDF columns")
+    return isempty(notes) ? "" : " (" * join(notes, "; ") * ")"
 end
 
 # Aggregate rows of df by exact match; return (unique_df, aggregated_values).
@@ -1118,7 +1136,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
         rej_df = isempty(value_cols) ? nothing :
                  _lazyLoadRejectedFromDisk(cal, t_next, max_nr_pop,
                                            accepted_monad_ids, value_cols, mapping)
-        note = isnothing(rej_df) ? " (rejected proposals unavailable)" : ""
+        note = _rejectedNote(cols, g, !isnothing(rej_df) || isempty(value_cols))
 
         _TransitionData(kde_df, kde_w, acc_df, acc_w, rej_df, cols,
                         pop_size, note,

@@ -56,6 +56,12 @@ to the internal [`CalibrationParameter`](@ref) representation automatically. A d
 needs at least two levels; one that can never vary is rejected rather than given a particle
 coordinate no proposal can move, so set such a value in the reference monad instead.
 
+Every parameter needs its own column names, because the posterior is one table. Two variations with
+the same name are refused, and so is a `LatentVariation` whose latent parameter is named like one of
+its targets. `LatentVariation(dv)` built from a `DistributedVariation` is the common case: its
+latent (a value in [0, 1]) and its target share the variation's name. Pass the
+`DistributedVariation` itself, which samples identically, or name the latent with `name=`.
+
 Two functions you supply:
 
 - **`summary_statistic`** — a [`QoI`](@ref), or a vector of them (a bare function is wrapped into

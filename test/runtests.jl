@@ -830,7 +830,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test occursin("Not a variation: Nothing", sprint(showerror, not_a_variation))
         # A mixed continuous/discrete set converts, which is the point of the change.
         mixed = ModelManager._toCalibrationParameters(
-            [dv, cv, DiscreteVariation(:config, xp2, [5.0, 6.0])])
+            [dv, cv, DiscreteVariation(:config, XMLPath(["path", "c"]), [5.0, 6.0])])
         @test length(mixed) == 3
         @test mixed[3].source isa ModelManager.DiscreteSource
 
@@ -8380,6 +8380,52 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test names(td.rej_df) == ModelManager._allColumns(g)
             @test td.rej_df[!, "cdf(u)"] == rej.u
             @test td.rej_df[!, "u"] ≈ 4.0 .* rej.u
+
+            # Without rejected proposals in memory, a CDF-only selection skips the database lookup and
+            # says why its panels have no red points; a mixed one says so too, even when the value
+            # columns got theirs.
+            res_norej = ABCResult(Calibration(1), [g1, GenerationResult(2, particles(0.1), w,
+                                  [0.2, 0.1, 0.1], 0.2, 6, [4, 5, 6], 0.5, 3.0, nothing)],
+                                  cps, ABCSMC(population_size=3))
+            td_cdf = data(applyk(Dict(:parameters => :cdf), res_norej, :transition))
+            @test isnothing(td_cdf.rej_df)
+            @test occursin("store_rejected=true", td_cdf.note)
+            @test !occursin("unavailable", td_cdf.note)
+            @test ModelManager._rejectedNote([a], g, true) == ""
+            @test ModelManager._rejectedNote([a], g, false) == " (rejected proposals unavailable)"
+            @test occursin("store_rejected=true", ModelManager._rejectedNote(["cdf($a)", a], g, true))
+            @test occursin("unavailable", ModelManager._rejectedNote(["cdf($a)", a], g, false))
+        end
+
+        @testset "a latent named like its target" begin
+            #! `LatentVariation(dv)` names its Uniform(0,1) latent and its value alike; `posterior` used
+            #! to write the value over the latent, losing it without a word.
+            xs  = XMLPath(["g", "s"])
+            dvs = DistributedVariation(:config, xs, Uniform(0.0, 2.0))
+            s   = columnName(xs)
+            err = try ModelManager._toCalibrationParameters([LatentVariation(dvs)]); nothing catch e; e end
+            @test err isa ArgumentError
+            @test occursin("share", err.msg)
+            @test occursin("pass the DistributedVariation itself", err.msg)
+            renamed = ModelManager._toCalibrationParameters([LatentVariation(dvs; name="u_s")])
+            @test ModelManager._displayColumns(renamed[1]) == ["u_s", s]
+
+            # Two parameters may not share a column either, in the display frame or the CDF frame.
+            dup = DistributedVariation(:config, XMLPath(["g", "t"]), Uniform(0.0, 1.0); name=s)
+            @test_throws ArgumentError ModelManager._toCalibrationParameters([dvs, dup])
+
+            # A run recorded before the check still plots: the shared name is the target (its display
+            # column holds target values), and the latent is left to its CDF column.
+            lv_old = LatentVariation(dvs)
+            g_old  = ModelManager._parameterGroups([CalibrationParameter(ModelManager.LVSource(lv_old), lv_old)])
+            @test g_old.latent == String[]
+            @test g_old.target == [s]
+            @test ModelManager._allColumns(g_old) == ["cdf($s)", s]
+            toml_path = joinpath(mktempdir(), "parameters.toml")
+            open(toml_path, "w") do io
+                TOML.print(io, Dict("parameters" => [ModelManager._parameterTOMLEntry(ModelManager.LVSource(lv_old), lv_old)]))
+            end
+            @test ModelManager._parameterGroupsFromTOML(toml_path).latent == String[]
         end
     end
 

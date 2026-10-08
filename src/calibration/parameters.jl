@@ -141,7 +141,19 @@ Return why `av` cannot be a calibration parameter, or `nothing` if it can.
 """
 _calibrationRejection(::DistributedVariation) = nothing
 _calibrationRejection(::CoVariation{DistributedVariation}) = nothing
-_calibrationRejection(::LatentVariation{<:Distribution}) = nothing
+
+#! A latent parameter sharing a name with one of its targets is two different numbers under one name:
+#! `LatentVariation(dv)` names its Uniform(0,1) latent and its value alike, so `posterior` wrote the
+#! target over the latent and the latent silently vanished from every display frame and plot. The
+#! user's choice of name is the only thing to change, so it is refused rather than renamed for them.
+function _calibrationRejection(lv::LatentVariation{<:Distribution})
+    shared = intersect(lv.latent_parameter_names, lv.target_names)
+    isempty(shared) && return nothing
+    return "latent parameter$(length(shared) == 1 ? "" : "s") $(shared) share$(length(shared) == 1 ? "s" : "") " *
+           "a name with a target, so the two cannot be told apart in the posterior. For a " *
+           "LatentVariation built from a DistributedVariation, pass the DistributedVariation itself " *
+           "(it samples identically), or give the latent its own name with `name=`."
+end
 
 #! Discrete parameters are calibratable. They are represented as `DiscreteUniform` over their value
 #! indices, so a particle coordinate stays a CDF value in [0,1] and the quantile does the quantising —
@@ -229,7 +241,22 @@ function _toCalibrationParameters(parameters::AbstractVector)
         $(join(lines, "\n"))
         """))
     end
-    return CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    _assertUniqueColumns(cps)
+    return cps
+end
+
+#! Every parameter's columns share two frames — the display frame (`posterior`, `particles.csv`) and
+#! the CDF frame (`cdfs.csv`) — and a repeated name in either overwrites one parameter's column with
+#! another's, with no error.
+function _assertUniqueColumns(cps::Vector{CalibrationParameter})
+    for (frame, cols) in (("posterior", vcat(String[], _displayColumns.(cps)...)),
+                          ("CDF", vcat(String[], (cp.lv.latent_parameter_names for cp in cps)...)))
+        dup = unique(c for c in cols if count(==(c), cols) > 1)
+        isempty(dup) || throw(ArgumentError(
+            "Calibration parameters share the $(frame) column name$(length(dup) == 1 ? "" : "s") " *
+            "$(dup), so one would overwrite the other. Give the variations distinct names with `name=`."))
+    end
 end
 
 ################## Display column helpers ##################
