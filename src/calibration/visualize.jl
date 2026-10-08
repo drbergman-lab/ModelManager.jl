@@ -428,8 +428,16 @@ with a weighted scatter (opacity ∝ weight).
                     markerstrokewidth := 0
                     xj, xi
                 end
+            else
+                #! Plots draws a frame and 0–1 ticks on a panel with no series, so the upper
+                #! triangle needs an empty series whose only job is to switch its axes off.
+                @series begin
+                    subplot    := sp
+                    seriestype := :path
+                    framestyle := :none
+                    Float64[], Float64[]
+                end
             end
-            # upper triangle: no series emitted → blank panel
         end
     end
 end
@@ -734,8 +742,16 @@ end
                         accj, acci
                     end
                 end
+            else
+                #! Plots draws a frame and 0–1 ticks on a panel with no series, so the upper
+                #! triangle needs an empty series whose only job is to switch its axes off.
+                @series begin
+                    subplot    := sp
+                    seriestype := :path
+                    framestyle := :none
+                    Float64[], Float64[]
+                end
             end
-            # upper triangle: blank
         end
     end
 end
