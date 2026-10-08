@@ -1465,6 +1465,51 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test df_empty[!, :u] ≈ [0.25, 0.75]
     end
 
+    @testset "LatentVariation from a DistributedVariation: the latent is the value" begin
+        xp  = XMLPath(["a", "x"])
+        xp2 = XMLPath(["a", "y"])
+        cs  = [0.1, 0.25, 0.5, 0.9]
+        for flip in (false, true)
+            dv = DistributedVariation(:config, xp, Gamma(2.0, 3.0); flip=flip)
+            lv = LatentVariation(dv)
+            @test lv.latent_parameters == [dv.distribution]
+            @test lv.maps == [first]
+            @test lv.flips == [flip]
+            @test lv.latent_parameter_names == lv.target_names
+            for c in cs
+                # The coordinate means what it always meant, so designs and stored coordinates agree
+                # with the DistributedVariation's own mapping.
+                @test ModelManager.variationValues(lv, [c]) ≈ ModelManager.variationValues(dv, [c])
+                # The latent and the target are one number.
+                lp = ModelManager._latentValues(lv, [c])
+                @test lp ≈ ModelManager.variationValues(lv, [c])
+                # And the coordinate comes back from the value, which is what the bank relies on.
+                @test ModelManager._latentCoordinates(lv, [lv.inverse_maps[1](lp)]) ≈ [c]
+            end
+            # Passed as itself, its latent and target are one display column holding the value.
+            cp = ModelManager._toCalibrationParameter(lv)
+            @test ModelManager._particleRowToDisplay(cp, [0.25]) ≈ ModelManager.variationValues(dv, [0.25])
+        end
+
+        # A co-variation's latent is its first variation's value; the others follow through the shared
+        # coordinate with their own flips, so every target matches its own variation at that coordinate.
+        for (f1, f2) in ((false, false), (true, false), (false, true), (true, true))
+            d1 = DistributedVariation(:config, xp, Uniform(0.0, 2.0); flip=f1)
+            d2 = DistributedVariation(:config, xp2, Normal(5.0, 1.0); flip=f2)
+            lv = LatentVariation(CoVariation(d1, d2))
+            @test lv.latent_parameters == [d1.distribution]
+            @test lv.flips == [f1]
+            for c in cs
+                tv = ModelManager.variationValues(lv, [c])
+                @test tv ≈ [ModelManager.variationValues(d1, [c])[1], ModelManager.variationValues(d2, [c])[1]]
+                @test ModelManager._latentValues(lv, [c]) ≈ tv[1:1]
+                @test lv.inverse_maps[1](tv) ≈ tv[1]
+                @test ModelManager._latentCoordinates(lv, [lv.inverse_maps[1](tv)]) ≈ [c]
+                @test isnan(lv.inverse_maps[1]([tv[1], tv[2] + 1.0]))   # off the curve
+            end
+        end
+    end
+
     @testset "posterior" begin
         particles1 = DataFrame(x=[1.0, 2.0])
         particles2 = DataFrame(x=[3.0, 4.0])
@@ -8398,34 +8443,45 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
 
         @testset "a latent named like its target" begin
-            #! `LatentVariation(dv)` names its Uniform(0,1) latent and its value alike; `posterior` used
-            #! to write the value over the latent, losing it without a word.
             xs  = XMLPath(["g", "s"])
-            dvs = DistributedVariation(:config, xs, Uniform(0.0, 2.0))
+            dvs = DistributedVariation(:config, xs, Uniform(0.0, 2.0); flip=true)
             s   = columnName(xs)
-            err = try ModelManager._toCalibrationParameters([LatentVariation(dvs)]); nothing catch e; e end
+
+            # `LatentVariation(dv)` names its latent and its target alike because they are one number
+            # (map `first`): accepted, and it displays and groups exactly like the variation itself.
+            lv_dv = LatentVariation(dvs)
+            cps   = ModelManager._toCalibrationParameters([lv_dv])
+            @test ModelManager._displayColumns(cps[1]) == [s]
+            @test ModelManager._particleRowToDisplay(cps[1], [0.25]) ≈ [quantile(Uniform(0.0, 2.0), 0.75)]
+            g_lv = ModelManager._parameterGroups(cps)
+            g_dv = ModelManager._parameterGroups(ModelManager._toCalibrationParameters([dvs]))
+            @test (g_lv.latent, g_lv.target, g_lv.values) == (g_dv.latent, g_dv.target, g_dv.values) == ([s], [s], [s])
+            @test ModelManager._allColumns(g_lv) == ["cdf($s)", s]
+
+            # The selector of latent i may be `Fix2(getindex, i)` as well as `first`.
+            lv_sel = LatentVariation([Uniform(0.0, 1.0), Normal(0.0, 1.0)], XMLPath[xs],
+                                     Function[Base.Fix2(getindex, 2)], ["a", s], Symbol[:config];
+                                     target_names=[s])
+            @test isnothing(ModelManager._calibrationRejection(lv_sel))
+
+            # Any other map under a shared name is two numbers under one name: refused.
+            lv_bad = LatentVariation([Uniform(0.0, 1.0)], XMLPath[xs], Function[lp -> 2.0 * lp[1]],
+                                     [s], Symbol[:config]; target_names=[s])
+            err = try ModelManager._toCalibrationParameters([lv_bad]); nothing catch e; e end
             @test err isa ArgumentError
-            @test occursin("share", err.msg)
-            @test occursin("pass the DistributedVariation itself", err.msg)
-            renamed = ModelManager._toCalibrationParameters([LatentVariation(dvs; name="u_s")])
-            @test ModelManager._displayColumns(renamed[1]) == ["u_s", s]
+            @test occursin("selector", err.msg)
+            # Selecting the wrong latent is a different number too.
+            lv_wrong = LatentVariation([Uniform(0.0, 1.0), Normal(0.0, 1.0)], XMLPath[xs],
+                                       Function[first], ["a", s], Symbol[:config]; target_names=[s])
+            @test !isnothing(ModelManager._calibrationRejection(lv_wrong))
+            # A discrete LatentVariation maps an index to a value, so its shared name is refused.
+            dd = DiscreteVariation(:config, xs, [1.0, 2.0, 3.0])
+            @test occursin("pass the DiscreteVariation itself",
+                           ModelManager._calibrationRejection(LatentVariation(dd)))
 
             # Two parameters may not share a column either, in the display frame or the CDF frame.
             dup = DistributedVariation(:config, XMLPath(["g", "t"]), Uniform(0.0, 1.0); name=s)
             @test_throws ArgumentError ModelManager._toCalibrationParameters([dvs, dup])
-
-            # A run recorded before the check still plots: the shared name is the target (its display
-            # column holds target values), and the latent is left to its CDF column.
-            lv_old = LatentVariation(dvs)
-            g_old  = ModelManager._parameterGroups([CalibrationParameter(ModelManager.LVSource(lv_old), lv_old)])
-            @test g_old.latent == String[]
-            @test g_old.target == [s]
-            @test ModelManager._allColumns(g_old) == ["cdf($s)", s]
-            toml_path = joinpath(mktempdir(), "parameters.toml")
-            open(toml_path, "w") do io
-                TOML.print(io, Dict("parameters" => [ModelManager._parameterTOMLEntry(ModelManager.LVSource(lv_old), lv_old)]))
-            end
-            @test ModelManager._parameterGroupsFromTOML(toml_path).latent == String[]
         end
     end
 

@@ -47,8 +47,7 @@ function _parameterGroups(cps::Vector{CalibrationParameter})
     cdf_raw, latent, target, values = String[], String[], String[], String[]
     for cp in cps
         targets = _targetColumns(cp)
-        lat     = cp.source isa LVSource ? _distinctLatents(cp.lv.latent_parameter_names, targets) :
-                  targets[1:1]
+        lat     = cp.source isa LVSource ? cp.lv.latent_parameter_names : targets[1:1]
         append!(cdf_raw, cp.lv.latent_parameter_names)
         append!(latent, lat)
         append!(target, targets)
@@ -71,9 +70,8 @@ function _parameterGroupsFromTOML(toml_path::String)
         elseif st == "CVSource" || st == "DiscreteCoSource"
             raw, lat, targets = [entry["covariation_name"]], entry["display_names"][1:1], entry["display_names"]
         elseif st == "LVSource"
-            raw     = entry["latent_display_names"]
+            raw = lat = entry["latent_display_names"]
             targets = entry["target_display_names"]
-            lat     = _distinctLatents(raw, targets)
         else
             return nothing
         end
@@ -84,12 +82,6 @@ function _parameterGroupsFromTOML(toml_path::String)
     end
     return _ParameterGroups(String.(cdf_raw), String.(latent), String.(target), String.(values))
 end
-
-#! `CalibrationProblem` now refuses a latent named like one of its targets, but a run recorded before
-#! that — or a problem restored from `problem.jld2` — can still carry one. Its display frame holds only
-#! the target under that name (`_buildDisplayDF` wrote the target over the latent), so the name is a
-#! target, and the latent is left to its CDF column rather than drawn as values it does not have.
-_distinctLatents(latents, targets) = [n for n in latents if n ∉ targets]
 
 #! With nothing to classify by — a result built without `CalibrationParameter`s, or a run whose
 #! `parameters.toml` is gone — every value column is treated as both latent and target, which is what

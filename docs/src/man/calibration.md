@@ -56,11 +56,10 @@ to the internal [`CalibrationParameter`](@ref) representation automatically. A d
 needs at least two levels; one that can never vary is rejected rather than given a particle
 coordinate no proposal can move, so set such a value in the reference monad instead.
 
-Every parameter needs its own column names, because the posterior is one table. Two variations with
-the same name are refused, and so is a `LatentVariation` whose latent parameter is named like one of
-its targets. `LatentVariation(dv)` built from a `DistributedVariation` is the common case: its
-latent (a value in [0, 1]) and its target share the variation's name. Pass the
-`DistributedVariation` itself, which samples identically, or name the latent with `name=`.
+Every parameter needs its own column names, because the posterior is one table, so two variations
+with the same name are refused. A `LatentVariation` may give a latent and a target the same name only
+when they are the same number, i.e. the target's map is that latent's selector (`first`, or
+`Base.Fix2(getindex, i)`); `LatentVariation(dv)` is built that way and behaves exactly like `dv`.
 
 Two functions you supply:
 

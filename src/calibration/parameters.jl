@@ -142,17 +142,24 @@ Return why `av` cannot be a calibration parameter, or `nothing` if it can.
 _calibrationRejection(::DistributedVariation) = nothing
 _calibrationRejection(::CoVariation{DistributedVariation}) = nothing
 
-#! A latent parameter sharing a name with one of its targets is two different numbers under one name:
-#! `LatentVariation(dv)` names its Uniform(0,1) latent and its value alike, so `posterior` wrote the
-#! target over the latent and the latent silently vanished from every display frame and plot. The
-#! user's choice of name is the only thing to change, so it is refused rather than renamed for them.
+#! A latent may share a name with a target only when they are the same number, i.e. when the target's
+#! map is the selector of that latent — what Julia's `identity` means for a map handed the whole latent
+#! vector. `LatentVariation(dv)` is built that way. Any other map would put two numbers under one name,
+#! and `posterior` would silently keep only the target; the user's choice of name is the only thing to
+#! change, so it is refused rather than renamed for them. Checked on the map object itself, not by
+#! evaluating it.
+_selectsLatent(m, i::Int) = (i == 1 && m === first) || (m isa Base.Fix2{typeof(getindex)} && m.x == i)
+
 function _calibrationRejection(lv::LatentVariation{<:Distribution})
-    shared = intersect(lv.latent_parameter_names, lv.target_names)
-    isempty(shared) && return nothing
-    return "latent parameter$(length(shared) == 1 ? "" : "s") $(shared) share$(length(shared) == 1 ? "s" : "") " *
-           "a name with a target, so the two cannot be told apart in the posterior. For a " *
-           "LatentVariation built from a DistributedVariation, pass the DistributedVariation itself " *
-           "(it samples identically), or give the latent its own name with `name=`."
+    clashes = [lv.latent_parameter_names[i]
+               for i in eachindex(lv.latent_parameter_names), j in eachindex(lv.target_names)
+               if lv.latent_parameter_names[i] == lv.target_names[j] && !_selectsLatent(lv.maps[j], i)]
+    isempty(clashes) && return nothing
+    return "latent parameter$(length(clashes) == 1 ? "" : "s") $(unique(clashes)) share" *
+           "$(length(clashes) == 1 ? "s" : "") a name with a target that is a different number, so " *
+           "the posterior could not hold both. Name them apart, or, if the target is meant to be the " *
+           "latent itself, make its map the latent's selector (`first`, or `Base.Fix2(getindex, i)`). " *
+           "For a LatentVariation built from a DiscreteVariation, pass the DiscreteVariation itself."
 end
 
 #! Discrete parameters are calibratable. They are represented as `DiscreteUniform` over their value
@@ -284,8 +291,10 @@ _displayColumns(cp::CalibrationParameter) = _displayColumns(cp.source, cp.lv)
 #! are the trailing columns.
 _displayColumns(s::AbstractCalibrationSource, lv::LatentVariation) = _targetColumns(s, lv)
 
+#! Deduplicated: a latent whose target is the latent itself (`LatentVariation(dv)`, map `first`) is one
+#! column, not two. `_particleRowToDisplay` drops the same positions, so the two stay aligned.
 _displayColumns(::LVSource, lv::LatentVariation) =
-    [lv.latent_parameter_names..., _targetColumns(LVSource, lv)...]
+    unique([lv.latent_parameter_names..., _targetColumns(LVSource, lv)...])
 
 """
     _targetColumns(cp::CalibrationParameter) → Vector{String}
@@ -426,7 +435,9 @@ function _particleRowToDisplay(::DiscreteCoSource, lv::LatentVariation, cdf_vals
 end
 
 function _particleRowToDisplay(::LVSource, lv::LatentVariation, cdf_vals::Vector{Float64})
-    lp_vals     = [quantile(d, cdf) for (d, cdf) in zip(lv.latent_parameters, cdf_vals)]
+    lp_vals     = _latentValues(lv, cdf_vals)
     target_vals = variationValues(lv, cdf_vals)
-    return [lp_vals..., target_vals...]
+    names       = [lv.latent_parameter_names..., _targetColumns(LVSource, lv)...]
+    keep        = [i for i in eachindex(names) if findfirst(==(names[i]), names) == i]
+    return [lp_vals..., target_vals...][keep]
 end

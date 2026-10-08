@@ -34,23 +34,46 @@ let one keyword carry the coordinates too.
 - **The GSA recipes follow**, Strings only, so `parameters` means one thing package-wide.
 
 ### Review: a latent named like its target (2026-10-08)
-Copilot found that a `DistributedVariation`'s latent and target can share a name while holding
-different numbers: `LatentVariation(dv)` passed as a calibration parameter is an `LVSource` whose
-Uniform(0,1) latent and value both take the variation's name. This predates the keyword change;
-`_buildDisplayDF` already wrote the target over the latent, so `posterior` and `particles.csv` never
-had the latent. Decided: **refuse it in `CalibrationProblem`** rather than rename it. Renaming would
-change `posterior`'s columns behind the user's back, and the user loses nothing by the refusal: the
-`DistributedVariation` itself samples identically, and `name=` gives the latent its own name. The same
-check refuses any column name repeated across parameters, since one would overwrite the other; the
-existing conversion test calibrated `path/a` through both a co-variation and a discrete variation, and
-was moved to its own path. Old runs still plot: the shared name is treated as the target, which is
-what its column holds. The two smaller findings were taken as given: a CDF-only `:transition` no
-longer queries the database, and a mixed selection always says that its CDF panels lack rejected
-points.
+Copilot found that `LatentVariation(dv)` passed as a calibration parameter put a `Uniform(0,1)` latent
+and the value under one name, and `posterior` wrote the value over the latent (a bug older than this
+PR). A first fix refused it outright; the maintainer's model said the latent of a distributed variation
+*is* its value, which led to #84 (prior on the latent, map `first`, flip on the coordinate). On top of
+that, the rule here narrowed to: a latent may share a target's name only when the target's map is that
+latent's selector, checked on the map object (the maintainer asked for `identity`; a map receives the
+whole latent vector, so the identity on latent `i` is `first`/`Fix2(getindex, i)`). LVSource display
+columns are deduplicated per parameter so such a latent is one column. The same check refuses a name
+repeated across parameters; the existing conversion test calibrated `path/a` twice and was moved to its
+own path. The two smaller findings were taken as given: a CDF-only `:transition` no longer queries the
+database, and a mixed selection always says that its CDF panels lack rejected points.
 
 ### Also corrected
 PRD.md claimed the `:transition` lazy lookup inverted rejected values to CDF coordinates for
 `space=:cdf`. It never did; it returned nothing for CDF space. The PRD now says what happens.
+
+---
+
+## A distributed variation's latent is its value (2026-10-08)
+
+### Trigger
+Reviewing the plot `parameters` keyword (#83): `LatentVariation(dv)` passed as a calibration parameter
+named a `Uniform(0,1)` latent and the value alike, and `posterior` wrote the value over the latent.
+The maintainer's model is CDF coordinate → latent (with the prior) → target (through the map), under
+which a distributed variation's latent *is* its value; the code put the prior in the map instead.
+
+### Decided
+- **Prior on the latent, map `first`.** Julia's `identity` is the intent, but a map receives the
+  whole latent vector, so the identity on latent `i` is its selector: `first`, or
+  `Base.Fix2(getindex, i)`.
+- **The flip is a property of the latent's coordinate** (`LatentVariation.flips`), not of the map.
+  Two rejected routes: dropping the flip for a lone variation (coordinates would have meant mirrored
+  targets, so seeded designs and stored `cdfs.csv` would change), and an internal `_Flipped(d)` wrapper
+  distribution (a "cdf" that decreases is a lie to anything generic). The field is explicit and costs
+  one JLD2 incompatibility, flagged with a `#!` on the field.
+- **Clean break over compatibility shims.** The maintainer chose to name what users must do over
+  carrying migration code. Because coordinates keep their meaning, the only thing to do is re-supply a
+  hand-built `LatentVariation` problem on resume.
+- **Co-variation latent keeps the co-variation's name** although its value is the first variation's,
+  so `cdfs.csv` column names and #83's `cdf(name)` columns are untouched.
 
 ## `carry=:varied` withdrawn (2026-09-30) — ships in v0.11.0
 

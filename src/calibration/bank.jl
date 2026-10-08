@@ -467,7 +467,7 @@ function _bankCdfCoords(lv::LatentVariation, vals::Dict{String, Float64})
         return nothing
     end
     any(isnan, lp_vals) && return nothing   # e.g. CVSource consistency check failed
-    cdfs = [cdf(d, lp) for (d, lp) in zip(lv.latent_parameters, lp_vals)]
+    cdfs = _latentCoordinates(lv, lp_vals)
     return cdfs
 end
 
