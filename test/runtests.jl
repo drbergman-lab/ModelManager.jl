@@ -1492,6 +1492,21 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test_throws ErrorException posterior(result_empty)
     end
 
+    @testset "corner and transition plots hide the upper triangle" begin
+        d  = 3
+        df = DataFrame(a=randn(50), b=randn(50), c=randn(50))
+        w  = fill(1 / 50, 50)
+        upper = Set((i - 1) * d + j for i in 1:d for j in 1:d if i < j)
+        hidden(series) = Set(s.plotattributes[:subplot] for s in series
+                             if get(s.plotattributes, :framestyle, nothing) === :none)
+
+        corner = RecipesBase.apply_recipe(Dict{Symbol,Any}(), ModelManager._CornerPlotData(df, w))
+        @test hidden(corner) == upper
+
+        td = ModelManager._TransitionData(df, w, df, w, df, names(df), 50, "", true, false)
+        @test hidden(RecipesBase.apply_recipe(Dict{Symbol,Any}(), td)) == upper
+    end
+
     @testset "samplePosterior" begin
         cal    = Calibration(1)
         method = ABCSMC()
@@ -8228,7 +8243,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test names(cpd.df) == ["gamma", "alpha"]
             @test cpd.df.gamma == p2.gamma
             @test cpd.weights == w
-            @test nseries(apply(cpd)) == 4       # 2 KDE diagonals + contour + scatter
+            @test nseries(apply(cpd)) == 5       # 2 KDE diagonals + contour + scatter + blank upper panel
             one = data(applyk(Dict(:parameters => "beta"), res))
             @test names(one.df) == ["beta"]
             @test nseries(apply(one)) == 1
