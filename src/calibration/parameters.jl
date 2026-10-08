@@ -399,7 +399,7 @@ function _particleRowToDisplay(::DiscreteCoSource, lv::LatentVariation, cdf_vals
 end
 
 function _particleRowToDisplay(::LVSource, lv::LatentVariation, cdf_vals::Vector{Float64})
-    lp_vals     = [quantile(d, cdf) for (d, cdf) in zip(lv.latent_parameters, cdf_vals)]
+    lp_vals     = _latentValues(lv, cdf_vals)
     target_vals = variationValues(lv, cdf_vals)
     return [lp_vals..., target_vals...]
 end

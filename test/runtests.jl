@@ -1465,6 +1465,52 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test df_empty[!, :u] ≈ [0.25, 0.75]
     end
 
+    @testset "LatentVariation from a DistributedVariation: the latent is the value" begin
+        xp  = XMLPath(["a", "x"])
+        xp2 = XMLPath(["a", "y"])
+        cs  = [0.1, 0.25, 0.5, 0.9]
+        for flip in (false, true)
+            dv = DistributedVariation(:config, xp, Gamma(2.0, 3.0); flip=flip)
+            lv = LatentVariation(dv)
+            @test lv.latent_parameters == [dv.distribution]
+            @test lv.maps == [first]
+            @test lv.flips == [flip]
+            @test lv.latent_parameter_names == lv.target_names
+            for c in cs
+                # The coordinate means what it always meant, so designs and stored coordinates agree
+                # with the DistributedVariation's own mapping.
+                @test ModelManager.variationValues(lv, [c]) ≈ ModelManager.variationValues(dv, [c])
+                # The latent and the target are one number.
+                lp = ModelManager._latentValues(lv, [c])
+                @test lp ≈ ModelManager.variationValues(lv, [c])
+                # And the coordinate comes back from the value, which is what the bank relies on.
+                @test ModelManager._latentCoordinates(lv, [lv.inverse_maps[1](lp)]) ≈ [c]
+            end
+            # Passed as itself, it displays its latent and its target as the same values.
+            cp = ModelManager._toCalibrationParameter(lv)
+            vals = ModelManager._particleRowToDisplay(cp, [0.25])
+            @test vals[1] ≈ vals[2]
+        end
+
+        # A co-variation's latent is its first variation's value; the others follow through the shared
+        # coordinate with their own flips, so every target matches its own variation at that coordinate.
+        for (f1, f2) in ((false, false), (true, false), (false, true), (true, true))
+            d1 = DistributedVariation(:config, xp, Uniform(0.0, 2.0); flip=f1)
+            d2 = DistributedVariation(:config, xp2, Normal(5.0, 1.0); flip=f2)
+            lv = LatentVariation(CoVariation(d1, d2))
+            @test lv.latent_parameters == [d1.distribution]
+            @test lv.flips == [f1]
+            for c in cs
+                tv = ModelManager.variationValues(lv, [c])
+                @test tv ≈ [ModelManager.variationValues(d1, [c])[1], ModelManager.variationValues(d2, [c])[1]]
+                @test ModelManager._latentValues(lv, [c]) ≈ tv[1:1]
+                @test lv.inverse_maps[1](tv) ≈ tv[1]
+                @test ModelManager._latentCoordinates(lv, [lv.inverse_maps[1](tv)]) ≈ [c]
+                @test isnan(lv.inverse_maps[1]([tv[1], tv[2] + 1.0]))   # off the curve
+            end
+        end
+    end
+
     @testset "posterior" begin
         particles1 = DataFrame(x=[1.0, 2.0])
         particles2 = DataFrame(x=[3.0, 4.0])

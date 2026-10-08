@@ -411,6 +411,9 @@ Internally, `ParsedVariations` converts all variations to `LatentVariation`s for
   `inverse_maps` keyword argument when constructing a user-defined `LatentVariation{<:Distribution}`.
   Monotonicity of the forward map is a user responsibility and is not validated at construction time beyond
   a round-trip accuracy check.
+- `flips`: Per latent dimension, whether its CDF coordinate runs backwards: latent value
+  `quantile(prior, 1 - c)` rather than `quantile(prior, c)`. All `false` unless set with the `flips`
+  keyword; `LatentVariation(dv)` sets it from a flipped `DistributedVariation`.
 - `types`: Output `eltype` of each forward map's return value.
 - `name`: User-supplied or default name.
 
@@ -419,11 +422,13 @@ Internally, `ParsedVariations` converts all variations to `LatentVariation`s for
 ## From existing variation types (preferred for single-parameter calibration)
 
 ```julia
-# From a DistributedVariation — inverse_maps auto-constructed
+# From a DistributedVariation — the latent is the value itself (prior = the variation's
+# distribution, map = `first`); inverse_maps auto-constructed
 dv = DistributedVariation(:config, XMLPath(["tumor", "growth_rate"]), Uniform(0.01, 0.5))
 lv = LatentVariation(dv)
 
-# From a CoVariation{DistributedVariation} — inverse_maps auto-constructed
+# From a CoVariation{DistributedVariation} — the latent is the first variation's value, and the
+# others follow it through the shared CDF coordinate; inverse_maps auto-constructed
 cv = CoVariation(DistributedVariation(:config, XMLPath(["k1"]), Uniform(0.1, 1.0)),
                  DistributedVariation(:config, XMLPath(["k2"]), Uniform(0.5, 5.0)))
 lv = LatentVariation(cv)
@@ -496,6 +501,13 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
     target_names::Vector{String}
     maps::Vector{<:Function}
     inverse_maps::Union{Nothing,Vector{Function}}
+    #! JLD2 COMPATIBILITY: `flips` was added in v0.12. `problem.jld2` serialises a `LatentVariation`
+    #! only inside an `LVSource` -- a hand-built one whose maps are named functions -- and one saved
+    #! before this field existed no longer reconstructs as this type. Such a run cannot be resumed
+    #! from its saved problem; pass the problem again with `resumeABC(cal; problem=...)`. Runs built
+    #! from `DistributedVariation`/`CoVariation`/`DiscreteVariation` are unaffected: their saved
+    #! source is the variation, and the `LatentVariation` is rebuilt from it on load.
+    flips::Vector{Bool}
     types::Vector{DataType}
     name::String
 
@@ -517,10 +529,11 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
         tnames = isnothing(target_names) ? shortVariationName.(locations, columnName.(targets)) : Vector{String}(target_names)
         default_name = join(shortVariationName.(locations, columnName.(targets)), " | ")
         variation_name = isnothing(name) ? default_name : String(name)
-        return new{Vector{T}}(latent_parameters, lp_names, locations, targets, tnames, maps, inv, types, variation_name)
+        return new{Vector{T}}(latent_parameters, lp_names, locations, targets, tnames, maps, inv,
+                              fill(false, length(latent_parameters)), types, variation_name)
     end
 
-    function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, inverse_maps::Union{Nothing,AbstractVector{<:Function}}=nothing, name::Union{Nothing,AbstractString}=nothing) where T<:Distribution
+    function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, inverse_maps::Union{Nothing,AbstractVector{<:Function}}=nothing, flips::Union{Nothing,AbstractVector{Bool}}=nothing, name::Union{Nothing,AbstractString}=nothing) where T<:Distribution
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
         if !isnothing(target_names)
@@ -538,7 +551,9 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
         tnames = isnothing(target_names) ? shortVariationName.(locations, columnName.(targets)) : Vector{String}(target_names)
         default_name = join(shortVariationName.(locations, columnName.(targets)), " | ")
         variation_name = isnothing(name) ? default_name : String(name)
-        lv = new{T}(latent_parameters, lp_names, locations, targets, tnames, maps, inv, types, variation_name)
+        fl = isnothing(flips) ? fill(false, length(latent_parameters)) : Vector{Bool}(flips)
+        @assert length(fl) == length(latent_parameters) "flips must have one entry per latent dimension ($(length(latent_parameters))). Got $(length(fl))."
+        lv = new{T}(latent_parameters, lp_names, locations, targets, tnames, maps, inv, fl, types, variation_name)
         isnothing(inv) || _validateInverseMaps(lv)
         return lv
     end
@@ -559,6 +574,28 @@ function defaultLatentParameterNames(latent_parameters::Vector, targets::Vector{
     par_names = join(columnName.(targets), " | ")
     return [par_names * " | lp#$(i)" for i in 1:length(latent_parameters)]
 end
+
+#! The only two places a latent value and its CDF coordinate are converted into each other. Every
+#! caller goes through these so a flipped dimension is honoured everywhere or nowhere: a flip applied
+#! on the way in but not on the way out would hand the `SimulationBank` the mirror of every coordinate.
+_latentValue(d::Distribution, flip::Bool, c::Real) = quantile(d, flip ? 1 - c : c)
+_latentCoordinate(d::Distribution, flip::Bool, x::Real) = flip ? 1 - cdf(d, x) : cdf(d, x)
+
+"""
+    _latentValues(lv::LatentVariation{<:Distribution}, cdfs) → Vector
+
+The latent values at CDF coordinates `cdfs`, one per latent dimension, honouring `lv.flips`.
+"""
+_latentValues(lv::LatentVariation{<:Distribution}, cdfs::AbstractVector{<:Real}) =
+    [_latentValue(d, f, c) for (d, f, c) in zip(lv.latent_parameters, lv.flips, cdfs)]
+
+"""
+    _latentCoordinates(lv::LatentVariation{<:Distribution}, lp_vals) → Vector{Float64}
+
+The CDF coordinates of latent values `lp_vals`; the inverse of `_latentValues`.
+"""
+_latentCoordinates(lv::LatentVariation{<:Distribution}, lp_vals::AbstractVector) =
+    [_latentCoordinate(d, f, x) for (d, f, x) in zip(lv.latent_parameters, lv.flips, lp_vals)]
 
 """
     _validateInverseMaps(lv::LatentVariation{<:Distribution}; n_samples=20, rtol=1e-6)
@@ -594,7 +631,7 @@ function _validateInverseMaps(lv::LatentVariation{<:Distribution};
     n = nLatentDims(lv)
     for s in 1:n_samples
         u = rand(n)
-        lp_vals = [quantile(d, u_i) for (d, u_i) in zip(lv.latent_parameters, u)]
+        lp_vals = _latentValues(lv, u)
         target_vals = Float64[fn(lp_vals) for fn in lv.maps]
         lp′ = [inv_map(target_vals) for inv_map in lv.inverse_maps]
 
@@ -668,15 +705,19 @@ function _discreteValueIndex(values::AbstractVector, target_value)
     return idx
 end
 
+#! The latent *is* the value: its prior is the variation's distribution and its map is `first`, the
+#! selector of the one latent. A flip is carried on the latent's coordinate rather than in the map, so
+#! a coordinate `c` still means `quantile(distribution, 1 - c)` for a flipped variation -- the same
+#! target it always meant -- while the latent and the target stay one number under one name.
 function LatentVariation(dv::T; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
-    latent_parameters = [Uniform(0,1)]
+    latent_parameters = [dv.distribution]
     targets = [variationTarget(dv)]
     locations = [variationLocation(dv)]
-    maps = [dv.flip ? us -> quantile(dv.distribution, 1 - us[1]) : us -> quantile(dv.distribution, us[1])]
-    inverse_maps = [dv.flip ? tv -> 1 - cdf(dv.distribution, tv[1]) : tv -> cdf(dv.distribution, tv[1])]
     resolved_name = isnothing(name) ? variationName(dv) : String(name)
     tnames = [variationName(dv)]
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
+    return LatentVariation(latent_parameters, targets, Function[first], [resolved_name], locations;
+                           target_names=tnames, inverse_maps=Function[first], flips=[dv.flip],
+                           name=resolved_name)
 end
 
 #! Same representation as the single-parameter case: one `DiscreteUniform` index driving every
@@ -705,27 +746,31 @@ function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}
     return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
+#! One latent, the first variation's value, with that variation's prior and flip. Every other
+#! variation follows it through the shared CDF coordinate, applying its own flip, so each target is
+#! `quantile(d_i, flip_i ? 1 - c : c)` for coordinate `c` -- exactly what it was when the latent was
+#! the coordinate itself.
 function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
-    latent_parameters = [Uniform(0.0, 1.0)]
-    targets = variationTarget(cv)
-    locations = variationLocation(cv)
-    maps = map(cv.variations) do dv
-        dv.flip ? us -> quantile(dv.distribution, 1 - us[1]) : us -> quantile(dv.distribution, us[1])
-    end
     dv1 = cv.variations[1]
-    # Recover u from first target; return NaN if remaining targets are inconsistent with u.
-    inverse_maps = [tv -> begin
-        u = dv1.flip ? 1 - cdf(dv1.distribution, tv[1]) : cdf(dv1.distribution, tv[1])
+    coordinate(x) = _latentCoordinate(dv1.distribution, dv1.flip, x)
+    follow(dv) = lp -> _latentValue(dv.distribution, dv.flip, coordinate(lp[1]))
+    maps = Function[first; [follow(dv) for dv in cv.variations[2:end]]]
+    # Recover the latent from the first target; NaN if the remaining targets are not on the curve.
+    function recoverLatent(tv)
+        c = coordinate(tv[1])
         for i in 2:length(cv.variations)
             dv_i  = cv.variations[i]
-            exp_i = dv_i.flip ? quantile(dv_i.distribution, 1 - u) : quantile(dv_i.distribution, u)
+            exp_i = _latentValue(dv_i.distribution, dv_i.flip, c)
             abs(exp_i - tv[i]) > 1e-8 * max(1.0, abs(exp_i)) && return NaN
         end
-        u
-    end]
+        return tv[1]
+    end
+    inverse_maps = Function[recoverLatent]
     resolved_name = isnothing(name) ? variationName(cv) : String(name)
     tnames = [variationName(v) for v in cv.variations]
-    return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
+    return LatentVariation([dv1.distribution], variationTarget(cv), maps, [resolved_name],
+                           variationLocation(cv); target_names=tnames, inverse_maps=inverse_maps,
+                           flips=[dv1.flip], name=resolved_name)
 end
 
 LatentVariation(lv::LatentVariation) = lv
@@ -842,7 +887,7 @@ end
 
 function variationValues(lv::LatentVariation{<:Distribution}, cdfs::AbstractVector{<:Real})
     @assert length(cdfs) == nLatentDims(lv) "CDF vector length must match number of latent parameters."
-    lp_vals = [quantile(d, cdf_val) for (d, cdf_val) in zip(lv.latent_parameters, cdfs)]
+    lp_vals = _latentValues(lv, cdfs)
     return [fn(lp_vals) for fn in lv.maps]
 end
 
