@@ -72,8 +72,17 @@ which a distributed variation's latent *is* its value; the code put the prior in
 - **Clean break over compatibility shims.** The maintainer chose to name what users must do over
   carrying migration code. Because coordinates keep their meaning, the only thing to do is re-supply a
   hand-built `LatentVariation` problem on resume.
-- **Co-variation latent keeps the co-variation's name** although its value is the first variation's,
-  so `cdfs.csv` column names and #83's `cdf(name)` columns are untouched.
+- **A co-variation's latent is its shared coordinate** (revised in review). The first version made it
+  the first variation's value, which forced a value → cdf → quantile round trip into every later map:
+  wrong when the first distribution is discrete (`cdf(d1, quantile(d1, c))` is the top of c's bin),
+  lossy in the tails, and arbitrary about which variation is first. The rule that settles it: the
+  latent is the quantity the prior is placed on, and a co-variation has n distributions on one
+  coordinate and no single prior. Reverting also exposed a pre-existing failure: the inverse map
+  recovered `c` from the first target, so a discrete first distribution failed the construction-time
+  round trip and the co-variation could not be built. The inverse now recovers from the first
+  continuous variation, and an all-discrete co-variation has no inverse map (no bank reuse).
+- **A one-variation `CoVariation`** builds exactly what its variation would, under the co-variation's
+  name; `CoVariation` does not require two.
 
 ## `carry=:varied` withdrawn (2026-09-30) — ships in v0.11.0
 

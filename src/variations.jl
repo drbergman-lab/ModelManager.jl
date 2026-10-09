@@ -393,6 +393,10 @@ The latent parameters themselves are not stored in the database; only the derive
 
 Internally, `ParsedVariations` converts all variations to `LatentVariation`s for processing.
 
+The latent is the quantity the prior is placed on; the maps are everything deterministic after it.
+So a `DistributedVariation`'s latent is its value, a `CoVariation`'s latent is its shared CDF
+coordinate, and a `DiscreteVariation`'s latent is its level index.
+
 # Fields
 - `latent_parameters`: Discrete value vectors or prior `Distribution`s, one per latent dimension.
 - `latent_parameter_names`: User-friendly names for each latent dimension.
@@ -427,8 +431,8 @@ Internally, `ParsedVariations` converts all variations to `LatentVariation`s for
 dv = DistributedVariation(:config, XMLPath(["tumor", "growth_rate"]), Uniform(0.01, 0.5))
 lv = LatentVariation(dv)
 
-# From a CoVariation{DistributedVariation} — the latent is the first variation's value, and the
-# others follow it through the shared CDF coordinate; inverse_maps auto-constructed
+# From a CoVariation{DistributedVariation} — the latent is the shared CDF coordinate, and each
+# variation maps it through its own distribution; inverse_maps auto-constructed
 cv = CoVariation(DistributedVariation(:config, XMLPath(["k1"]), Uniform(0.1, 1.0)),
                  DistributedVariation(:config, XMLPath(["k2"]), Uniform(0.5, 5.0)))
 lv = LatentVariation(cv)
@@ -746,31 +750,45 @@ function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}
     return LatentVariation(latent_parameters, targets, maps, [resolved_name], locations; target_names=tnames, inverse_maps=inverse_maps, name=resolved_name)
 end
 
-#! One latent, the first variation's value, with that variation's prior and flip. Every other
-#! variation follows it through the shared CDF coordinate, applying its own flip, so each target is
-#! `quantile(d_i, flip_i ? 1 - c : c)` for coordinate `c` -- exactly what it was when the latent was
-#! the coordinate itself.
+#! The latent is the shared CDF coordinate itself. A co-variation ties n distributions to one
+#! coordinate and has no single prior to put on a latent, so making it "the first variation's value"
+#! (tried, and rejected) forced a value -> cdf -> quantile round trip into every later map, which is
+#! wrong when the first distribution is discrete -- `cdf(d1, quantile(d1, c))` is the top of c's bin,
+#! not c -- loses precision in the tails, and makes the first variation special for no reason. Each map
+#! applies its own variation's flip, so stored coordinates mean what they always have.
+#!
+#! `CoVariation` accepts a single variation, and that one builds exactly what the variation alone would,
+#! under the co-variation's name, so the two cannot differ.
 function LatentVariation(cv::CoVariation{T}; name::Union{Nothing,AbstractString}=nothing) where T<:DistributedVariation
-    dv1 = cv.variations[1]
-    coordinate(x) = _latentCoordinate(dv1.distribution, dv1.flip, x)
-    follow(dv) = lp -> _latentValue(dv.distribution, dv.flip, coordinate(lp[1]))
-    maps = Function[first; [follow(dv) for dv in cv.variations[2:end]]]
-    # Recover the latent from the first target; NaN if the remaining targets are not on the curve.
-    function recoverLatent(tv)
-        c = coordinate(tv[1])
-        for i in 2:length(cv.variations)
-            dv_i  = cv.variations[i]
+    resolved_name = isnothing(name) ? variationName(cv) : String(name)
+    length(cv.variations) == 1 && return LatentVariation(only(cv.variations); name=resolved_name)
+    maps = Function[(lp -> _latentValue(dv.distribution, dv.flip, lp[1])) for dv in cv.variations]
+    #! The coordinate is recovered from a *continuous* variation's target. A discrete one only pins it to
+    #! a bin -- `cdf(d, quantile(d, c))` is the top of c's bin, not c -- so recovering from one failed
+    #! the round trip `_validateInverseMaps` runs at construction, and a co-variation listing a discrete
+    #! distribution first could not be built at all. With no continuous variation there is no exact
+    #! inverse, so there is none: the `SimulationBank` simply does not reuse such monads.
+    k = findfirst(dv -> !(dv.distribution isa DiscreteUnivariateDistribution), cv.variations)
+    inverse_maps = isnothing(k) ? nothing : Function[_coVariationInverse(cv, k)]
+    tnames = [variationName(v) for v in cv.variations]
+    return LatentVariation([Uniform(0.0, 1.0)], variationTarget(cv), maps, [resolved_name],
+                           variationLocation(cv); target_names=tnames,
+                           inverse_maps=inverse_maps, name=resolved_name)
+end
+
+# Recover a co-variation's coordinate from variation `k`'s target; `NaN` if any other target is off the
+# curve, which is how an inverse map says "not reusable" to the `SimulationBank`.
+function _coVariationInverse(cv::CoVariation{DistributedVariation}, k::Int)
+    dvk = cv.variations[k]
+    return function (tv)
+        c = _latentCoordinate(dvk.distribution, dvk.flip, tv[k])
+        for (i, dv_i) in enumerate(cv.variations)
+            i == k && continue
             exp_i = _latentValue(dv_i.distribution, dv_i.flip, c)
             abs(exp_i - tv[i]) > 1e-8 * max(1.0, abs(exp_i)) && return NaN
         end
-        return tv[1]
+        return c
     end
-    inverse_maps = Function[recoverLatent]
-    resolved_name = isnothing(name) ? variationName(cv) : String(name)
-    tnames = [variationName(v) for v in cv.variations]
-    return LatentVariation([dv1.distribution], variationTarget(cv), maps, [resolved_name],
-                           variationLocation(cv); target_names=tnames, inverse_maps=inverse_maps,
-                           flips=[dv1.flip], name=resolved_name)
 end
 
 LatentVariation(lv::LatentVariation) = lv

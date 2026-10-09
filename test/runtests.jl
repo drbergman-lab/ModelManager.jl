@@ -1491,22 +1491,43 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test ModelManager._particleRowToDisplay(cp, [0.25]) ≈ ModelManager.variationValues(dv, [0.25])
         end
 
-        # A co-variation's latent is its first variation's value; the others follow through the shared
-        # coordinate with their own flips, so every target matches its own variation at that coordinate.
-        for (f1, f2) in ((false, false), (true, false), (false, true), (true, true))
-            d1 = DistributedVariation(:config, xp, Uniform(0.0, 2.0); flip=f1)
-            d2 = DistributedVariation(:config, xp2, Normal(5.0, 1.0); flip=f2)
-            lv = LatentVariation(CoVariation(d1, d2))
-            @test lv.latent_parameters == [d1.distribution]
-            @test lv.flips == [f1]
-            for c in cs
-                tv = ModelManager.variationValues(lv, [c])
-                @test tv ≈ [ModelManager.variationValues(d1, [c])[1], ModelManager.variationValues(d2, [c])[1]]
-                @test ModelManager._latentValues(lv, [c]) ≈ tv[1:1]
-                @test lv.inverse_maps[1](tv) ≈ tv[1]
-                @test ModelManager._latentCoordinates(lv, [lv.inverse_maps[1](tv)]) ≈ [c]
-                @test isnan(lv.inverse_maps[1]([tv[1], tv[2] + 1.0]))   # off the curve
+        # A co-variation's latent is its shared CDF coordinate; each variation maps it through its own
+        # distribution and flip, so every target is quantile(d_i, flip_i ? 1 - c : c), including when
+        # the first distribution is discrete.
+        val(d, flip, c) = quantile(d, flip ? 1 - c : c)
+        for (D1, D2) in ((Uniform(0.0, 2.0), Normal(5.0, 1.0)), (Binomial(10, 0.3), Normal(5.0, 1.0)))
+            for (f1, f2) in ((false, false), (true, false), (false, true), (true, true))
+                d1 = DistributedVariation(:config, xp, D1; flip=f1)
+                d2 = DistributedVariation(:config, xp2, D2; flip=f2)
+                lv = LatentVariation(CoVariation(d1, d2))
+                @test lv.latent_parameters == [Uniform(0.0, 1.0)]
+                @test lv.flips == [false]
+                @test lv.latent_parameter_names == [variationName(CoVariation(d1, d2))]
+                for c in cs
+                    @test ModelManager._latentValues(lv, [c]) == [c]       # the latent is the coordinate
+                    tv = ModelManager.variationValues(lv, [c])
+                    @test tv ≈ [val(D1, f1, c), val(D2, f2, c)]
+                    # The coordinate comes back exactly, from the continuous variation's target.
+                    @test lv.inverse_maps[1](tv) ≈ c
+                    @test isnan(lv.inverse_maps[1]([tv[1], tv[2] + 1.0]))   # off the curve
+                end
             end
+        end
+        # With no continuous variation the coordinate is only known to a bin, so there is no inverse.
+        all_discrete = LatentVariation(CoVariation(DistributedVariation(:config, xp, Binomial(10, 0.3)),
+                                                   DistributedVariation(:config, xp2, Poisson(3.0))))
+        @test isnothing(all_discrete.inverse_maps)
+        @test ModelManager.variationValues(all_discrete, [0.5]) ≈ [quantile(Binomial(10, 0.3), 0.5), quantile(Poisson(3.0), 0.5)]
+
+        # A one-variation co-variation builds exactly what the variation alone would.
+        for flip in (false, true)
+            dv  = DistributedVariation(:config, xp, Gamma(2.0, 3.0); flip=flip)
+            lv1 = LatentVariation(CoVariation(dv))
+            lvd = LatentVariation(dv)
+            for f in (:latent_parameters, :latent_parameter_names, :targets, :target_names, :maps, :flips, :name)
+                @test getfield(lv1, f) == getfield(lvd, f)
+            end
+            @test ModelManager.variationValues(lv1, [0.3]) ≈ ModelManager.variationValues(lvd, [0.3])
         end
     end
 
