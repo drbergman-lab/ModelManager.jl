@@ -420,12 +420,17 @@ _bankColDistribution(::LVSource, ::LatentVariation, ::String) = nothing
 #! every monad run at that level, a level the sampler proposes as often as any other. Nothing
 #! downstream minds: the bank's coordinates are compared in an L∞ box and become a particle's own
 #! coordinates, `quantile(DiscreteUniform(1, k), 1.0)` is `k`, the kernels stay inside [0,1], and the
-#! prior density is 1 everywhere in CDF space. Zero stays excluded either way: no level maps to it.
-_bankCoordUsable(::Distribution, u::Real) = 0 < u < 1
-_bankCoordUsable(::DiscreteUnivariateDistribution, u::Real) = 0 < u <= 1
+#! prior density is 1 everywhere in CDF space.
+#!
+#! A flipped dimension mirrors this: its coordinate is `1 - cdf(d, x)`, so the top level lands on 0.0
+#! rather than 1.0, and `quantile(d, 1 - 0.0)` is that level. Only the end no level maps to is excluded
+#! -- 0.0 unflipped, 1.0 flipped. Before `flips`, a discrete `DistributedVariation` could not be built
+#! as a `LatentVariation` at all, so no flipped discrete coordinate ever reached this filter.
+_bankCoordUsable(::Distribution, ::Bool, u::Real) = 0 < u < 1
+_bankCoordUsable(::DiscreteUnivariateDistribution, flip::Bool, u::Real) = flip ? 0 <= u < 1 : 0 < u <= 1
 
 _bankCoordsUsable(lv::LatentVariation, coords) =
-    all(_bankCoordUsable(d, u) for (d, u) in zip(lv.latent_parameters, coords))
+    all(_bankCoordUsable(d, f, u) for (d, f, u) in zip(lv.latent_parameters, lv.flips, coords))
 
 """
     _bankCdfCoords(cp::CalibrationParameter, vals::Dict{String,Float64})

@@ -1989,6 +1989,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test !ModelManager._bankCoordsUsable(disc_cp_bank.lv, [0.0])   # no level maps there
         @test !ModelManager._bankCoordsUsable(cp.lv, [1.0])             # continuous: still strict
         @test ModelManager._bankCoordsUsable(cp.lv, [0.5])
+        # A flipped discrete dimension mirrors it: the top level's coordinate is 0.0, not 1.0.
+        flip_disc = ModelManager._toCalibrationParameter(
+            DistributedVariation(:config, xp, Binomial(4, 0.5); flip=true))
+        top = ModelManager._bankCdfCoords(flip_disc, Dict{String,Float64}("overall/max_time" => 4.0))
+        @test top ≈ [0.0]
+        @test ModelManager._bankCoordsUsable(flip_disc.lv, top)
+        @test ModelManager.variationValues(flip_disc.lv, top) ≈ [4.0]
+        @test !ModelManager._bankCoordsUsable(flip_disc.lv, [1.0])        # no level maps there
 
         # --- CVSource: single latent CDF, two targets ---
         dv2 = DistributedVariation(:config, xp2, Uniform(0.0, 2.0))
