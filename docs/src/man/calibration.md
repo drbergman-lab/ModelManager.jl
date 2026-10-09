@@ -58,8 +58,8 @@ coordinate no proposal can move, so set such a value in the reference monad inst
 
 Every parameter needs its own column names, because the posterior is one table, so two variations
 with the same name are refused. A `LatentVariation` may give a latent and a target the same name only
-when they are the same number, i.e. the target's map is that latent's selector (`first`, or
-`Base.Fix2(getindex, i)`); `LatentVariation(dv)` is built that way and behaves exactly like `dv`.
+when they are the same number, i.e. the target's map is that latent's selector (`first` or `only`
+for a single latent, `Base.Fix2(getindex, i)` for latent `i`); `LatentVariation(dv)` is built that way and behaves exactly like `dv`.
 
 Two functions you supply:
 

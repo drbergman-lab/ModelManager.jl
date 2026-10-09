@@ -148,7 +148,10 @@ _calibrationRejection(::CoVariation{DistributedVariation}) = nothing
 #! and `posterior` would silently keep only the target; the user's choice of name is the only thing to
 #! change, so it is refused rather than renamed for them. Checked on the map object itself, not by
 #! evaluating it.
-_selectsLatent(m, i::Int) = (i == 1 && m === first) || (m isa Base.Fix2{typeof(getindex)} && m.x == i)
+#! `only` counts too: on one latent it is the same selector as `first`, and on more it throws when the
+#! constructor evaluates the maps, so it never gets this far.
+_selectsLatent(m, i::Int) = (i == 1 && (m === first || m === only)) ||
+                            (m isa Base.Fix2{typeof(getindex)} && m.x == i)
 
 function _calibrationRejection(lv::LatentVariation{<:Distribution})
     clashes = [lv.latent_parameter_names[i]
@@ -158,7 +161,8 @@ function _calibrationRejection(lv::LatentVariation{<:Distribution})
     return "latent parameter$(length(clashes) == 1 ? "" : "s") $(unique(clashes)) share" *
            "$(length(clashes) == 1 ? "s" : "") a name with a target that is a different number, so " *
            "the posterior could not hold both. Name them apart, or, if the target is meant to be the " *
-           "latent itself, make its map the latent's selector (`first`, or `Base.Fix2(getindex, i)`). " *
+           "latent itself, make its map the latent's selector (`first` or `only` for a single latent, " *
+           "`Base.Fix2(getindex, i)` for latent i). " *
            "For a LatentVariation built from a DiscreteVariation, pass the DiscreteVariation itself."
 end
 

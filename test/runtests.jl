@@ -8484,6 +8484,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                                      Function[Base.Fix2(getindex, 2)], ["a", s], Symbol[:config];
                                      target_names=[s])
             @test isnothing(ModelManager._calibrationRejection(lv_sel))
+            # And `only` on a single latent, the same selector as `first`.
+            lv_only = LatentVariation([Uniform(0.0, 2.0)], XMLPath[xs], Function[only], [s], Symbol[:config];
+                                      target_names=[s])
+            @test isnothing(ModelManager._calibrationRejection(lv_only))
 
             # Any other map under a shared name is two numbers under one name: refused.
             lv_bad = LatentVariation([Uniform(0.0, 1.0)], XMLPath[xs], Function[lp -> 2.0 * lp[1]],
