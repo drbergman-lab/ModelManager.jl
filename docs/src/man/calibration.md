@@ -59,7 +59,8 @@ coordinate no proposal can move, so set such a value in the reference monad inst
 Every parameter needs its own column names, because the posterior is one table, so two variations
 with the same name are refused. A `LatentVariation` may give a latent and a target the same name only
 when they are the same number, i.e. the target's map is that latent's selector (`first` or `only`
-for a single latent, `Base.Fix2(getindex, i)` for latent `i`); `LatentVariation(dv)` is built that way and behaves exactly like `dv`.
+for a single latent, `Base.Fix2(getindex, i)` for latent `i`). `LatentVariation(dv)` is built that
+way, so its posterior and plots show the same columns as `dv`'s.
 
 Two functions you supply:
 
@@ -475,7 +476,8 @@ plot(Calibration(42), :distances; generation=3)
 
 Every recipe with a parameter axis (the corner plot, `:ridgeline` and `:transition`) takes
 `parameters`, which picks both the columns and the coordinates they are drawn in. Calibration
-parameters come in three groups, each a Symbol:
+columns come in three groups, CDF coordinates, latents and targets, each named by a Symbol, plus
+`:all` for every column:
 
 | `parameters =` | Draws |
 |:---|:---|
@@ -487,7 +489,8 @@ parameters come in three groups, each a Symbol:
 If you don't use `LatentVariation`s, `:latent` and `:target` are the same columns, so the default
 shows your parameters as you defined them. A `DistributedVariation`'s latent and target are one
 column, not two, so `:all` draws it twice: its CDF and its value. A `CoVariation` moves several
-targets through one dimension, and `:latent` shows that dimension through its first variation.
+targets through one shared coordinate. That coordinate is its `:cdf` column, and `:latent` shows the
+same dimension in value units through the co-variation's first variation.
 
 To draw particular columns, name them with a String or a vector of Strings. Names come from any
 group, a vector is drawn in the order given, and the names are the columns of `posterior(result)`

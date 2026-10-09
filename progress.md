@@ -24,9 +24,9 @@ let one keyword carry the coordinates too.
   draws it twice (CDF and value), not three times. The alternative (b), only `LatentVariation`
   latents, would leave `:latent` empty on most problems. The name was kept although a non-LV user
   may not know it: with no `LatentVariation`s, `:latent == :target`, and the manual says so.
-- **A co-variation's latent is its first variation**, the one its inverse map recovers the CDF
-  from. The other honest choice, the bare shared `u`, has no units and duplicates `:cdf`. This is the
-  one judgement call the maintainer did not make directly.
+- **`:latent` shows a co-variation through its first variation's value.** Its internal latent is the
+  shared coordinate (#84), which has no units and is already the `:cdf` column, so `:latent`, which is
+  in value units, uses the first variation as that dimension's stand-in. A display convention only.
 - **CDF columns are renamed `cdf(name)` at display time only.** `cdfs.csv`, `particles` and the
   resume path keep the raw latent names, so existing runs need no migration.
 - **`space` stays declared, to throw.** RecipesBase consumes declared keywords, and the `Calibration`

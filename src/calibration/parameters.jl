@@ -282,7 +282,8 @@ Return the column names used in human-readable generation CSVs for this paramete
 - `CVSource`: one column per covaried target — `variationName(v)` for each individual
   `DistributedVariation` in the `CoVariation`.
 - `LVSource`: latent parameter names (user-supplied, actual sampled values not CDFs)
-  followed by `columnName.(lv.targets)` for the target columns.
+  followed by `lv.target_names`, less any target named like a latent: such a target's map is the
+  latent's selector, so the latent's column already holds it.
 
 The mapping from display names back to DB column names is written to `parameters.toml`
 by `_writeParametersTOML`.
@@ -295,10 +296,16 @@ _displayColumns(cp::CalibrationParameter) = _displayColumns(cp.source, cp.lv)
 #! are the trailing columns.
 _displayColumns(s::AbstractCalibrationSource, lv::LatentVariation) = _targetColumns(s, lv)
 
-#! Deduplicated: a latent whose target is the latent itself (`LatentVariation(dv)`, map `first`) is one
-#! column, not two. `_particleRowToDisplay` drops the same positions, so the two stay aligned.
+#! A target named like a latent is dropped, because `CalibrationProblem` admits that only when its map
+#! is the latent's selector, so the latent's column already holds it (`LatentVariation(dv)`, map
+#! `first`). Only that pair is merged: two *targets* sharing a name stay two entries, so
+#! `_assertUniqueColumns` sees the clash instead of one value silently replacing the other.
+#! `_particleRowToDisplay` drops the same positions, so the two stay aligned.
 _displayColumns(::LVSource, lv::LatentVariation) =
-    unique([lv.latent_parameter_names..., _targetColumns(LVSource, lv)...])
+    [lv.latent_parameter_names..., _targetsApartFromLatents(lv)...]
+
+_targetsApartFromLatents(lv::LatentVariation) =
+    [t for t in _targetColumns(LVSource, lv) if t ∉ lv.latent_parameter_names]
 
 """
     _targetColumns(cp::CalibrationParameter) → Vector{String}
@@ -412,8 +419,8 @@ Convert a row of CDF coordinates to human-readable display values.
 - `DVSource` / `CVSource`: returns the actual target parameter value(s). The internal
   `LatentVariation` applies `quantile(prior, cdf)` (and the user's map) to obtain
   interpretable values.
-- `LVSource`: returns the latent parameter samples — i.e., `quantile(D_i, cdf_i)` for
-  each latent dimension — followed by the target parameter values.
+- `LVSource`: returns the latent parameter values at the coordinates (honouring `lv.flips`),
+  followed by the target values, less any target named like a latent (see `_displayColumns`).
 
 The returned vector corresponds element-wise to `_displayColumns`.
 """
@@ -441,7 +448,6 @@ end
 function _particleRowToDisplay(::LVSource, lv::LatentVariation, cdf_vals::Vector{Float64})
     lp_vals     = _latentValues(lv, cdf_vals)
     target_vals = variationValues(lv, cdf_vals)
-    names       = [lv.latent_parameter_names..., _targetColumns(LVSource, lv)...]
-    keep        = [i for i in eachindex(names) if findfirst(==(names[i]), names) == i]
-    return [lp_vals..., target_vals...][keep]
+    keep        = [t ∉ lv.latent_parameter_names for t in _targetColumns(LVSource, lv)]
+    return [lp_vals..., target_vals[keep]...]
 end

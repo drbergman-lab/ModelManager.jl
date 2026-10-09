@@ -13,8 +13,9 @@ using RecipesBase
 _cdfColumnName(name::AbstractString) = "cdf($name)"
 
 #! `latent` holds one column per dimension the sampler draws, in value units: a `LatentVariation`'s
-#! latent parameters, and for every other variation its value. A co-variation's single dimension is
-#! shown through its first variation, which is also the one its inverse map recovers the CDF from.
+#! latent parameters, and for every other variation its value. A co-variation's latent is its shared
+#! coordinate, which has no units and is already the `:cdf` column, so `:latent` shows that dimension in
+#! value units through its first variation instead.
 #! A `DistributedVariation`'s latent and target are therefore one and the same column, which is why
 #! `values` is deduplicated per parameter rather than being `latent` followed by `target`.
 """
@@ -51,7 +52,7 @@ function _parameterGroups(cps::Vector{CalibrationParameter})
         append!(cdf_raw, cp.lv.latent_parameter_names)
         append!(latent, lat)
         append!(target, targets)
-        append!(values, unique(vcat(lat, targets)))
+        append!(values, vcat(lat, [t for t in targets if t ∉ lat]))
     end
     return _ParameterGroups(cdf_raw, latent, target, values)
 end
@@ -78,7 +79,7 @@ function _parameterGroupsFromTOML(toml_path::String)
         append!(cdf_raw, raw)
         append!(latent, lat)
         append!(target, targets)
-        append!(values, unique(vcat(lat, targets)))
+        append!(values, vcat(lat, [t for t in targets if t ∉ lat]))
     end
     return _ParameterGroups(String.(cdf_raw), String.(latent), String.(target), String.(values))
 end
@@ -318,19 +319,22 @@ function _getRejected(result::ABCResult, t_next::Int, cols::Vector{String}, g::_
     #! free: it can throw on a rejected monad deleted after all its simulations failed.
     value_cols = [c for c in cols if c ∉ g.cdf]
     df = isempty(value_cols) ? nothing : _lazyLoadRejected(result, t_next)
-    available  = isnothing(df) ? String[] : [c for c in value_cols if c in names(df)]
-    note = _rejectedNote(cols, g, !isempty(available) || isempty(value_cols))
-    return isempty(available) ? nothing : select(df, available), note
+    available = isnothing(df) ? String[] : [c for c in value_cols if c in names(df)]
+    rej_df    = isempty(available) ? nothing : select(df, available)
+    return rej_df, _rejectedNote(cols, rej_df; in_memory=true)
 end
 
-#! The title note for rejected proposals read back from the database. A CDF column never has them that
-#! way, which is worth saying even when the value columns did get theirs — otherwise its empty panels
-#! read as "nothing was rejected".
-function _rejectedNote(cols::Vector{String}, g::_ParameterGroups, values_found::Bool)
-    notes = String[]
-    values_found || push!(notes, "rejected proposals unavailable")
-    any(in(g.cdf), cols) && push!(notes, "set store_rejected=true for rejected proposals in CDF columns")
-    return isempty(notes) ? "" : " (" * join(notes, "; ") * ")"
+#! The title note for rejected proposals read back from the database, which holds target values only.
+#! Any selected column it cannot supply — a CDF column, or a `LatentVariation`'s latent without inverse
+#! maps — is named, even when other columns did get theirs: otherwise its empty panels read as "nothing
+#! was rejected". `store_rejected=true` is suggested only where it would have helped, in memory.
+function _rejectedNote(cols::Vector{String}, rej_df::Union{Nothing,DataFrame}; in_memory::Bool)
+    found   = isnothing(rej_df) ? String[] : intersect(cols, names(rej_df))
+    missing_cols = setdiff(cols, found)
+    isempty(missing_cols) && return ""
+    what = isempty(found) ? "rejected proposals unavailable" :
+                            "no rejected proposals for " * join(missing_cols, ", ")
+    return " (" * what * (in_memory ? "; store_rejected=true keeps them" : "") * ")"
 end
 
 # Aggregate rows of df by exact match; return (unique_df, aggregated_values).
@@ -1128,7 +1132,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
         rej_df = isempty(value_cols) ? nothing :
                  _lazyLoadRejectedFromDisk(cal, t_next, max_nr_pop,
                                            accepted_monad_ids, value_cols, mapping)
-        note = _rejectedNote(cols, g, !isnothing(rej_df) || isempty(value_cols))
+        note = _rejectedNote(cols, rej_df; in_memory=false)
 
         _TransitionData(kde_df, kde_w, acc_df, acc_w, rej_df, cols,
                         pop_size, note,

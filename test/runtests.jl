@@ -8448,19 +8448,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test td.rej_df[!, "u"] ≈ 4.0 .* rej.u
 
             # Without rejected proposals in memory, a CDF-only selection skips the database lookup and
-            # says why its panels have no red points; a mixed one says so too, even when the value
-            # columns got theirs.
+            # says why its panels have no red points.
             res_norej = ABCResult(Calibration(1), [g1, GenerationResult(2, particles(0.1), w,
                                   [0.2, 0.1, 0.1], 0.2, 6, [4, 5, 6], 0.5, 3.0, nothing)],
                                   cps, ABCSMC(population_size=3))
             td_cdf = data(applyk(Dict(:parameters => :cdf), res_norej, :transition))
             @test isnothing(td_cdf.rej_df)
+            @test occursin("unavailable", td_cdf.note)
             @test occursin("store_rejected=true", td_cdf.note)
-            @test !occursin("unavailable", td_cdf.note)
-            @test ModelManager._rejectedNote([a], g, true) == ""
-            @test ModelManager._rejectedNote([a], g, false) == " (rejected proposals unavailable)"
-            @test occursin("store_rejected=true", ModelManager._rejectedNote(["cdf($a)", a], g, true))
-            @test occursin("unavailable", ModelManager._rejectedNote(["cdf($a)", a], g, false))
+            # Any selected column the database could not supply is named, even when others got theirs:
+            # a CDF column, or a latent with no inverse maps.
+            note(cols, rej; in_memory=true) = ModelManager._rejectedNote(cols, rej; in_memory=in_memory)
+            some = DataFrame(a => [1.0])
+            @test note([a], some) == ""
+            @test note([a], nothing) == " (rejected proposals unavailable; store_rejected=true keeps them)"
+            @test note(["cdf($a)", "u", a], some) ==
+                  " (no rejected proposals for cdf($a), u; store_rejected=true keeps them)"
+            @test note(["cdf($a)", a], some; in_memory=false) == " (no rejected proposals for cdf($a))"
         end
 
         @testset "a latent named like its target" begin
@@ -8507,6 +8511,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             # Two parameters may not share a column either, in the display frame or the CDF frame.
             dup = DistributedVariation(:config, XMLPath(["g", "t"]), Uniform(0.0, 1.0); name=s)
             @test_throws ArgumentError ModelManager._toCalibrationParameters([dvs, dup])
+            # Nor may two targets of one LatentVariation: merging a latent with its selected target
+            # must not also merge two different targets that happen to share a name.
+            lv_twins = LatentVariation([Uniform(0.0, 1.0)], XMLPath[xs, XMLPath(["g", "t"])],
+                                       Function[lp -> lp[1], lp -> 2.0 * lp[1]], ["u"],
+                                       Symbol[:config, :config]; target_names=["v", "v"])
+            @test ModelManager._displayColumns(ModelManager._toCalibrationParameter(lv_twins)) == ["u", "v", "v"]
+            @test_throws ArgumentError ModelManager._toCalibrationParameters([lv_twins])
         end
     end
 
