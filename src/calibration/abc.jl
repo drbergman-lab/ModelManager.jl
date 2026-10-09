@@ -885,7 +885,9 @@ function _loadProblem(calibration::Calibration; required::Bool=true)
             "This is what a `summary_statistic`, `distance` or `LatentVariation` map that is a " *
             "closure -- a lambda, or a named function defined inside another function -- looks like " *
             "from a fresh session. Either `include` the file that defines those functions before " *
-            "resuming, or pass the original problem: $(rescue).")
+            "resuming, or pass the original problem: $(rescue). A problem with a hand-built " *
+            "`LatentVariation` saved before v0.12 fails here too, because `LatentVariation` gained " *
+            "a `flips` field; pass the problem again the same way.")
     end
     manifest === :unrecognized && return unreadable(
         "Unrecognized problem.jld2 format in $path: it has no `manifest` entry. Re-run with the " *
@@ -1176,7 +1178,7 @@ function _validateParticleConsistency(cps::Vector{CalibrationParameter}, src_lis
             # Round-trip check for LVSource with inverse_maps.
             if cp.source isa LVSource && !isnothing(cp.lv.inverse_maps)
                 lv = cp.lv
-                lp_vals     = [quantile(d, u) for (d, u) in zip(lv.latent_parameters, cdf_vals)]
+                lp_vals     = _latentValues(lv, cdf_vals)
                 target_vals = Float64[fn(lp_vals) for fn in lv.maps]
                 recovered   = [inv_map(target_vals) for inv_map in lv.inverse_maps]
                 for (k, (lp, rec)) in enumerate(zip(lp_vals, recovered))

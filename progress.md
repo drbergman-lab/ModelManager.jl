@@ -5,6 +5,38 @@
 
 ---
 
+## A distributed variation's latent is its value (2026-10-08)
+
+### Trigger
+Reviewing the plot `parameters` keyword (#83): `LatentVariation(dv)` passed as a calibration parameter
+named a `Uniform(0,1)` latent and the value alike, and `posterior` wrote the value over the latent.
+The maintainer's model is CDF coordinate → latent (with the prior) → target (through the map), under
+which a distributed variation's latent *is* its value; the code put the prior in the map instead.
+
+### Decided
+- **Prior on the latent, map `first`.** Julia's `identity` is the intent, but a map receives the
+  whole latent vector, so the identity on latent `i` is its selector: `first`, or
+  `Base.Fix2(getindex, i)`.
+- **The flip is a property of the latent's coordinate** (`LatentVariation.flips`), not of the map.
+  Two rejected routes: dropping the flip for a lone variation (coordinates would have meant mirrored
+  targets, so seeded designs and stored `cdfs.csv` would change), and an internal `_Flipped(d)` wrapper
+  distribution (a "cdf" that decreases is a lie to anything generic). The field is explicit and costs
+  one JLD2 incompatibility, flagged with a `#!` on the field.
+- **Clean break over compatibility shims.** The maintainer chose to name what users must do over
+  carrying migration code. Because coordinates keep their meaning, the only thing to do is re-supply a
+  hand-built `LatentVariation` problem on resume.
+- **A co-variation's latent is its shared coordinate** (revised in review). The first version made it
+  the first variation's value, which forced a value → cdf → quantile round trip into every later map:
+  wrong when the first distribution is discrete (`cdf(d1, quantile(d1, c))` is the top of c's bin),
+  lossy in the tails, and arbitrary about which variation is first. The rule that settles it: the
+  latent is the quantity the prior is placed on, and a co-variation has n distributions on one
+  coordinate and no single prior. Reverting also exposed a pre-existing failure: the inverse map
+  recovered `c` from the first target, so a discrete first distribution failed the construction-time
+  round trip and the co-variation could not be built. The inverse now recovers from the first
+  continuous variation, and an all-discrete co-variation has no inverse map (no bank reuse).
+- **A one-variation `CoVariation`** builds exactly what its variation would, under the co-variation's
+  name; `CoVariation` does not require two.
+
 ## `carry=:varied` withdrawn (2026-09-30) — ships in v0.11.0
 
 The three-way `carry` shipped in #79 with `:varied` as the middle: only what the old variation row

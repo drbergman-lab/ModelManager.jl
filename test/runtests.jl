@@ -1465,6 +1465,73 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test df_empty[!, :u] ≈ [0.25, 0.75]
     end
 
+    @testset "LatentVariation from a DistributedVariation: the latent is the value" begin
+        xp  = XMLPath(["a", "x"])
+        xp2 = XMLPath(["a", "y"])
+        cs  = [0.1, 0.25, 0.5, 0.9]
+        for flip in (false, true)
+            dv = DistributedVariation(:config, xp, Gamma(2.0, 3.0); flip=flip)
+            lv = LatentVariation(dv)
+            @test lv.latent_parameters == [dv.distribution]
+            @test lv.maps == [first]
+            @test lv.flips == [flip]
+            @test lv.latent_parameter_names == lv.target_names
+            for c in cs
+                # The coordinate means what it always meant, so designs and stored coordinates agree
+                # with the DistributedVariation's own mapping.
+                @test ModelManager.variationValues(lv, [c]) ≈ ModelManager.variationValues(dv, [c])
+                # The latent and the target are one number.
+                lp = ModelManager._latentValues(lv, [c])
+                @test lp ≈ ModelManager.variationValues(lv, [c])
+                # And the coordinate comes back from the value, which is what the bank relies on.
+                @test ModelManager._latentCoordinates(lv, [lv.inverse_maps[1](lp)]) ≈ [c]
+            end
+            # Passed as itself, it displays its latent and its target as the same values.
+            cp = ModelManager._toCalibrationParameter(lv)
+            vals = ModelManager._particleRowToDisplay(cp, [0.25])
+            @test vals[1] ≈ vals[2]
+        end
+
+        # A co-variation's latent is its shared CDF coordinate; each variation maps it through its own
+        # distribution and flip, so every target is quantile(d_i, flip_i ? 1 - c : c), including when
+        # the first distribution is discrete.
+        val(d, flip, c) = quantile(d, flip ? 1 - c : c)
+        for (D1, D2) in ((Uniform(0.0, 2.0), Normal(5.0, 1.0)), (Binomial(10, 0.3), Normal(5.0, 1.0)))
+            for (f1, f2) in ((false, false), (true, false), (false, true), (true, true))
+                d1 = DistributedVariation(:config, xp, D1; flip=f1)
+                d2 = DistributedVariation(:config, xp2, D2; flip=f2)
+                lv = LatentVariation(CoVariation(d1, d2))
+                @test lv.latent_parameters == [Uniform(0.0, 1.0)]
+                @test lv.flips == [false]
+                @test lv.latent_parameter_names == [variationName(CoVariation(d1, d2))]
+                for c in cs
+                    @test ModelManager._latentValues(lv, [c]) == [c]       # the latent is the coordinate
+                    tv = ModelManager.variationValues(lv, [c])
+                    @test tv ≈ [val(D1, f1, c), val(D2, f2, c)]
+                    # The coordinate comes back exactly, from the continuous variation's target.
+                    @test lv.inverse_maps[1](tv) ≈ c
+                    @test isnan(lv.inverse_maps[1]([tv[1], tv[2] + 1.0]))   # off the curve
+                end
+            end
+        end
+        # With no continuous variation the coordinate is only known to a bin, so there is no inverse.
+        all_discrete = LatentVariation(CoVariation(DistributedVariation(:config, xp, Binomial(10, 0.3)),
+                                                   DistributedVariation(:config, xp2, Poisson(3.0))))
+        @test isnothing(all_discrete.inverse_maps)
+        @test ModelManager.variationValues(all_discrete, [0.5]) ≈ [quantile(Binomial(10, 0.3), 0.5), quantile(Poisson(3.0), 0.5)]
+
+        # A one-variation co-variation builds exactly what the variation alone would.
+        for flip in (false, true)
+            dv  = DistributedVariation(:config, xp, Gamma(2.0, 3.0); flip=flip)
+            lv1 = LatentVariation(CoVariation(dv))
+            lvd = LatentVariation(dv)
+            for f in (:latent_parameters, :latent_parameter_names, :targets, :target_names, :maps, :flips, :name)
+                @test getfield(lv1, f) == getfield(lvd, f)
+            end
+            @test ModelManager.variationValues(lv1, [0.3]) ≈ ModelManager.variationValues(lvd, [0.3])
+        end
+    end
+
     @testset "posterior" begin
         particles1 = DataFrame(x=[1.0, 2.0])
         particles2 = DataFrame(x=[3.0, 4.0])
