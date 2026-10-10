@@ -5,6 +5,31 @@
 
 ---
 
+## The bank reuses a monad only if its coordinates map back to its values (2026-10-10)
+
+Two Copilot findings after #84, which made a `DistributedVariation` over a discrete distribution
+buildable. First, a flipped one's top level has coordinate 0.0, which the endpoint filter always
+rejected. Second, for an unbounded discrete prior like `Poisson`, a far-tail value's CDF rounds to
+exactly 1.0, and that coordinate maps back to `Inf`. The maintainer pointed out the second is not
+specific to unbounded priors: near the top of `Binomial(100, 0.01)`, `cdf(99)` rounds to 1.0, which
+maps back to 100.
+
+### Decided
+- **Check the round trip, not the endpoints.** Each candidate monad's coordinates must map back to its
+  own values (`rtol = 1e-8`). Endpoint rules can't catch the Binomial case, where 99 and 100 share
+  coordinate 1.0; the round trip catches every way a coordinate can fail to identify its value. The
+  endpoint rules stay, mirrored for flipped discrete dimensions, because they are about keeping
+  continuous particles inside (0, 1).
+- **Why it matters although the lookup is consistent.** A bank hit reuses the monad by ID without
+  re-running it, while everything downstream (`particles.csv`, `posterior`, `samplePosterior`,
+  `createTrial`, the next kernel) reads the particle's value from its coordinate. A mismatch therefore
+  records one value against a distance measured at another, silently. The ordinary path (coordinate to
+  values, then lookup or run) cannot mismatch.
+- **Cost:** one forward map per candidate per parameter, once, in `_buildSimulationBank` at the start of
+  a run or resume.
+
+---
+
 ## One `parameters` keyword for the calibration and GSA plots (2026-10-08)
 
 The calibration recipes took `space` (`:target`/`:cdf`) and `parameters` (a DataFrames selector

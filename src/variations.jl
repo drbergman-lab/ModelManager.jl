@@ -409,7 +409,8 @@ coordinate, and a `DiscreteVariation`'s latent is its level index.
 - `maps`: Forward maps — each `map_j(lp_vals::Vector) → scalar` computes one target value from all latent values.
 - `inverse_maps`: Optional inverse maps — each `inv_map_i(target_vals::Vector{Float64}) → Float64` recovers
   the latent parameter value `lp_i` for latent dimension `i` from the full vector of target values (ordered
-  by `targets`). The library applies `cdf(dist_i, lp_i)` internally to obtain the CDF coordinate. One
+  by `targets`). The library applies `cdf(dist_i, lp_i)` internally (`1 - cdf(dist_i, lp_i)` for a
+  dimension flipped in `flips`) to obtain the CDF coordinate. One
   inverse per latent dimension. Required for `SimulationBank` support with `LVSource` calibration parameters.
   Auto-constructed for `DVSource`/`CVSource`-backed `LatentVariation`s. Supply via the
   `inverse_maps` keyword argument when constructing a user-defined `LatentVariation{<:Distribution}`.

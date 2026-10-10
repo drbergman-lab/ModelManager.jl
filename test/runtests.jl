@@ -1988,6 +1988,27 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test !ModelManager._bankCoordsUsable(disc_cp_bank.lv, [0.0])   # no level maps there
         @test !ModelManager._bankCoordsUsable(cp.lv, [1.0])             # continuous: still strict
         @test ModelManager._bankCoordsUsable(cp.lv, [0.5])
+        # A flipped discrete dimension mirrors it: the top level's coordinate is 0.0, not 1.0.
+        flip_disc = ModelManager._toCalibrationParameter(
+            DistributedVariation(:config, xp, Binomial(4, 0.5); flip=true))
+        top = ModelManager._bankCdfCoords(flip_disc, Dict{String,Float64}("overall/max_time" => 4.0))
+        @test top ≈ [0.0]
+        @test ModelManager._bankCoordsUsable(flip_disc.lv, top)
+        @test ModelManager.variationValues(flip_disc.lv, top) ≈ [4.0]
+        @test !ModelManager._bankCoordsUsable(flip_disc.lv, [1.0])        # no level maps there
+
+        # A coordinate must map back to the monad's own value. Near the top of a discrete distribution
+        # Float64 rounds the CDF to 1.0, so a level below the top would come back as the top.
+        near_top = ModelManager._toCalibrationParameter(
+            DistributedVariation(:config, xp, Binomial(100, 0.01)))
+        @test ModelManager._bankCdfCoords(near_top, Dict{String,Float64}("overall/max_time" => 100.0)) ≈ [1.0]
+        @test isnothing(ModelManager._bankCdfCoords(near_top, Dict{String,Float64}("overall/max_time" => 99.0)))
+        @test ModelManager._bankCdfCoords(near_top, Dict{String,Float64}("overall/max_time" => 1.0)) ≈
+              [cdf(Binomial(100, 0.01), 1.0)]
+        # And a far-tail value of an unbounded one would come back as Inf.
+        tail = ModelManager._toCalibrationParameter(DistributedVariation(:config, xp, Poisson(3.0)))
+        @test isnothing(ModelManager._bankCdfCoords(tail, Dict{String,Float64}("overall/max_time" => 60.0)))
+        @test !isnothing(ModelManager._bankCdfCoords(tail, Dict{String,Float64}("overall/max_time" => 3.0)))
 
         # --- CVSource: single latent CDF, two targets ---
         dv2 = DistributedVariation(:config, xp2, Uniform(0.0, 2.0))

@@ -420,12 +420,17 @@ _bankColDistribution(::LVSource, ::LatentVariation, ::String) = nothing
 #! every monad run at that level, a level the sampler proposes as often as any other. Nothing
 #! downstream minds: the bank's coordinates are compared in an L∞ box and become a particle's own
 #! coordinates, `quantile(DiscreteUniform(1, k), 1.0)` is `k`, the kernels stay inside [0,1], and the
-#! prior density is 1 everywhere in CDF space. Zero stays excluded either way: no level maps to it.
-_bankCoordUsable(::Distribution, u::Real) = 0 < u < 1
-_bankCoordUsable(::DiscreteUnivariateDistribution, u::Real) = 0 < u <= 1
+#! prior density is 1 everywhere in CDF space.
+#!
+#! A flipped dimension mirrors this: its coordinate is `1 - cdf(d, x)`, so the top level lands on 0.0
+#! rather than 1.0, and `quantile(d, 1 - 0.0)` is that level. Only the end no level maps to is excluded
+#! -- 0.0 unflipped, 1.0 flipped. Before `flips`, a discrete `DistributedVariation` could not be built
+#! as a `LatentVariation` at all, so no flipped discrete coordinate ever reached this filter.
+_bankCoordUsable(::Distribution, ::Bool, u::Real) = 0 < u < 1
+_bankCoordUsable(::DiscreteUnivariateDistribution, flip::Bool, u::Real) = flip ? 0 <= u < 1 : 0 < u <= 1
 
 _bankCoordsUsable(lv::LatentVariation, coords) =
-    all(_bankCoordUsable(d, u) for (d, u) in zip(lv.latent_parameters, coords))
+    all(_bankCoordUsable(d, f, u) for (d, f, u) in zip(lv.latent_parameters, lv.flips, coords))
 
 """
     _bankCdfCoords(cp::CalibrationParameter, vals::Dict{String,Float64})
@@ -468,6 +473,19 @@ function _bankCdfCoords(lv::LatentVariation, vals::Dict{String, Float64})
     end
     any(isnan, lp_vals) && return nothing   # e.g. CVSource consistency check failed
     cdfs = _latentCoordinates(lv, lp_vals)
+    #! The coordinates must map back to the monad's own values, or it is not reused. A reused monad keeps
+    #! its ID and its simulations, while its particle carries these coordinates, so a mismatch would
+    #! record one parameter value while the distance came from another. Float64 makes that real near the
+    #! top of a discrete distribution: in `Binomial(100, 0.01)`, `cdf(99)` rounds to exactly 1.0, which
+    #! maps back to 100, and a far-tail `Poisson` value's coordinate rounds to 1.0, which maps to `Inf`.
+    #! Asking the round trip directly covers those and any other value the coordinate cannot carry,
+    #! where a rule about endpoints could only guess.
+    forward = try
+        variationValues(lv, cdfs)
+    catch
+        return nothing
+    end
+    all(isapprox(f, v; rtol=1e-8) for (f, v) in zip(forward, target_vals)) || return nothing
     return cdfs
 end
 
