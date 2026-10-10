@@ -481,18 +481,21 @@ columns come in three groups, CDF coordinates, latents and targets, each named b
 
 | `parameters =` | Draws |
 |:---|:---|
-| `:latent` (default) | one column per dimension the sampler draws, the quantity its prior is placed on: a `LatentVariation`'s latent parameters, a `DistributedVariation`'s or `DiscreteVariation`'s value, and a `CoVariation`'s shared coordinate |
+| `:latent` (default) | one column per dimension the sampler draws: the quantity its prior is placed on |
 | `:target` | the values written to the model |
 | `:cdf` | the sampler's CDF coordinates in [0, 1], one per latent dimension, named `cdf(name)` |
 | `:all` | every column above, each once |
 
-If your parameters are all `DistributedVariation`s and `DiscreteVariation`s, `:latent` and `:target`
-are the same columns, so the default shows your parameters as you defined them. A
-`DistributedVariation`'s latent and target are one column, not two, so `:all` draws it twice: its CDF
-and its value. A `CoVariation` moves several targets through one shared coordinate, and that
-coordinate is its latent: `:latent` draws it in [0, 1] under the co-variation's name, and `:target`
-draws each of its variations. (A `DiscreteVariation`'s latent is really a level index, which nothing
-shows, so it is drawn as its value; a co-variation of `DiscreteVariation`s as its first variation's.)
+What `:latent` draws depends on the kind of variation:
+
+- **`DistributedVariation` and `DiscreteVariation`:** the value, which is also its target, so the two
+  groups share the column and `:all` draws it twice, as its CDF and its value. With only these,
+  `:latent` and `:target` are the same columns. (A discrete variation's real latent is a level index,
+  which nothing shows.)
+- **`CoVariation`:** its shared coordinate, in [0, 1], under the co-variation's name; `:target` draws
+  each of its variations. A co-variation of `DiscreteVariation`s draws its first variation's value
+  instead.
+- **`LatentVariation`:** its latent parameters, in their own units.
 
 To draw particular columns, name them with a String or a vector of Strings. Names come from any
 group, a vector is drawn in the order given, and the names are the columns of `posterior(result)`,
