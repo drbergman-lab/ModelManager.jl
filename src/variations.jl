@@ -300,34 +300,6 @@ struct CoVariation{T<:ElementaryVariation} <: AbstractVariation
     variations::Vector{T}
     name::String
 
-    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Distribution},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
-        variations = DistributedVariation[]
-        for (xml_path, distribution) in inputs
-            @assert xml_path isa Vector{<:AbstractString} "xml_path must be a vector of strings"
-            push!(variations, DistributedVariation(xml_path, distribution))
-        end
-        default_name = join(variationName.(variations), " AND ")
-        variation_name = isnothing(name) ? default_name : String(name)
-        return new{DistributedVariation}(variations, variation_name)
-    end
-
-    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Vector},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
-        variations = DiscreteVariation[]
-        n_discrete = -1
-        for (xml_path, val) in inputs
-            n_vals = length(val)
-            if n_discrete == -1
-                n_discrete = n_vals
-            else
-                @assert n_discrete == n_vals "All discrete vals must have the same length"
-            end
-            push!(variations, DiscreteVariation(xml_path, val))
-        end
-        default_name = join(variationName.(variations), " AND ")
-        variation_name = isnothing(name) ? default_name : String(name)
-        return new{DiscreteVariation}(variations, variation_name)
-    end
-
     function CoVariation(evs::Vector{DistributedVariation}; name::Union{Nothing,AbstractString}=nothing)
         default_name = join(variationName.(evs), " AND ")
         variation_name = isnothing(name) ? default_name : String(name)
