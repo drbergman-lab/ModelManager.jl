@@ -473,6 +473,19 @@ function _bankCdfCoords(lv::LatentVariation, vals::Dict{String, Float64})
     end
     any(isnan, lp_vals) && return nothing   # e.g. CVSource consistency check failed
     cdfs = _latentCoordinates(lv, lp_vals)
+    #! The coordinates must map back to the monad's own values, or it is not reused. A reused monad keeps
+    #! its ID and its simulations, while its particle carries these coordinates, so a mismatch would
+    #! record one parameter value while the distance came from another. Float64 makes that real near the
+    #! top of a discrete distribution: in `Binomial(100, 0.01)`, `cdf(99)` rounds to exactly 1.0, which
+    #! maps back to 100, and a far-tail `Poisson` value's coordinate rounds to 1.0, which maps to `Inf`.
+    #! Asking the round trip directly covers those and any other value the coordinate cannot carry,
+    #! where a rule about endpoints could only guess.
+    forward = try
+        variationValues(lv, cdfs)
+    catch
+        return nothing
+    end
+    all(isapprox(f, v; rtol=1e-8) for (f, v) in zip(forward, target_vals)) || return nothing
     return cdfs
 end
 
