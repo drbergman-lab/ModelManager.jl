@@ -141,7 +141,30 @@ Return why `av` cannot be a calibration parameter, or `nothing` if it can.
 """
 _calibrationRejection(::DistributedVariation) = nothing
 _calibrationRejection(::CoVariation{DistributedVariation}) = nothing
-_calibrationRejection(::LatentVariation{<:Distribution}) = nothing
+
+#! A latent may share a name with a target only when they are the same number, i.e. when the target's
+#! map is the selector of that latent — what Julia's `identity` means for a map handed the whole latent
+#! vector. `LatentVariation(dv)` is built that way. Any other map would put two numbers under one name,
+#! and `posterior` would silently keep only the target; the user's choice of name is the only thing to
+#! change, so it is refused rather than renamed for them. Checked on the map object itself, not by
+#! evaluating it.
+#! `only` counts too: on one latent it is the same selector as `first`, and on more it throws when the
+#! constructor evaluates the maps, so it never gets this far.
+_selectsLatent(m, i::Int) = (i == 1 && (m === first || m === only)) ||
+                            (m isa Base.Fix2{typeof(getindex)} && m.x == i)
+
+function _calibrationRejection(lv::LatentVariation{<:Distribution})
+    clashes = [lv.latent_parameter_names[i]
+               for i in eachindex(lv.latent_parameter_names), j in eachindex(lv.target_names)
+               if lv.latent_parameter_names[i] == lv.target_names[j] && !_selectsLatent(lv.maps[j], i)]
+    isempty(clashes) && return nothing
+    return "latent parameter$(length(clashes) == 1 ? "" : "s") $(unique(clashes)) share" *
+           "$(length(clashes) == 1 ? "s" : "") a name with a target that is a different number, so " *
+           "the posterior could not hold both. Name them apart, or, if the target is meant to be the " *
+           "latent itself, make its map the latent's selector (`first` or `only` for a single latent, " *
+           "`Base.Fix2(getindex, i)` for latent i). " *
+           "For a LatentVariation built from a DiscreteVariation, pass the DiscreteVariation itself."
+end
 
 #! Discrete parameters are calibratable. They are represented as `DiscreteUniform` over their value
 #! indices, so a particle coordinate stays a CDF value in [0,1] and the quantile does the quantising —
@@ -229,7 +252,22 @@ function _toCalibrationParameters(parameters::AbstractVector)
         $(join(lines, "\n"))
         """))
     end
-    return CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    cps = CalibrationParameter[_toCalibrationParameter(av) for av in parameters]
+    _assertUniqueColumns(cps)
+    return cps
+end
+
+#! Every parameter's columns share two frames — the display frame (`posterior`, `particles.csv`) and
+#! the CDF frame (`cdfs.csv`) — and a repeated name in either overwrites one parameter's column with
+#! another's, with no error.
+function _assertUniqueColumns(cps::Vector{CalibrationParameter})
+    for (frame, cols) in (("posterior", vcat(String[], _displayColumns.(cps)...)),
+                          ("CDF", vcat(String[], (cp.lv.latent_parameter_names for cp in cps)...)))
+        dup = unique(c for c in cols if count(==(c), cols) > 1)
+        isempty(dup) || throw(ArgumentError(
+            "Calibration parameters share the $(frame) column name$(length(dup) == 1 ? "" : "s") " *
+            "$(dup), so one would overwrite the other. Give the variations distinct names with `name=`."))
+    end
 end
 
 ################## Display column helpers ##################
@@ -244,7 +282,8 @@ Return the column names used in human-readable generation CSVs for this paramete
 - `CVSource`: one column per covaried target — `variationName(v)` for each individual
   `DistributedVariation` in the `CoVariation`.
 - `LVSource`: latent parameter names (user-supplied, actual sampled values not CDFs)
-  followed by `columnName.(lv.targets)` for the target columns.
+  followed by `lv.target_names`, less any target named like a latent: such a target's map is the
+  latent's selector, so the latent's column already holds it.
 
 The mapping from display names back to DB column names is written to `parameters.toml`
 by `_writeParametersTOML`.
@@ -257,8 +296,16 @@ _displayColumns(cp::CalibrationParameter) = _displayColumns(cp.source, cp.lv)
 #! are the trailing columns.
 _displayColumns(s::AbstractCalibrationSource, lv::LatentVariation) = _targetColumns(s, lv)
 
+#! A target named like a latent is dropped, because `CalibrationProblem` admits that only when its map
+#! is the latent's selector, so the latent's column already holds it (`LatentVariation(dv)`, map
+#! `first`). Only that pair is merged: two *targets* sharing a name stay two entries, so
+#! `_assertUniqueColumns` sees the clash instead of one value silently replacing the other.
+#! `_particleRowToDisplay` drops the same positions, so the two stay aligned.
 _displayColumns(::LVSource, lv::LatentVariation) =
-    [lv.latent_parameter_names..., _targetColumns(LVSource, lv)...]
+    [lv.latent_parameter_names..., _targetsApartFromLatents(lv)...]
+
+_targetsApartFromLatents(lv::LatentVariation) =
+    [t for t in _targetColumns(LVSource, lv) if t ∉ lv.latent_parameter_names]
 
 """
     _targetColumns(cp::CalibrationParameter) → Vector{String}
@@ -372,8 +419,8 @@ Convert a row of CDF coordinates to human-readable display values.
 - `DVSource` / `CVSource`: returns the actual target parameter value(s). The internal
   `LatentVariation` applies `quantile(prior, cdf)` (and the user's map) to obtain
   interpretable values.
-- `LVSource`: returns the latent parameter samples — i.e., `quantile(D_i, cdf_i)` for
-  each latent dimension — followed by the target parameter values.
+- `LVSource`: returns the latent parameter values at the coordinates (honouring `lv.flips`),
+  followed by the target values, less any target named like a latent (see `_displayColumns`).
 
 The returned vector corresponds element-wise to `_displayColumns`.
 """
@@ -401,5 +448,6 @@ end
 function _particleRowToDisplay(::LVSource, lv::LatentVariation, cdf_vals::Vector{Float64})
     lp_vals     = _latentValues(lv, cdf_vals)
     target_vals = variationValues(lv, cdf_vals)
-    return [lp_vals..., target_vals...]
+    keep        = [t ∉ lv.latent_parameter_names for t in _targetColumns(LVSource, lv)]
+    return [lp_vals..., target_vals[keep]...]
 end

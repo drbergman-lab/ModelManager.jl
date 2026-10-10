@@ -5,6 +5,59 @@
 
 ---
 
+## One `parameters` keyword for the calibration and GSA plots (2026-10-08)
+
+The calibration recipes took `space` (`:target`/`:cdf`) and `parameters` (a DataFrames selector
+applied within that space). The maintainer wanted a single keyword that says which set of
+parameters to work with. `space` turned out to do more than pick columns — it picked the units, the
+file (`particles.csv` vs `cdfs.csv`), and whether `:ridgeline` drew a prior — so the merge had to
+let one keyword carry the coordinates too.
+
+### What was decided
+- **Groups are Symbols, columns are Strings.** `:latent` (default), `:target`, `:cdf`, `:all`; a
+  String or `Vector{String}` names columns from any group. Requiring Strings for columns is what
+  keeps a variation named `latent` from colliding with the group, so Regex, `Not(...)` and positions
+  were dropped rather than kept beside the presets. Leaving one out means listing the rest; the
+  maintainer judged the selector vocabulary over-engineering for that.
+- **`:latent` means one column per sampled dimension, in value units** (option (a)). For a
+  `DistributedVariation` that is its value, so its latent and target are one column and `:all`
+  draws it twice (CDF and value), not three times. The alternative (b), only `LatentVariation`
+  latents, would leave `:latent` empty on most problems. The name was kept although a non-LV user
+  may not know it: with only distributed and discrete variations, `:latent == :target`, and the
+  manual says so.
+- **`:latent` shows a co-variation's shared coordinate, under its own name** (revised in review).
+  The first version showed its first variation's value as a stand-in, because the coordinate has no
+  units and is already the `:cdf` column. The maintainer pointed out that this contradicts #84's
+  rule, the latent is what the prior sits on, and a co-variation's latent is its coordinate. Following
+  the rule also makes the calibration `:latent` column agree with the GSA x-axis and with
+  `LatentVariation(cv)`, which both use the co-variation's name. The column duplicates `cdf(name)`'s
+  numbers, as a `LatentVariation` with a `Uniform(0, 1)` latent already does. Discrete variations keep
+  their value as the stand-in: their latent is a level index nobody wants drawn.
+- **CDF columns are renamed `cdf(name)` at display time only.** `cdfs.csv`, `particles` and the
+  resume path keep the raw latent names, so existing runs need no migration.
+- **`space` stays declared, to throw.** RecipesBase consumes declared keywords, and the `Calibration`
+  style recipe never declared `space`, so `plot(cal, :ridgeline; space=:cdf)` silently drew values.
+- **The GSA recipes follow**, Strings only, so `parameters` means one thing package-wide.
+
+### Review: a latent named like its target (2026-10-08)
+Copilot found that `LatentVariation(dv)` passed as a calibration parameter put a `Uniform(0,1)` latent
+and the value under one name, and `posterior` wrote the value over the latent (a bug older than this
+PR). A first fix refused it outright; the maintainer's model said the latent of a distributed variation
+*is* its value, which led to #84 (prior on the latent, map `first`, flip on the coordinate). On top of
+that, the rule here narrowed to: a latent may share a target's name only when the target's map is that
+latent's selector, checked on the map object (the maintainer asked for `identity`; a map receives the
+whole latent vector, so the identity on latent `i` is `first`/`Fix2(getindex, i)`). LVSource display
+columns are deduplicated per parameter so such a latent is one column. The same check refuses a name
+repeated across parameters; the existing conversion test calibrated `path/a` twice and was moved to its
+own path. The two smaller findings were taken as given: a CDF-only `:transition` no longer queries the
+database, and a mixed selection always says that its CDF panels lack rejected points.
+
+### Also corrected
+PRD.md claimed the `:transition` lazy lookup inverted rejected values to CDF coordinates for
+`space=:cdf`. It never did; it returned nothing for CDF space. The PRD now says what happens.
+
+---
+
 ## A distributed variation's latent is its value (2026-10-08)
 
 ### Trigger
