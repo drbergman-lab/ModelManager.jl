@@ -56,6 +56,12 @@ to the internal [`CalibrationParameter`](@ref) representation automatically. A d
 needs at least two levels; one that can never vary is rejected rather than given a particle
 coordinate no proposal can move, so set such a value in the reference monad instead.
 
+Every parameter needs its own column names, because the posterior is one table, so two variations
+with the same name are refused. A `LatentVariation` may give a latent and a target the same name only
+when they are the same number, i.e. the target's map is that latent's selector (`first` or `only`
+for a single latent, `Base.Fix2(getindex, i)` for latent `i`). `LatentVariation(dv)` is built that
+way, so its posterior and plots show the same columns as `dv`'s.
+
 Two functions you supply:
 
 - **`summary_statistic`** — a [`QoI`](@ref), or a vector of them (a bare function is wrapped into
@@ -468,20 +474,51 @@ plot(Calibration(42), :distances; generation=3)
 
 ### Choosing which parameters to draw
 
-A corner plot of eight parameters is a 64-panel grid. Every recipe with a parameter axis — the corner
-plot, `:ridgeline` and `:transition` — takes `parameters`, which accepts anything `select` does on a
-`DataFrame`: a name, a vector of names, positions, a `Regex`, or `Not(...)`. The names are the columns
-of `posterior(result)` (the latent names when `space=:cdf`).
+Every recipe with a parameter axis (the corner plot, `:ridgeline` and `:transition`) takes
+`parameters`, which picks both the columns and the coordinates they are drawn in. Calibration
+columns come in three groups, CDF coordinates, latents and targets, each named by a Symbol, plus
+`:all` for every column:
+
+| `parameters =` | Draws |
+|:---|:---|
+| `:latent` (default) | one column per dimension the sampler draws: the quantity its prior is placed on |
+| `:target` | the values written to the model |
+| `:cdf` | the sampler's CDF coordinates in [0, 1], one per latent dimension, named `cdf(name)` |
+| `:all` | every column above, each once |
+
+What `:latent` draws depends on the kind of variation:
+
+- **`DistributedVariation` and `DiscreteVariation`:** the value, which is also its target, so the two
+  groups share the column and `:all` draws it twice, as its CDF and its value. With only these,
+  `:latent` and `:target` are the same columns. (A discrete variation's real latent is a level index,
+  which nothing shows.)
+- **`CoVariation`:** its shared coordinate, in [0, 1], under the co-variation's name; `:target` draws
+  each of its variations. A co-variation of `DiscreteVariation`s draws its first variation's value
+  instead.
+- **`LatentVariation`:** its latent parameters, in their own units.
+
+To draw particular columns, name them with a String or a vector of Strings. Names come from any
+group, a vector is drawn in the order given, and the names are the columns of `posterior(result)`,
+the `cdf(...)` ones, and each co-variation's name:
 
 ```julia
-using DataFrames   # for `Not`
+plot(result)                                      # :latent
+plot(result; parameters=:cdf)                     # CDF coordinates, e.g. to check prior support
 plot(result; parameters=["k_on", "k_off"])        # two parameters, panels in this order
-plot(result, :ridgeline; parameters=r"^rate_")     # everything whose name starts with rate_
-plot(result, :transition; parameters=Not("dt"))    # all but one
+plot(result, :ridgeline; parameters="k_on")       # one
+plot(result, :transition; parameters=:target)     # proposals in the values written to the model
+plot(result; parameters=["cdf(k_on)", "k_on"])    # a CDF column beside its value
 ```
 
-A vector of names is drawn in the order given, so it also reorders the panels. An unknown name is an
-error that lists the available ones. `:distances` has no parameter axis and refuses the keyword.
+Columns are only ever named by Strings, so a variation called `latent` can never be mistaken for the
+group. To leave a parameter out, list the ones you want. An unknown name is an error that lists the
+available ones. `:distances` has no parameter axis and refuses the keyword.
+
+On `:ridgeline` from an `ABCResult`, the prior is drawn as generation 0 for every column, flat for a
+CDF column. On `:transition`, rejected proposals come from memory when the run kept them
+(`store_rejected=true`), and then every column has them. Otherwise they are read back from the
+database, which holds target values: a CDF column then has no rejected points, and neither does a
+`LatentVariation`'s latent parameter unless it has inverse maps and you are plotting the `ABCResult`.
 
 ### Proposal distances
 
