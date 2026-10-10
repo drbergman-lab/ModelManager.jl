@@ -481,26 +481,29 @@ columns come in three groups, CDF coordinates, latents and targets, each named b
 
 | `parameters =` | Draws |
 |:---|:---|
-| `:latent` (default) | one column per dimension the sampler draws, in its own units: a `LatentVariation`'s latent parameters, and every other variation's value |
+| `:latent` (default) | one column per dimension the sampler draws, the quantity its prior is placed on: a `LatentVariation`'s latent parameters, a `DistributedVariation`'s or `DiscreteVariation`'s value, and a `CoVariation`'s shared coordinate |
 | `:target` | the values written to the model |
 | `:cdf` | the sampler's CDF coordinates in [0, 1], one per latent dimension, named `cdf(name)` |
 | `:all` | every column above, each once |
 
-If you don't use `LatentVariation`s, `:latent` and `:target` are the same columns, so the default
-shows your parameters as you defined them. A `DistributedVariation`'s latent and target are one
-column, not two, so `:all` draws it twice: its CDF and its value. A `CoVariation` moves several
-targets through one shared coordinate. That coordinate is its `:cdf` column, and `:latent` shows the
-same dimension in value units through the co-variation's first variation.
+If your parameters are all `DistributedVariation`s and `DiscreteVariation`s, `:latent` and `:target`
+are the same columns, so the default shows your parameters as you defined them. A
+`DistributedVariation`'s latent and target are one column, not two, so `:all` draws it twice: its CDF
+and its value. A `CoVariation` moves several targets through one shared coordinate, and that
+coordinate is its latent: `:latent` draws it in [0, 1] under the co-variation's name, and `:target`
+draws each of its variations. (A `DiscreteVariation`'s latent is really a level index, which nothing
+shows, so it is drawn as its value; a co-variation of `DiscreteVariation`s as its first variation's.)
 
 To draw particular columns, name them with a String or a vector of Strings. Names come from any
-group, a vector is drawn in the order given, and the names are the columns of `posterior(result)`
-plus the `cdf(...)` ones:
+group, a vector is drawn in the order given, and the names are the columns of `posterior(result)`,
+the `cdf(...)` ones, and each co-variation's name:
 
 ```julia
 plot(result)                                      # :latent
 plot(result; parameters=:cdf)                     # CDF coordinates, e.g. to check prior support
 plot(result; parameters=["k_on", "k_off"])        # two parameters, panels in this order
 plot(result, :ridgeline; parameters="k_on")       # one
+plot(result, :transition; parameters=:target)     # proposals in the values written to the model
 plot(result; parameters=["cdf(k_on)", "k_on"])    # a CDF column beside its value
 ```
 

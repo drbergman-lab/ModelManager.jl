@@ -8389,10 +8389,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             cvn  = variationName(cv)
 
             g = ModelManager._parameterGroups(cps)
-            @test g.latent == [a, b, "u"]                     # a co-variation through its first variation
+            @test g.latent == [a, cvn, "u"]                   # a co-variation's latent is its coordinate
             @test g.target == [a, b, c, d]
             @test g.cdf    == ["cdf($a)", "cdf($cvn)", "cdf(u)"]
-            @test ModelManager._allColumns(g) == ["cdf($a)", "cdf($cvn)", "cdf(u)", a, b, c, "u", d]
+            @test ModelManager._allColumns(g) == ["cdf($a)", "cdf($cvn)", "cdf(u)", a, cvn, b, c, "u", d]
 
             # parameters.toml carries enough to classify the same way, for a plot from disk.
             toml_path = joinpath(mktempdir(), "parameters.toml")
@@ -8400,7 +8400,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 TOML.print(io, Dict("parameters" => [ModelManager._parameterTOMLEntry(cp) for cp in cps]))
             end
             gt = ModelManager._parameterGroupsFromTOML(toml_path)
-            @test (gt.cdf_raw, gt.latent, gt.target, gt.values) == (g.cdf_raw, g.latent, g.target, g.values)
+            @test (gt.cdf_raw, gt.latent, gt.target, gt.values, gt.coord_latents) ==
+                  (g.cdf_raw, g.latent, g.target, g.values, g.coord_latents)
 
             cdfs = [0.25, 0.5, 0.75]
             particles(off) = DataFrame(a => cdfs .+ off, cvn => cdfs .+ off, "u" => cdfs .+ off)
@@ -8412,7 +8413,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
             # Each group, and the coordinates each column is drawn in.
             frame(p) = data(applyk(Dict(:parameters => p), res)).df
-            @test names(data(applyk(Dict(), res)).df) == [a, b, "u"]
+            @test names(data(applyk(Dict(), res)).df) == [a, cvn, "u"]
             @test names(frame(:target)) == [a, b, c, d]
             all_df = frame(:all)
             @test names(all_df) == ModelManager._allColumns(g)
@@ -8420,6 +8421,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test all_df[!, "u"] ≈ 4.0 .* g2.particles.u                   # the latent, in its units
             @test all_df[!, d] ≈ 40.0 .* g2.particles.u                    # the target, through the map
             @test all_df[!, c] ≈ quantile.(Uniform(1.0, 3.0), g2.particles[!, cvn])
+            @test all_df[!, cvn] == g2.particles[!, cvn]                    # the co-variation's coordinate
 
             # Without LatentVariations, :latent and :target are the same columns, and :all draws each
             # DistributedVariation twice — its CDF and its value — never a third time for the latent.

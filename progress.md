@@ -23,10 +23,16 @@ let one keyword carry the coordinates too.
   `DistributedVariation` that is its value, so its latent and target are one column and `:all`
   draws it twice (CDF and value), not three times. The alternative (b), only `LatentVariation`
   latents, would leave `:latent` empty on most problems. The name was kept although a non-LV user
-  may not know it: with no `LatentVariation`s, `:latent == :target`, and the manual says so.
-- **`:latent` shows a co-variation through its first variation's value.** Its internal latent is the
-  shared coordinate (#84), which has no units and is already the `:cdf` column, so `:latent`, which is
-  in value units, uses the first variation as that dimension's stand-in. A display convention only.
+  may not know it: with only distributed and discrete variations, `:latent == :target`, and the
+  manual says so.
+- **`:latent` shows a co-variation's shared coordinate, under its own name** (revised in review).
+  The first version showed its first variation's value as a stand-in, because the coordinate has no
+  units and is already the `:cdf` column. The maintainer pointed out that this contradicts #84's
+  rule, the latent is what the prior sits on, and a co-variation's latent is its coordinate. Following
+  the rule also makes the calibration `:latent` column agree with the GSA x-axis and with
+  `LatentVariation(cv)`, which both use the co-variation's name. The column duplicates `cdf(name)`'s
+  numbers, as a `LatentVariation` with a `Uniform(0, 1)` latent already does. Discrete variations keep
+  their value as the stand-in: their latent is a level index nobody wants drawn.
 - **CDF columns are renamed `cdf(name)` at display time only.** `cdfs.csv`, `particles` and the
   resume path keep the raw latent names, so existing runs need no migration.
 - **`space` stays declared, to throw.** RecipesBase consumes declared keywords, and the `Calibration`

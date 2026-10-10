@@ -12,17 +12,19 @@ using RecipesBase
 #! `DistributedVariation` is also the name of its value column.
 _cdfColumnName(name::AbstractString) = "cdf($name)"
 
-#! `latent` holds one column per dimension the sampler draws, in value units: a `LatentVariation`'s
-#! latent parameters, and for every other variation its value. A co-variation's latent is its shared
-#! coordinate, which has no units and is already the `:cdf` column, so `:latent` shows that dimension in
-#! value units through its first variation instead.
-#! A `DistributedVariation`'s latent and target are therefore one and the same column, which is why
-#! `values` is deduplicated per parameter rather than being `latent` followed by `target`.
+#! `latent` holds one column per dimension the sampler draws: the quantity its prior is placed on. A
+#! `LatentVariation`'s latent parameters; a `DistributedVariation`'s value, so its latent and target are
+#! one and the same column, which is why `values` is deduplicated per parameter rather than being
+#! `latent` followed by `target`; and a `CoVariation{DistributedVariation}`'s shared coordinate, under
+#! the co-variation's own name. That last one lives in the CDF frame rather than the display frame, so
+#! `coord_latents` records where to read it. A discrete variation's latent is a level index, which is
+#! internal and shown nowhere, so it stands in with its value (a discrete co-variation's first one).
 """
     _ParameterGroups
 
 The columns a calibration plot can draw, by group. `cdf_raw[i]` is the CDF frame's name for the
-column displayed as `cdf[i]`; `values` is the union of `latent` and `target` in `posterior`'s order.
+column displayed as `cdf[i]`; `values` is the union of `latent` and `target` in `posterior`'s order;
+`coord_latents` maps a latent column read from the CDF frame to that frame's name for it.
 """
 struct _ParameterGroups
     cdf_raw::Vector{String}
@@ -30,7 +32,8 @@ struct _ParameterGroups
     latent::Vector{String}
     target::Vector{String}
     values::Vector{String}
-    function _ParameterGroups(cdf_raw, latent, target, values)
+    coord_latents::Dict{String,String}
+    function _ParameterGroups(cdf_raw, latent, target, values, coord_latents=Dict{String,String}())
         cdf = _cdfColumnName.(cdf_raw)
         all_names = vcat(cdf, values)
         dup = [n for n in unique(all_names) if count(==(n), all_names) > 1]
@@ -38,23 +41,33 @@ struct _ParameterGroups
             "Calibration columns $(dup) are each both a CDF column and a value column, so a name " *
             "cannot say which one to draw. Rename the variation(s) so no value column is called " *
             "`cdf(...)`."))
-        return new(cdf_raw, cdf, latent, target, values)
+        return new(cdf_raw, cdf, latent, target, values, coord_latents)
     end
 end
 
 _allColumns(g::_ParameterGroups) = vcat(g.cdf, g.values)
 
+# A column holding a CDF coordinate: a `cdf(...)` column, or a co-variation's latent. The database
+# holds neither, so a rejected proposal read back from it never has one.
+_isCoordinateColumn(g::_ParameterGroups, c::String) = c in g.cdf || haskey(g.coord_latents, c)
+
 function _parameterGroups(cps::Vector{CalibrationParameter})
     cdf_raw, latent, target, values = String[], String[], String[], String[]
+    coord_latents = Dict{String,String}()
     for cp in cps
         targets = _targetColumns(cp)
-        lat     = cp.source isa LVSource ? cp.lv.latent_parameter_names : targets[1:1]
+        lat = if cp.source isa LVSource || cp.source isa CVSource
+            cp.lv.latent_parameter_names
+        else
+            targets[1:1]
+        end
+        cp.source isa CVSource && (coord_latents[only(lat)] = only(cp.lv.latent_parameter_names))
         append!(cdf_raw, cp.lv.latent_parameter_names)
         append!(latent, lat)
         append!(target, targets)
         append!(values, vcat(lat, [t for t in targets if t ∉ lat]))
     end
-    return _ParameterGroups(cdf_raw, latent, target, values)
+    return _ParameterGroups(cdf_raw, latent, target, values, coord_latents)
 end
 
 #! The same classification read back from `parameters.toml`, so a calibration plotted from disk needs
@@ -64,11 +77,16 @@ function _parameterGroupsFromTOML(toml_path::String)
     entries = get(TOML.parsefile(toml_path), "parameters", nothing)
     (isnothing(entries) || isempty(entries)) && return nothing
     cdf_raw, latent, target, values = String[], String[], String[], String[]
+    coord_latents = Dict{String,String}()
     for entry in entries
         st = get(entry, "source_type", "")
         if st == "DVSource" || st == "DiscreteSource"
             raw, lat, targets = [entry["display_name"]], [entry["display_name"]], [entry["display_name"]]
-        elseif st == "CVSource" || st == "DiscreteCoSource"
+        elseif st == "CVSource"
+            raw = lat = [entry["covariation_name"]]
+            targets = entry["display_names"]
+            coord_latents[only(lat)] = only(raw)
+        elseif st == "DiscreteCoSource"
             raw, lat, targets = [entry["covariation_name"]], entry["display_names"][1:1], entry["display_names"]
         elseif st == "LVSource"
             raw = lat = entry["latent_display_names"]
@@ -81,7 +99,8 @@ function _parameterGroupsFromTOML(toml_path::String)
         append!(target, targets)
         append!(values, vcat(lat, [t for t in targets if t ∉ lat]))
     end
-    return _ParameterGroups(String.(cdf_raw), String.(latent), String.(target), String.(values))
+    return _ParameterGroups(String.(cdf_raw), String.(latent), String.(target), String.(values),
+                            coord_latents)
 end
 
 #! With nothing to classify by — a result built without `CalibrationParameter`s, or a run whose
@@ -145,7 +164,7 @@ _rejectSpaceKeyword(space) = throw(ArgumentError(
 #! needs it — so a selection with no CDF column never reads `cdfs.csv`. The loaders return
 #! `(df, weights)`; both frames describe the same particles, so either's weights will do.
 function _parameterFrame(cols::Vector{String}, g::_ParameterGroups, load_values, load_cdfs)
-    cdf_index = Dict(zip(g.cdf, g.cdf_raw))
+    cdf_index = merge(Dict(zip(g.cdf, g.cdf_raw)), g.coord_latents)
     values_df, w = any(c -> !haskey(cdf_index, c), cols) ? load_values() : (nothing, nothing)
     cdf_df, w_cdf = any(c -> haskey(cdf_index, c), cols) ? load_cdfs() : (nothing, nothing)
     df = DataFrame()
@@ -317,7 +336,7 @@ function _getRejected(result::ABCResult, t_next::Int, cols::Vector{String}, g::_
 
     #! A selection of CDF columns alone has nothing to gain from the database, and the lookup is not
     #! free: it can throw on a rejected monad deleted after all its simulations failed.
-    value_cols = [c for c in cols if c ∉ g.cdf]
+    value_cols = [c for c in cols if !_isCoordinateColumn(g, c)]
     df = isempty(value_cols) ? nothing : _lazyLoadRejected(result, t_next)
     available = isnothing(df) ? String[] : [c for c in value_cols if c in names(df)]
     rej_df    = isempty(available) ? nothing : select(df, available)
@@ -390,9 +409,10 @@ with a weighted scatter (opacity ∝ weight).
 
 `parameters` picks the columns, and with them their coordinates:
 
-- `:latent` (default) — one column per dimension the sampler draws, in value units: a
-  `LatentVariation`'s latent parameters and every other variation's value. Without
-  `LatentVariation`s this is the same set as `:target`.
+- `:latent` (default) — one column per dimension the sampler draws, the quantity its prior is placed
+  on: a `LatentVariation`'s latent parameters, a `DistributedVariation`'s or `DiscreteVariation`'s
+  value, and a `CoVariation`'s shared coordinate under the co-variation's name. With only
+  `DistributedVariation`s and `DiscreteVariation`s this is the same set as `:target`.
 - `:target` — the values written to the model.
 - `:cdf` — the sampler's CDF coordinates in [0, 1], named `cdf(name)`.
 - `:all` — every column above, each once.
@@ -1126,7 +1146,7 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
 
         #! Rejected proposals are read back from the database, which holds values only: a CDF column,
         #! and a `LatentVariation`'s latent parameters, have no rejected points from disk.
-        value_cols  = [c for c in cols if c ∉ g.cdf]
+        value_cols  = [c for c in cols if !_isCoordinateColumn(g, c)]
         params_toml = joinpath(calibrationFolder(cal), "parameters.toml")
         mapping     = _buildDbToDisplayMappingFromTOML(params_toml)
         rej_df = isempty(value_cols) ? nothing :
