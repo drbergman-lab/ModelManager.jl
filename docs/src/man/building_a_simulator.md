@@ -144,6 +144,7 @@ These have working defaults; override only when your simulator needs them.
 | [`clearSimulatorArtifacts`](@ref) | no-op | remove compiled artifacts on database reset |
 | [`simulationThreads`](@ref) | `nothing` | how many threads a simulation starts, so SLURM jobs request that many CPUs; implement it when the simulator sets its own thread count |
 | [`postVariationXMLProcessing`](@ref) | no-op | post-process a variation file after ModelManager writes it |
+| [`inferVariationLocation`](@ref) | throws | map a variation target to its project location, so users can build variations without naming one (`DiscreteVariation(target, values)`, the tuple forms of `CoVariation`) |
 
 ### Database migrations
 
@@ -172,9 +173,10 @@ Two your backend will want rather than reimplement:
 
 ## Boundary rules
 
-- **`location` is explicit.** ModelManager does not resolve a variation target to a project
-  location — your package must pass `location` when constructing variations (or provide
-  convenience constructors that infer it). See [Variations](@ref variations).
+- **ModelManager does not resolve a variation target to a project location.** The explicit
+  constructors take `location` first; the location-free ones ask your backend through
+  [`inferVariationLocation`](@ref) and throw until you implement it. Implement the one hook
+  rather than adding location-free constructors of your own. See [Variations](@ref variations).
 - **No simulator specifics leak into ModelManager.** If you find yourself wanting ModelManager
   to know something about your simulator, that knowledge belongs behind one of these interface
   methods — add or override a hook rather than special-casing the core.

@@ -47,6 +47,8 @@ struct XMLPath
     end
 end
 
+XMLPath(xp::XMLPath) = xp
+
 columnName(xp::XMLPath) = columnName(xp.xml_path)
 
 Base.show(io::IO, xp::XMLPath) = print(io, "XMLPath: $(columnName(xp))")
@@ -67,11 +69,18 @@ abstract type AbstractVariation end
     ElementaryVariation <: AbstractVariation
 
 The base type for variations of a single parameter.
+
+Called as a constructor, `ElementaryVariation(location, target, v)` builds a
+[`DistributedVariation`](@ref) when `v` is a univariate `Distribution` and a
+[`DiscreteVariation`](@ref) otherwise. It takes the same location-free and simulator-first forms
+as those constructors.
 """
 abstract type ElementaryVariation <: AbstractVariation end
 
 """
-    DiscreteVariation{T} <: ElementaryVariation
+    DiscreteVariation(location::Symbol, target::XMLPath, values; name=nothing)
+    DiscreteVariation(target, values; name=nothing)
+    DiscreteVariation(sim::AbstractSimulator, target, values; name=nothing)
 
 The location, target, and values of a discrete variation.
 
@@ -82,8 +91,10 @@ The location, target, and values of a discrete variation.
 
 A singleton value can be passed in place of `values` for convenience.
 
-`location` must be provided explicitly.  Simulator packages (e.g. PhysiCellModelManager)
-may provide convenience constructors that infer `location` from the target.
+Omit `location` to infer it from the target through the active simulator's
+[`inferVariationLocation`](@ref), or name the simulator to infer through instead of using the
+active one. These two forms also accept the target as a vector of strings. They throw on a
+simulator that does not implement the hook, in which case pass the location explicitly.
 """
 struct DiscreteVariation{T} <: ElementaryVariation
     location::Symbol
@@ -120,7 +131,9 @@ function ElementaryVariation(location::Symbol, target::XMLPath, v; kwargs...)
 end
 
 """
-    DistributedVariation <: ElementaryVariation
+    DistributedVariation(location::Symbol, target::XMLPath, distribution; flip=false, name=nothing)
+    DistributedVariation(target, distribution; flip=false, name=nothing)
+    DistributedVariation(sim::AbstractSimulator, target, distribution; flip=false, name=nothing)
 
 The location, target, and distribution of a distributed variation.
 
@@ -130,8 +143,10 @@ The location, target, and distribution of a distributed variation.
 - `distribution::Distribution`: The distribution of the variation.
 - `flip::Bool=false`: Whether to flip the distribution (iCDF of `1-x` instead of `x`).
 
-`location` must be provided explicitly.  Simulator packages (e.g. PhysiCellModelManager)
-may provide convenience constructors that infer `location` from the target.
+Omit `location` to infer it from the target through the active simulator's
+[`inferVariationLocation`](@ref), or name the simulator to infer through instead of using the
+active one. These two forms also accept the target as a vector of strings. They throw on a
+simulator that does not implement the hook, in which case pass the location explicitly.
 """
 struct DistributedVariation <: ElementaryVariation
     location::Symbol
@@ -183,27 +198,107 @@ function Base.show(io::IO, dv::DistributedVariation)
 end
 
 """
-    UniformDistributedVariation(location, xml_path, lb, ub; flip=false)
+    UniformDistributedVariation(location, target, lb, ub; flip=false, name=nothing)
+    UniformDistributedVariation(target, lb, ub; flip=false, name=nothing)
+    UniformDistributedVariation(sim::AbstractSimulator, target, lb, ub; flip=false, name=nothing)
 
 Create a `DistributedVariation` with a `Uniform(lb, ub)` distribution.
 
-`location` must be provided explicitly.  Simulator packages (e.g. PhysiCellModelManager)
-may provide convenience constructors that infer `location` from the target.
+The location-free and simulator-first forms are those of [`DistributedVariation`](@ref).
 """
-function UniformDistributedVariation(location::Symbol, target::XMLPath, lb::T, ub::T; flip::Bool=false) where {T<:Real}
-    return DistributedVariation(location, target, Uniform(lb, ub); flip=flip)
+function UniformDistributedVariation(location::Symbol, target::XMLPath, lb::T, ub::T; flip::Bool=false, name::Union{Nothing,AbstractString}=nothing) where {T<:Real}
+    return DistributedVariation(location, target, Uniform(lb, ub); flip=flip, name=name)
 end
 
 """
-    NormalDistributedVariation(location, target, mu, sigma; lb=-Inf, ub=Inf, flip=false)
+    NormalDistributedVariation(location, target, mu, sigma; lb=-Inf, ub=Inf, flip=false, name=nothing)
+    NormalDistributedVariation(target, mu, sigma; lb=-Inf, ub=Inf, flip=false, name=nothing)
+    NormalDistributedVariation(sim::AbstractSimulator, target, mu, sigma; lb=-Inf, ub=Inf, flip=false, name=nothing)
 
 Create a (possibly truncated) `DistributedVariation` with a Normal distribution.
 
-`location` must be provided explicitly.  Simulator packages (e.g. PhysiCellModelManager)
-may provide convenience constructors that infer `location` from the target.
+The location-free and simulator-first forms are those of [`DistributedVariation`](@ref).
 """
-function NormalDistributedVariation(location::Symbol, target::XMLPath, mu::T, sigma::T; lb::Real=-Inf, ub::Real=Inf, flip::Bool=false) where {T<:Real}
-    return DistributedVariation(location, target, truncated(Normal(mu, sigma), lb, ub); flip=flip)
+function NormalDistributedVariation(location::Symbol, target::XMLPath, mu::T, sigma::T; lb::Real=-Inf, ub::Real=Inf, flip::Bool=false, name::Union{Nothing,AbstractString}=nothing) where {T<:Real}
+    return DistributedVariation(location, target, truncated(Normal(mu, sigma), lb, ub); flip=flip, name=name)
+end
+
+################## Location inference ##################
+
+"""
+    inferVariationLocation(sim::AbstractSimulator, target::XMLPath) -> Symbol
+
+The project location `target` lives in, for a variation built without one. A simulator package
+implements this when its targets determine their location, and every location-free constructor
+(`DiscreteVariation(target, values)`, the tuple forms of [`CoVariation`](@ref), and so on) resolves
+its location through it. The default throws, so a backend that does not implement it leaves those
+constructors unusable rather than guessing: its users pass the location explicitly.
+"""
+inferVariationLocation(sim::AbstractSimulator, target::XMLPath) =
+    throw(ArgumentError("$(nameof(typeof(sim))) does not infer variation locations, so the location of $(columnName(target)) cannot be inferred. Pass it explicitly as the first argument, e.g. DiscreteVariation(location, target, values)."))
+
+#! Public, not exported: a simulator package implements `ModelManager.inferVariationLocation` and
+#! never calls it, and PhysiCellModelManager keeps a one-argument `inferVariationLocation` of its own
+#! that an exported name of the same spelling would clash with. See CLAUDE.md, "Docstring
+#! cross-references".
+@compat public inferVariationLocation
+
+#! Resolved through `mm_globals_ref` rather than `simulator()`: `mm_globals()` asserts about project
+#! initialization, which is the wrong diagnosis here. A simulator registers in its package's
+#! `__init__`, so a variation can be built before any project is initialized, and the only way to have
+#! no simulator is to have loaded no simulator package.
+function _inferringSimulator()
+    g = mm_globals_ref[]
+    isnothing(g) && throw(ArgumentError("No simulator package is loaded, so a variation's location cannot be inferred from its target. Load one (e.g. PhysiCellModelManager) or pass the location explicitly as the first argument, e.g. DiscreteVariation(location, target, values)."))
+    return g.simulator
+end
+
+#! The location-free forms are untyped in their target, so they also catch a call that forgot the
+#! target rather than the location -- `DiscreteVariation(:config, [1.0, 2.0])` -- and the message must
+#! not claim to know which argument is missing.
+function _asXMLPath(target)
+    target isa XMLPath && return target
+    target isa AbstractVector{<:AbstractString} && return XMLPath(target)
+    throw(ArgumentError("Expected a variation target (an XMLPath or a vector of strings) but got $(repr(target)). A constructor called without a location, as (target, ...), infers the location through the active simulator; to pass the location, call it as (location, target, ...)."))
+end
+
+#! Keep the location-free forms untyped in their target. A simulator package may add typed methods of
+#! its own -- PhysiCellModelManager defines `DiscreteVariation(::XMLPath, ::Any)` and
+#! `DiscreteVariation(::Vector{<:AbstractString}, ::Any)` -- and a method here whose signature is
+#! identical to a downstream one fails that package's precompilation ("Method overwriting is not
+#! permitted during Module precompilation"). Untyped, these are strictly less specific, so a downstream
+#! method keeps winning and the two packages coexist.
+DiscreteVariation(target, values; kwargs...) = DiscreteVariation(_inferringSimulator(), target, values; kwargs...)
+DistributedVariation(target, distribution::Distribution; kwargs...) = DistributedVariation(_inferringSimulator(), target, distribution; kwargs...)
+ElementaryVariation(target, v; kwargs...) = ElementaryVariation(_inferringSimulator(), target, v; kwargs...)
+UniformDistributedVariation(target, lb::T, ub::T; kwargs...) where {T<:Real} = UniformDistributedVariation(_inferringSimulator(), target, lb, ub; kwargs...)
+NormalDistributedVariation(target, mu::T, sigma::T; kwargs...) where {T<:Real} = NormalDistributedVariation(_inferringSimulator(), target, mu, sigma; kwargs...)
+
+#! The simulator-first forms are the generic ones: they normalize the target to an `XMLPath`, so an
+#! implementer of `inferVariationLocation` only ever sees one, and resolve the location through it.
+function DiscreteVariation(sim::AbstractSimulator, target, values; kwargs...)
+    xp = _asXMLPath(target)
+    return DiscreteVariation(inferVariationLocation(sim, xp), xp, values; kwargs...)
+end
+
+function DistributedVariation(sim::AbstractSimulator, target, distribution::Distribution; kwargs...)
+    xp = _asXMLPath(target)
+    return DistributedVariation(inferVariationLocation(sim, xp), xp, distribution; kwargs...)
+end
+
+function ElementaryVariation(sim::AbstractSimulator, target, v; kwargs...)
+    xp = _asXMLPath(target)
+    return ElementaryVariation(inferVariationLocation(sim, xp), xp, v; kwargs...)
+end
+
+function UniformDistributedVariation(sim::AbstractSimulator, target, lb::T, ub::T; kwargs...) where {T<:Real}
+    xp = _asXMLPath(target)
+    return UniformDistributedVariation(inferVariationLocation(sim, xp), xp, lb, ub; kwargs...)
+end
+
+function NormalDistributedVariation(sim::AbstractSimulator, target, mu::T, sigma::T; kwargs...) where {T<:Real}
+    xp = _asXMLPath(target)
+    return NormalDistributedVariation(inferVariationLocation(sim, xp), xp, mu, sigma; kwargs...)
 end
 
 """
@@ -289,21 +384,48 @@ cdf(ev::ElementaryVariation, ::Real) = error("cdf not defined for $(typeof(ev))"
 ################## Co-Variations ##################
 
 """
-    CoVariation{T<:ElementaryVariation} <: AbstractVariation
+    CoVariation(ev1, ev2, ...; name=nothing)
+    CoVariation(evs::Vector{<:ElementaryVariation}; name=nothing)
+    CoVariation((xml_path, values), (xml_path, values), ...; name=nothing)
+    CoVariation((xml_path, distribution), (xml_path, distribution), ...; name=nothing)
 
 A co-variation of one or more [`ElementaryVariation`](@ref)s that are varied together.
 
 Each constituent variation must be of the same subtype (all `DiscreteVariation` or all
 `DistributedVariation`).
+
+The tuple forms name each target as a vector of strings and carry no location: each member is built
+with the location-free constructor, which infers it through the active simulator's
+[`inferVariationLocation`](@ref). On a simulator that does not implement the hook they throw; build
+the members with explicit locations and pass those instead.
 """
 struct CoVariation{T<:ElementaryVariation} <: AbstractVariation
     variations::Vector{T}
     name::String
 
+    function CoVariation(evs::Vector{DistributedVariation}; name::Union{Nothing,AbstractString}=nothing)
+        default_name = join(variationName.(evs), " AND ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{DistributedVariation}(evs, variation_name)
+    end
+
+    function CoVariation(evs::Vector{<:DiscreteVariation}; name::Union{Nothing,AbstractString}=nothing)
+        @assert (length.(evs) |> unique |> length) == 1 "All DiscreteVariations in a CoVariation must have the same length."
+        default_name = join(variationName.(evs), " AND ")
+        variation_name = isnothing(name) ? default_name : String(name)
+        return new{DiscreteVariation}(evs, variation_name)
+    end
+
+    function CoVariation(inputs::Vararg{T}; name::Union{Nothing,AbstractString}=nothing) where {T<:ElementaryVariation}
+        return CoVariation(Vector{T}([inputs...]); name=name)
+    end
+
+    #! The tuple forms build their members with the location-free `DistributedVariation(target,
+    #! distribution)` / `DiscreteVariation(target, values)` defined under "Location inference", so the
+    #! location of each is whatever the active simulator's `inferVariationLocation` says.
     function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Distribution},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
         variations = DistributedVariation[]
         for (xml_path, distribution) in inputs
-            @assert xml_path isa Vector{<:AbstractString} "xml_path must be a vector of strings"
             push!(variations, DistributedVariation(xml_path, distribution))
         end
         default_name = join(variationName.(variations), " AND ")
@@ -326,23 +448,6 @@ struct CoVariation{T<:ElementaryVariation} <: AbstractVariation
         default_name = join(variationName.(variations), " AND ")
         variation_name = isnothing(name) ? default_name : String(name)
         return new{DiscreteVariation}(variations, variation_name)
-    end
-
-    function CoVariation(evs::Vector{DistributedVariation}; name::Union{Nothing,AbstractString}=nothing)
-        default_name = join(variationName.(evs), " AND ")
-        variation_name = isnothing(name) ? default_name : String(name)
-        return new{DistributedVariation}(evs, variation_name)
-    end
-
-    function CoVariation(evs::Vector{<:DiscreteVariation}; name::Union{Nothing,AbstractString}=nothing)
-        @assert (length.(evs) |> unique |> length) == 1 "All DiscreteVariations in a CoVariation must have the same length."
-        default_name = join(variationName.(evs), " AND ")
-        variation_name = isnothing(name) ? default_name : String(name)
-        return new{DiscreteVariation}(evs, variation_name)
-    end
-
-    function CoVariation(inputs::Vararg{T}; name::Union{Nothing,AbstractString}=nothing) where {T<:ElementaryVariation}
-        return CoVariation(Vector{T}([inputs...]); name=name)
     end
 end
 
@@ -443,6 +548,12 @@ lv = LatentVariation(cv)
 
 The positional arguments are:
 `LatentVariation(latent_parameters, targets, maps, lp_names, locations; inverse_maps, name)`
+
+Omit `locations` (and optionally `lp_names`, which then default to `"<targets> | lp#i"`) to infer
+each target's location through the active simulator's [`inferVariationLocation`](@ref), or put the
+simulator first, `LatentVariation(sim, latent_parameters, targets, maps[, lp_names])`, to infer
+through that one. Both forms also accept each target as a vector of strings, and both throw on a
+simulator that does not implement the hook.
 
 - **1 latent dim, 1 target** — log-normal forward map:
 ```julia
@@ -793,6 +904,22 @@ function _coVariationInverse(cv::CoVariation{DistributedVariation}, k::Int)
 end
 
 LatentVariation(lv::LatentVariation) = lv
+
+#! Location-free forms, resolving each target's location through `inferVariationLocation` and
+#! defaulting the latent names. Untyped in `targets` for the reason given under "Location inference":
+#! PhysiCellModelManager defines these with `AbstractVector{XMLPath}` and
+#! `AbstractVector{<:AbstractVector{<:AbstractString}}` targets, and an identical signature here would
+#! fail its precompilation. `target_names` needs no handling: the explicit constructor derives it from
+#! the resolved locations when it is not given.
+function LatentVariation(sim::AbstractSimulator, latent_parameters::Vector, targets::AbstractVector, maps::Vector{<:Function}, lp_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing; kwargs...)
+    xps = XMLPath[_asXMLPath(target) for target in targets]
+    locations = Symbol[inferVariationLocation(sim, xp) for xp in xps]
+    names = isnothing(lp_names) ? defaultLatentParameterNames(latent_parameters, xps) : lp_names
+    return LatentVariation(latent_parameters, xps, maps, names, locations; kwargs...)
+end
+
+LatentVariation(latent_parameters::Vector, targets::AbstractVector, maps::Vector{<:Function}, lp_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing; kwargs...) =
+    LatentVariation(_inferringSimulator(), latent_parameters, targets, maps, lp_names; kwargs...)
 
 variationName(lv::LatentVariation) = lv.name
 

@@ -31,11 +31,15 @@ written into the file is the backend's concern.
     XML — a different input format could supply its own path type. A backend may add
     convenience constructors that take a plain vector if it wants that ergonomics.
 
-!!! note "location is explicit"
+!!! note "Where the location comes from"
     Every variation needs a `location` (the [project location](@ref project_configuration) the
-    target lives in, e.g. `:config`). ModelManager requires it explicitly. Backends often add
-    convenience constructors that infer the location from the path — but at this layer you
-    pass it yourself.
+    target lives in, e.g. `:config`). Pass it as the first argument, or leave it out and the
+    constructor asks the active simulator for it through
+    [`inferVariationLocation`](@ref)`(sim, target)`: `DiscreteVariation(target, values)` resolves
+    to `DiscreteVariation(location, target, values)` with the location the backend says. The
+    location-free forms also accept the target as a vector of strings. ModelManager itself has no
+    way to map a target to a location, so on a backend that does not implement the hook they throw
+    and the explicit form is the only one.
 
 ## Elementary variations
 

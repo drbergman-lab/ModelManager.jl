@@ -5,6 +5,73 @@
 
 ---
 
+## Location-free constructors route through the active simulator (2026-10-13)
+
+`CoVariation`'s tuple constructors, `CoVariation((xml_path, values), ...)`, build their members
+with `DiscreteVariation(xml_path, values)` and `DistributedVariation(xml_path, distribution)`:
+two-argument forms ModelManager never defined. They worked only because PhysiCellModelManager
+defines location-inferring two-argument methods, so a ModelManager constructor silently depended
+on a downstream package. Handed over from a PCMM session with the design below; this PR makes the
+dependency an honest hook.
+
+### Decided
+- **One hook, not one method per constructor.** `inferVariationLocation(sim, target::XMLPath)`
+  is the whole backend contract; PCMM's inference depends only on the target, so per-constructor
+  `(::PhysiCellSimulator, ...)` methods in PCMM (the first proposal) would have repeated the same
+  lookup six times. Every constructor gets a location-free form that forwards the registered
+  simulator to a simulator-first form, and the simulator-first form is the generic one: it
+  normalizes the target to an `XMLPath` and calls the hook, so an implementer only ever sees an
+  `XMLPath`. The default hook throws naming the backend, so a backend that does not implement it
+  keeps the explicit forms as its only ones rather than guessing.
+- **The location-free forms are untyped in their target, and must stay so.** PCMM already defines
+  `DiscreteVariation(::XMLPath, ::Any)`, `(::Vector{<:AbstractString}, ::Any)` and the like, and
+  Julia refuses to precompile a package whose method has a signature identical to one in a
+  dependency ("Method overwriting is not permitted during Module precompilation"). Untyped,
+  ModelManager's forms are strictly less specific, PCMM's keep winning, and PCMM needs no change
+  to keep working. A `#!` comment at the definitions says why; the PRD carries the rule.
+  Verified by developing this branch into a scratch environment with PCMM: it precompiles, PCMM's
+  own methods are still the ones dispatched to, and `detect_ambiguities` across the two modules
+  reports nothing new.
+- **Resolved through `mm_globals_ref`, not `simulator()`.** `mm_globals()` asserts about project
+  initialization, but a simulator registers in its package's `__init__`, so variations are built
+  before any project exists and the only way to have no simulator is to have loaded no simulator
+  package. The error says that and names the explicit form.
+- **The forgotten-target case is named honestly.** An untyped `(target, values)` also matches
+  `DiscreteVariation(:config, [1.0, 2.0])`, where the target, not the location, is missing. The
+  error describes both call shapes instead of asserting which argument was left out.
+- **Public, not exported.** PCMM keeps its own one-argument `inferVariationLocation(::XMLPath)` and
+  re-exports ModelManager wholesale; an exported name of the same spelling would clash. `@compat
+  public` is enough for `@ref` links and the docs build.
+- **The stub lives in `variations.jl`, next to `XMLPath`**, not in `abstract_simulator.jl`, which
+  is included before `XMLPath` exists; same precedent as `postVariationXMLProcessing` in
+  `xml_utilities.jl`.
+- **The tuple `CoVariation` forms stay in ModelManager.** Moving them to PCMM would need identical
+  signatures (impossible, above) and a coordinated release. They moved below the vector
+  constructors in the struct body, which changes nothing about dispatch; the docstring now says
+  they infer locations and when they throw.
+- **`LatentVariation` gets the same two forms**, `(latent_parameters, targets, maps[, lp_names])`
+  with and without a leading simulator, one inferred location per target and the latent names
+  defaulted through `defaultLatentParameterNames`. `target_names` needed no handling: the explicit
+  constructor already derives it from the locations when it is not given.
+- **`Uniform`/`NormalDistributedVariation` gained a `name` keyword** on the explicit form, which
+  PCMM's inferring versions already had and which the new forms forward.
+
+### Rejected
+- Typing the location-free forms on `XMLPath` for better errors: identical to PCMM's
+  `(XMLPath, Any)`, fails its precompilation.
+- Extending the `mm_globals()` assertion message instead of a dedicated check: the assertion is
+  about initialization, and a user building a variation before `initializeModelManager` would be
+  sent to the wrong fix.
+
+### Follow-up (PCMM, after this ships)
+Implement `ModelManager.inferVariationLocation(::PhysiCellSimulator, xp::XMLPath)` with the body of
+PCMM's current one-argument function and delete PCMM's backward-compat constructors
+(`src/variations.jl` there, including the `LatentVariation` inference wrappers). Until then PCMM's
+own methods win and nothing changes for its users; the simulator-first forms reach ModelManager's
+throwing default on a `PhysiCellSimulator`.
+
+---
+
 ## The bank reuses a monad only if its coordinates map back to its values (2026-10-10)
 
 Two Copilot findings after #84, which made a `DistributedVariation` over a discrete distribution
