@@ -72,8 +72,8 @@ dependency an honest hook.
   they infer locations and when they throw.
 - **`LatentVariation` gets the same two forms**, `(latent_parameters, targets, maps[, lp_names])`
   with and without a leading simulator, one inferred location per target and the latent names
-  defaulted through `defaultLatentParameterNames`. `target_names` needed no handling: the explicit
-  constructor already derives it from the locations when it is not given.
+  defaulted through `defaultLatentParameterNames`. The default `target_names` and `name` are
+  derived in the simulator-first form, through `sim`, for the reason above.
 - **`Uniform`/`NormalDistributedVariation` gained a `name` keyword** on the explicit form, which
   PCMM's inferring versions already had and which the new forms forward.
 

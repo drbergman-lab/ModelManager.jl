@@ -355,8 +355,8 @@ simulationThreads(::AbstractSimulator, simulation) = nothing
 """
     inferVariationLocation(sim::AbstractSimulator, target) -> Symbol
 
-The project location `target`, an [`XMLPath`](@ref), lives in, for a variation built without one.
-A simulator package implements this when its targets determine their location, and every
+The project location that `target`, an [`XMLPath`](@ref), lives in, asked for by a variation built
+without one. A simulator package implements this when its targets determine their location, and every
 location-free constructor (`DiscreteVariation(target, values)`, the tuple forms of
 [`CoVariation`](@ref), and so on) resolves its location through it. The default throws, so a backend
 that does not implement it leaves those constructors unusable rather than guessing: its users pass
