@@ -32,13 +32,23 @@ dependency an honest hook.
   Verified by developing this branch into a scratch environment with PCMM: it precompiles, PCMM's
   own methods are still the ones dispatched to, and `detect_ambiguities` across the two modules
   reports nothing new.
-- **Resolved through `mm_globals_ref`, not `simulator()`.** `mm_globals()` asserts about project
-  initialization, but a simulator registers in its package's `__init__`, so variations are built
-  before any project exists and the only way to have no simulator is to have loaded no simulator
-  package. The error says that and names the explicit form.
-- **The forgotten-target case is named honestly.** An untyped `(target, values)` also matches
-  `DiscreteVariation(:config, [1.0, 2.0])`, where the target, not the location, is missing. The
-  error describes both call shapes instead of asserting which argument was left out.
+- **Through `simulator()`, like everything else.** A first version resolved the simulator through
+  `mm_globals_ref` with its own "no simulator package is loaded" error, so a variation could be
+  built before `initializeModelManager`. The maintainer saw no reason to make these constructors
+  the one exception to the initialization requirement; they now call `simulator()` and fail the
+  way every other call does.
+- **A wrong target is `XMLPath`'s `MethodError`.** The untyped `(target, values)` forms also match
+  `DiscreteVariation(:config, [1.0, 2.0])`, where the target was forgotten. A first version wrapped
+  that in a custom error describing both call shapes; the maintainer preferred the plain
+  `XMLPath(xp::XMLPath) = xp` identity method, so either spelling of a target goes through
+  `XMLPath(target)` and anything else is a `MethodError` from it.
+- **A simulator-first call names its variation through the simulator it was given** (Copilot
+  finding, endorsed in review). The explicit constructor derives the default name through
+  `shortVariationName(location, name)`, which asks the *active* simulator, so
+  `DiscreteVariation(sim, target, values)` with a different `sim` would combine `sim`'s location
+  with the active backend's naming. The simulator-first forms now derive the name (and, for
+  `LatentVariation`, the target names and default name) through `shortVariationName(sim, ...)` and
+  pass them to the explicit constructor; an explicit `name`/`target_names` is kept.
 - **Public, not exported.** PCMM keeps its own one-argument `inferVariationLocation(::XMLPath)` and
   re-exports ModelManager wholesale; an exported name of the same spelling would clash. `@compat
   public` is enough for `@ref` links and the docs build.
@@ -53,8 +63,8 @@ dependency an honest hook.
   `lp_names`, so the location-free form could build a variation with no latent names from an empty
   vector; PCMM's wrapper had treated an empty vector as "use defaults", which this does not). The
   tuple `CoVariation` forms take an `XMLPath` as well as a vector of strings, as every other
-  location-free form does. The two error messages name a way out that applies to every constructor
-  they can be reached from, not only `DiscreteVariation`. The five simulator-first bodies share one
+  location-free form does. The hook's error names a way out that applies to every constructor it
+  can be reached from, not only `DiscreteVariation`. The five simulator-first bodies share one
   `_withInferredLocation` helper.
 - **The tuple `CoVariation` forms stay in ModelManager.** Moving them to PCMM would need identical
   signatures (impossible, above) and a coordinated release. They moved below the vector
@@ -70,9 +80,6 @@ dependency an honest hook.
 ### Rejected
 - Typing the location-free forms on `XMLPath` for better errors: identical to PCMM's
   `(XMLPath, Any)`, fails its precompilation.
-- Extending the `mm_globals()` assertion message instead of a dedicated check: the assertion is
-  about initialization, and a user building a variation before `initializeModelManager` would be
-  sent to the wrong fix.
 
 ### Follow-up (PCMM, after this ships)
 Implement `ModelManager.inferVariationLocation(::PhysiCellSimulator, xp::XMLPath)` with the body of

@@ -228,32 +228,16 @@ end
 #! The hook itself, `inferVariationLocation`, is declared in `abstract_simulator.jl` with the other
 #! interface methods. Everything here is the generic machinery that calls it.
 
-#! Resolved through `mm_globals_ref` rather than `simulator()`: `mm_globals()` asserts about project
-#! initialization, which is the wrong diagnosis here. A simulator registers in its package's
-#! `__init__`, so a variation can be built before any project is initialized, and the only way to have
-#! no simulator is to have loaded no simulator package.
-function _inferringSimulator()
-    g = mm_globals_ref[]
-    isnothing(g) && throw(ArgumentError("No simulator package is loaded, so a variation's location cannot be inferred from its target. Load one (e.g. PhysiCellModelManager) or pass the location explicitly as the first argument, e.g. DiscreteVariation(location, target, values)."))
-    return g.simulator
-end
-
-#! The location-free forms are untyped in their target, so they also catch a call that forgot the
-#! target rather than the location -- `DiscreteVariation(:config, [1.0, 2.0])` -- and the message must
-#! not claim to know which argument is missing. It also must not name a call shape: `LatentVariation`
-#! takes its locations last, not first.
-function _asXMLPath(target)
-    target isa XMLPath && return target
-    target isa AbstractVector{<:AbstractString} && return XMLPath(target)
-    throw(ArgumentError("Expected a variation target (an XMLPath or a vector of strings) but got $(repr(target)). A constructor called without a location infers it through the active simulator and otherwise takes the explicit form's arguments in the same order; to skip inference, pass the location yourself (first, e.g. DiscreteVariation(location, target, values); for LatentVariation, as the trailing locations vector)."))
-end
-
-#! The one generic body behind every simulator-first form: normalize the target to an `XMLPath`, so
-#! an implementer of `inferVariationLocation` only ever sees one, then call the explicit constructor
-#! with the location the hook returns.
-function _withInferredLocation(f, sim::AbstractSimulator, target, args...; kwargs...)
-    xp = _asXMLPath(target)
-    return f(inferVariationLocation(sim, xp), xp, args...; kwargs...)
+#! The one body behind every simulator-first form. The target goes through `XMLPath`, whose
+#! `XMLPath(::XMLPath)` method lets either spelling land as one, so an implementer of
+#! `inferVariationLocation` only ever sees an `XMLPath`. The default name is derived through `sim` as
+#! well: the explicit constructor would derive it through `shortVariationName(location, name)`, which
+#! asks the *active* simulator, and a call that names a simulator should depend on nothing else.
+function _withInferredLocation(f, sim::AbstractSimulator, target, args...; name::Union{Nothing,AbstractString}=nothing, kwargs...)
+    xp = XMLPath(target)
+    location = inferVariationLocation(sim, xp)
+    resolved_name = isnothing(name) ? shortVariationName(sim, location, columnName(xp)) : name
+    return f(location, xp, args...; name=resolved_name, kwargs...)
 end
 
 #! Keep the location-free forms untyped in their target. A simulator package may add typed methods of
@@ -261,12 +245,13 @@ end
 #! `DiscreteVariation(::Vector{<:AbstractString}, ::Any)` -- and a method here whose signature is
 #! identical to a downstream one fails that package's precompilation ("Method overwriting is not
 #! permitted during Module precompilation"). Untyped, these are strictly less specific, so a downstream
-#! method keeps winning and the two packages coexist.
-DiscreteVariation(target, values; kwargs...) = DiscreteVariation(_inferringSimulator(), target, values; kwargs...)
-DistributedVariation(target, distribution::Distribution; kwargs...) = DistributedVariation(_inferringSimulator(), target, distribution; kwargs...)
-ElementaryVariation(target, v; kwargs...) = ElementaryVariation(_inferringSimulator(), target, v; kwargs...)
-UniformDistributedVariation(target, lb::T, ub::T; kwargs...) where {T<:Real} = UniformDistributedVariation(_inferringSimulator(), target, lb, ub; kwargs...)
-NormalDistributedVariation(target, mu::T, sigma::T; kwargs...) where {T<:Real} = NormalDistributedVariation(_inferringSimulator(), target, mu, sigma; kwargs...)
+#! method keeps winning and the two packages coexist. Being untyped, they also match a call that forgot
+#! the target rather than the location, which `XMLPath` then refuses with a `MethodError`.
+DiscreteVariation(target, values; kwargs...) = DiscreteVariation(simulator(), target, values; kwargs...)
+DistributedVariation(target, distribution::Distribution; kwargs...) = DistributedVariation(simulator(), target, distribution; kwargs...)
+ElementaryVariation(target, v; kwargs...) = ElementaryVariation(simulator(), target, v; kwargs...)
+UniformDistributedVariation(target, lb::T, ub::T; kwargs...) where {T<:Real} = UniformDistributedVariation(simulator(), target, lb, ub; kwargs...)
+NormalDistributedVariation(target, mu::T, sigma::T; kwargs...) where {T<:Real} = NormalDistributedVariation(simulator(), target, mu, sigma; kwargs...)
 
 DiscreteVariation(sim::AbstractSimulator, target, values; kwargs...) = _withInferredLocation(DiscreteVariation, sim, target, values; kwargs...)
 DistributedVariation(sim::AbstractSimulator, target, distribution::Distribution; kwargs...) = _withInferredLocation(DistributedVariation, sim, target, distribution; kwargs...)
@@ -885,17 +870,20 @@ LatentVariation(lv::LatentVariation) = lv
 #! defaulting the latent names. Untyped in `targets` for the reason given under "Location inference":
 #! PhysiCellModelManager defines these with `AbstractVector{XMLPath}` and
 #! `AbstractVector{<:AbstractVector{<:AbstractString}}` targets, and an identical signature here would
-#! fail its precompilation. `target_names` needs no handling: the explicit constructor derives it from
-#! the resolved locations when it is not given.
-function LatentVariation(sim::AbstractSimulator, latent_parameters::Vector, targets::AbstractVector, maps::Vector{<:Function}, lp_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing; kwargs...)
-    xps = XMLPath[_asXMLPath(target) for target in targets]
+#! fail its precompilation. The target names and the default name are derived through `sim`, as the
+#! elementary simulator-first forms do, because the explicit constructor would ask the active simulator.
+function LatentVariation(sim::AbstractSimulator, latent_parameters::Vector, targets::AbstractVector, maps::Vector{<:Function}, lp_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, name::Union{Nothing,AbstractString}=nothing, kwargs...)
+    xps = XMLPath.(targets)
     locations = Symbol[inferVariationLocation(sim, xp) for xp in xps]
+    short_names = [shortVariationName(sim, location, columnName(xp)) for (location, xp) in zip(locations, xps)]
+    tnames = isnothing(target_names) ? short_names : target_names
+    resolved_name = isnothing(name) ? join(short_names, " | ") : name
     names = isnothing(lp_names) ? defaultLatentParameterNames(latent_parameters, xps) : lp_names
-    return LatentVariation(latent_parameters, xps, maps, names, locations; kwargs...)
+    return LatentVariation(latent_parameters, xps, maps, names, locations; target_names=tnames, name=resolved_name, kwargs...)
 end
 
 LatentVariation(latent_parameters::Vector, targets::AbstractVector, maps::Vector{<:Function}, lp_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing; kwargs...) =
-    LatentVariation(_inferringSimulator(), latent_parameters, targets, maps, lp_names; kwargs...)
+    LatentVariation(simulator(), latent_parameters, targets, maps, lp_names; kwargs...)
 
 variationName(lv::LatentVariation) = lv.name
 

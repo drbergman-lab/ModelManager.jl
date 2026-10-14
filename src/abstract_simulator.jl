@@ -29,11 +29,10 @@ a SLURM job; override it only for a simulator that is not an external process. O
 asks the backend how many CPUs to request through [`simulationThreads`](@ref), which defaults to
 "no request"; implement it for a simulator that decides its own thread count.
 
-Note: `variationLocation` is **not** part of the ModelManager interface.  The calling
-framework (e.g. PhysiCellModelManager) is responsible for resolving variation targets
-to their locations before constructing variation objects — the `location::Symbol` argument
-must be passed explicitly when constructing [`DiscreteVariation`](@ref) or
-[`DistributedVariation`](@ref).
+ModelManager cannot map a variation target to a project location on its own. The explicit
+constructors take `location` first; the location-free ones (`DiscreteVariation(target, values)`,
+the tuple forms of [`CoVariation`](@ref)) ask the backend through [`inferVariationLocation`](@ref),
+whose default throws. Implement it for a simulator whose targets determine their location.
 """
 abstract type AbstractSimulator end
 
@@ -351,20 +350,20 @@ without this every job time-slices its threads on one core. Called once per subm
 """
 simulationThreads(::AbstractSimulator, simulation) = nothing
 
-#! Untyped in `target` because `XMLPath` is defined in `variations.jl`, included after this file; a
-#! backend's `(::MySimulator, ::XMLPath)` method is more specific and wins. (Above the docstring: a
-#! comment between a docstring and its definition detaches the docstring. See CLAUDE.md.)
+#! Untyped in `target`: `XMLPath` is defined in `variations.jl`, included after this file. A backend's
+#! `(::MySimulator, ::XMLPath)` method is the more specific one and wins.
 """
-    inferVariationLocation(sim::AbstractSimulator, target::XMLPath) -> Symbol
+    inferVariationLocation(sim::AbstractSimulator, target) -> Symbol
 
-The project location `target` lives in, for a variation built without one. A simulator package
-implements this when its targets determine their location, and every location-free constructor
-(`DiscreteVariation(target, values)`, the tuple forms of [`CoVariation`](@ref), and so on) resolves
-its location through it. The default throws, so a backend that does not implement it leaves those
-constructors unusable rather than guessing: its users pass the location explicitly.
+The project location `target`, an [`XMLPath`](@ref), lives in, for a variation built without one.
+A simulator package implements this when its targets determine their location, and every
+location-free constructor (`DiscreteVariation(target, values)`, the tuple forms of
+[`CoVariation`](@ref), and so on) resolves its location through it. The default throws, so a backend
+that does not implement it leaves those constructors unusable rather than guessing: its users pass
+the location explicitly.
 
-Always called with an [`XMLPath`](@ref): the constructors normalize a target given as a vector of
-strings before asking.
+The constructors convert a target given as a vector of strings before asking, so an implementation
+is only ever handed an `XMLPath`.
 """
 inferVariationLocation(sim::AbstractSimulator, target) =
     throw(ArgumentError("$(nameof(typeof(sim))) does not infer variation locations, so the location of $(columnName(target)) cannot be inferred. Pass it explicitly: every constructor has a form taking the location (e.g. DiscreteVariation(location, target, values); LatentVariation takes a trailing locations vector), and a CoVariation is then built from those members rather than from tuples."))

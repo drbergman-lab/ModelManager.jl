@@ -71,6 +71,12 @@ ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
 # it unimplemented, which is the backend-that-does-not-infer case.
 ModelManager.inferVariationLocation(::TestSimulator, xp::XMLPath) = xp.xml_path[1] == "rules" ? :rules : :config
 
+# A backend with its own naming rule, for checking that a simulator-first call names its variation
+# through the simulator it was given rather than the active one. Same locations as TestSimulator.
+struct _NamingSimulator <: AbstractSimulator end
+ModelManager.inferVariationLocation(::_NamingSimulator, xp::XMLPath) = xp.xml_path[1] == "rules" ? :rules : :config
+ModelManager.shortVariationName(::_NamingSimulator, ::Symbol, name::String) = "short:" * name
+
 # ---- Package version / upgrade ----------------------------------------------
 # TestSimulator is defined in Main, which carries no version, so point the version machinery at
 # ModelManager itself. This is the seam a real backend never needs: its simulator type lives in
@@ -3084,6 +3090,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test UniformDistributedVariation(TestSimulator(), config_path, 0.0, 1.0).location == :config
         @test NormalDistributedVariation(TestSimulator(), rules_path, 0.0, 1.0).location == :rules
 
+        # A simulator-first call depends on nothing but the simulator it names: the default name is
+        # derived through that simulator's shortVariationName, not the active one's.
+        naming = _NamingSimulator()
+        @test variationName(DiscreteVariation(naming, rules_path, [1])) == "short:rules/x"
+        @test variationName(DistributedVariation(naming, config_path, Normal())) == "short:a"
+        @test variationName(ElementaryVariation(naming, config_path, [1])) == "short:a"
+        @test variationName(UniformDistributedVariation(naming, config_path, 0.0, 1.0)) == "short:a"
+        @test variationName(NormalDistributedVariation(naming, config_path, 0.0, 1.0)) == "short:a"
+        @test variationName(DiscreteVariation(naming, config_path, [1]; name="mine")) == "mine"
+        @test variationName(DiscreteVariation(rules_path, [1])) == "rules/x"
+        lv = LatentVariation(naming, [Normal()], [rules_path, config_path], Function[first, first])
+        @test lv.target_names == ["short:rules/x", "short:a"]
+        @test variationName(lv) == "short:rules/x | short:a"
+        lv = LatentVariation(naming, [Normal()], [config_path], Function[first]; target_names=["t"], name="n")
+        @test lv.target_names == ["t"]
+        @test variationName(lv) == "n"
+
         # An explicit location is never second-guessed.
         @test DiscreteVariation(:elsewhere, XMLPath(rules_path), [1]).location == :elsewhere
 
@@ -3146,25 +3169,20 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test_throws "_DefaultsSimulator does not infer" CoVariation((config_path, [1]), (rules_path, [2]))
             @test_throws "_DefaultsSimulator does not infer" CoVariation((config_path, Normal()),)
             @test_throws "_DefaultsSimulator does not infer" LatentVariation([Normal()], [config_path], Function[first])
-            # No simulator package loaded at all: the message says so rather than asserting about
-            # project initialization, since a simulator registers at package load.
+            # Nothing registered at all: the location-free forms go through `simulator()`, so they
+            # fail the way every other call does before a simulator package is loaded.
             ModelManager.mm_globals_ref[] = nothing
-            @test_throws "No simulator package is loaded" DiscreteVariation(config_path, [1])
-            @test_throws "No simulator package is loaded" LatentVariation([Normal()], [config_path], Function[first])
+            @test_throws AssertionError DiscreteVariation(config_path, [1])
+            @test_throws AssertionError LatentVariation([Normal()], [config_path], Function[first])
         finally
             ModelManager.mm_globals_ref[] = saved
         end
 
-        # The untyped forms also catch a forgotten target; the message must not claim to know which
-        # argument is missing, nor name a call shape that LatentVariation does not have.
-        err = try DiscreteVariation(:config, [1.0, 2.0]); nothing catch e; e end
-        @test err isa ArgumentError
-        @test occursin(":config", err.msg)
-        @test occursin("DiscreteVariation(location, target, values)", err.msg)
-        @test occursin("for LatentVariation, as the trailing locations vector", err.msg)
-        @test_throws ArgumentError DistributedVariation(:config, Normal())
-        # A flat path where a vector of paths was meant reaches the same check element by element.
-        @test_throws "Expected a variation target" LatentVariation([Normal()], rules_path, Function[first])
+        # The untyped forms also match a call that forgot the target rather than the location;
+        # `XMLPath` has no method for what arrives, and that MethodError is the diagnosis.
+        @test_throws MethodError DiscreteVariation(:config, [1.0, 2.0])
+        @test_throws MethodError DistributedVariation(:config, Normal())
+        @test_throws MethodError LatentVariation([Normal()], rules_path, Function[first])
 
         @test XMLPath(XMLPath(config_path)) isa XMLPath
     end
