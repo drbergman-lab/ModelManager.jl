@@ -225,23 +225,8 @@ end
 
 ################## Location inference ##################
 
-"""
-    inferVariationLocation(sim::AbstractSimulator, target::XMLPath) -> Symbol
-
-The project location `target` lives in, for a variation built without one. A simulator package
-implements this when its targets determine their location, and every location-free constructor
-(`DiscreteVariation(target, values)`, the tuple forms of [`CoVariation`](@ref), and so on) resolves
-its location through it. The default throws, so a backend that does not implement it leaves those
-constructors unusable rather than guessing: its users pass the location explicitly.
-"""
-inferVariationLocation(sim::AbstractSimulator, target::XMLPath) =
-    throw(ArgumentError("$(nameof(typeof(sim))) does not infer variation locations, so the location of $(columnName(target)) cannot be inferred. Pass it explicitly as the first argument, e.g. DiscreteVariation(location, target, values)."))
-
-#! Public, not exported: a simulator package implements `ModelManager.inferVariationLocation` and
-#! never calls it, and PhysiCellModelManager keeps a one-argument `inferVariationLocation` of its own
-#! that an exported name of the same spelling would clash with. See CLAUDE.md, "Docstring
-#! cross-references".
-@compat public inferVariationLocation
+#! The hook itself, `inferVariationLocation`, is declared in `abstract_simulator.jl` with the other
+#! interface methods. Everything here is the generic machinery that calls it.
 
 #! Resolved through `mm_globals_ref` rather than `simulator()`: `mm_globals()` asserts about project
 #! initialization, which is the wrong diagnosis here. A simulator registers in its package's
@@ -255,11 +240,20 @@ end
 
 #! The location-free forms are untyped in their target, so they also catch a call that forgot the
 #! target rather than the location -- `DiscreteVariation(:config, [1.0, 2.0])` -- and the message must
-#! not claim to know which argument is missing.
+#! not claim to know which argument is missing. It also must not name a call shape: `LatentVariation`
+#! takes its locations last, not first.
 function _asXMLPath(target)
     target isa XMLPath && return target
     target isa AbstractVector{<:AbstractString} && return XMLPath(target)
-    throw(ArgumentError("Expected a variation target (an XMLPath or a vector of strings) but got $(repr(target)). A constructor called without a location, as (target, ...), infers the location through the active simulator; to pass the location, call it as (location, target, ...)."))
+    throw(ArgumentError("Expected a variation target (an XMLPath or a vector of strings) but got $(repr(target)). A constructor called without a location infers it through the active simulator and otherwise takes the explicit form's arguments in the same order; to skip inference, pass the location yourself (first, e.g. DiscreteVariation(location, target, values); for LatentVariation, as the trailing locations vector)."))
+end
+
+#! The one generic body behind every simulator-first form: normalize the target to an `XMLPath`, so
+#! an implementer of `inferVariationLocation` only ever sees one, then call the explicit constructor
+#! with the location the hook returns.
+function _withInferredLocation(f, sim::AbstractSimulator, target, args...; kwargs...)
+    xp = _asXMLPath(target)
+    return f(inferVariationLocation(sim, xp), xp, args...; kwargs...)
 end
 
 #! Keep the location-free forms untyped in their target. A simulator package may add typed methods of
@@ -274,32 +268,11 @@ ElementaryVariation(target, v; kwargs...) = ElementaryVariation(_inferringSimula
 UniformDistributedVariation(target, lb::T, ub::T; kwargs...) where {T<:Real} = UniformDistributedVariation(_inferringSimulator(), target, lb, ub; kwargs...)
 NormalDistributedVariation(target, mu::T, sigma::T; kwargs...) where {T<:Real} = NormalDistributedVariation(_inferringSimulator(), target, mu, sigma; kwargs...)
 
-#! The simulator-first forms are the generic ones: they normalize the target to an `XMLPath`, so an
-#! implementer of `inferVariationLocation` only ever sees one, and resolve the location through it.
-function DiscreteVariation(sim::AbstractSimulator, target, values; kwargs...)
-    xp = _asXMLPath(target)
-    return DiscreteVariation(inferVariationLocation(sim, xp), xp, values; kwargs...)
-end
-
-function DistributedVariation(sim::AbstractSimulator, target, distribution::Distribution; kwargs...)
-    xp = _asXMLPath(target)
-    return DistributedVariation(inferVariationLocation(sim, xp), xp, distribution; kwargs...)
-end
-
-function ElementaryVariation(sim::AbstractSimulator, target, v; kwargs...)
-    xp = _asXMLPath(target)
-    return ElementaryVariation(inferVariationLocation(sim, xp), xp, v; kwargs...)
-end
-
-function UniformDistributedVariation(sim::AbstractSimulator, target, lb::T, ub::T; kwargs...) where {T<:Real}
-    xp = _asXMLPath(target)
-    return UniformDistributedVariation(inferVariationLocation(sim, xp), xp, lb, ub; kwargs...)
-end
-
-function NormalDistributedVariation(sim::AbstractSimulator, target, mu::T, sigma::T; kwargs...) where {T<:Real}
-    xp = _asXMLPath(target)
-    return NormalDistributedVariation(inferVariationLocation(sim, xp), xp, mu, sigma; kwargs...)
-end
+DiscreteVariation(sim::AbstractSimulator, target, values; kwargs...) = _withInferredLocation(DiscreteVariation, sim, target, values; kwargs...)
+DistributedVariation(sim::AbstractSimulator, target, distribution::Distribution; kwargs...) = _withInferredLocation(DistributedVariation, sim, target, distribution; kwargs...)
+ElementaryVariation(sim::AbstractSimulator, target, v; kwargs...) = _withInferredLocation(ElementaryVariation, sim, target, v; kwargs...)
+UniformDistributedVariation(sim::AbstractSimulator, target, lb::T, ub::T; kwargs...) where {T<:Real} = _withInferredLocation(UniformDistributedVariation, sim, target, lb, ub; kwargs...)
+NormalDistributedVariation(sim::AbstractSimulator, target, mu::T, sigma::T; kwargs...) where {T<:Real} = _withInferredLocation(NormalDistributedVariation, sim, target, mu, sigma; kwargs...)
 
 """
     variationValues(ev::ElementaryVariation[, cdf])
@@ -394,8 +367,8 @@ A co-variation of one or more [`ElementaryVariation`](@ref)s that are varied tog
 Each constituent variation must be of the same subtype (all `DiscreteVariation` or all
 `DistributedVariation`).
 
-The tuple forms name each target as a vector of strings and carry no location: each member is built
-with the location-free constructor, which infers it through the active simulator's
+The tuple forms name each target as an `XMLPath` or a vector of strings and carry no location: each
+member is built with the location-free constructor, which infers it through the active simulator's
 [`inferVariationLocation`](@ref). On a simulator that does not implement the hook they throw; build
 the members with explicit locations and pass those instead.
 """
@@ -422,28 +395,29 @@ struct CoVariation{T<:ElementaryVariation} <: AbstractVariation
 
     #! The tuple forms build their members with the location-free `DistributedVariation(target,
     #! distribution)` / `DiscreteVariation(target, values)` defined under "Location inference", so the
-    #! location of each is whatever the active simulator's `inferVariationLocation` says.
-    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Distribution},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
+    #! location of each is whatever the active simulator's `inferVariationLocation` says, and the
+    #! target may be anything those forms accept.
+    function CoVariation(inputs::Vararg{Tuple{Union{XMLPath,Vector{<:AbstractString}},Distribution},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
         variations = DistributedVariation[]
-        for (xml_path, distribution) in inputs
-            push!(variations, DistributedVariation(xml_path, distribution))
+        for (target, distribution) in inputs
+            push!(variations, DistributedVariation(target, distribution))
         end
         default_name = join(variationName.(variations), " AND ")
         variation_name = isnothing(name) ? default_name : String(name)
         return new{DistributedVariation}(variations, variation_name)
     end
 
-    function CoVariation(inputs::Vararg{Tuple{Vector{<:AbstractString},Vector},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
+    function CoVariation(inputs::Vararg{Tuple{Union{XMLPath,Vector{<:AbstractString}},Vector},N}; name::Union{Nothing,AbstractString}=nothing) where {N}
         variations = DiscreteVariation[]
         n_discrete = -1
-        for (xml_path, val) in inputs
+        for (target, val) in inputs
             n_vals = length(val)
             if n_discrete == -1
                 n_discrete = n_vals
             else
                 @assert n_discrete == n_vals "All discrete vals must have the same length"
             end
-            push!(variations, DiscreteVariation(xml_path, val))
+            push!(variations, DiscreteVariation(target, val))
         end
         default_name = join(variationName.(variations), " AND ")
         variation_name = isnothing(name) ? default_name : String(name)
@@ -630,6 +604,7 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
     function LatentVariation(latent_parameters::Vector{<:Vector{T}}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, inverse_maps::Union{Nothing,AbstractVector{<:Function}}=nothing, name::Union{Nothing,AbstractString}=nothing) where T<:Real
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
+        @assert length(lp_names) == length(latent_parameters) "LatentVariation requires one latent parameter name per latent parameter. Found $(length(lp_names)) and $(length(latent_parameters)), respectively."
         if !isnothing(target_names)
             @assert length(target_names) == length(targets) "target_names length ($(length(target_names))) must equal targets length ($(length(targets)))."
         end
@@ -652,6 +627,7 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
     function LatentVariation(latent_parameters::Vector{T}, targets::AbstractVector{XMLPath}, maps::Vector{<:Function}, lp_names::AbstractVector{<:AbstractString}, locations::AbstractVector{Symbol}; target_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing, inverse_maps::Union{Nothing,AbstractVector{<:Function}}=nothing, flips::Union{Nothing,AbstractVector{Bool}}=nothing, name::Union{Nothing,AbstractString}=nothing) where T<:Distribution
         @assert length(targets) == length(maps) "LatentVariation requires the number of targets and maps to be the same. Found $(length(targets)) and $(length(maps)), respectively."
         @assert length(targets) == length(locations) "LatentVariation requires the number of targets and locations to be the same. Found $(length(targets)) and $(length(locations)), respectively."
+        @assert length(lp_names) == length(latent_parameters) "LatentVariation requires one latent parameter name per latent parameter. Found $(length(lp_names)) and $(length(latent_parameters)), respectively."
         if !isnothing(target_names)
             @assert length(target_names) == length(targets) "target_names length ($(length(target_names))) must equal targets length ($(length(targets)))."
         end

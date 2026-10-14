@@ -3087,11 +3087,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         # An explicit location is never second-guessed.
         @test DiscreteVariation(:elsewhere, XMLPath(rules_path), [1]).location == :elsewhere
 
-        # The tuple forms of CoVariation infer each member's location.
-        cv = CoVariation((rules_path, [1, 2]), (config_path, [3, 4]))
+        # The tuple forms of CoVariation infer each member's location, and take the target in either
+        # spelling the location-free constructors do.
+        cv = CoVariation((rules_path, [1, 2]), (XMLPath(config_path), [3, 4]))
         @test ModelManager.variationLocation(cv) == [:rules, :config]
+        @test ModelManager.variationTarget(cv) == XMLPath.([rules_path, config_path])
         @test length(cv) == 2
-        cv = CoVariation((rules_path, Uniform(0, 1)), (config_path, Normal()); name="pair")
+        cv = CoVariation((XMLPath(rules_path), Uniform(0, 1)), (config_path, Normal()); name="pair")
         @test ModelManager.variationLocation(cv) == [:rules, :config]
         @test variationName(cv) == "pair"
 
@@ -3111,6 +3113,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test lv.target_names == ["rate"]
         @test !isnothing(lv.inverse_maps)
         @test variationName(lv) == "lv"
+        # Every keyword reaches the explicit constructor, `flips` included.
+        lv = LatentVariation([Uniform(0, 1)], [config_path], Function[first]; flips=[true])
+        @test lv.flips == [true]
+        # ...and so does its validation: the location-free forms add no leniency.
+        @test_throws AssertionError LatentVariation([Normal()], [config_path, rules_path], Function[first])
+        @test_throws "one latent parameter name per latent parameter" LatentVariation([Normal()], [config_path], Function[first], String[])
+        @test_throws "one latent parameter name per latent parameter" LatentVariation([Normal()], XMLPath[XMLPath(config_path)], Function[first], ["a", "b"], [:config])
 
         # A backend that does not implement the hook: every form throws, naming the backend.
         bare = _DefaultsSimulator()
@@ -3122,6 +3131,11 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                       () -> LatentVariation(bare, [Normal()], [config_path], Function[first]))
             @test_throws ArgumentError build()
             @test_throws "_DefaultsSimulator does not infer variation locations" build()
+            # The way out is stated for every constructor the error can be reached from, not only
+            # DiscreteVariation: a LatentVariation's locations go last, and a CoVariation has no
+            # explicit-location tuple form at all.
+            @test_throws "LatentVariation takes a trailing locations vector" build()
+            @test_throws "built from those members rather than from tuples" build()
         end
         # ...and so do the location-free forms while it is the active simulator, the tuple
         # CoVariation forms included.
@@ -3142,12 +3156,15 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
 
         # The untyped forms also catch a forgotten target; the message must not claim to know which
-        # argument is missing.
+        # argument is missing, nor name a call shape that LatentVariation does not have.
         err = try DiscreteVariation(:config, [1.0, 2.0]); nothing catch e; e end
         @test err isa ArgumentError
         @test occursin(":config", err.msg)
-        @test occursin("(target, ...)", err.msg) && occursin("(location, target, ...)", err.msg)
+        @test occursin("DiscreteVariation(location, target, values)", err.msg)
+        @test occursin("for LatentVariation, as the trailing locations vector", err.msg)
         @test_throws ArgumentError DistributedVariation(:config, Normal())
+        # A flat path where a vector of paths was meant reaches the same check element by element.
+        @test_throws "Expected a variation target" LatentVariation([Normal()], rules_path, Function[first])
 
         @test XMLPath(XMLPath(config_path)) isa XMLPath
     end

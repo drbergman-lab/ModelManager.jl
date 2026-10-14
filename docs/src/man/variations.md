@@ -98,6 +98,13 @@ cv = CoVariation(
     DiscreteVariation(:config, XMLPath(["cell","birth_rate"]), [0.01, 0.03, 0.05]),
     DiscreteVariation(:config, XMLPath(["cell","death_rate"]), [0.001, 0.005, 0.01]),
 )
+
+# The same two, as (target, values) tuples. Each member's location is inferred through the
+# active simulator's `inferVariationLocation`, so this form needs a backend that implements it.
+cv = CoVariation(
+    (["cell","birth_rate"], [0.01, 0.03, 0.05]),
+    (["cell","death_rate"], [0.001, 0.005, 0.01]),
+)
 ```
 
 ## Reparameterizing: LatentVariation
@@ -115,6 +122,18 @@ lv = LatentVariation(
     [lp -> exp(lp[1])],              # map: latent → target value(s)
     ["log_rate"],                    # latent parameter name(s)
     [:config];                       # target location(s)
+    inverse_maps = [tv -> log(tv[1])],
+)
+```
+
+Leave off the locations (and, if you like, the latent names) to have them inferred through the
+active simulator, one location per target:
+
+```julia
+lv = LatentVariation(
+    [Normal(-7, 1)],
+    [["cell", "rate"]],              # targets, as XMLPaths or vectors of strings
+    [lp -> exp(lp[1])];
     inverse_maps = [tv -> log(tv[1])],
 )
 ```

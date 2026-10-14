@@ -42,9 +42,20 @@ dependency an honest hook.
 - **Public, not exported.** PCMM keeps its own one-argument `inferVariationLocation(::XMLPath)` and
   re-exports ModelManager wholesale; an exported name of the same spelling would clash. `@compat
   public` is enough for `@ref` links and the docs build.
-- **The stub lives in `variations.jl`, next to `XMLPath`**, not in `abstract_simulator.jl`, which
-  is included before `XMLPath` exists; same precedent as `postVariationXMLProcessing` in
-  `xml_utilities.jl`.
+- **The stub lives in `abstract_simulator.jl`, untyped in its target.** It was first put in
+  `variations.jl` next to `XMLPath`, since `abstract_simulator.jl` is included before `XMLPath`
+  exists, but the interface API page renders only `abstract_simulator.jl`, so the one hook a backend
+  author needs was missing from the page they read. Leaving `target` untyped needs no `XMLPath` in
+  scope, a backend's `(::MySimulator, ::XMLPath)` method is still the more specific one, and the
+  constructors guarantee the hook only ever receives an `XMLPath`. Review finding.
+- **Review fixes, same PR.** The explicit `LatentVariation` constructors now require one latent
+  name per latent parameter (they checked targets, maps and locations against each other but never
+  `lp_names`, so the location-free form could build a variation with no latent names from an empty
+  vector; PCMM's wrapper had treated an empty vector as "use defaults", which this does not). The
+  tuple `CoVariation` forms take an `XMLPath` as well as a vector of strings, as every other
+  location-free form does. The two error messages name a way out that applies to every constructor
+  they can be reached from, not only `DiscreteVariation`. The five simulator-first bodies share one
+  `_withInferredLocation` helper.
 - **The tuple `CoVariation` forms stay in ModelManager.** Moving them to PCMM would need identical
   signatures (impossible, above) and a coordinated release. They moved below the vector
   constructors in the struct body, which changes nothing about dispatch; the docstring now says
