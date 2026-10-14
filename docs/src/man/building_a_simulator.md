@@ -144,7 +144,57 @@ These have working defaults; override only when your simulator needs them.
 | [`clearSimulatorArtifacts`](@ref) | no-op | remove compiled artifacts on database reset |
 | [`simulationThreads`](@ref) | `nothing` | how many threads a simulation starts, so SLURM jobs request that many CPUs; implement it when the simulator sets its own thread count |
 | [`postVariationXMLProcessing`](@ref) | no-op | post-process a variation file after ModelManager writes it |
-| [`inferVariationLocation`](@ref) | throws | map a variation target to its project location, so users can build variations without naming one (`DiscreteVariation(target, values)`, the tuple forms of `CoVariation`) |
+| [`inferVariationLocation`](@ref) | throws | map a variation target to its project location, so users can build variations without naming one; see [Inferring a variation's location](@ref infer_variation_location) |
+| [`shortVariationName`](@ref) | the column name unchanged | shorten a variation's default display name |
+
+### [Inferring a variation's location](@id infer_variation_location)
+
+A user names a parameter by its path in an input file, and every variation also needs the
+[project location](@ref project_configuration) that file belongs to. The explicit constructors
+take it first, `DiscreteVariation(:config, target, values)`. The location-free forms leave it
+out, and ModelManager asks your backend:
+
+```julia
+ModelManager.inferVariationLocation(sim::MySimulator, target::XMLPath)::Symbol
+```
+
+Return the location symbol for `target`: one of the locations the project's `inputs.toml`
+declares. `target.xml_path` is the path as a `Vector{String}`. A backend whose input files are
+told apart by their root element decides from the first one:
+
+```julia
+function ModelManager.inferVariationLocation(::MySimulator, target::XMLPath)
+    first_element = target.xml_path[1]
+    startswith(first_element, "behavior_ruleset:") && return :rulesets_collection
+    first_element == "intracellulars" && return :intracellular
+    return :config
+end
+```
+
+That one method gives your users `DiscreteVariation(target, values)`,
+`DistributedVariation(target, distribution)`, `UniformDistributedVariation(target, lb, ub)`,
+`NormalDistributedVariation(target, mu, sigma)`, `ElementaryVariation(target, v)`,
+`LatentVariation(latent_parameters, targets, maps[, lp_names])`, and the tuple forms of
+[`CoVariation`](@ref), each taking a target as an [`XMLPath`](@ref) or a plain vector of strings.
+The hook is always handed an `XMLPath`. It runs when the variation is constructed, through the
+registered simulator, so it works as soon as your package is loaded; the mapping should need
+nothing but the path.
+
+Without an implementation the location-free forms throw an error naming your backend, and the
+explicit forms remain. ModelManager never guesses a location.
+
+Two related points:
+
+- **Naming.** A variation's default display name is
+  `shortVariationName(sim, location, column)`, where `column` is the slash-joined path; the
+  default returns the column unchanged. Override [`shortVariationName`](@ref) on your type to
+  shorten it. The simulator-first forms, `DiscreteVariation(sim, target, values)`, derive both the
+  location and the name through the `sim` they are given rather than the registered one.
+- **If your package already has location-free constructors of its own**, as PhysiCellModelManager
+  did before this hook existed, implement the hook and delete them. They can coexist in the
+  meantime because yours are typed on the target and ModelManager's are deliberately not, so
+  yours win dispatch. Never add a constructor whose signature is identical to one of
+  ModelManager's: Julia refuses to precompile a package that overwrites a dependency's method.
 
 ### Database migrations
 

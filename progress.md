@@ -33,10 +33,10 @@ dependency an honest hook.
   own methods are still the ones dispatched to, and `detect_ambiguities` across the two modules
   reports nothing new.
 - **Through `simulator()`, like everything else.** A first version resolved the simulator through
-  `mm_globals_ref` with its own "no simulator package is loaded" error, so a variation could be
-  built before `initializeModelManager`. The maintainer saw no reason to make these constructors
-  the one exception to the initialization requirement; they now call `simulator()` and fail the
-  way every other call does.
+  `mm_globals_ref` with its own "no simulator package is loaded" error. The maintainer saw no
+  reason for a dedicated path; they now call `simulator()` and fail as it does with no simulator
+  package loaded. (`simulator()` needs only registration, which happens at package load, so the
+  forms still work before a project is initialized; the dedicated path bought nothing.)
 - **A wrong target is `XMLPath`'s `MethodError`.** The untyped `(target, values)` forms also match
   `DiscreteVariation(:config, [1.0, 2.0])`, where the target was forgotten. A first version wrapped
   that in a custom error describing both call shapes; the maintainer preferred the plain

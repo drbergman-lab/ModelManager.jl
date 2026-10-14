@@ -363,7 +363,9 @@ that does not implement it leaves those constructors unusable rather than guessi
 the location explicitly.
 
 The constructors convert a target given as a vector of strings before asking, so an implementation
-is only ever handed an `XMLPath`.
+is only ever handed an `XMLPath`; its path elements are `target.xml_path`. Return one of the
+location symbols the project's `inputs.toml` declares. See "Building a Simulator Backend" for a
+worked implementation.
 """
 inferVariationLocation(sim::AbstractSimulator, target) =
     throw(ArgumentError("$(nameof(typeof(sim))) does not infer variation locations, so the location of $(columnName(target)) cannot be inferred. Pass it explicitly: every constructor has a form taking the location (e.g. DiscreteVariation(location, target, values); LatentVariation takes a trailing locations vector), and a CoVariation is then built from those members rather than from tuples."))
