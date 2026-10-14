@@ -159,8 +159,9 @@ ModelManager.inferVariationLocation(sim::MySimulator, target::XMLPath)::Symbol
 ```
 
 Return the location symbol for `target`: one of the locations the project's `inputs.toml`
-declares. `target.xml_path` is the path as a `Vector{String}`. A backend whose input files are
-told apart by their root element decides from the first one:
+declares. `target.xml_path` is the path as a `Vector{String}`. How you decide is up to you. A
+backend whose input files are differentiated by their root element could use that to drive the
+inference:
 
 ```julia
 function ModelManager.inferVariationLocation(::MySimulator, target::XMLPath)
@@ -183,18 +184,11 @@ nothing but the path.
 Without an implementation the location-free forms throw an error naming your backend, and the
 explicit forms remain. ModelManager never guesses a location.
 
-Two related points:
-
-- **Naming.** A variation's default display name is
-  `shortVariationName(sim, location, column)`, where `column` is the slash-joined path; the
-  default returns the column unchanged. Override [`shortVariationName`](@ref) on your type to
-  shorten it. The simulator-first forms, `DiscreteVariation(sim, target, values)`, derive both the
-  location and the name through the `sim` they are given rather than the registered one.
-- **If your package already has location-free constructors of its own**, as PhysiCellModelManager
-  did before this hook existed, implement the hook and delete them. They can coexist in the
-  meantime because yours are typed on the target and ModelManager's are deliberately not, so
-  yours win dispatch. Never add a constructor whose signature is identical to one of
-  ModelManager's: Julia refuses to precompile a package that overwrites a dependency's method.
+A related point on naming: a variation's default display name is
+`shortVariationName(sim, location, column)`, where `column` is the slash-joined path; the default
+returns the column unchanged. Override [`shortVariationName`](@ref) on your type to shorten it.
+The simulator-first forms, `DiscreteVariation(sim, target, values)`, derive both the location and
+the name through the `sim` they are given rather than the registered one.
 
 ### Database migrations
 
