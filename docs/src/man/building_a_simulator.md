@@ -144,6 +144,51 @@ These have working defaults; override only when your simulator needs them.
 | [`clearSimulatorArtifacts`](@ref) | no-op | remove compiled artifacts on database reset |
 | [`simulationThreads`](@ref) | `nothing` | how many threads a simulation starts, so SLURM jobs request that many CPUs; implement it when the simulator sets its own thread count |
 | [`postVariationXMLProcessing`](@ref) | no-op | post-process a variation file after ModelManager writes it |
+| [`inferVariationLocation`](@ref) | throws | map a variation target to its project location, so users can build variations without naming one; see [Inferring a variation's location](@ref infer_variation_location) |
+| [`shortVariationName`](@ref) | the column name unchanged | shorten a variation's default display name |
+
+### [Inferring a variation's location](@id infer_variation_location)
+
+A user names a parameter by its path in an input file, and every variation also needs the
+[project location](@ref project_configuration) that file belongs to. The explicit constructors
+take it first, `DiscreteVariation(:config, target, values)`. The location-free forms leave it
+out, and ModelManager asks your backend:
+
+```julia
+ModelManager.inferVariationLocation(sim::MySimulator, target::XMLPath)::Symbol
+```
+
+Return the location symbol for `target`: one of the locations the project's `inputs.toml`
+declares. `target.xml_path` is the path as a `Vector{String}`. How you decide is up to you. A
+backend whose input files are differentiated by their root element could use that to drive the
+inference:
+
+```julia
+function ModelManager.inferVariationLocation(::MySimulator, target::XMLPath)
+    first_element = target.xml_path[1]
+    startswith(first_element, "behavior_ruleset:") && return :rulesets_collection
+    first_element == "intracellulars" && return :intracellular
+    return :config
+end
+```
+
+That one method gives your users `DiscreteVariation(target, values)`,
+`DistributedVariation(target, distribution)`, `UniformDistributedVariation(target, lb, ub)`,
+`NormalDistributedVariation(target, mu, sigma)`, `ElementaryVariation(target, v)`,
+`LatentVariation(latent_parameters, targets, maps[, lp_names])`, and the tuple forms of
+[`CoVariation`](@ref), each taking a target as an [`XMLPath`](@ref) or a plain vector of strings.
+The hook is always handed an `XMLPath`. It runs when the variation is constructed, through the
+registered simulator, so it works as soon as your package is loaded; the mapping should need
+nothing but the path.
+
+Without an implementation the location-free forms throw an error naming your backend, and the
+explicit forms remain. ModelManager never guesses a location.
+
+A related point on naming: a variation's default display name is
+`shortVariationName(sim, location, column)`, where `column` is the slash-joined path; the default
+returns the column unchanged. Override [`shortVariationName`](@ref) on your type to shorten it.
+The simulator-first forms, `DiscreteVariation(sim, target, values)`, derive both the location and
+the name through the `sim` they are given rather than the registered one.
 
 ### Database migrations
 
@@ -172,9 +217,10 @@ Two your backend will want rather than reimplement:
 
 ## Boundary rules
 
-- **`location` is explicit.** ModelManager does not resolve a variation target to a project
-  location — your package must pass `location` when constructing variations (or provide
-  convenience constructors that infer it). See [Variations](@ref variations).
+- **ModelManager does not resolve a variation target to a project location.** The explicit
+  constructors take `location` first; the location-free ones ask your backend through
+  [`inferVariationLocation`](@ref) and throw until you implement it. Implement the one hook
+  rather than adding location-free constructors of your own. See [Variations](@ref variations).
 - **No simulator specifics leak into ModelManager.** If you find yourself wanting ModelManager
   to know something about your simulator, that knowledge belongs behind one of these interface
   methods — add or override a hook rather than special-casing the core.

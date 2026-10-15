@@ -65,6 +65,18 @@ ModelManager.currentSimulatorVersionID(sim::TestSimulator) = sim.current_version
 ModelManager.simulatorInfo(::TestSimulator) = "TestSimulator (stub)"
 ModelManager.simulatorDir(::TestSimulator)  = ModelManager.dataDir()
 
+# ---- Location inference -----------------------------------------------------
+# The hook a backend implements so variations can be built without a location: a target whose
+# first element is "rules" lives in :rules, everything else in :config. _DefaultsSimulator leaves
+# it unimplemented, which is the backend-that-does-not-infer case.
+ModelManager.inferVariationLocation(::TestSimulator, xp::XMLPath) = xp.xml_path[1] == "rules" ? :rules : :config
+
+# A backend with its own naming rule, for checking that a simulator-first call names its variation
+# through the simulator it was given rather than the active one. Same locations as TestSimulator.
+struct _NamingSimulator <: AbstractSimulator end
+ModelManager.inferVariationLocation(::_NamingSimulator, xp::XMLPath) = xp.xml_path[1] == "rules" ? :rules : :config
+ModelManager.shortVariationName(::_NamingSimulator, ::Symbol, name::String) = "short:" * name
+
 # ---- Package version / upgrade ----------------------------------------------
 # TestSimulator is defined in Main, which carries no version, so point the version machinery at
 # ModelManager itself. This is the seam a real backend never needs: its simulator type lives in
@@ -3034,6 +3046,145 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         finally
             ModelManager.mm_globals_ref[] = saved
         end
+    end
+
+    @testset "location-free constructors infer through the active simulator" begin
+        rules_path = ["rules", "x"]
+        config_path = ["a"]
+
+        # Every location-free form, with the target as a vector of strings and as an XMLPath.
+        dv = DiscreteVariation(rules_path, [1, 2])
+        @test dv.location == :rules
+        @test dv.values == [1, 2]
+        @test variationName(dv) == "rules/x"
+        dv = DiscreteVariation(XMLPath(config_path), 3; name="single")
+        @test dv.location == :config
+        @test dv.values == [3]
+        @test variationName(dv) == "single"
+
+        d = DistributedVariation(rules_path, Uniform(0, 1); flip=true)
+        @test d.location == :rules
+        @test d.flip
+        d = DistributedVariation(XMLPath(config_path), Normal(); name="n")
+        @test d.location == :config
+        @test variationName(d) == "n"
+
+        @test ElementaryVariation(config_path, Uniform(0, 1)) isa DistributedVariation
+        ev = ElementaryVariation(rules_path, [1, 2])
+        @test ev isa DiscreteVariation
+        @test ev.location == :rules
+
+        u = UniformDistributedVariation(rules_path, 0.0, 1.0; name="u")
+        @test u.location == :rules
+        @test u.distribution == Uniform(0.0, 1.0)
+        @test variationName(u) == "u"
+        n = NormalDistributedVariation(XMLPath(config_path), 0.0, 1.0; lb=0.0, flip=true)
+        @test n.location == :config
+        @test n.flip
+        @test minimum(n.distribution) == 0.0
+
+        # The simulator-first forms name the simulator instead of using the active one.
+        @test DiscreteVariation(TestSimulator(), rules_path, [1]).location == :rules
+        @test DistributedVariation(TestSimulator(), XMLPath(rules_path), Normal()).location == :rules
+        @test ElementaryVariation(TestSimulator(), config_path, Normal()).location == :config
+        @test UniformDistributedVariation(TestSimulator(), config_path, 0.0, 1.0).location == :config
+        @test NormalDistributedVariation(TestSimulator(), rules_path, 0.0, 1.0).location == :rules
+
+        # A simulator-first call depends on nothing but the simulator it names: the default name is
+        # derived through that simulator's shortVariationName, not the active one's.
+        naming = _NamingSimulator()
+        @test variationName(DiscreteVariation(naming, rules_path, [1])) == "short:rules/x"
+        @test variationName(DistributedVariation(naming, config_path, Normal())) == "short:a"
+        @test variationName(ElementaryVariation(naming, config_path, [1])) == "short:a"
+        @test variationName(UniformDistributedVariation(naming, config_path, 0.0, 1.0)) == "short:a"
+        @test variationName(NormalDistributedVariation(naming, config_path, 0.0, 1.0)) == "short:a"
+        @test variationName(DiscreteVariation(naming, config_path, [1]; name="mine")) == "mine"
+        @test variationName(DiscreteVariation(rules_path, [1])) == "rules/x"
+        lv = LatentVariation(naming, [Normal()], [rules_path, config_path], Function[first, first])
+        @test lv.target_names == ["short:rules/x", "short:a"]
+        @test variationName(lv) == "short:rules/x | short:a"
+        lv = LatentVariation(naming, [Normal()], [config_path], Function[first]; target_names=["t"], name="n")
+        @test lv.target_names == ["t"]
+        @test variationName(lv) == "n"
+
+        # An explicit location is never second-guessed.
+        @test DiscreteVariation(:elsewhere, XMLPath(rules_path), [1]).location == :elsewhere
+
+        # The tuple forms of CoVariation infer each member's location, and take the target in either
+        # spelling the location-free constructors do.
+        cv = CoVariation((rules_path, [1, 2]), (XMLPath(config_path), [3, 4]))
+        @test ModelManager.variationLocation(cv) == [:rules, :config]
+        @test ModelManager.variationTarget(cv) == XMLPath.([rules_path, config_path])
+        @test length(cv) == 2
+        cv = CoVariation((XMLPath(rules_path), Uniform(0, 1)), (config_path, Normal()); name="pair")
+        @test ModelManager.variationLocation(cv) == [:rules, :config]
+        @test variationName(cv) == "pair"
+
+        # LatentVariation: one inferred location per target, latent names defaulted, target names
+        # derived from the inferred locations.
+        lv = LatentVariation([Uniform(0, 1)], [rules_path, config_path], Function[lp -> lp[1], lp -> 2lp[1]])
+        @test lv.locations == [:rules, :config]
+        @test lv.target_names == ["rules/x", "a"]
+        @test lv.latent_parameter_names == ModelManager.defaultLatentParameterNames(lv.latent_parameters, lv.targets)
+        lv = LatentVariation([[1.0, 2.0]], XMLPath[XMLPath(config_path)], Function[lp -> lp[1]], ["level"])
+        @test lv isa LatentVariation{Vector{Float64}}
+        @test lv.locations == [:config]
+        @test lv.latent_parameter_names == ["level"]
+        lv = LatentVariation(TestSimulator(), [Normal()], [rules_path], Function[lp -> exp(lp[1])], ["log_rate"];
+                             inverse_maps=Function[tv -> log(tv[1])], target_names=["rate"], name="lv")
+        @test lv.locations == [:rules]
+        @test lv.target_names == ["rate"]
+        @test !isnothing(lv.inverse_maps)
+        @test variationName(lv) == "lv"
+        # Every keyword reaches the explicit constructor, `flips` included.
+        lv = LatentVariation([Uniform(0, 1)], [config_path], Function[first]; flips=[true])
+        @test lv.flips == [true]
+        # ...and so does its validation: the location-free forms add no leniency.
+        @test_throws AssertionError LatentVariation([Normal()], [config_path, rules_path], Function[first])
+        @test_throws "one latent parameter name per latent parameter" LatentVariation([Normal()], [config_path], Function[first], String[])
+        @test_throws "one latent parameter name per latent parameter" LatentVariation([Normal()], XMLPath[XMLPath(config_path)], Function[first], ["a", "b"], [:config])
+
+        # A backend that does not implement the hook: every form throws, naming the backend.
+        bare = _DefaultsSimulator()
+        for build in (() -> DiscreteVariation(bare, config_path, [1]),
+                      () -> DistributedVariation(bare, config_path, Normal()),
+                      () -> ElementaryVariation(bare, config_path, [1]),
+                      () -> UniformDistributedVariation(bare, config_path, 0.0, 1.0),
+                      () -> NormalDistributedVariation(bare, config_path, 0.0, 1.0),
+                      () -> LatentVariation(bare, [Normal()], [config_path], Function[first]))
+            @test_throws ArgumentError build()
+            @test_throws "_DefaultsSimulator does not infer variation locations" build()
+            # The way out is stated for every constructor the error can be reached from, not only
+            # DiscreteVariation: a LatentVariation's locations go last, and a CoVariation has no
+            # explicit-location tuple form at all.
+            @test_throws "LatentVariation takes a trailing locations vector" build()
+            @test_throws "built from those members rather than from tuples" build()
+        end
+        # ...and so do the location-free forms while it is the active simulator, the tuple
+        # CoVariation forms included.
+        saved = ModelManager.mm_globals_ref[]
+        try
+            ModelManager.mm_globals_ref[] = ModelManagerGlobals(simulator = bare)
+            @test_throws "_DefaultsSimulator does not infer" DiscreteVariation(config_path, [1])
+            @test_throws "_DefaultsSimulator does not infer" CoVariation((config_path, [1]), (rules_path, [2]))
+            @test_throws "_DefaultsSimulator does not infer" CoVariation((config_path, Normal()),)
+            @test_throws "_DefaultsSimulator does not infer" LatentVariation([Normal()], [config_path], Function[first])
+            # Nothing registered at all: the location-free forms go through `simulator()`, so they
+            # fail the way every other call does before a simulator package is loaded.
+            ModelManager.mm_globals_ref[] = nothing
+            @test_throws AssertionError DiscreteVariation(config_path, [1])
+            @test_throws AssertionError LatentVariation([Normal()], [config_path], Function[first])
+        finally
+            ModelManager.mm_globals_ref[] = saved
+        end
+
+        # The untyped forms also match a call that forgot the target rather than the location;
+        # `XMLPath` has no method for what arrives, and that MethodError is the diagnosis.
+        @test_throws MethodError DiscreteVariation(:config, [1.0, 2.0])
+        @test_throws MethodError DistributedVariation(:config, Normal())
+        @test_throws MethodError LatentVariation([Normal()], rules_path, Function[first])
+
+        @test XMLPath(XMLPath(config_path)) isa XMLPath
     end
 
     @testset "DB-backed integration" begin

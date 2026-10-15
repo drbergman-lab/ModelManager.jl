@@ -31,11 +31,15 @@ written into the file is the backend's concern.
     XML — a different input format could supply its own path type. A backend may add
     convenience constructors that take a plain vector if it wants that ergonomics.
 
-!!! note "location is explicit"
+!!! note "Where the location comes from"
     Every variation needs a `location` (the [project location](@ref project_configuration) the
-    target lives in, e.g. `:config`). ModelManager requires it explicitly. Backends often add
-    convenience constructors that infer the location from the path — but at this layer you
-    pass it yourself.
+    target lives in, e.g. `:config`). Pass it as the first argument, or leave it out and the
+    constructor asks the active simulator for it through
+    [`inferVariationLocation`](@ref)`(sim, target)`: `DiscreteVariation(target, values)` resolves
+    to `DiscreteVariation(location, target, values)` with the location the backend says. The
+    location-free forms also accept the target as a vector of strings. ModelManager itself has no
+    way to map a target to a location, so on a backend that does not implement the hook they throw
+    and the explicit form is the only one.
 
 ## Elementary variations
 
@@ -94,6 +98,13 @@ cv = CoVariation(
     DiscreteVariation(:config, XMLPath(["cell","birth_rate"]), [0.01, 0.03, 0.05]),
     DiscreteVariation(:config, XMLPath(["cell","death_rate"]), [0.001, 0.005, 0.01]),
 )
+
+# The same two, as (target, values) tuples. Each member's location is inferred through the
+# active simulator's `inferVariationLocation`, so this form needs a backend that implements it.
+cv = CoVariation(
+    (["cell","birth_rate"], [0.01, 0.03, 0.05]),
+    (["cell","death_rate"], [0.001, 0.005, 0.01]),
+)
 ```
 
 ## Reparameterizing: LatentVariation
@@ -111,6 +122,18 @@ lv = LatentVariation(
     [lp -> exp(lp[1])],              # map: latent → target value(s)
     ["log_rate"],                    # latent parameter name(s)
     [:config];                       # target location(s)
+    inverse_maps = [tv -> log(tv[1])],
+)
+```
+
+Leave off the locations (and, if you like, the latent names) to have them inferred through the
+active simulator, one location per target:
+
+```julia
+lv = LatentVariation(
+    [Normal(-7, 1)],
+    [["cell", "rate"]],              # targets, as XMLPaths or vectors of strings
+    [lp -> exp(lp[1])];
     inverse_maps = [tv -> log(tv[1])],
 )
 ```
