@@ -7,11 +7,10 @@ Assistant professor working on computational modeling of cancer-immune interacti
 
 | Document | Purpose |
 |----------|---------|
-| [README.md](README.md) | Project overview + **Implementation Status** (what is built, what remains) |
+| [README.md](README.md) | Project overview and roadmap |
 | [PRD.md](PRD.md) | Behavioral specification for every feature — acceptance criteria and edge cases |
-| [progress.md](progress.md) | Session journal: decisions made, approaches rejected, open questions |
 
-Start any feature session by reading the relevant PRD entry and the Implementation Status section of `README.md`.
+Start any feature session by reading the relevant PRD entry.
 
 ## Project Overview
 ModelManager.jl is a simulator-agnostic Julia package providing the generic ABM infrastructure used by [PhysiCellModelManager.jl](https://github.com/drbergman-lab/PhysiCellModelManager.jl) and future simulator packages. It provides:
@@ -130,7 +129,7 @@ teaches the wrong mental model does more damage than the omission it was filling
 The same rule governs `docs/src/man/*.md`: a manual page describes how the code behaves, never
 which cases the current change happened to touch. If a list of "cases worth knowing about" is
 really an inventory of your diff, delete it — the substance belongs in the docstring and the
-reasoning in `progress.md`.
+reasoning in the PR description.
 
 ## Docstring Cross-References
 
@@ -233,12 +232,10 @@ and is internal. Verify against the actual signature.
 1. Generate a **design brief** in the assistant response **before any code changes**.
 2. Wait for human approval.
    1. Update the PRD.md to include new feature or changes.
-   2. Open a new entry in the progress.md and start logging the design process, decisions, and open questions there.
 3. Run `git branch feature/<desc>` to create the branch ref, then tell the user to run `git checkout feature/<desc>` from their terminal before implementation begins.
 4. Implement in the feature branch only.
-5. Update [README.md](README.md) Implementation Status when a feature is complete.
-6. Trim the PRD.md and progress.md to reflect the final implementation before merging.
-7. When done, output the ready-to-run commit command for the user to copy-paste into their terminal.
+5. Trim the PRD.md to reflect the final implementation before merging.
+6. When done, output the ready-to-run commit command for the user to copy-paste into their terminal.
 
 **Design brief template:**
 ```
@@ -275,9 +272,8 @@ A feature is complete when **all** of the following are true:
 1. **Tests pass:** `julia --project=. -e 'using Pkg; Pkg.test()'` runs green.
 2. **Docstrings written:** Every exported function has a docstring. Length is earned by
    non-obvious content, not owed by default — see [Docstring Length](#docstring-length).
-3. **README updated:** Implementation Status section marks the feature as complete.
-4. **PRD reflects reality:** If implementation deviated from the PRD, update the PRD entry.
-5. **No regressions:** Full test suite has no new failures.
+3. **PRD reflects reality:** If implementation deviated from the PRD, update the PRD entry.
+4. **No regressions:** Full test suite has no new failures.
 
 ## ModelManager-Specific Guidance
 ModelManager is **simulator-agnostic** infrastructure. Therefore:
@@ -306,7 +302,7 @@ Deliberate decisions whose symptoms would otherwise look like bugs. Check here b
 
   Setting that pragma has a trap worth reading before you try. `busy_timeout` lives in the connection handle, not the database file: it is not shared between connections to the same file and does not survive a close. ModelManager opens the central connection in **two** places — `initializeModelManager` (`src/globals.jl`) and `initializeDatabase` (`src/database.jl`) — and the second one **closes and reopens** the first, because `initializeModelManager` calls `initializeDatabase` right after opening. Set the pragma only in `initializeModelManager` and it is silently discarded a few lines later, with no error. Apply it through a single `openCentralDB(path)` wrapper used at both sites so it cannot be missed. The three other `SQLite.DB(...)` calls in `src/database.jl` are separate connections to separate files (per-location variations, the post-processing sink) and would each need their own.
 
-  See `progress.md` for the measurements behind why this is off by default.
+- **`DiscreteVariation` does not take string values.** `DiscreteVariation{T}` accepts any element type, but the sampler, `LatentVariation`, and the `par_key` fingerprint (`reinterpret(UInt8, Vector{Float64}(vals))` in `src/variations.jl`) are `Float64`-locked, so a `Vector{String}` fails downstream of the constructor. This is deliberate: a categorical parameter is a separate input folder per value, and folders are already first-class (`InputFolders(inputs; location=folder)`). Generalising three layers for no gain over the folder route was rejected.
 
 ## To-dos
 When setting you off on a task, check this list and assess if any of these should be done first.
