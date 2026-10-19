@@ -4090,6 +4090,23 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test nrow(postProcessingTable(sids)) == 0
             end
 
+            @testset "deleteMonad whose listed simulations are all gone" begin
+                # deleteSimulations(...; delete_supers=false) leaves the monad's simulations.csv
+                # listing the deleted IDs. Deleting that monad later collects those IDs, and the
+                # lookup matches no row: SQLite types an empty result Union{Missing,Int64}, which
+                # once threw a MethodError from the Integer-only cleanup helpers.
+                m    = createTrial(inputs, [DiscreteVariation(:config, xp_x, 503.0)]; n_replicates=2)
+                run(m)
+                sids = simulationIDs(m)
+                @test length(sids) == 2
+                deleteSimulations(sids; delete_supers=false)
+                @test nrow(ModelManager.queryToDataFrame(
+                    "SELECT simulation_id FROM simulations WHERE simulation_id IN ($(join(sids, ",")));")) == 0
+                @test ModelManager.constituentIDs(Monad, m.id) == sids   # the stale listing
+                deleteMonad(m.id)
+                @test !(m.id in monadIDs())
+            end
+
             # ---------- getParameterValue ----------
             @testset "getParameterValue" begin
                 dv = DiscreteVariation(:config, xp_x, 42.0)
