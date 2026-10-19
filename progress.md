@@ -5,6 +5,33 @@
 
 ---
 
+## The `:transition` plot survives a monad the runner deleted (2026-10-19)
+
+A user's `plot(result, :transition; generation=g)` died with `Monad 73999 not in the database.`
+Each generation's `monads.csv` is written before its batch runs, for crash safety, and never
+rewritten; a monad that then loses every simulation is deleted by the runner but stays in the
+record. The two rejected-proposal loaders in `src/calibration/visualize.jl` subtracted the
+accepted IDs from that record and called `Monad(id)` on the rest, so one such monad took the
+whole plot down. The accessors had already been hardened against exactly this —
+`monadIDs(calibration)` filters through `_survivingMonadIDs` — but the plot path never was.
+
+### Decided
+- **Filter, do not rewrite the record.** Both loaders now pass the rejected IDs through
+  `_survivingMonadIDs` before constructing monads. The record keeps listing what the generation
+  *evaluated* — that is what `calibrationMonadIDs` documents and what the AUTOINCREMENT to-do in
+  `CLAUDE.md` relies on for diagnosing aliased IDs — and a monad with no completed simulation has
+  no parameter values to draw anyway, so dropping it loses nothing the plot could have shown.
+- **No note on the plot.** A deleted rejected monad is indistinguishable from a proposal that was
+  never recorded; the existing "rejected proposals unavailable" note already covers the case
+  where nothing survives.
+
+### Open
+- The record still cannot tell a deleted monad from a reused ID (see the AUTOINCREMENT to-do).
+  Persisting the runner's `without_success` set per generation would make that exact; it is
+  out of scope here.
+
+---
+
 ## Location-free constructors route through the active simulator (2026-10-13)
 
 `CoVariation`'s tuple constructors, `CoVariation((xml_path, values), ...)`, build their members

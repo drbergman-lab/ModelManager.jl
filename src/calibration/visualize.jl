@@ -231,6 +231,11 @@ function _buildDbToDisplayMappingFromTOML(toml_path::String)
 end
 
 # Lazy-load rejected proposals for a disk-resident Calibration (no inverse_maps available).
+#! The monads record lists every monad the generation *evaluated*, and it is written before the batch
+#! runs and never rewritten. A monad that then lost every simulation is deleted by the runner, so its
+#! ID is still in the record but `Monad(id)` throws for it — which took the whole plot down with
+#! `Monad N not in the database.` Such a monad is a rejected proposal with no value to show, so it is
+#! dropped here, exactly as `monadIDs(calibration)` drops it. Same in `_lazyLoadRejected` below.
 function _lazyLoadRejectedFromDisk(cal::Calibration, t_next::Int, max_nr_populations::Int,
                                     accepted_monad_ids, pnames::Vector{String},
                                     mapping::Dict{String,String})
@@ -242,7 +247,7 @@ function _lazyLoadRejectedFromDisk(cal::Calibration, t_next::Int, max_nr_populat
 
     all_ids      = constituentIDs(monads_path)
     accepted_set = Set(accepted_monad_ids)
-    rejected_ids = [id for id in all_ids if id ∉ accepted_set]
+    rejected_ids = _survivingMonadIDs([id for id in all_ids if id ∉ accepted_set])
     isempty(rejected_ids) && return nothing
 
     sim_df = simulationsTable(Monad.(rejected_ids); remove_constants=false, short_names=false)
@@ -290,7 +295,7 @@ function _lazyLoadRejected(result::ABCResult, t_next::Int)
 
     all_ids      = constituentIDs(monads_path)
     accepted_set = Set(result.generations[t_next].monad_ids)
-    rejected_ids = [id for id in all_ids if id ∉ accepted_set]
+    rejected_ids = _survivingMonadIDs([id for id in all_ids if id ∉ accepted_set])
     isempty(rejected_ids) && return nothing
 
     sim_df = simulationsTable(Monad.(rejected_ids); remove_constants=false, short_names=false)
