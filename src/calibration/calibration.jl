@@ -543,7 +543,7 @@ end
 #! a trial. Kept as explicit forwards instead of an `AbstractMMOutput` supertype: the three result
 #! wrappers in the package name their payload differently (`MMOutput.trial`,
 #! `GSASampling.sampling`, `ABCResult.calibration`), so unifying them needs a `resultTarget`
-#! accessor for the forwards to be written against, not just a shared supertype. See progress.md.
+#! accessor for the forwards to be written against, not just a shared supertype.
 Sampling(result::ABCResult) = Sampling(result.calibration)
 Sampling(result::ABCResult, generation::Integer) = Sampling(result.calibration, generation)
 
