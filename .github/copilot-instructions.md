@@ -64,9 +64,8 @@ src/
 - **Runner/HPC layer**: local parallel execution and SLURM-oriented helpers live here, but without simulator-specific runtime assumptions.
 
 ### Repository-Level Guidance
-- `README.md` contains the project overview and implementation status.
+- `README.md` contains the project overview and roadmap.
 - `PRD.md` is the behavioral specification for the package.
-- `progress.md` is the running design log for in-flight work.
 - `.github/workflows/` contains CI, CompatHelper, and TagBot automation.
 
 ## Scope Boundaries
@@ -96,7 +95,7 @@ When changing behavior, prefer moving simulator-specific work out of ModelManage
 1. Confirm registry setup and instantiate the environment.
 2. Run `julia --project=. -e 'using Pkg; Pkg.test()'` when the change could affect package behavior.
 3. Keep changes simulator-agnostic and verify they do not cross the `AbstractSimulator` boundary.
-4. Update `README.md`, `PRD.md`, or `progress.md` when the change alters implementation status, intended behavior, or design history.
+4. Update `PRD.md` when the change alters intended behavior.
 
 ## Working Rules for This Repo
 
@@ -110,9 +109,8 @@ When changing behavior, prefer moving simulator-specific work out of ModelManage
 ## Quick Development Workflow
 
 1. Read `README.md` and the relevant section of `PRD.md` before making behavioral changes.
-2. Check `progress.md` for active design context if the task is part of ongoing feature work.
-3. Implement generic infrastructure changes in `src/` and keep simulator-specific behavior behind interface dispatch.
-4. Validate with `Pkg.test()` when appropriate.
-5. Update status/specification documents when the implementation meaningfully changes.
+2. Implement generic infrastructure changes in `src/` and keep simulator-specific behavior behind interface dispatch.
+3. Validate with `Pkg.test()` when appropriate.
+4. Update `PRD.md` when the implementation meaningfully changes.
 
 **Use these instructions as the default mental model for this repository: ModelManager.jl is generic infrastructure, and simulator packages are the integration layer.**

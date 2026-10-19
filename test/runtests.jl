@@ -9462,8 +9462,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             sim_ids = sort(simulationIDs(sampling))
 
             # Creating the same configuration twice must reuse rows, not duplicate them.
-            # These find-or-insert paths run without a transaction; see progress.md if
-            # duplicates ever show up in samplings/trials.
+            # These find-or-insert paths run without a transaction; see Known Trade-offs in
+            # CLAUDE.md if duplicates ever show up in samplings/trials.
             n_samplings = ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM samplings;").n[1]
             n_monads = ModelManager.queryToDataFrame("SELECT COUNT(*) AS n FROM monads;").n[1]
             again = createTrial(inputs, [DiscreteVariation(:config, xp, [101.0, 102.0])]; n_replicates=2)
