@@ -31,7 +31,9 @@ function deleteSimulations(simulation_ids::AbstractVector{<:Union{Integer,Missin
     where_stmt, params = buildWhereClause("simulations", simulation_ids, filters)
     stmt_str = constructSelectQuery("simulations", where_stmt)
     sim_df = stmtToDataFrame(stmt_str, params)
-    simulation_ids = sim_df.simulation_id
+    #! An empty result comes back typed Union{Missing,Int64}, which the Integer-only helpers
+    #! below would reject; nothing below needs the column type, so pin it to Int here.
+    simulation_ids = Vector{Int}(sim_df.simulation_id)
 
     DBInterface.execute(centralDB(), "DELETE FROM simulations WHERE simulation_id IN ($(join(simulation_ids, ",")));")
 

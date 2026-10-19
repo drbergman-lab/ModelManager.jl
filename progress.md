@@ -5,6 +5,30 @@
 
 ---
 
+## `deleteMonad` threw when every listed simulation was already gone (2026-10-19)
+
+`deleteMonad(135685:136084)` failed with `MethodError: no method matching
+_deletePostProcessingRows(::Vector{Union{Missing, Int64}})`. The monads' `simulations.csv`
+files still listed simulations that `deleteSimulations(...; delete_supers=false)` had removed
+from the table (that path returns before rewriting parent CSVs; see the `AUTOINCREMENT` to-do
+in CLAUDE.md). `deleteMonad` collected those IDs and `deleteSimulations` looked them up, and
+SQLite.jl types a result with **no rows** as `Union{Missing,Int64}` (a non-empty one is `Int64`),
+so the column fed `_deletePostProcessingRows` and `deleteTagsFor`, whose
+`AbstractVector{<:Integer}` signatures rejected it. Both are no-ops on an empty vector; only
+dispatch failed. The existing sink test deleted two of a sampling's four simulations and then
+cascaded, so the lookup always matched something and the empty case went untested.
+
+### Decided
+- **Pin the column to `Vector{Int}` at the DataFrame boundary in `deleteSimulations`**, not
+  widen the helpers to accept `Missing`. The helpers' signatures are right; the DataFrame type
+  is an artifact of SQLite.jl's empty-result typing, so it is normalized where it is produced.
+- The monad rows and folders were already deleted before the throw, so the user's monads are
+  gone; what the error skipped was the `delete_supers` sweep of now-empty samplings and trials.
+  Re-running `deleteMonad` on the same range after the fix performs that sweep (the row deletes
+  and folder removals are idempotent).
+
+---
+
 ## Location-free constructors route through the active simulator (2026-10-13)
 
 `CoVariation`'s tuple constructors, `CoVariation((xml_path, values), ...)`, build their members
