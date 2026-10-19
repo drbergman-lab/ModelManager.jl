@@ -65,8 +65,8 @@ that may itself be invoked inside one.
 statement is already atomic, and an `INSERT OR IGNORE` against a `UNIQUE`
 constraint is self-correcting, since a losing racer's lookup finds the winner's
 row. `"EXCLUSIVE"` exists as an escape hatch for a find-or-insert that has no such
-constraint to fall back on — see the note in `progress.md` on duplicate `samplings`
-or `trials` rows.
+constraint to fall back on — the `samplings` and `trials` inserts — where it holds
+the write lock across both the lookup and the insert.
 
 !!! note
     SQLite holds locks per *connection*, and ModelManager uses one per session, so
