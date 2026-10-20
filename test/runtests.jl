@@ -1585,6 +1585,32 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @test hidden(RecipesBase.apply_recipe(Dict{Symbol,Any}(), td)) == upper
     end
 
+    @testset "recipe styling is overridable" begin
+        df = DataFrame(a=randn(20), b=randn(20))
+        w  = fill(1 / 20, 20)
+        scatters(series) = [s.plotattributes for s in series if s.plotattributes[:seriestype] === :scatter]
+
+        #! The aggregated transition bubbles once carried a 1-px stroke that swallowed a marker at the
+        #! 2-px size floor, so every marker series must default to no stroke...
+        for aggregate in (true, false)
+            td = ModelManager._TransitionData(df, w, df, w, df, names(df), 20, "", true, aggregate)
+            applied = RecipesBase.apply_recipe(Dict{Symbol,Any}(), td)
+            sc = scatters(applied)
+            @test !isempty(sc)
+            @test all(pa -> pa[:markerstrokewidth] == 0, sc)
+            @test all(s -> s.plotattributes[:legend] == false, applied)
+
+            #! ...and a keyword passed to `plot` must win over every series' default.
+            kw = Dict{Symbol,Any}(:markerstrokewidth => 1, :markercolor => :white, :legend => :topleft)
+            forced = RecipesBase.apply_recipe(kw, td)
+            @test all(pa -> pa[:markerstrokewidth] == 1 && pa[:markercolor] === :white, scatters(forced))
+            @test all(s -> s.plotattributes[:legend] === :topleft, forced)
+        end
+
+        corner = RecipesBase.apply_recipe(Dict{Symbol,Any}(:markersize => 7), ModelManager._CornerPlotData(df, w))
+        @test all(pa -> pa[:markersize] == 7 && pa[:markerstrokewidth] == 0, scatters(corner))
+    end
+
     @testset "samplePosterior" begin
         cal    = Calibration(1)
         method = ABCSMC()

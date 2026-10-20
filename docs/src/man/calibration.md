@@ -472,6 +472,20 @@ the database, so you can plot a finished run without re-running it:
 plot(Calibration(42), :distances; generation=3)
 ```
 
+### Restyling a recipe
+
+Every recipe sets its colours, marker sizes, opacities and line widths as defaults, so a keyword
+passed to `plot` overrides them. The value applies to every series in the figure, which is what you
+want for a global change and worth knowing when a recipe colours its series apart:
+
+```julia
+plot(result, :transition; markerstrokewidth=1)    # outline the proposal bubbles (none by default)
+plot(result; markersize=5, markeralpha=0.8)       # larger, more opaque corner-plot points
+plot(result, :transition; markercolor=:white)     # accepted and rejected now share a colour
+```
+
+Layout, panel assignment, per-panel axis labels and legend labels are fixed by the recipe.
+
 ### Choosing which parameters to draw
 
 Every recipe with a parameter axis (the corner plot, `:ridgeline` and `:transition`) takes
