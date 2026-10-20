@@ -422,6 +422,10 @@ with a weighted scatter (opacity ∝ weight).
 - `:cdf` — the sampler's CDF coordinates in [0, 1], named `cdf(name)`.
 - `:all` — every column above, each once.
 - a String or vector of Strings — exactly those columns, from any group, in that order.
+Cosmetic series attributes (`markersize`, `markerstrokewidth`, `markercolor`, `markeralpha`,
+`linecolor`, `linewidth`, `linealpha`, `fillalpha`, `legend`, `plot_title`) are defaults: a keyword
+passed to `plot` overrides them for every series in the figure. Markers draw no stroke unless
+`markerstrokewidth` is given.
 """
 @recipe function f(cpd::_CornerPlotData)
     df      = cpd.df
@@ -431,7 +435,7 @@ with a weighted scatter (opacity ∝ weight).
     d == 0 && error("No parameters to plot.")
 
     layout := (d, d)
-    legend := false
+    legend --> false
 
     for i in 1:d
         for j in 1:d
@@ -462,9 +466,9 @@ with a weighted scatter (opacity ∝ weight).
                 @series begin
                     subplot          := sp
                     seriestype       := :scatter
-                    markeralpha      := alpha_vals
-                    markersize       := 3
-                    markerstrokewidth := 0
+                    markeralpha      --> alpha_vals
+                    markersize       --> 3
+                    markerstrokewidth --> 0
                     xj, xi
                 end
             else
@@ -524,7 +528,7 @@ end
     R = length(all_dfs)
 
     layout := (1, d)
-    legend := false
+    legend --> false
 
     offset_factor = 0.35   # <1 → ridges overlap noticeably
 
@@ -546,8 +550,8 @@ end
                 subplot    := j
                 seriestype := :path
                 fillrange  := offsets[r]
-                fillalpha  := alpha_val * 0.4
-                linealpha  := alpha_val
+                fillalpha  --> alpha_val * 0.4
+                linealpha  --> alpha_val
                 xlabel     := param_names[j]
                 ylabel     := j == 1 ? "generation" : ""
                 yticks     := (tick_positions, tick_labels)
@@ -562,8 +566,8 @@ end
 @recipe function f(cs::ConvergenceSummary)
     df = cs.df
     layout := (3, 1)
-    legend := false
-    link   := :x
+    legend --> false
+    link   --> :x
 
     @series begin
         subplot    := 1
@@ -613,9 +617,9 @@ end
 
     w_ref = 1.0 / td.pop_size
     layout := (d, d)
-    legend := false
+    legend --> false
 
-    isempty(td.note) || (plot_title := "Generation transition" * td.note)
+    isempty(td.note) || (plot_title --> "Generation transition" * td.note)
 
     for i in 1:d
         for j in 1:d
@@ -637,10 +641,10 @@ end
                     @series begin
                         subplot          := sp
                         seriestype       := :scatter
-                        markersize       := 2
-                        markerstrokewidth := 0
-                        markercolor      := :grey
-                        markeralpha      := 0.5
+                        markersize       --> 2
+                        markerstrokewidth --> 0
+                        markercolor      --> :grey
+                        markeralpha      --> 0.5
                         kdei, zeros(length(kdei))
                     end
                 end
@@ -653,9 +657,9 @@ end
                         @series begin
                             subplot          := sp
                             seriestype       := :path
-                            linecolor        := :green
-                            linealpha        := 0.8
-                            linewidth        := 2 + 4 * h / max(w_ref * length(acci), 1e-12)
+                            linecolor        --> :green
+                            linealpha        --> 0.8
+                            linewidth        --> 2 + 4 * h / max(w_ref * length(acci), 1e-12)
                             [xi, xi], [-0.05 * maximum(k.density), 0.0]
                         end
                     end
@@ -663,10 +667,10 @@ end
                     @series begin
                         subplot          := sp
                         seriestype       := :scatter
-                        markersize       := 3
-                        markerstrokewidth := 0
-                        markercolor      := :green
-                        markeralpha      := 0.5
+                        markersize       --> 3
+                        markerstrokewidth --> 0
+                        markercolor      --> :green
+                        markeralpha      --> 0.5
                         acci, fill(-0.025 * maximum(k.density), length(acci))
                     end
                 end
@@ -680,9 +684,9 @@ end
                             @series begin
                                 subplot          := sp
                                 seriestype       := :path
-                                linecolor        := :red
-                                linealpha        := 0.7
-                                linewidth        := 1 + 3 * cnt / max(length(reji), 1)
+                                linecolor        --> :red
+                                linealpha        --> 0.7
+                                linewidth        --> 1 + 3 * cnt / max(length(reji), 1)
                                 [xi, xi], [0.0, -0.05 * maximum(k.density)]
                             end
                         end
@@ -690,10 +694,10 @@ end
                         @series begin
                             subplot          := sp
                             seriestype       := :scatter
-                            markersize       := 3
-                            markerstrokewidth := 0
-                            markercolor      := :red
-                            markeralpha      := 0.4
+                            markersize       --> 3
+                            markerstrokewidth --> 0
+                            markercolor      --> :red
+                            markeralpha      --> 0.4
                             reji, fill(-0.05 * maximum(k.density), length(reji))
                         end
                     end
@@ -714,10 +718,10 @@ end
                     @series begin
                         subplot          := sp
                         seriestype       := :scatter
-                        markersize       := 2
-                        markerstrokewidth := 0
-                        markercolor      := :grey
-                        markeralpha      := 0.4
+                        markersize       --> 2
+                        markerstrokewidth --> 0
+                        markercolor      --> :grey
+                        markeralpha      --> 0.4
                         kdej, kdei
                     end
                 end
@@ -734,20 +738,20 @@ end
                         @series begin
                             subplot          := sp
                             seriestype       := :scatter
-                            markersize       := msizes
-                            markerstrokewidth := 1
-                            markercolor      := :red
-                            markeralpha      := 0.5
+                            markersize       --> msizes
+                            markerstrokewidth --> 0
+                            markercolor      --> :red
+                            markeralpha      --> 0.5
                             rdf.x, rdf.y
                         end
                     else
                         @series begin
                             subplot          := sp
                             seriestype       := :scatter
-                            markersize       := 4
-                            markerstrokewidth := 0
-                            markercolor      := :red
-                            markeralpha      := 0.3
+                            markersize       --> 4
+                            markerstrokewidth --> 0
+                            markercolor      --> :red
+                            markeralpha      --> 0.3
                             rejj, reji
                         end
                     end
@@ -763,10 +767,10 @@ end
                     @series begin
                         subplot          := sp
                         seriestype       := :scatter
-                        markersize       := msizes
-                        markerstrokewidth := 1
-                        markercolor      := :green
-                        markeralpha      := 0.7
+                        markersize       --> msizes
+                        markerstrokewidth --> 0
+                        markercolor      --> :green
+                        markeralpha      --> 0.7
                         adf.x, adf.y
                     end
                 else
@@ -774,10 +778,10 @@ end
                     @series begin
                         subplot          := sp
                         seriestype       := :scatter
-                        markersize       := 4
-                        markerstrokewidth := 0
-                        markercolor      := :green
-                        markeralpha      := alpha_acc
+                        markersize       --> 4
+                        markerstrokewidth --> 0
+                        markercolor      --> :green
+                        markeralpha      --> alpha_acc
                         accj, acci
                     end
                 end
@@ -929,8 +933,8 @@ end
         @series begin
             seriestype := :bar
             bar_width  := step
-            linewidth  := 0
-            fillcolor  := :seagreen
+            linewidth  --> 0
+            fillcolor  --> :seagreen
             label      := "passed ε ($(Int(sum(dd.accepted_counts))))"
             mids, dd.accepted_counts
         end
@@ -939,8 +943,8 @@ end
         @series begin
             seriestype := :bar
             bar_width  := step
-            linewidth  := 0
-            fillcolor  := :indianred
+            linewidth  --> 0
+            fillcolor  --> :indianred
             label      := "rejected ($(Int(sum(dd.rejected_counts))))"
             mids, dd.rejected_counts
         end
@@ -950,9 +954,9 @@ end
         #! recipe does not require a particular backend's series types.
         @series begin
             seriestype := :path
-            linestyle  := :dash
-            linewidth  := 2
-            linecolor  := :black
+            linestyle  --> :dash
+            linewidth  --> 2
+            linecolor  --> :black
             label      := "threshold"
             top = maximum(vcat(dd.accepted_counts, dd.rejected_counts); init=1.0)
             [dd.epsilon_threshold, dd.epsilon_threshold], [0.0, top]
@@ -1005,6 +1009,10 @@ Dispatch to specialized visualization recipes for `ABCResult`:
 `parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: `:latent`
 (default), `:target`, `:cdf`, `:all`, or a String or vector of Strings naming columns.
 `:distances` has no parameter axis and rejects it.
+Cosmetic series attributes (`markersize`, `markerstrokewidth`, `markercolor`, `markeralpha`,
+`linecolor`, `linewidth`, `linealpha`, `fillalpha`, `legend`, `plot_title`) are defaults: a keyword
+passed to `plot` overrides them for every series in the figure. Markers draw no stroke unless
+`markerstrokewidth` is given.
 """
 @recipe function f(result::ABCResult, style::Symbol;
                    generation          = nothing,
@@ -1099,6 +1107,10 @@ Dispatch to specialized visualization recipes for a disk-resident `Calibration`:
 `parameters` applies to `:ridgeline` and `:transition` exactly as to the corner plot: `:latent`
 (default), `:target`, `:cdf`, `:all`, or a String or vector of Strings naming columns.
 `:distances` has no parameter axis and rejects it.
+Cosmetic series attributes (`markersize`, `markerstrokewidth`, `markercolor`, `markeralpha`,
+`linecolor`, `linewidth`, `linealpha`, `fillalpha`, `legend`, `plot_title`) are defaults: a keyword
+passed to `plot` overrides them for every series in the figure. Markers draw no stroke unless
+`markerstrokewidth` is given.
 """
 @recipe function f(cal::Calibration, style::Symbol;
                    generation           = nothing,

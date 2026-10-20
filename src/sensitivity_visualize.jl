@@ -87,7 +87,7 @@ end
     for g in d.groups
         @series begin
             label     := g.label
-            fillalpha := g.fillalpha
+            fillalpha --> g.fillalpha
             isnothing(g.yerror) || (yerror := g.yerror)
             g.values
         end
