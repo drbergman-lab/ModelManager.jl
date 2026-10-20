@@ -4245,6 +4245,53 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     rm(inflight; recursive=true, force=true)
                 end
 
+                # A generation's monads record is written before its batch runs and never rewritten,
+                # so a monad that then lost every simulation is still listed there after the runner
+                # deleted it. The rejected-proposal loaders called `Monad(id)` on every listed ID
+                # and took the whole :transition plot down with `Monad N not in the database.`
+                # Both loaders — from disk and from an in-memory result — drop such an ID instead.
+                t_gone  = last(done) + 1
+                gone    = joinpath(gen_dir, lpad(t_gone, ndigits(3), '0'))
+                real_id = first(ModelManager.calibrationMonadIDs(result.calibration))
+                no_such = maximum(monadIDs()) + 1_000_000
+                n_real  = length(simulationIDs(Monad(real_id)))
+                mkpath(gone)
+                write(joinpath(gone, "monads.csv"), "$(real_id)\n$(no_such)\n")
+                try
+                    mapping = ModelManager._buildDbToDisplayMappingFromTOML(
+                        joinpath(ModelManager.calibrationFolder(result.calibration), "parameters.toml"))
+                    from_disk(ids) = (write(joinpath(gone, "monads.csv"), join(ids, "\n") * "\n");
+                                      ModelManager._lazyLoadRejectedFromDisk(result.calibration, t_gone, 3,
+                                                                              Int[], [pname], mapping))
+                    rej = from_disk([real_id, no_such])
+                    @test rej isa DataFrame
+                    @test names(rej) == [pname]
+                    @test nrow(rej) == n_real
+                    # Only the deleted monad listed: nothing to show, and still no throw.
+                    @test isnothing(from_disk([no_such]))
+
+                    # The in-memory result reaches the same record when it holds no rejected
+                    # proposals of its own. Its accepted IDs are nonexistent monads, one per particle,
+                    # so every listed ID counts as rejected.
+                    g_last = result.generations[end]
+                    g_gone = GenerationResult(t_gone, g_last.particles, g_last.weights, g_last.distances,
+                                              g_last.max_epsilon_accepted, g_last.n_evaluations,
+                                              fill(no_such + 1, nrow(g_last.particles)),
+                                              g_last.acceptance_rate, g_last.ess, nothing)
+                    res_gone = ABCResult(result.calibration, [result.generations; g_gone],
+                                         result.parameters, result.method)
+                    in_memory() = RecipesBase.apply_recipe(Dict{Symbol,Any}(:parameters => pname,
+                                                                            :generation => last(done)),
+                                                           res_gone, :transition)[1].args[1]
+                    @test isnothing(in_memory().rej_df)
+                    write(joinpath(gone, "monads.csv"), "$(real_id)\n$(no_such)\n")
+                    td = in_memory()
+                    @test names(td.rej_df) == [pname]
+                    @test nrow(td.rej_df) == n_real
+                finally
+                    rm(gone; recursive=true, force=true)
+                end
+
                 # Draws become a runnable Sampling. A plain draw resolves to the monad it came
                 # from, so nothing new is created ...
                 cal_monads = ModelManager.calibrationMonadIDs(result.calibration)
