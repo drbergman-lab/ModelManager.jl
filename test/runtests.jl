@@ -9791,7 +9791,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         shim = mktempdir()
         write(joinpath(shim, "sbatch"), """
             #!/bin/sh
-            echo "\$@" >> "$shim/sbatch.log"
+            # The job script is the last argument; its sentinel line goes on the same log line,
+            # since the simulation's job.sh is overwritten by the next submission.
+            for a in "\$@"; do script="\$a"; done
+            echo "\$@ \$(grep '^mm_sentinel=' "\$script" 2>/dev/null)" >> "$shim/sbatch.log"
             [ -e "$shim/sbatch.fail" ] && { echo "boom: bad partition" >&2; exit 1; }
             if [ -e "$shim/sbatch.transient" ]; then
               n=\$(cat "$shim/sbatch.transient")
@@ -9868,7 +9871,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             setHPCCompletionOptions(poll_interval=0.02, reap_interval=0.05, grace_period=0.0)
             sim = Simulation(InputFolders(config="default"))
 
-            # The test plays the job. The sentinel path is baked into the `--wrap` text sbatch
+            # The test plays the job. The sentinel path is baked into the job script sbatch
             # received, so read it back from the shim's log rather than guessing. Waiting for the
             # submission to appear there is also what makes publishing race-free: a real job cannot
             # write its sentinel before sbatch has returned either -- and on a cold JIT the worker's
@@ -9878,14 +9881,14 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 timedwait(() -> isfile(log) && count(!isempty, readlines(log)) >= nth, 10.0) === :ok ||
                     error("submission $(nth) never reached sbatch")
                 argv = filter(!isempty, readlines(log))[nth]
-                # The wrap binds the path once, single-quoted, then the trap refers to the variable.
+                # The script binds the path once, single-quoted, then the trap refers to the variable.
                 m = match(r"mm_sentinel='([^']*)'", argv)
                 isnothing(m) && error("no sentinel path in sbatch argv: $(argv)")
                 path = String(m.captures[1])
                 # Guard against a helper that parses the wrap wrongly: a relative path here would
                 # make _publish write into the repo working directory instead of the test project.
                 # That is exactly what happened once when this regex went stale against a changed
-                # wrap format and captured the literal "\${mm_sentinel}".
+                # script format and captured the literal "\${mm_sentinel}".
                 isabspath(path) || error("parsed a non-absolute sentinel path: $(repr(path))")
                 return path
             end
@@ -10338,32 +10341,90 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test flags[1] == "sbatch"
                 @test "--parsable" in flags
                 @test !("--wait" in flags)
+                @test !any(startswith("--wrap"), flags)
                 sim_folder = MM.trialFolder(Simulation, sim.id)
                 @test "--output=$(joinpath(sim_folder, "output.log"))" in flags
                 @test "--error=$(joinpath(sim_folder, "output.err"))" in flags
                 @test "--chdir=$(MM.simulatorDir(TestSimulator()))" in flags
-                wrap = only(filter(f -> startswith(f, "--wrap="), flags))
-                @test occursin("trap ", wrap)
-                @test occursin(sentinel, wrap)
-                @test endswith(wrap, "echo hello")
+                # The job script is the last argument and is left in the simulation's folder.
+                @test flags[end] == joinpath(sim_folder, "job.sh")
+                script = read(flags[end], String)
+                @test startswith(script, "#!/bin/bash\n")
+                @test occursin(MM._shQuote(sentinel), script)
+                @test occursin("\necho hello <&0 &\n", script)
                 # A Cmd carrying its own dir is honored, the same as the local path does.
                 flags2 = collect(MM._prepareHPCSubmitCommand(Cmd(`echo hi`; dir="/tmp"), sim.id, sentinel).exec)
                 @test "--chdir=/tmp" in flags2
             end
 
-            @testset "the generated trap really records exit codes under /bin/sh" begin
+            # Runs `script` as SLURM would, in its own process group with SIGINT not inherited as
+            # ignored (a shell cannot trap a signal ignored on entry), and optionally sends `sig`
+            # to the whole group, the way `scancel` does, once the command has created `ready`.
+            # Signalled any earlier, the script may not have installed its traps yet.
+            function _runJobScript(script::String; sig::Union{Nothing,String}=nothing, ready::String="")
+                launcher = `perl -e '$SIG{INT}="DEFAULT"; setpgrp(0,0); exec @ARGV' bash $script`
+                p = run(pipeline(ignorestatus(launcher); stderr=devnull); wait=false)
+                if !isnothing(sig)
+                    timedwait(() -> isfile(ready), 20.0) === :ok || error("the job script never started its command")
+                    run(`kill -$sig -- -$(getpid(p))`)
+                end
+                wait(p)
+                return p
+            end
+
+            @testset "the job script records exit codes, and a signal is never a success" begin
+                dir = mktempdir()
                 for ec in (0, 4)
-                    sentinel = joinpath(done_dir, "trap$(ec)")
-                    cmd = MM._prepareHPCSubmitCommand(`sh -c "exit $(ec)"`, sim.id, sentinel)
-                    wrap = only(filter(f -> startswith(f, "--wrap="), collect(cmd.exec)))[length("--wrap=")+1:end]
-                    script = joinpath(mktempdir(), "job.sh")
-                    write(script, "#!/bin/sh\n$(wrap)\n")
-                    p = run(ignorestatus(`sh $(script)`))                   # no SLURM_JOB_ID needed any more
+                    sentinel = joinpath(dir, "ec$(ec)")
+                    script = joinpath(dir, "ec$(ec).sh")
+                    write(script, MM._jobScript("sh -c 'exit $(ec)'", sentinel))
+                    p = _runJobScript(script)
                     @test p.exitcode == ec                                  # SLURM still sees the real status
                     @test strip(read(sentinel, String)) == string(ec)
                     @test !isfile(sentinel * ".tmp")                        # staged name did not leak
-                    rm(sentinel; force=true)
                 end
+                # `scancel` and a time limit send TERM to every process in the job. Under bash,
+                # an EXIT trap that recorded `$?` wrote 0 here, and the job counted as a success.
+                # A trapped signal is the command's exit code; an untrapped one is `killed`, which
+                # reads as a failure. Neither can be a 0.
+                for (sig, expected) in (("TERM", "143"), ("INT", "130"), ("HUP", "killed"))
+                    sentinel = joinpath(dir, "sig$(sig)")
+                    script = joinpath(dir, "sig$(sig).sh")
+                    ready = joinpath(dir, "ready$(sig)")
+                    write(script, MM._jobScript("sh -c 'touch $(ready); exec sleep 30'", sentinel))
+                    p = _runJobScript(script; sig=sig, ready=ready)
+                    @test !success(p)            # an untrapped signal kills bash: termsignal, not exitcode
+                    @test strip(read(sentinel, String)) == expected
+                    @test MM._readSentinel(sentinel) != 0
+                end
+                # A cancel in the window before the command has a PID must not let the script go on
+                # to start it: a command quick enough to finish before SLURM's SIGKILL would record
+                # 0. The window is widened here by pausing the script just ahead of the launch.
+                for sig in ("TERM", "INT")
+                    sentinel = joinpath(dir, "early$(sig)")
+                    ready = joinpath(dir, "earlyready$(sig)")
+                    started = joinpath(dir, "earlystarted$(sig)")
+                    script = joinpath(dir, "early$(sig).sh")
+                    body = MM._jobScript("touch $(started)", sentinel)
+                    write(script, replace(body, "touch $(started) <&0 &" => "touch $(ready); sleep 30\ntouch $(started) <&0 &"))
+                    p = _runJobScript(script; sig=sig, ready=ready)
+                    @test !success(p)
+                    @test strip(read(sentinel, String)) == "killed"
+                    @test !isfile(started)
+                end
+            end
+
+            @testset "the job script passes the job's stdin to the command" begin
+                # bash gives a backgrounded command /dev/null unless told otherwise, which would
+                # silently empty a simulation's `sbatch --input`.
+                dir = mktempdir()
+                input = joinpath(dir, "input.txt"); write(input, "from stdin\n")
+                copied = joinpath(dir, "copied.txt")
+                script = joinpath(dir, "job.sh")
+                write(script, MM._jobScript("sh -c 'cat > $(copied)'", joinpath(dir, "s")))
+                run(pipeline(`bash $script`; stdin=input))
+                @test read(copied, String) == "from stdin\n"
+                @test strip(read(joinpath(dir, "s"), String)) == "0"
             end
 
             @testset "the sentinel path is shell-quoted, not interpolated" begin
@@ -10377,17 +10438,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test MM._shQuote("/it's") == raw"'/it'\''s'"
                 hostile = ["plain", "has space", raw"dollar$USER", "quote\"d", raw"back`tick`",
                            raw"it's", "semi;rm -rf x"]
-                for shell in ("sh", "dash")
-                    Sys.which(shell) === nothing && continue
-                    for name in hostile
-                        dir = mktempdir(); target = joinpath(dir, name)
-                        wrap = MM._sentinelWrap("exit 7", target)
-                        script = joinpath(dir, "job.sh"); write(script, "#!/bin/sh\n$(wrap)\n")
-                        pr = run(ignorestatus(`$shell $script`))
-                        @test pr.exitcode == 7                       # status still the job's
-                        @test isfile(target)                         # written to the literal path
-                        @test strip(read(target, String)) == "7"
-                    end
+                for name in hostile
+                    dir = mktempdir(); target = joinpath(dir, name)
+                    script = joinpath(dir, "job.sh"); write(script, MM._jobScript("sh -c 'exit 7'", target))
+                    pr = run(ignorestatus(`bash $script`))
+                    @test pr.exitcode == 7                       # status still the job's
+                    @test isfile(target)                         # written to the literal path
+                    @test strip(read(target, String)) == "7"
                 end
             end
 
@@ -10398,7 +10455,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 flags = collect(MM._prepareHPCSubmitCommand(`echo hi`, sim.id, joinpath(done_dir, "s")).exec)
                 @test "--cpus-per-task=4" in flags
                 @test "--comment=two words" in flags                 # one argv element, no quotes
-                # Only the option flags: --wrap legitimately contains quotes of its own.
+                # Only the option flags.
                 opts = filter(f -> startswith(f, "--cpus-per-task=") || startswith(f, "--comment="), flags)
                 @test length(opts) == 2
                 @test !any(f -> occursin("\"", f), opts)
