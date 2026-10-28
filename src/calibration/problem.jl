@@ -627,8 +627,8 @@ end
 ################## createTrial from posterior draws ##################
 
 """
-    createTrial(result::ABCResult, draws::DataFrame; n_replicates, use_previous=true) → Sampling
-    createTrial(calibration::Calibration, draws::DataFrame; n_replicates, use_previous=true) → Sampling
+    createTrial(result::ABCResult, draws::DataFrame; n_replicates, use_previous=true, problem=nothing) → Sampling
+    createTrial(calibration::Calibration, draws::DataFrame; n_replicates, use_previous=true, problem=nothing) → Sampling
 
 Turn a frame of posterior draws from [`samplePosterior`](@ref) into a runnable [`Sampling`](@ref)
 over the run's inputs, one monad per distinct parameter set, ready for [`run`](@ref).
@@ -642,8 +642,10 @@ their `monad_id` column directly.
 
 The inputs, reference variation and default `n_replicates` are read from the run's `problem.jld2`.
 Only each parameter's targets and types are needed, not its maps, so this also works for a
-`LatentVariation` saved with anonymous maps. `draws` must carry the parameter columns
-`samplePosterior` returned; other columns such as `monad_id` are ignored.
+`LatentVariation` saved with anonymous maps. When `problem.jld2` cannot be read back -- a map that
+was a closure in the saving session -- pass the run's [`CalibrationProblem`](@ref) as `problem` and
+it is used instead of the file. `draws` must carry the parameter columns `samplePosterior` returned;
+other columns such as `monad_id` are ignored.
 
 # Examples
 ```julia
@@ -652,17 +654,23 @@ sampling = createTrial(result, points)
 run(sampling)
 ```
 """
-function createTrial(result::ABCResult, draws::DataFrame; kwargs...)
-    manifest = _loadProblem(result.calibration)
+function createTrial(result::ABCResult, draws::DataFrame;
+                     problem::Union{Nothing,CalibrationProblem}=nothing, kwargs...)
+    manifest = _drawManifest(result.calibration, problem)
     specs = _DrawTargetSpec[_drawTargetSpec(cp) for cp in result.parameters]
     return _samplingFromDraws(manifest, specs, draws; kwargs...)
 end
 
-function createTrial(calibration::Calibration, draws::DataFrame; kwargs...)
-    manifest = _loadProblem(calibration)
+function createTrial(calibration::Calibration, draws::DataFrame;
+                     problem::Union{Nothing,CalibrationProblem}=nothing, kwargs...)
+    manifest = _drawManifest(calibration, problem)
     specs = _DrawTargetSpec[_drawTargetSpec(src) for src in manifest.sources]
     return _samplingFromDraws(manifest, specs, draws; kwargs...)
 end
+
+_drawManifest(calibration::Calibration, ::Nothing) = _loadProblem(calibration;
+    rescue="`createTrial(Calibration($(calibration.id)), draws; problem=my_problem)`")
+_drawManifest(::Calibration, problem::CalibrationProblem) = _ProblemManifest(problem)
 
 #! Only what turning a draw back into variations needs: which display columns hold target values,
 #! and where each value goes. A `_StrippedLVSource` still has all of it -- the maps are what was
