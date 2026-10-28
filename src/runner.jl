@@ -113,7 +113,11 @@ The shape is Nextflow's `command-run.txt`. The command runs in the background an
 `wait`s on it, so a `TERM` or `INT` from the scheduler -- `scancel`, a time limit, preemption --
 interrupts the `wait` at once: the trap forwards it to the command, and `wait` returns 128 plus
 the signal number, which is recorded like any other exit code. A foreground command would leave
-the signal pending until the command exited.
+the signal pending until the command exited. A signal that arrives before the command has a PID
+exits the script instead, so the command is never started after a cancel.
+
+`<&0` keeps the job's stdin. Without it, bash gives a backgrounded command `/dev/null`, and a
+simulation reading `sbatch --input` would see an empty file.
 
 The `EXIT` trap writes `mm_ec`, which is set only once `wait` has returned. If the script dies
 from a signal nothing traps, `mm_ec` is unset and the sentinel says `killed`, which
@@ -137,8 +141,9 @@ function _jobScript(cmd_str::AbstractString, sentinel::String)
         #!/bin/bash
         mm_sentinel=$(_shQuote(sentinel))
         trap 'echo "\${mm_ec:-killed}" > "\${mm_sentinel}.tmp" && mv "\${mm_sentinel}.tmp" "\${mm_sentinel}"' EXIT
-        trap 'kill "\$mm_pid" 2>/dev/null' TERM INT
-        $(cmd_str) &
+        trap '[ -n "\${mm_pid:-}" ] || exit 143; kill "\$mm_pid" 2>/dev/null' TERM
+        trap '[ -n "\${mm_pid:-}" ] || exit 130; kill "\$mm_pid" 2>/dev/null' INT
+        $(cmd_str) <&0 &
         mm_pid=\$!
         wait "\$mm_pid"
         mm_ec=\$?

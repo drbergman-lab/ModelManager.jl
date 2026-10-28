@@ -10351,7 +10351,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 script = read(flags[end], String)
                 @test startswith(script, "#!/bin/bash\n")
                 @test occursin(MM._shQuote(sentinel), script)
-                @test occursin("\necho hello &\n", script)
+                @test occursin("\necho hello <&0 &\n", script)
                 # A Cmd carrying its own dir is honored, the same as the local path does.
                 flags2 = collect(MM._prepareHPCSubmitCommand(Cmd(`echo hi`; dir="/tmp"), sim.id, sentinel).exec)
                 @test "--chdir=/tmp" in flags2
@@ -10397,6 +10397,34 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                     @test strip(read(sentinel, String)) == expected
                     @test MM._readSentinel(sentinel) != 0
                 end
+                # A cancel in the window before the command has a PID must not let the script go on
+                # to start it: a command quick enough to finish before SLURM's SIGKILL would record
+                # 0. The window is widened here by pausing the script just ahead of the launch.
+                for sig in ("TERM", "INT")
+                    sentinel = joinpath(dir, "early$(sig)")
+                    ready = joinpath(dir, "earlyready$(sig)")
+                    started = joinpath(dir, "earlystarted$(sig)")
+                    script = joinpath(dir, "early$(sig).sh")
+                    body = MM._jobScript("touch $(started)", sentinel)
+                    write(script, replace(body, "touch $(started) <&0 &" => "touch $(ready); sleep 30\ntouch $(started) <&0 &"))
+                    p = _runJobScript(script; sig=sig, ready=ready)
+                    @test !success(p)
+                    @test strip(read(sentinel, String)) == "killed"
+                    @test !isfile(started)
+                end
+            end
+
+            @testset "the job script passes the job's stdin to the command" begin
+                # bash gives a backgrounded command /dev/null unless told otherwise, which would
+                # silently empty a simulation's `sbatch --input`.
+                dir = mktempdir()
+                input = joinpath(dir, "input.txt"); write(input, "from stdin\n")
+                copied = joinpath(dir, "copied.txt")
+                script = joinpath(dir, "job.sh")
+                write(script, MM._jobScript("sh -c 'cat > $(copied)'", joinpath(dir, "s")))
+                run(pipeline(`bash $script`; stdin=input))
+                @test read(copied, String) == "from stdin\n"
+                @test strip(read(joinpath(dir, "s"), String)) == "0"
             end
 
             @testset "the sentinel path is shell-quoted, not interpolated" begin
