@@ -4342,9 +4342,6 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 # From disk, the same draws resolve to the same monads; a frame without the
                 # parameter columns is refused, as is an empty one.
                 @test sort(monadIDs(createTrial(result.calibration, sm))) == sort(monadIDs(s_sm))
-                # A supplied problem stands in for problem.jld2, for a run whose file cannot be read.
-                @test sort(monadIDs(createTrial(result, sm; problem=prob))) == sort(monadIDs(s_sm))
-                @test sort(monadIDs(createTrial(result.calibration, sm; problem=prob))) == sort(monadIDs(s_sm))
                 @test_throws ArgumentError createTrial(result, DataFrame(monad_id=[1, 2]))
                 @test_throws ArgumentError createTrial(result, sm[1:0, :])
             end
@@ -6531,7 +6528,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @testset "_loadProblem: a problem.jld2 saved before LatentVariation.flips" begin
                 # Written by ModelManager v0.11 (test/fixtures/make_problem_pre_0.12.jl): a hand-built
                 # LatentVariation with named maps, from before the struct gained `flips`. It used to fail
-                # here with a MethodError, and createTrial has no other way to read the run.
+                # here with a MethodError, which also stopped createTrial from reading the run.
                 cal = ModelManager.createCalibration("ABCSMC"; description="pre-0.12 manifest")
                 folder = ModelManager.calibrationFolder(cal)
                 mkpath(folder)
@@ -6551,12 +6548,6 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 jldsave(path; manifest=ModelManager._ProblemManifest(manifest.inputs, Any[ModelManager.LVSource(flipped)],
                     manifest.observed_data, 1, manifest.reference_variation_id, nothing, nothing))
                 @test only(ModelManager._loadProblem(cal).sources).lv.flips == [true]
-
-                # An unreadable file read by createTrial names createTrial's own `problem=`.
-                write(path, "not a JLD2 file")
-                err = try; createTrial(cal, DataFrame(x=[1.0])); nothing; catch e; e; end
-                @test err isa ErrorException
-                @test occursin("createTrial(Calibration($(cal.id)), draws; problem=my_problem)", err.msg)
             end
 
             @testset "sensitivity on a discrepancy-to-data QoI" begin

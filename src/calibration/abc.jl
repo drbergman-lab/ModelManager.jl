@@ -866,16 +866,16 @@ function JLD2.rconvert(::Type{LatentVariation}, nt::NamedTuple)
 end
 
 """
-    _loadProblem(calibration::Calibration; required::Bool=true, rescue) → Union{Nothing,_ProblemManifest}
+    _loadProblem(calibration::Calibration; required::Bool=true) → Union{Nothing,_ProblemManifest}
 
 Load `problem.jld2` and return a `_ProblemManifest`. A file that exists but cannot be reconstructed
 -- what a closure that only the saving session could name looks like from a fresh one -- is an error
 naming the two ways out when `required`, and a warning plus `nothing` when the caller has a
-`problem=` to fall back on. `rescue` is the call that passes the problem, as the caller spells it.
+`problem=` to fall back on.
 """
-function _loadProblem(calibration::Calibration; required::Bool=true,
-                      rescue::String="`resumeCalibration(Calibration($(calibration.id)); problem=my_problem)`")
+function _loadProblem(calibration::Calibration; required::Bool=true)
     path = joinpath(calibrationFolder(calibration), "problem.jld2")
+    rescue = "`resumeCalibration(Calibration($(calibration.id)); problem=my_problem)`"
     #! Every way the saved problem can fail to read takes the same exit -- absent, unrecognised, or
     #! unreconstructable -- because the caller's situation is the same in all three: with a
     #! `problem=` in hand the file is advisory and a warning will do; without one it is the only
