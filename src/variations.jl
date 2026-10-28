@@ -577,11 +577,9 @@ struct LatentVariation{T<:Union{Vector{<:Real},<:Distribution}} <: AbstractVaria
     maps::Vector{<:Function}
     inverse_maps::Union{Nothing,Vector{Function}}
     #! JLD2 COMPATIBILITY: `flips` was added in v0.12. `problem.jld2` serialises a `LatentVariation`
-    #! only inside an `LVSource` -- a hand-built one whose maps are named functions -- and one saved
-    #! before this field existed no longer reconstructs as this type. Such a run cannot be resumed
-    #! from its saved problem; pass the problem again with `resumeABC(cal; problem=...)`. Runs built
-    #! from `DistributedVariation`/`CoVariation`/`DiscreteVariation` are unaffected: their saved
-    #! source is the variation, and the `LatentVariation` is rebuilt from it on load.
+    #! only inside an `LVSource` -- a hand-built one whose maps are named functions. `_loadProblem`
+    #! reads every one through `JLD2.rconvert`, which supplies `flips` all `false` for a file saved
+    #! before the field existed. A field added here later needs a default there too.
     flips::Vector{Bool}
     types::Vector{DataType}
     name::String

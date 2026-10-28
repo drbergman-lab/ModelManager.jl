@@ -850,6 +850,21 @@ function _saveProblem(calibration::Calibration, problem::CalibrationProblem)
     jldsave(path; manifest=manifest)
 end
 
+#! JLD2 COMPATIBILITY: v0.12 added `LatentVariation.flips`, so a `problem.jld2` written before then
+#! holds an `LVSource` whose `LatentVariation` lacks the field and no longer reconstructs as the type.
+#! Every `LatentVariation` is therefore read through `rconvert` and rebuilt by its constructor, with
+#! `flips` all `false` when absent -- exactly what a pre-0.12 one meant, since nothing flipped a
+#! hand-built latent then. Rebuilding a current one is a no-op: the constructor recomputes the same
+#! `types` and re-checks inverse maps that already passed when the problem was built.
+const _PROBLEM_TYPEMAP = Dict("ModelManager.LatentVariation" => JLD2.Upgrade(LatentVariation))
+
+function JLD2.rconvert(::Type{LatentVariation}, nt::NamedTuple)
+    flips = haskey(nt, :flips) ? nt.flips : nothing
+    return LatentVariation(nt.latent_parameters, nt.targets, nt.maps, nt.latent_parameter_names,
+                           nt.locations; target_names=nt.target_names, inverse_maps=nt.inverse_maps,
+                           flips=flips, name=nt.name)
+end
+
 """
     _loadProblem(calibration::Calibration; required::Bool=true) → Union{Nothing,_ProblemManifest}
 
@@ -875,7 +890,7 @@ function _loadProblem(calibration::Calibration; required::Bool=true)
         "runABC/runCalibration, so a run from before it existed can only be resumed by passing the " *
         "original problem: $(rescue).")
     manifest = try
-        jldopen(path) do f
+        jldopen(path; typemap=_PROBLEM_TYPEMAP) do f
             haskey(f, "manifest") || return :unrecognized
             f["manifest"]::_ProblemManifest
         end
@@ -885,9 +900,7 @@ function _loadProblem(calibration::Calibration; required::Bool=true)
             "This is what a `summary_statistic`, `distance` or `LatentVariation` map that is a " *
             "closure -- a lambda, or a named function defined inside another function -- looks like " *
             "from a fresh session. Either `include` the file that defines those functions before " *
-            "resuming, or pass the original problem: $(rescue). A problem with a hand-built " *
-            "`LatentVariation` saved before v0.12 fails here too, because `LatentVariation` gained " *
-            "a `flips` field; pass the problem again the same way.")
+            "resuming, or pass the original problem: $(rescue).")
     end
     manifest === :unrecognized && return unreadable(
         "Unrecognized problem.jld2 format in $path: it has no `manifest` entry. Re-run with the " *

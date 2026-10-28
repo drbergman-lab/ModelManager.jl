@@ -6525,6 +6525,31 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test (@test_logs (:warn, r"not found") ModelManager._loadProblem(cal; required=false)) === nothing
             end
 
+            @testset "_loadProblem: a problem.jld2 saved before LatentVariation.flips" begin
+                # Written by ModelManager v0.11 (test/fixtures/make_problem_pre_0.12.jl): a hand-built
+                # LatentVariation with named maps, from before the struct gained `flips`. It used to fail
+                # here with a MethodError, which also stopped createTrial from reading the run.
+                cal = ModelManager.createCalibration("ABCSMC"; description="pre-0.12 manifest")
+                folder = ModelManager.calibrationFolder(cal)
+                mkpath(folder)
+                path = joinpath(folder, "problem.jld2")
+                cp(joinpath(@__DIR__, "fixtures", "problem_pre_0.12.jld2"), path)
+                manifest = ModelManager._loadProblem(cal)
+                lv = only(manifest.sources).lv
+                @test lv isa LatentVariation{<:Distribution}
+                @test lv.flips == [false, false]
+                @test lv.maps == [first, sum]
+                @test lv.name == "pre_0.12_lv"
+                @test lv.target_names == ["max_time", "dt_diffusion"]
+                @test manifest.n_replicates == 2
+
+                # A current file goes through the same rconvert and keeps its flips.
+                flipped = LatentVariation([Uniform(0, 1)], [XMLPath(["overall", "max_time"])], Function[first]; flips=[true])
+                jldsave(path; manifest=ModelManager._ProblemManifest(manifest.inputs, Any[ModelManager.LVSource(flipped)],
+                    manifest.observed_data, 1, manifest.reference_variation_id, nothing, nothing))
+                @test only(ModelManager._loadProblem(cal).sources).lv.flips == [true]
+            end
+
             @testset "sensitivity on a discrepancy-to-data QoI" begin
                 # The workflow: a simulation yields several values; average each across replicates,
                 # THEN compare to data. Squaring is nonlinear, so mean-then-square is not
