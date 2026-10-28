@@ -43,8 +43,8 @@ setJobOptions(Dict(
 ))
 ```
 
-Set `time` and `mem` explicitly. A job the scheduler kills for exceeding either writes no exit
-code, so it is only noticed by the reaper described below -- several minutes later, per job. If
+Set `time` and `mem` explicitly; the site defaults may be far smaller than a simulation needs, and
+a job that exceeds either is recorded as failed. If
 your backend does not implement `simulationThreads`, set `cpus-per-task` yourself to the thread
 count the simulator actually uses: SLURM allocates one CPU by default, and a simulator that starts
 more threads than that runs them all on one core. A value may be a function of the `Simulation`
@@ -70,8 +70,9 @@ spawning a local process. From your script's perspective nothing changes — you
 [`run`](@ref) on a trial; the runner decides per-simulation whether to execute locally or
 submit a job.
 
-Each job still writes its own `output.log` and `output.err` into that simulation's output folder,
-and `setNumberOfParallelSims` still bounds how many jobs sit in the queue at once.
+Each job is a bash script, `job.sh`, written into that simulation's output folder next to the
+`output.log` and `output.err` the job fills, so you can read exactly what ran. Compute nodes need
+`bash`. `setNumberOfParallelSims` still bounds how many jobs sit in the queue at once.
 
 ### When `sbatch` refuses a job
 
@@ -150,17 +151,19 @@ Two things to get right:
 
 Jobs are submitted with `--parsable` rather than `--wait`. Each job's script records its exit code
 in a sentinel file whose name was chosen before submission, and the worker that submitted it waits
-for that one file — a `stat` a second. `squeue` is consulted only as a reaper, for jobs killed by
-the scheduler (out of memory, time limit, node failure) or cancelled before they started, which
-never get the chance to write anything — and only through one answer shared by every waiting
-worker, so the scheduler sees one query per interval however many jobs are in flight.
+for that one file — a `stat` a second. A job cancelled while running or stopped at its time limit
+records the signal as a nonzero exit code, and any other signal that ends the script is recorded
+as a failure, so a killed job is never counted as a success. `squeue` is consulted only as a
+reaper, for jobs that never get the chance to write anything (a node failure, a `SIGKILL`, a
+cancel before the job started) — and only through one answer shared by every waiting worker, so
+the scheduler sees one query per interval however many jobs are in flight.
 
 This matters on a shared cluster. `sbatch --wait` is a poll, not a callback: each waiting `sbatch`
 queries the controller on a 2-to-32-second cycle, so one waiter per simulation put load on
 slurmctld proportional to your parallelism — and worst for short simulations, because every waiter
 restarts that cycle at two seconds.
 
-A job the scheduler kills therefore takes a while to be noticed: up to one `reap_interval` for
+A job that writes nothing therefore takes a while to be noticed: up to one `reap_interval` for
 the queue snapshot to refresh, plus the `grace_period`, plus a second snapshot -- five to ten
 minutes with the defaults. Each such job is reported with its job ID so `sacct -j` can say why.
 
