@@ -25,10 +25,13 @@ end
     getChildByChildContent(current_element::XMLElement, path_element::AbstractString)
 
 Get the child element of `current_element` that matches the given tag and child content.
+
+`path_element` has the form `<tag>::<child_tag>:<child_content>`. The child tag ends at its
+first `:`, so the content may itself contain `:`, as in `distribution::behavior:custom:my_var`.
 """
 function getChildByChildContent(current_element::XMLElement, path_element::AbstractString)
-    tag, child_scheme = split(path_element, "::")
-    tokens = split(child_scheme, ":")
+    tag, child_scheme = split(path_element, "::"; limit=2)
+    tokens = split(child_scheme, ":"; limit=2)
     @assert length(tokens) == 2 "Invalid child scheme for $(path_element). Expected format: <tag>::<child_tag>:<child_content>"
     child_tag, child_content = tokens
     candidate_elements = get_elements_by_tagname(current_element, tag)
