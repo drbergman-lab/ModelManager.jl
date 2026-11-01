@@ -399,12 +399,13 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         xml_doc = ModelManager.LightXML.parse_string("""
             <root>
                 <cell_definition name="default"><speed>1</speed></cell_definition>
-                <cell_definition name="a:b"><speed>2</speed></cell_definition>
+                <cell_definition name="custom:a"><speed>2</speed></cell_definition>
                 <distribution><behavior>Volume</behavior><min>3</min></distribution>
                 <distribution><behavior>custom:my_var</behavior><min>4</min></distribution>
             </root>""")
         @test getSimpleContent(xml_doc, ["cell_definition:name:default", "speed"]) == "1"
-        @test getSimpleContent(xml_doc, ["cell_definition:name:a:b", "speed"]) == "2"
+        @test getSimpleContent(xml_doc, ["cell_definition:name:custom:a", "speed"]) == "2"
+        @test XMLPath(["distribution::behavior:custom:my_var", "min"]) isa XMLPath
         @test getSimpleContent(xml_doc, ["distribution::behavior:Volume", "min"]) == "3"
         @test getSimpleContent(xml_doc, ["distribution::behavior:custom:my_var", "min"]) == "4"
         ModelManager.setSimpleContent(xml_doc, ["distribution::behavior:custom:my_var", "min"], 5)
