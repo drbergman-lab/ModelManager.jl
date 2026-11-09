@@ -245,7 +245,9 @@ It performs all framework-agnostic initialization steps in order:
 8. Call [`postInitDisplay`](@ref) to print startup information.
 9. Launch a background `@async` task that retries the removal of anything
    [`rm_hpc_safe`](@ref) had to stage in `data/.trash/`, then runs `databaseDiagnostics` over the
-   stranded-simulation and maximum-ID snapshots taken synchronously just before it.
+   stranded-simulation and maximum-ID snapshots taken synchronously just before it. Setting the
+   environment variable `MODELMANAGER_DIAGNOSTICS=0` skips the snapshots and `databaseDiagnostics`;
+   the trash retry still runs.
 10. Write the SLURM driver-job template, if HPC mode is on and it is not already there.
 
 Returns `true` on success, `false` on any initialization failure — including errors that
@@ -337,19 +339,23 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     # Snapshot max IDs now (before any simulations launch) so that diagnostics
     # only check entities that existed at init time and won't be confused by
     # in-progress runs started later in the same session.
-    snapshot = _snapshotMaxIDs()
+    #! Read at every initialization, like `MODELMANAGER_TAG_HINTS`, so a session can opt out without
+    #! a code change. Skipping also skips the recovery of simulations a killed session left at
+    #! `Running`/`Queued`, which lives inside `databaseDiagnostics`; a hand call still does it.
+    run_diagnostics = get(ENV, "MODELMANAGER_DIAGNOSTICS", "1") != "0"
+    snapshot = run_diagnostics ? _snapshotMaxIDs() : nothing
     #! Taken here, synchronously, and not by the task itself: the task runs at the first yield
     #! after this function returns, and a `run` started on the line after `initializeModelManager`
     #! may by then have marked this session's own simulations `Queued` and `Running`. Those are
     #! exactly the two statuses the reconciler treats as evidence of a dead driver. Querying now,
     #! when no `run` of this session can have started, is what keeps it off them.
-    stranded = _strandedSimulationIDs()
+    stranded = run_diagnostics ? _strandedSimulationIDs() : nothing
     mm_globals().diagnostics_task = @async begin
         try
             #! Before the report, not after: `databaseDiagnostics` only warns about what is
             #! left in `data/.trash`, so the retry has to have had its turn first.
             _sweepTrash()
-            databaseDiagnostics(snapshot; stranded=stranded)
+            run_diagnostics && databaseDiagnostics(snapshot; stranded=stranded)
         catch e
             println("""
             Database diagnostics failed during initialization with error: $(e).

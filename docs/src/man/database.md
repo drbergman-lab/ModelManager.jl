@@ -76,4 +76,14 @@ status). Because they run in the background, their output may appear shortly aft
 initialization returns; call [`waitForDiagnostics`](@ref) if you need them to finish first
 (useful in short scripts or tests).
 
+On a large project the checks can take long enough to stall the session, since the task shares
+Julia's main thread. Set `MODELMANAGER_DIAGNOSTICS=0` before initializing to skip them:
+
+```sh
+MODELMANAGER_DIAGNOSTICS=0 julia scripts/GenerateData.jl
+```
+
+The checks also return simulations a killed session left at `Running` or `Queued` to a usable
+status, so with them skipped, call `ModelManager.databaseDiagnostics()` by hand when you want that.
+
 See the [Database](@ref database_lib) API reference for the complete set of functions.
