@@ -10985,6 +10985,34 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 waitForDiagnostics()
             end
         end
+
+        @testset "MODELMANAGER_DIAGNOSTICS=0 skips the diagnostics pass" begin
+            mktempdir() do project_root
+                project_dir = joinpath(project_root, "data")
+                _make_test_project(project_dir)
+                initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+
+                sim_id = only(simulationIDs(Monad(InputFolders(config="default"); n_replicates=1)))
+                status() = MM.queryToDataFrame(
+                    MM.constructSelectQuery("simulations", "WHERE simulation_id=$(sim_id)";
+                                            selection="status_code_id"))[1, 1]
+                MM.DBInterface.execute(MM.centralDB(),
+                    "UPDATE simulations SET status_code_id=$(MM.statusCodeID("Queued")) WHERE simulation_id=$(sim_id);")
+
+                # The diagnostics pass is what returns a stranded `Queued` row to `Not Started`,
+                # so whether that happened says whether the pass ran.
+                withenv("MODELMANAGER_DIAGNOSTICS" => "0") do
+                    @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                    waitForDiagnostics()
+                end
+                @test status() == MM.statusCodeID("Queued")
+
+                @test initializeModelManager(TestSimulator(), project_dir; auto_upgrade=true)
+                waitForDiagnostics()
+                @test status() == MM.statusCodeID("Not Started")
+            end
+        end
         end  # withenv
     end
 
