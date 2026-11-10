@@ -507,8 +507,9 @@ struct SobolIndices
     n_bootstrap::Int
 end
 
-#! Lets the four-argument `SobolSampling` constructor keep accepting the results dictionary it used
-#! to be given, which held GlobalSensitivity's type.
+#! For the four-argument `SobolSampling` constructor, whose results dictionary may hold
+#! `GlobalSensitivity.SobolResult`s, the type results had before 0.13. Drop at v1.0 with the
+#! unprefixed `monad_ids_df` layout.
 SobolIndices(r::GlobalSensitivity.SobolResult) =
     SobolIndices(r.S1, r.ST, r.S2, nothing, nothing, nothing, _DEFAULT_CONF_LEVEL, 0)
 SobolIndices(r::SobolIndices) = r
@@ -667,15 +668,18 @@ function _sobolIndices(fA::AbstractVector, fB::AbstractVector, fAB::AbstractMatr
     ST = total_order_variances ./ total_variance
     isnothing(fBA) && return (S1=S1, ST=ST, S2=nothing)
     #! Saltelli 2002: B_A^j and A_B^k share exactly parameters j and k, so the mean of their product
-    #! less f₀² is the closed variance V_jk^c = V_j + V_k + V_jk. The Saltelli 2010 first-order
-    #! variances are subtracted because the closed term is in that same form; subtracting a
-    #! different estimator's V_j would leave the difference between estimators in S2.
+    #! less f₀² is the closed variance V_jk^c = V_j + V_k + V_jk. Subtracting V_j and V_k leaves V_jk.
+    #! Those are Saltelli 2010 first-order variances whatever `methods.first_order` is, because that
+    #! estimator has the same product form as the closed term; another estimator's V_j would leave
+    #! the difference between estimators in S2.
     #!
-    #! Every block is centred by one common value first. These are uncentred products, so an output
-    #! offset of size c contributes terms of order c² that cancel only in exact arithmetic: for
-    #! x₁ + x₂ + 10⁹ on an exhaustive ±1 design, S2 came out −0.97 instead of 0. A common shift
-    #! leaves every expectation here unchanged, so this changes nothing but the rounding. S1 and ST
-    #! are left as they were computed above.
+    #! The outputs are shifted by their mean before any of this, purely for floating-point accuracy.
+    #! The products are of order (mean output)², while V_jk is a small difference between them, so a
+    #! large mean output (10⁹, say) leaves V_jk as rounding noise. Shifting every block by the same
+    #! constant does not change what the estimator estimates. The first-order terms are recomputed on
+    #! the shifted outputs so both sides of the difference are rounded alike. S1 and ST are not
+    #! shifted: the default Jansen estimators use only differences of outputs, which never grow
+    #! with the mean.
     c = mean(fA) / 2 + mean(fB) / 2
     cA, cB = fA .- c, fB .- c
     cAB, cBA = fAB .- c, fBA .- c
