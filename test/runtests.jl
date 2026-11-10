@@ -7815,6 +7815,8 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test Sobolʼ(SobolVariation(4; n_matrices=2), (first_order=:Jansen1999, total_order=:Jansen1999)) isa Sobolʼ
                 @test_throws ArgumentError Sobolʼ(4; n_bootstrap=-1)
                 @test_throws ArgumentError Sobolʼ(4; conf_level=1.0)
+                @test_throws ArgumentError Sobolʼ(4; sobol_index_methods=(first_order=:Jansen, total_order=:Jansen1999))
+                @test_throws ArgumentError Sobolʼ(4; sobol_index_methods=(first_order=:Jansen1999, total_order=:Saltelli2010))
             end
 
             @testset "GSA — RBD" begin

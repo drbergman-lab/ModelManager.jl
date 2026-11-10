@@ -409,7 +409,15 @@ const _DEFAULT_CONF_LEVEL = 0.95
 #! advanced by running an analysis.
 _defaultBootstrapRNG() = Random.Xoshiro(0)
 
-function _checkBootstrapSettings(n_bootstrap::Int, conf_level::Real)
+const _SOBOL_FIRST_ORDER_METHODS = (:Jansen1999, :Sobol1993, :Saltelli2010)
+const _SOBOL_TOTAL_ORDER_METHODS = (:Jansen1999, :Homma1996, :Sobol2007)
+
+#! An unrecognised estimator name would otherwise leave its indices at zero without complaint.
+function _checkSobolSettings(sobol_index_methods::_SobolIndexMethods, n_bootstrap::Int, conf_level::Real)
+    sobol_index_methods.first_order in _SOBOL_FIRST_ORDER_METHODS || throw(ArgumentError(
+        "Unknown first-order Sobol' estimator :$(sobol_index_methods.first_order). Use one of $(_SOBOL_FIRST_ORDER_METHODS)."))
+    sobol_index_methods.total_order in _SOBOL_TOTAL_ORDER_METHODS || throw(ArgumentError(
+        "Unknown total-order Sobol' estimator :$(sobol_index_methods.total_order). Use one of $(_SOBOL_TOTAL_ORDER_METHODS)."))
     n_bootstrap >= 0 || throw(ArgumentError("`n_bootstrap` must be non-negative (0 disables the bootstrap); got $(n_bootstrap)."))
     0 < conf_level < 1 || throw(ArgumentError("`conf_level` must lie strictly between 0 and 1; got $(conf_level)."))
     return
@@ -460,7 +468,7 @@ struct Sobolʼ <: GSAMethod
 
     function Sobolʼ(sobol_variation::SobolVariation, sobol_index_methods::_SobolIndexMethods,
                     second_order::Bool, n_bootstrap::Int, conf_level::Real, rng::AbstractRNG)
-        _checkBootstrapSettings(n_bootstrap, conf_level)
+        _checkSobolSettings(sobol_index_methods, n_bootstrap, conf_level)
         return new(sobol_variation, sobol_index_methods, second_order, n_bootstrap, conf_level, rng)
     end
 end
@@ -532,7 +540,7 @@ struct SobolSampling <: GSASampling
     function SobolSampling(sampling::Sampling, monad_ids_df::DataFrame, results::Dict{String,SobolIndices},
                            sobol_index_methods::_SobolIndexMethods, n_bootstrap::Int, conf_level::Real,
                            rng::AbstractRNG)
-        _checkBootstrapSettings(n_bootstrap, conf_level)
+        _checkSobolSettings(sobol_index_methods, n_bootstrap, conf_level)
         return new(sampling, monad_ids_df, results, sobol_index_methods, n_bootstrap, conf_level, rng)
     end
 end
