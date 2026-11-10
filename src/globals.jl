@@ -336,13 +336,13 @@ function initializeModelManager(simulator::AbstractSimulator, data_dir::Abstract
     mm_globals().hpc_done_dir = hpc_done_dir
     postInitDisplay(simulator)
     flush(stdout)
-    # Snapshot max IDs now (before any simulations launch) so that diagnostics
-    # only check entities that existed at init time and won't be confused by
-    # in-progress runs started later in the same session.
     #! Read at every initialization, like `MODELMANAGER_TAG_HINTS`, so a session can opt out without
     #! a code change. Skipping also skips the recovery of simulations a killed session left at
     #! `Running`/`Queued`, which lives inside `databaseDiagnostics`; a hand call still does it.
     run_diagnostics = get(ENV, "MODELMANAGER_DIAGNOSTICS", "1") != "0"
+    # Snapshot max IDs now (before any simulations launch) so that diagnostics
+    # only check entities that existed at init time and won't be confused by
+    # in-progress runs started later in the same session.
     snapshot = run_diagnostics ? _snapshotMaxIDs() : nothing
     #! Taken here, synchronously, and not by the task itself: the task runs at the first yield
     #! after this function returns, and a `run` started on the line after `initializeModelManager`
