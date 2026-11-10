@@ -9,9 +9,10 @@ _gsaLabels(results::AbstractDict) = sort(collect(keys(results)))
 
 # Parameter (latent dimension) names for each GSA sampling type, in the same column
 # order as the corresponding index vectors. The leading bookkeeping columns differ:
-# MOAT prepends "base"; Sobolʼ prepends "A" and "B"; RBD has none.
+# MOAT prepends "base"; Sobolʼ prepends "A" and "B" and prefixes the rest (see `_sobolColumns`);
+# RBD has none.
 _moatParameterNames(monad_ids_df::DataFrame)  = names(monad_ids_df)[2:end]
-_sobolParameterNames(monad_ids_df::DataFrame) = names(monad_ids_df)[3:end]
+_sobolParameterNames(monad_ids_df::DataFrame) = _sobolColumns(monad_ids_df).names
 _rbdParameterNames(monad_ids_df::DataFrame)   = names(monad_ids_df)
 
 const _NO_FUNCTIONS_MSG =
@@ -58,13 +59,14 @@ method's bookkeeping columns. The default draws all of them."""
 
 ################## Bar recipe (shared) ##################
 
-# One bar series: legend label, per-parameter values, fill opacity, and optional ±error
-# (rendered as whiskers via `yerror`). `yerror === nothing` means no whiskers.
+# One bar series: legend label, per-parameter values, fill opacity, and optional error
+# (rendered as whiskers via `yerror`): a vector for symmetric whiskers, a `(below, above)` tuple for
+# asymmetric ones. `yerror === nothing` means no whiskers.
 struct _GSABarGroup
     label::String
     values::Vector{Float64}
     fillalpha::Float64
-    yerror::Union{Nothing,Vector{Float64}}
+    yerror::Union{Nothing,Vector{Float64},Tuple{Vector{Float64},Vector{Float64}}}
 end
 
 # Grouped bar chart of sensitivity indices: x-axis = parameters, one bar series per group.
@@ -280,8 +282,14 @@ end
 
 ################## Sobolʼ recipe ##################
 
+#! Whisker lengths from `[lo hi]` bounds. Clamped at zero because a percentile interval is built
+#! from resamples and need not contain the full-sample estimate; a negative length is not drawable.
+function _ciWhiskers(values::Vector{Float64}, ci::AbstractMatrix, idx::Vector{Int})
+    return (max.(values .- ci[idx, 1], 0.0), max.(ci[idx, 2] .- values, 0.0))
+end
+
 function _sobolBarData(results::AbstractDict, monad_ids_df::DataFrame, show_ST::Bool;
-                       parameters=nothing)
+                       show_CI::Bool=true, parameters=nothing)
     isempty(results) && error(_NO_FUNCTIONS_MSG)
     all_names = _sobolParameterNames(monad_ids_df)
     pnames    = _selectParameters(all_names, parameters)
@@ -296,38 +304,105 @@ function _sobolBarData(results::AbstractDict, monad_ids_df::DataFrame, show_ST::
         #! its excess over S1 shows above an opaque S1; drawn in front (the earlier order) it covered
         #! S1 entirely and every bar read as one blended colour.
         if show_ST && !isnothing(res.ST)
-            push!(groups, _GSABarGroup(multi ? "ST: $(name)" : "ST",
-                                       Float64.(res.ST)[idx], 0.45, nothing))
+            ST = Float64.(res.ST)[idx]
+            yerr = show_CI && !isnothing(res.ST_CI) ? _ciWhiskers(ST, res.ST_CI, idx) : nothing
+            push!(groups, _GSABarGroup(multi ? "ST: $(name)" : "ST", ST, 0.45, yerr))
         end
-        push!(groups, _GSABarGroup(multi ? "S1: $(name)" : "S1",
-                                   Float64.(res.S1)[idx], 1.0, nothing))
+        S1 = Float64.(res.S1)[idx]
+        yerr = show_CI && !isnothing(res.S1_CI) ? _ciWhiskers(S1, res.S1_CI, idx) : nothing
+        push!(groups, _GSABarGroup(multi ? "S1: $(name)" : "S1", S1, 1.0, yerr))
     end
     return _GSABarData(pnames, groups)
 end
 
-"""
-    plot(s::SobolSampling; show_ST=true, parameters=nothing)
+# Heatmap of a square matrix over named parameters.
+struct _GSAHeatmapData
+    param_names::Vector{String}
+    values::Matrix{Float64}
+    title::String
+end
 
-Grouped bar chart of Sobolʼ sensitivity indices. For each sensitivity quantity (see
+@recipe function f(d::_GSAHeatmapData)
+    n = length(d.param_names)
+    n == 0 && error("No parameters to plot.")
+
+    seriestype     := :heatmap
+    xticks         := (1:n, d.param_names)
+    yticks         := (1:n, d.param_names)
+    yflip          --> true
+    aspect_ratio   --> :equal
+    title          --> d.title
+    colorbar_title --> "S2"
+    1:n, 1:n, d.values
+end
+
+function _sobolS2Data(results::AbstractDict, monad_ids_df::DataFrame; quantity=nothing, parameters=nothing)
+    isempty(results) && error(_NO_FUNCTIONS_MSG)
+    labels = _gsaLabels(results)
+    if isnothing(quantity)
+        length(labels) == 1 || throw(ArgumentError(
+            "This sampling holds several sensitivity quantities, so `quantity` must name one: $(labels)."))
+        quantity = only(labels)
+    end
+    haskey(results, quantity) || throw(ArgumentError(
+        "No sensitivity quantity \"$(quantity)\". Available: $(labels)."))
+    res = results[quantity]
+    isnothing(res.S2) && throw(ArgumentError(
+        "\"$(quantity)\" has no second-order indices. Run the analysis with `Sobolʼ(n; second_order=true)`."))
+    all_names = _sobolParameterNames(monad_ids_df)
+    pnames    = _selectParameters(all_names, parameters)
+    idx       = _parameterIndices(all_names, pnames)
+    return _GSAHeatmapData(pnames, Float64.(res.S2)[idx, idx], quantity)
+end
+
+"""
+    plot(s::SobolSampling; show_ST=true, show_CI=true, parameters=nothing)
+    plot(s::SobolSampling, :bar; show_ST=true, show_CI=true, parameters=nothing)
+    plot(s::SobolSampling, :S2; quantity=nothing, parameters=nothing)
+
+Chart Sobolʼ sensitivity indices.
+
+`:bar` (default) is a grouped bar chart. For each sensitivity quantity (see
 [`gsaLabels`](@ref)), the first-order index `S1` is shown per parameter; when `show_ST=true`
 (default) the total-order index `ST` is drawn behind it at reduced opacity, so the part of `ST`
-that exceeds `S1` shows above the opaque `S1` bar. Labels include the
-quantity's own label when more than one is present.
+that exceeds `S1` shows above the opaque `S1` bar. When the indices carry confidence intervals and
+`show_CI=true`, each bar has whiskers to its bootstrap bounds. Labels include the quantity's own
+label when more than one is present.
+
+`:S2` is a heatmap of the second-order indices of one quantity, which needs an analysis run with
+`second_order=true`. `quantity` names the quantity and can be left out when there is only one.
 
 $_PARAMETERS_KW_DOC
 
 # Examples
 ```julia
 using Plots
-plot(sobol_sampling)                 # S1 + ST
+plot(sobol_sampling)                 # S1 + ST, with CI whiskers
 plot(sobol_sampling; show_ST=false)  # S1 only
 plot(sobol_sampling; parameters=["k_on", "k_off"])   # only these, in this order
+plot(sobol_sampling, :S2)            # interaction heatmap
+plot(sobol_sampling, :S2; quantity="final_count")
 ```
 """
 @recipe function f(s::SobolSampling)
     show_ST    = pop!(plotattributes, :show_ST, true)
+    show_CI    = pop!(plotattributes, :show_CI, true)
     parameters = pop!(plotattributes, :parameters, nothing)
-    _sobolBarData(s.results, s.monad_ids_df, show_ST; parameters=parameters)
+    _sobolBarData(s.results, s.monad_ids_df, show_ST; show_CI=show_CI, parameters=parameters)
+end
+
+@recipe function f(s::SobolSampling, style::Symbol)
+    parameters = pop!(plotattributes, :parameters, nothing)
+    if style === :bar
+        show_ST = pop!(plotattributes, :show_ST, true)
+        show_CI = pop!(plotattributes, :show_CI, true)
+        _sobolBarData(s.results, s.monad_ids_df, show_ST; show_CI=show_CI, parameters=parameters)
+    elseif style === :S2
+        quantity = pop!(plotattributes, :quantity, nothing)
+        _sobolS2Data(s.results, s.monad_ids_df; quantity=quantity, parameters=parameters)
+    else
+        error("Unknown SobolSampling plot style :$style. Use :bar or :S2.")
+    end
 end
 
 ################## RBD recipe ##################

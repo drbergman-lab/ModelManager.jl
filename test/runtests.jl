@@ -6697,7 +6697,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 sob = run(Sobolʼ(4), spec; functions=[spread])
                 waitForDiagnostics()
                 @test ModelManager.gsaLabels(sob) == ["counts.x", "counts.y"]
-                @test sob.results["counts.y"] isa GlobalSensitivity.SobolResult
+                @test sob.results["counts.y"] isa ModelManager.SobolIndices
                 rbd = run(RBD(4), spec; functions=[spread])
                 waitForDiagnostics()
                 @test ModelManager.gsaLabels(rbd) == ["counts.x", "counts.y"]
@@ -7738,11 +7738,85 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
 
                 samp = run(Sobolʼ(4), inputs, [dv1, dv2]; functions=[gs_fn])
                 @test samp isa ModelManager.GSASampling
+                @test all(startswith("A_B:"), names(samp.monad_ids_df)[3:end])
 
                 rd = RecipesBase.apply_recipe(Dict{Symbol,Any}(), samp)
                 @test rd[1].args[1] isa ModelManager._GSABarData
-                @test rd[1].args[1].param_names == names(samp.monad_ids_df)[3:end]
+                @test rd[1].args[1].param_names == [chopprefix(c, "A_B:") for c in names(samp.monad_ids_df)[3:end]]
                 @test length(rd[1].args[1].groups) == 2   # S1 + ST for one function
+                # A constant output has no variance to decompose: NaN indices and NaN bounds,
+                # rather than `quantile` throwing on the NaN resamples.
+                res = only(values(samp.results))
+                @test all(isnan, res.S1) && all(isnan, res.S1_CI)
+            end
+
+            @testset "GSA — Sobol second order and bootstrap" begin
+                dv1 = UniformDistributedVariation(:config, xp_x, 0.5, 3.0)
+                dv2 = UniformDistributedVariation(:config, xp_y, 1.0, 4.0)
+                prod_qoi = QoI("prod", s -> getParameterValue(s, :config, xp_x) * getParameterValue(s, :config, xp_y))
+                n = 8
+
+                first_order = run(Sobolʼ(n), inputs, [dv1, dv2]; functions=[prod_qoi])
+                waitForDiagnostics()
+                @test size(first_order.monad_ids_df) == (n, 2 + 2)
+                res1 = first_order.results["prod"]
+                @test isnothing(res1.S2) && isnothing(res1.S2_CI)
+                @test size(res1.S1_CI) == (2, 2) && size(res1.ST_CI) == (2, 2)
+                @test res1.n_bootstrap == 1000 && res1.conf_level == 0.95
+
+                second = run(Sobolʼ(n; second_order=true), inputs, [dv1, dv2]; functions=[prod_qoi])
+                waitForDiagnostics()
+                df = second.monad_ids_df
+                @test size(df) == (n, 2 + 2 * 2)
+                @test count(startswith("B_A:"), names(df)) == 2
+                # The same design, so turning second order on reuses every first-order monad and
+                # adds only the B_A^i ones.
+                @test Matrix(df[:, 1:4]) == Matrix(first_order.monad_ids_df)
+                res2 = second.results["prod"]
+                @test res2.S1 ≈ res1.S1 && res2.ST ≈ res1.ST
+                @test size(res2.S2) == (2, 2) && issymmetric(replace(res2.S2, NaN => 0.0))
+                @test all(isnan, [res2.S2[i, i] for i in 1:2])
+                @test size(res2.S2_CI) == (2, 2, 2)
+
+                # Reproducible, and the global RNG stream is left where it was.
+                before = copy(Random.default_rng())
+                calculateGSA!(second, [prod_qoi]; recompute=true)
+                @test rand(before) == rand()
+                @test second.results["prod"].S1_CI == res2.S1_CI
+                @test isequal(second.results["prod"].S2_CI, res2.S2_CI)
+
+                # A different rng gives different resamples; n_bootstrap=0 gives none.
+                other = run(Sobolʼ(n; second_order=true, rng=Random.Xoshiro(7)), inputs, [dv1, dv2]; functions=[prod_qoi])
+                waitForDiagnostics()
+                @test other.results["prod"].S1 ≈ res2.S1
+                @test other.results["prod"].S1_CI != res2.S1_CI
+                none = run(Sobolʼ(n; n_bootstrap=0), inputs, [dv1, dv2]; functions=[prod_qoi])
+                waitForDiagnostics()
+                @test isnothing(none.results["prod"].S1_CI) && isnothing(none.results["prod"].ST_CI)
+
+                # ignore_indices drops a parameter from every order.
+                ign = run(Sobolʼ(n; second_order=true), inputs, [dv1, dv2]; functions=[prod_qoi], ignore_indices=[2])
+                waitForDiagnostics()
+                @test size(ign.monad_ids_df) == (n, 2 + 2 * 1)
+                @test length(ign.results["prod"].S1) == 1 && size(ign.results["prod"].S2) == (1, 1)
+
+                # Heatmap and CI whiskers through the public recipe.
+                hm = RecipesBase.apply_recipe(Dict{Symbol,Any}(), second, :S2)
+                @test hm[1].args[1] isa ModelManager._GSAHeatmapData
+                bars = RecipesBase.apply_recipe(Dict{Symbol,Any}(), second)[1].args[1]
+                @test all(g -> g.yerror isa Tuple, bars.groups)
+                @test_throws ArgumentError RecipesBase.apply_recipe(Dict{Symbol,Any}(), first_order, :S2)
+
+                # The constructors that predate the new fields still work.
+                old = ModelManager.SobolSampling(second.sampling, first_order.monad_ids_df,
+                                                 Dict{String,GlobalSensitivity.SobolResult}(),
+                                                 second.sobol_index_methods)
+                @test old isa ModelManager.SobolSampling && old.n_bootstrap == 1000
+                @test Sobolʼ(SobolVariation(4; n_matrices=2), (first_order=:Jansen1999, total_order=:Jansen1999)) isa Sobolʼ
+                @test_throws ArgumentError Sobolʼ(4; n_bootstrap=-1)
+                @test_throws ArgumentError Sobolʼ(4; conf_level=1.0)
+                @test_throws ArgumentError Sobolʼ(4; sobol_index_methods=(first_order=:Jansen, total_order=:Jansen1999))
+                @test_throws ArgumentError Sobolʼ(4; sobol_index_methods=(first_order=:Jansen1999, total_order=:Saltelli2010))
             end
 
             @testset "GSA — RBD" begin
@@ -8280,11 +8354,21 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 reshape([0.1, 0.5, 0.2], 1, d),    # means_star (µ*)
                 reshape([0.01, 0.04, 0.02], 1, d), # variances (σ²)
                 randn(5, d)))                      # elementary_effects (n_base × d)
-        sobol() = GlobalSensitivity.SobolResult(
-            [0.2, 0.5, 0.1], nothing, nothing, nothing, [0.3, 0.6, 0.2], nothing)
+        sobol() = ModelManager.SobolIndices(
+            [0.2, 0.5, 0.1], [0.3, 0.6, 0.2], nothing, nothing, nothing, nothing, 0.95, 0)
+        sobol_ci() = ModelManager.SobolIndices(
+            [0.2, 0.5, 0.1], [0.3, 0.6, 0.2],
+            [NaN 0.05 0.0; 0.05 NaN 0.1; 0.0 0.1 NaN],
+            [0.1 0.3; 0.4 0.6; 0.15 0.2],      # S1 bounds; the last excludes its estimate
+            [0.2 0.4; 0.5 0.7; 0.1 0.3],
+            fill(0.0, 3, 3, 2), 0.95, 1000)
 
         moat_df  = DataFrame("base" => [1, 2, 3], "p1" => [4, 5, 6], "p2" => [7, 8, 9], "p3" => [10, 11, 12])
+        # Pre-0.13 layout: unprefixed columns after A and B are all A_B.
         sobol_df = DataFrame("A" => [1, 2], "B" => [3, 4], "p1" => [5, 6], "p2" => [7, 8], "p3" => [9, 10])
+        sobol2_df = DataFrame("A" => [1, 2], "B" => [3, 4],
+                              "A_B:p1" => [5, 6], "A_B:p2" => [7, 8], "A_B:p3" => [9, 10],
+                              "B_A:p1" => [11, 12], "B_A:p2" => [13, 14], "B_A:p3" => [15, 16])
         rbd_df   = DataFrame("p1" => [1, 2], "p2" => [3, 4], "p3" => [5, 6])
 
         nseries(recipe_data) = length(recipe_data)
@@ -8293,6 +8377,9 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         @testset "parameter name extraction" begin
             @test ModelManager._moatParameterNames(moat_df)   == pnames
             @test ModelManager._sobolParameterNames(sobol_df) == pnames
+            @test ModelManager._sobolParameterNames(sobol2_df) == pnames
+            @test ModelManager._sobolColumns(sobol_df) == (ab=[3, 4, 5], ba=Int[], names=pnames)
+            @test ModelManager._sobolColumns(sobol2_df) == (ab=[3, 4, 5], ba=[6, 7, 8], names=pnames)
             @test ModelManager._rbdParameterNames(rbd_df)     == pnames
         end
 
@@ -8339,7 +8426,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
         end
 
         @testset "Sobolʼ" begin
-            res1 = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol())
+            res1 = Dict{String,ModelManager.SobolIndices}(_GSA_LABEL_A => sobol())
             @test nseries(apply(ModelManager._sobolBarData(res1, sobol_df, true)))  == 2  # S1 + ST
             @test nseries(apply(ModelManager._sobolBarData(res1, sobol_df, false))) == 1  # S1 only
 
@@ -8351,8 +8438,99 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test bd.groups[1].fillalpha == 0.45                     # ST de-emphasized, behind
             @test bd.groups[2].fillalpha == 1.0                      # S1 opaque, in front
 
-            res2 = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol(), _GSA_LABEL_B => sobol())
+            res2 = Dict{String,ModelManager.SobolIndices}(_GSA_LABEL_A => sobol(), _GSA_LABEL_B => sobol())
             @test nseries(apply(ModelManager._sobolBarData(res2, sobol_df, true))) == 4   # 2 fns × (S1+ST)
+            @test all(g -> isnothing(g.yerror), ModelManager._sobolBarData(res2, sobol_df, true).groups)
+        end
+
+        @testset "Sobolʼ — CI whiskers and S2 heatmap" begin
+            res = Dict{String,ModelManager.SobolIndices}(_GSA_LABEL_A => sobol_ci())
+            bd = ModelManager._sobolBarData(res, sobol2_df, true)
+            st, s1 = bd.groups
+            @test st.yerror[1] ≈ [0.1, 0.1, 0.1] && st.yerror[2] ≈ [0.1, 0.1, 0.1]
+            # Below/above the estimate, clamped at 0 where the bound is on the wrong side.
+            @test s1.yerror[1] ≈ [0.1, 0.1, 0.0] && s1.yerror[2] ≈ [0.1, 0.1, 0.1]
+            @test nseries(apply(bd)) == 2
+            @test all(g -> isnothing(g.yerror), ModelManager._sobolBarData(res, sobol2_df, true; show_CI=false).groups)
+            sliced = ModelManager._sobolBarData(res, sobol2_df, false; parameters=["p3", "p1"])
+            @test only(sliced.groups).yerror[2] ≈ [0.1, 0.1]
+
+            hm = ModelManager._sobolS2Data(res, sobol2_df)
+            @test hm.param_names == pnames && isequal(hm.values, res[_GSA_LABEL_A].S2)
+            @test hm.title == _GSA_LABEL_A
+            hs = ModelManager._sobolS2Data(res, sobol2_df; parameters=["p3", "p2"])
+            @test isequal(hs.values, [NaN 0.1; 0.1 NaN])
+            @test nseries(apply(hm)) == 1
+            @test_throws ArgumentError ModelManager._sobolS2Data(res, sobol2_df; quantity="nope")
+            two = Dict{String,ModelManager.SobolIndices}(_GSA_LABEL_A => sobol_ci(), _GSA_LABEL_B => sobol_ci())
+            @test_throws ArgumentError ModelManager._sobolS2Data(two, sobol2_df)
+            @test ModelManager._sobolS2Data(two, sobol2_df; quantity=_GSA_LABEL_B).title == _GSA_LABEL_B
+            no_s2 = Dict{String,ModelManager.SobolIndices}(_GSA_LABEL_A => sobol())
+            @test_throws ArgumentError ModelManager._sobolS2Data(no_s2, sobol_df)
+        end
+
+        @testset "Sobolʼ index arithmetic and bootstrap (Ishigami)" begin
+            # Ishigami (a=7, b=0.1) on U(-π, π)³ has closed-form indices, so this checks the
+            # estimators themselves, with no simulations involved.
+            ish(x) = sin(x[1]) + 7sin(x[2])^2 + 0.1x[3]^4 * sin(x[1])
+            N, dI = 2048, 3
+            cdfs = ModelManager.generateSobolCDFs(N, dI; n_matrices=2)
+            A = -π .+ 2π .* cdfs[:, 1, :]
+            B = -π .+ 2π .* cdfs[:, 2, :]
+            f(M) = [ish(M[:, r]) for r in 1:size(M, 2)]
+            swap(X, Y, i) = (Z = copy(X); Z[i, :] .= Y[i, :]; Z)
+            vals = hcat(f(A), f(B), (f(swap(A, B, i)) for i in 1:dI)..., (f(swap(B, A, i)) for i in 1:dI)...)
+            df = DataFrame(zeros(Int, N, 2 + 2dI),
+                           ["A"; "B"; "A_B:" .* ["x1", "x2", "x3"]; "B_A:" .* ["x1", "x2", "x3"]])
+            S1_true = [0.3139, 0.4424, 0.0]
+            ST_true = [0.5576, 0.4424, 0.2437]
+            for methods in [(first_order=:Jansen1999, total_order=:Jansen1999),
+                            (first_order=:Saltelli2010, total_order=:Sobol2007),
+                            (first_order=:Sobol1993, total_order=:Homma1996)]
+                r = ModelManager._sobolResult(vals, df, methods, 500, 0.95, Random.Xoshiro(1))
+                # Element-wise: `≈` on vectors compares norms. Homma1996 is the noisiest of these.
+                @test all(isapprox.(r.S1, S1_true; atol=0.02))
+                @test all(isapprox.(r.ST, ST_true; atol=0.02))
+                @test r.S2[1, 3] ≈ 0.2437 atol=0.02
+                @test abs(r.S2[1, 2]) < 0.02 && abs(r.S2[2, 3]) < 0.02
+                @test r.S2 == r.S2' || isequal(r.S2, permutedims(r.S2))
+                # Each interval brackets its true value and is ordered.
+                @test all(r.S1_CI[:, 1] .<= S1_true .+ 0.01) && all(S1_true .- 0.01 .<= r.S1_CI[:, 2])
+                @test all(r.ST_CI[:, 1] .<= r.ST_CI[:, 2])
+                @test r.S2_CI[1, 3, 1] <= 0.2437 <= r.S2_CI[1, 3, 2]
+            end
+            # S2 is invariant to an additive output offset. Exhaustive ±1 design of x₁ + x₂, which
+            # has no interaction; uncentred products gave S2 = −0.97 once 10⁹ was added.
+            pm = [-1.0, 1.0]
+            rowsA = [(a1, a2) for a1 in pm for a2 in pm]
+            prs = [(a, b) for a in rowsA for b in rowsA]
+            add(x) = x[1] + x[2]
+            hyb(a, b, i) = (i == 1 ? b[1] : a[1], i == 2 ? b[2] : a[2])
+            offset_blocks(off) = ([add(a) + off for (a, b) in prs], [add(b) + off for (a, b) in prs],
+                                  hcat([[add(hyb(a, b, i)) + off for (a, b) in prs] for i in 1:2]...),
+                                  hcat([[add(hyb(b, a, i)) + off for (a, b) in prs] for i in 1:2]...))
+            mJ = (first_order=:Jansen1999, total_order=:Jansen1999)
+            r0 = ModelManager._sobolIndices(offset_blocks(0.0)..., mJ)
+            r9 = ModelManager._sobolIndices(offset_blocks(1e9)..., mJ)
+            @test r0.S2[1, 2] ≈ 0.0 atol=1e-12
+            @test r9.S2[1, 2] ≈ 0.0 atol=1e-6
+
+            # A resample with an infinite index (zero variance, varying hybrids) has no bound.
+            @test all(isnan, ModelManager._percentileBounds([0.1, 0.2, Inf], 0.95))
+            @test all(isnan, ModelManager._percentileBounds([0.1, -Inf], 0.95))
+            @test all(isnan, ModelManager._percentileBounds([0.1, NaN], 0.95))
+
+            # The stored RNG is copied, never advanced.
+            rng = Random.Xoshiro(3)
+            snapshot = copy(rng)
+            m = (first_order=:Jansen1999, total_order=:Jansen1999)
+            a = ModelManager._sobolResult(vals, df, m, 200, 0.9, rng)
+            b = ModelManager._sobolResult(vals, df, m, 200, 0.9, rng)
+            @test rng == snapshot
+            @test isequal(a.S2_CI, b.S2_CI) && a.S1_CI == b.S1_CI
+            # First-order design: no S2, and S1/ST are unchanged by dropping the B_A columns.
+            r1 = ModelManager._sobolResult(vals[:, 1:5], df[:, 1:5], m, 0, 0.95, rng)
+            @test isnothing(r1.S2) && isnothing(r1.S1_CI) && r1.S1 ≈ a.S1
         end
 
         @testset "RBD" begin
@@ -8424,7 +8602,7 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
             @test sd.groups[1][3] ≈ sqrt.([0.04, 0.02])
 
             # Sobolʼ: S1 and ST sliced alike; a single name still plots.
-            sres = Dict{String,GlobalSensitivity.SobolResult}(_GSA_LABEL_A => sobol())
+            sres = Dict{String,ModelManager.SobolIndices}(_GSA_LABEL_A => sobol())
             sb   = ModelManager._sobolBarData(sres, sobol_df, true; parameters="p2")
             @test sb.param_names == ["p2"]
             @test sb.groups[1].values ≈ [0.6]   # ST, drawn first
