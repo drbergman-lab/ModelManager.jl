@@ -96,12 +96,31 @@ The integer is the number of base points (trajectories).
 ## Sobol' — variance decomposition
 
 [`Sobolʼ`](@ref) computes variance-based first-order and total-order indices: the fraction of
-output variance attributable to each parameter alone, and including all its interactions.
+output variance attributable to each parameter alone, and including all its interactions. With
+`second_order=true` it also computes the pairwise interaction indices.
 
 ```julia
 gsa = run(Sobolʼ(256), inputs, dists; functions=[final_count])
 gsa = run(Sobolʼ(256; sobol_index_methods=(first_order=:Jansen1999, total_order=:Jansen1999)),
           inputs, dists; functions=[final_count])
+gsa = run(Sobolʼ(256; second_order=true), inputs, dists; functions=[final_count])
+```
+
+The integer `n` is the number of rows in the base matrices A and B. A first-order analysis of `d`
+parameters runs `n*(d+2)` monads; `second_order=true` makes that `n*(2d+2)`. Monads are reused, so
+adding `second_order=true` to a design already run costs only the extra `n*d`.
+
+Each entry of `gsa.results` is a [`ModelManager.SobolIndices`](@ref) holding `S1`, `ST` and `S2`
+plus bootstrap confidence intervals `S1_CI`, `ST_CI` and `S2_CI`. The intervals come from
+resampling the design's rows, so they cost no extra simulations. `n_bootstrap` (default 1000) and
+`conf_level` (default 0.95) control them, and `n_bootstrap=0` turns them off. The resamples are
+drawn from a copy of `rng`, which defaults to a fixed seed, so the intervals are the same on every
+run unless you pass a different `rng`:
+
+```julia
+gsa = run(Sobolʼ(256; n_bootstrap=5000, conf_level=0.9, rng=Random.Xoshiro(42)),
+          inputs, dists; functions=[final_count])
+gsa.results["final_count"].S1_CI     # d×2: lower and upper bound per parameter
 ```
 
 !!! note "Typing the name"
@@ -158,8 +177,11 @@ plot(moat, :scatter)             # classic µ*–σ screening scatter, points la
 plot(moat, :violin)              # full elementary-effect distribution per parameter
 
 # Sobol' — first-order (S1) bars in front of total-order (ST) bars at reduced opacity
-plot(sobol)                      # S1 + ST
+plot(sobol)                      # S1 + ST, with confidence-interval whiskers
 plot(sobol; show_ST=false)       # S1 only
+plot(sobol; show_CI=false)       # no whiskers
+plot(sobol, :S2)                 # second-order heatmap (needs second_order=true)
+plot(sobol, :S2; quantity="final_count")   # which quantity, when there are several
 
 # RBD — first-order index bars
 plot(rbd)

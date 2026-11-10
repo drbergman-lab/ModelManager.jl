@@ -26,7 +26,7 @@ abstract type GSASampling end
 #! back, `GSAMethod` is the method argument they pass in, and `getMonadIDDataFrame` /
 #! `methodString` are the accessors the manual tells them to call on the result.
 #! See CLAUDE.md, "Docstring cross-references".
-@compat public GSASampling, GSAMethod, MOATSampling, SobolSampling, RBDSampling,
+@compat public GSASampling, GSAMethod, MOATSampling, SobolSampling, SobolIndices, RBDSampling,
                getMonadIDDataFrame, methodString, gsaLabels
 
 """
@@ -400,6 +400,21 @@ end
 
 ############# Sobolʼ Indices #############
 
+const _SobolIndexMethods = NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}
+const _DEFAULT_SOBOL_INDEX_METHODS = (first_order=:Jansen1999, total_order=:Jansen1999)
+const _DEFAULT_N_BOOTSTRAP = 1000
+const _DEFAULT_CONF_LEVEL = 0.95
+#! A fixed seed, not `Random.default_rng()`: every bootstrap draws from a `copy` of this, so the CIs
+#! are reproducible with no action from the user and a script's own `Random.seed!` stream is never
+#! advanced by running an analysis.
+_defaultBootstrapRNG() = Random.Xoshiro(0)
+
+function _checkBootstrapSettings(n_bootstrap::Int, conf_level::Real)
+    n_bootstrap >= 0 || throw(ArgumentError("`n_bootstrap` must be non-negative (0 disables the bootstrap); got $(n_bootstrap)."))
+    0 < conf_level < 1 || throw(ArgumentError("`conf_level` must lie strictly between 0 and 1; got $(conf_level)."))
+    return
+end
+
 """
     Sobolʼ <: GSAMethod
 
@@ -408,24 +423,55 @@ Sobol' variance-based global sensitivity analysis.
 The `ʼ` (rasp) symbol avoids conflict with the `Sobol` module. Type `\\rasp<tab>` in VS Code.
 [`SobolMM`](@ref) is provided as a plain-ASCII alias.
 
-# Fields
-- `sobol_variation::SobolVariation`
-- `sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}`
+    Sobolʼ(n; sobol_index_methods, second_order=false, n_bootstrap=1000, conf_level=0.95, rng, kwargs...)
+
+`n` is the number of rows in each of the base matrices A and B. Other `kwargs` go to
+[`SobolVariation`](@ref).
+
+# Keywords
+- `sobol_index_methods`: estimators for the first- and total-order indices, as
+  `(first_order=…, total_order=…)`. First order: `:Jansen1999` (default), `:Sobol1993`,
+  `:Saltelli2010`. Total order: `:Jansen1999` (default), `:Homma1996`, `:Sobol2007`.
+- `second_order`: also compute the pairwise interaction indices `S2`. This adds `n*d` monads to
+  the `n*(d+2)` of a first-order design. `S2` always subtracts Saltelli 2010 first-order
+  estimates, whatever `sobol_index_methods.first_order` says.
+- `n_bootstrap`: number of bootstrap resamples behind the confidence intervals; `0` skips them.
+  Resampling reuses the simulations already run.
+- `conf_level`: coverage of the percentile confidence intervals.
+- `rng`: where the bootstrap draws its resamples. Each bootstrap uses a `copy`, so `rng` itself
+  never advances, and the default (a fixed-seed `Xoshiro`) makes the intervals reproducible. This
+  does not touch the design, whose randomization is `SobolVariation`'s `randomization` keyword.
 
 # Examples
 ```julia
 Sobolʼ(15)
-Sobolʼ(15; sobol_index_methods=(first_order=:Jansen1999, total_order=:Jansen1999))
+Sobolʼ(15; second_order=true)
+Sobolʼ(15; n_bootstrap=5000, conf_level=0.9, rng=Random.Xoshiro(42))
 Sobolʼ(15; skip_start=true)
 ```
 """
 struct Sobolʼ <: GSAMethod
     sobol_variation::SobolVariation
-    sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}
+    sobol_index_methods::_SobolIndexMethods
+    second_order::Bool
+    n_bootstrap::Int
+    conf_level::Float64
+    rng::AbstractRNG
+
+    function Sobolʼ(sobol_variation::SobolVariation, sobol_index_methods::_SobolIndexMethods,
+                    second_order::Bool, n_bootstrap::Int, conf_level::Real, rng::AbstractRNG)
+        _checkBootstrapSettings(n_bootstrap, conf_level)
+        return new(sobol_variation, sobol_index_methods, second_order, n_bootstrap, conf_level, rng)
+    end
 end
 
-Sobolʼ(n::Int; sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}=(first_order=:Jansen1999, total_order=:Jansen1999), kwargs...) =
-    Sobolʼ(SobolVariation(n; n_matrices=2, kwargs...), sobol_index_methods)
+Sobolʼ(sobol_variation::SobolVariation, sobol_index_methods::_SobolIndexMethods) =
+    Sobolʼ(sobol_variation, sobol_index_methods, false, _DEFAULT_N_BOOTSTRAP, _DEFAULT_CONF_LEVEL, _defaultBootstrapRNG())
+
+Sobolʼ(n::Int; sobol_index_methods::_SobolIndexMethods=_DEFAULT_SOBOL_INDEX_METHODS,
+       second_order::Bool=false, n_bootstrap::Int=_DEFAULT_N_BOOTSTRAP,
+       conf_level::Real=_DEFAULT_CONF_LEVEL, rng::AbstractRNG=_defaultBootstrapRNG(), kwargs...) =
+    Sobolʼ(SobolVariation(n; n_matrices=2, kwargs...), sobol_index_methods, second_order, n_bootstrap, conf_level, rng)
 
 """
     SobolMM
@@ -435,19 +481,73 @@ ASCII alias for [`Sobolʼ`](@ref).
 const SobolMM = Sobolʼ
 
 """
+    SobolIndices
+
+Sobol' indices for one sensitivity quantity of a [`SobolSampling`](@ref), over its focus parameters
+in `monad_ids_df` order.
+
+- `S1`, `ST`: first- and total-order indices.
+- `S2`: symmetric matrix of second-order indices with a `NaN` diagonal, or `nothing` unless the
+  analysis was run with `second_order=true`.
+- `S1_CI`, `ST_CI`, `S2_CI`: percentile-bootstrap bounds, with lower and upper bound along the last
+  dimension (`S1_CI[i, :] == [lo, hi]`, `S2_CI[j, k, :] == [lo, hi]`), or `nothing` when
+  `n_bootstrap == 0`. A bound is `NaN` when some resample had no variance to decompose. The bounds
+  need not bracket the estimate, which is computed from every row while the bounds come from
+  resamples.
+- `conf_level`, `n_bootstrap`: how the intervals were made.
+"""
+struct SobolIndices
+    S1::Vector{Float64}
+    ST::Vector{Float64}
+    S2::Union{Nothing,Matrix{Float64}}
+    S1_CI::Union{Nothing,Matrix{Float64}}
+    ST_CI::Union{Nothing,Matrix{Float64}}
+    S2_CI::Union{Nothing,Array{Float64,3}}
+    conf_level::Float64
+    n_bootstrap::Int
+end
+
+#! Lets the four-argument `SobolSampling` constructor keep accepting the results dictionary it used
+#! to be given, which held GlobalSensitivity's type.
+SobolIndices(r::GlobalSensitivity.SobolResult) =
+    SobolIndices(r.S1, r.ST, r.S2, nothing, nothing, nothing, _DEFAULT_CONF_LEVEL, 0)
+SobolIndices(r::SobolIndices) = r
+
+"""
     SobolSampling <: GSASampling
 
-Result of a [`Sobolʼ`](@ref) sensitivity analysis.
+Result of a [`Sobolʼ`](@ref) sensitivity analysis. Each entry of `results` is a
+[`SobolIndices`](@ref).
 """
 struct SobolSampling <: GSASampling
     sampling::Sampling
     monad_ids_df::DataFrame
-    results::Dict{String,GlobalSensitivity.SobolResult}
-    sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}
+    results::Dict{String,SobolIndices}
+    sobol_index_methods::_SobolIndexMethods
+    n_bootstrap::Int
+    conf_level::Float64
+    rng::AbstractRNG
+
+    function SobolSampling(sampling::Sampling, monad_ids_df::DataFrame, results::Dict{String,SobolIndices},
+                           sobol_index_methods::_SobolIndexMethods, n_bootstrap::Int, conf_level::Real,
+                           rng::AbstractRNG)
+        _checkBootstrapSettings(n_bootstrap, conf_level)
+        return new(sampling, monad_ids_df, results, sobol_index_methods, n_bootstrap, conf_level, rng)
+    end
 end
 
-SobolSampling(sampling::Sampling, monad_ids_df::DataFrame; sobol_index_methods::NamedTuple{(:first_order,:total_order),Tuple{Symbol,Symbol}}=(first_order=:Jansen1999, total_order=:Jansen1999)) =
-    SobolSampling(sampling, monad_ids_df, Dict{String,GlobalSensitivity.SobolResult}(), sobol_index_methods)
+SobolSampling(sampling::Sampling, monad_ids_df::DataFrame, results::AbstractDict,
+              sobol_index_methods::_SobolIndexMethods) =
+    SobolSampling(sampling, monad_ids_df,
+                  Dict{String,SobolIndices}(k => SobolIndices(v) for (k, v) in results),
+                  sobol_index_methods, _DEFAULT_N_BOOTSTRAP, _DEFAULT_CONF_LEVEL, _defaultBootstrapRNG())
+
+SobolSampling(sampling::Sampling, monad_ids_df::DataFrame;
+              sobol_index_methods::_SobolIndexMethods=_DEFAULT_SOBOL_INDEX_METHODS,
+              n_bootstrap::Int=_DEFAULT_N_BOOTSTRAP, conf_level::Real=_DEFAULT_CONF_LEVEL,
+              rng::AbstractRNG=_defaultBootstrapRNG()) =
+    SobolSampling(sampling, monad_ids_df, Dict{String,SobolIndices}(), sobol_index_methods,
+                  n_bootstrap, conf_level, rng)
 
 function Base.show(io::IO, sobol_sampling::SobolSampling)
     println(io, "Sobol sampling")
@@ -456,10 +556,34 @@ function Base.show(io::IO, sobol_sampling::SobolSampling)
     println(io, "Sobol index methods:")
     println(io, "  First order: $(sobol_sampling.sobol_index_methods.first_order)")
     println(io, "  Total order: $(sobol_sampling.sobol_index_methods.total_order)")
+    println(io, "  Second order: $(isempty(_sobolColumns(sobol_sampling.monad_ids_df).ba) ? "no" : "yes (Saltelli2002)")")
+    if sobol_sampling.n_bootstrap > 0
+        println(io, "Confidence intervals: $(sobol_sampling.conf_level) percentile bootstrap, $(sobol_sampling.n_bootstrap) resamples")
+    else
+        println(io, "Confidence intervals: none")
+    end
     println(io, "Sensitivity quantities calculated:")
     for label in gsaLabels(sobol_sampling)
         println(io, "  $label")
     end
+end
+
+const _SOBOL_AB_PREFIX = "A_B:"
+const _SOBOL_BA_PREFIX = "B_A:"
+
+#! Column positions in a Sobolʼ `monad_ids_df`. Columns 1 and 2 are A and B; the rest are prefixed
+#! `A_B:` or `B_A:`. A frame with no prefixed column is the pre-0.13 layout, in which every column
+#! after B was an A_B column named for its parameter. Drop that branch at v1.0.
+function _sobolColumns(monad_ids_df::DataFrame)
+    cols = names(monad_ids_df)[3:end]
+    ab = findall(startswith(_SOBOL_AB_PREFIX), cols)
+    ba = findall(startswith(_SOBOL_BA_PREFIX), cols)
+    if isempty(ab) && isempty(ba)
+        return (ab=collect(3:length(cols)+2), ba=Int[], names=cols)
+    end
+    ab_names = [chopprefix(c, _SOBOL_AB_PREFIX) for c in cols[ab]]
+    @assert isempty(ba) || [chopprefix(c, _SOBOL_BA_PREFIX) for c in cols[ba]] == ab_names "The B_A: columns of a Sobolʼ design must name the same parameters, in the same order, as its A_B: columns."
+    return (ab=ab .+ 2, ba=ba .+ 2, names=String.(ab_names))
 end
 
 function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::ParsedVariations;
@@ -477,60 +601,139 @@ function runSensitivitySampling(method::Sobolʼ, inputs::InputFolders, pv::Parse
 
     A = cdfs[:,1,:]
     B = cdfs[:,2,:]
-    variation_ids_Aᵦ = stack(focus_indices) do i
-        Aᵦ = copy(A)
-        Aᵦ[i,:] .= B[i,:]
-        addCDFVariations(inputs, pv, reference_variation_id, Aᵦ)
+    #! `X` with parameter `i`'s row taken from `Y`: A_B^i for (A, B), B_A^i for (B, A).
+    function swapped(X, Y)
+        return stack(focus_indices) do i
+            Xᵢ = copy(X)
+            Xᵢ[i,:] .= Y[i,:]
+            addCDFVariations(inputs, pv, reference_variation_id, Xᵢ)
+        end
     end
-    monads = variationsToMonads(inputs, hcat(variation_ids, variation_ids_Aᵦ))
-    monad_ids = [monad.id for monad in monads]
     all_latent_names = mapreduce(lv -> lv.latent_parameter_names, vcat, pv.latent_variations)
-    perturb_headers = all_latent_names[focus_indices]
-    header_line = ["A"; "B"; perturb_headers]
+    focus_names = all_latent_names[focus_indices]
+    variation_id_blocks = [variation_ids, swapped(A, B)]
+    header_line = ["A"; "B"; _SOBOL_AB_PREFIX .* focus_names]
+    if method.second_order
+        push!(variation_id_blocks, swapped(B, A))
+        append!(header_line, _SOBOL_BA_PREFIX .* focus_names)
+    end
+    monads = variationsToMonads(inputs, reduce(hcat, variation_id_blocks))
+    monad_ids = [monad.id for monad in monads]
     monad_ids_df = DataFrame(monad_ids, header_line)
     sampling = buildAndRunSensitivitySampling(method, monads;
                                               n_replicates=n_replicates, use_previous=use_previous, kwargs...)
-    return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods)
+    return SobolSampling(sampling, monad_ids_df; sobol_index_methods=method.sobol_index_methods,
+                         n_bootstrap=method.n_bootstrap, conf_level=method.conf_level, rng=method.rng)
 end
 
 function _gsaResults(sobol_sampling::SobolSampling, q::QoI)
-    out = Pair{String,GlobalSensitivity.SobolResult}[]
+    out = Pair{String,SobolIndices}[]
     for (label, vals) in evaluateFunctionOnSampling(sobol_sampling, q)
         push!(out, label => _sobolResult(sobol_sampling, vals))
     end
     return out
 end
 
-function _sobolResult(sobol_sampling::SobolSampling, vals::Matrix{Float64})
-    d = size(vals, 2) - 2
-    A_values = @view vals[:, 1]
-    B_values = @view vals[:, 2]
-    Aᵦ_values = [vals[:, 2+i] for i in 1:d]
-    expected_value² = mean(A_values .* B_values)
-    total_variance = var([A_values; B_values])
+#! The index arithmetic, on one set of rows. `fAB[:, i]` is f(A_B^i), `fBA[:, i]` is f(B_A^i) or
+#! `fBA === nothing` for a first-order design. Separate from `_sobolResult` so the bootstrap can call
+#! it on resampled rows, and so it can be checked against an analytic function without simulations.
+function _sobolIndices(fA::AbstractVector, fB::AbstractVector, fAB::AbstractMatrix,
+                       fBA::Union{Nothing,AbstractMatrix}, methods::_SobolIndexMethods)
+    d = size(fAB, 2)
+    expected_value² = mean(fA .* fB)
+    total_variance = var([fA; fB])
     first_order_variances = zeros(Float64, d)
     total_order_variances = zeros(Float64, d)
-    si_method = sobol_sampling.sobol_index_methods.first_order
-    st_method = sobol_sampling.sobol_index_methods.total_order
-    for (i, Aᵦ) in enumerate(Aᵦ_values)
-        if si_method == :Sobol1993
-            first_order_variances[i] = mean(B_values .* Aᵦ) .- expected_value²
-        elseif si_method == :Jansen1999
-            first_order_variances[i] = total_variance - 0.5 * mean((B_values .- Aᵦ) .^ 2)
-        elseif si_method == :Saltelli2010
-            first_order_variances[i] = mean(B_values .* (Aᵦ .- A_values))
+    saltelli_first_order_variances = zeros(Float64, d)
+    for i in 1:d
+        Aᵦ = @view fAB[:, i]
+        saltelli_first_order_variances[i] = mean(fB .* (Aᵦ .- fA))
+        if methods.first_order == :Sobol1993
+            first_order_variances[i] = mean(fB .* Aᵦ) - expected_value²
+        elseif methods.first_order == :Jansen1999
+            first_order_variances[i] = total_variance - 0.5 * mean((fB .- Aᵦ) .^ 2)
+        elseif methods.first_order == :Saltelli2010
+            first_order_variances[i] = saltelli_first_order_variances[i]
         end
-        if st_method == :Homma1996
-            total_order_variances[i] = total_variance - mean(A_values .* Aᵦ) + expected_value²
-        elseif st_method == :Jansen1999
-            total_order_variances[i] = 0.5 * mean((Aᵦ .- A_values) .^ 2)
-        elseif st_method == :Sobol2007
-            total_order_variances[i] = mean(A_values .* (A_values .- Aᵦ))
+        if methods.total_order == :Homma1996
+            total_order_variances[i] = total_variance - mean(fA .* Aᵦ) + expected_value²
+        elseif methods.total_order == :Jansen1999
+            total_order_variances[i] = 0.5 * mean((Aᵦ .- fA) .^ 2)
+        elseif methods.total_order == :Sobol2007
+            total_order_variances[i] = mean(fA .* (fA .- Aᵦ))
         end
     end
-    first_order_indices = first_order_variances ./ total_variance
-    total_order_indices = total_order_variances ./ total_variance
-    return GlobalSensitivity.SobolResult(first_order_indices, nothing, nothing, nothing, total_order_indices, nothing)
+    S1 = first_order_variances ./ total_variance
+    ST = total_order_variances ./ total_variance
+    isnothing(fBA) && return (S1=S1, ST=ST, S2=nothing)
+    #! Saltelli 2002: B_A^j and A_B^k share exactly parameters j and k, so the mean of their product
+    #! less f₀² is the closed variance V_jk^c = V_j + V_k + V_jk. The Saltelli 2010 first-order
+    #! variances are subtracted because the closed term is in that same form; subtracting a
+    #! different estimator's V_j would leave the difference between estimators in S2.
+    S2 = fill(NaN, d, d)
+    for j in 1:d, k in (j+1):d
+        closed = mean(fBA[:, j] .* fAB[:, k] .- fA .* fB)
+        S2[j, k] = S2[k, j] = (closed - saltelli_first_order_variances[j] - saltelli_first_order_variances[k]) / total_variance
+    end
+    return (S1=S1, ST=ST, S2=S2)
+end
+
+#! Bounds from a set of resampled values. `quantile` refuses `NaN`, and a `NaN` here means a resample
+#! with zero variance, so the interval is undefined rather than an error.
+function _percentileBounds(samples::AbstractVector{Float64}, conf_level::Float64)
+    any(isnan, samples) && return (NaN, NaN)
+    α = (1 - conf_level) / 2
+    return (quantile(samples, α), quantile(samples, 1 - α))
+end
+
+#! `[lo hi]` along a new last dimension, one bound per entry of the estimate.
+function _bootstrapBounds(draws::Vector{<:AbstractArray{Float64}}, conf_level::Float64)
+    sz = size(first(draws))
+    out = Array{Float64}(undef, sz..., 2)
+    for I in CartesianIndices(sz)
+        lo, hi = _percentileBounds([draw[I] for draw in draws], conf_level)
+        out[I, 1] = lo
+        out[I, 2] = hi
+    end
+    return out
+end
+
+_sobolResult(sobol_sampling::SobolSampling, vals::Matrix{Float64}) =
+    _sobolResult(vals, sobol_sampling.monad_ids_df, sobol_sampling.sobol_index_methods,
+                 sobol_sampling.n_bootstrap, sobol_sampling.conf_level, sobol_sampling.rng)
+
+#! `vals` is laid out like `monad_ids_df`: one row per design row, one column per matrix.
+function _sobolResult(vals::Matrix{Float64}, monad_ids_df::DataFrame, methods::_SobolIndexMethods,
+                      n_bootstrap::Int, conf_level::Float64, stored_rng::AbstractRNG)
+    cols = _sobolColumns(monad_ids_df)
+    fA = vals[:, 1]
+    fB = vals[:, 2]
+    fAB = vals[:, cols.ab]
+    fBA = isempty(cols.ba) ? nothing : vals[:, cols.ba]
+    point = _sobolIndices(fA, fB, fAB, fBA, methods)
+
+    n_bootstrap == 0 && return SobolIndices(point.S1, point.ST, point.S2, nothing, nothing, nothing, conf_level, 0)
+
+    #! Rows are the resampling unit: row r is one paired draw across A, B and every A_B^i / B_A^i,
+    #! so a resample must keep them together. A `copy` of the stored RNG, so every quantity sees the
+    #! same resamples whatever order it is evaluated in and the caller's RNG never advances.
+    rng = copy(stored_rng)
+    N = length(fA)
+    S1_draws = Vector{Vector{Float64}}(undef, n_bootstrap)
+    ST_draws = Vector{Vector{Float64}}(undef, n_bootstrap)
+    S2_draws = Vector{Matrix{Float64}}(undef, isnothing(fBA) ? 0 : n_bootstrap)
+    for b in 1:n_bootstrap
+        rows = rand(rng, 1:N, N)
+        draw = _sobolIndices(view(fA, rows), view(fB, rows), view(fAB, rows, :),
+                             isnothing(fBA) ? nothing : view(fBA, rows, :), methods)
+        S1_draws[b] = draw.S1
+        ST_draws[b] = draw.ST
+        isnothing(fBA) || (S2_draws[b] = draw.S2)
+    end
+    S1_CI = _bootstrapBounds(S1_draws, conf_level)
+    ST_CI = _bootstrapBounds(ST_draws, conf_level)
+    S2_CI = isnothing(fBA) ? nothing : _bootstrapBounds(S2_draws, conf_level)
+    return SobolIndices(point.S1, point.ST, point.S2, S1_CI, ST_CI, S2_CI, conf_level, n_bootstrap)
 end
 
 ############# Random Balance Design (RBD) #############
