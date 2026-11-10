@@ -670,18 +670,30 @@ function _sobolIndices(fA::AbstractVector, fB::AbstractVector, fAB::AbstractMatr
     #! less f₀² is the closed variance V_jk^c = V_j + V_k + V_jk. The Saltelli 2010 first-order
     #! variances are subtracted because the closed term is in that same form; subtracting a
     #! different estimator's V_j would leave the difference between estimators in S2.
+    #!
+    #! Every block is centred by one common value first. These are uncentred products, so an output
+    #! offset of size c contributes terms of order c² that cancel only in exact arithmetic: for
+    #! x₁ + x₂ + 10⁹ on an exhaustive ±1 design, S2 came out −0.97 instead of 0. A common shift
+    #! leaves every expectation here unchanged, so this changes nothing but the rounding. S1 and ST
+    #! are left as they were computed above.
+    c = mean(fA) / 2 + mean(fB) / 2
+    cA, cB = fA .- c, fB .- c
+    cAB, cBA = fAB .- c, fBA .- c
+    centred_first_order_variances = [mean(cB .* (view(cAB, :, i) .- cA)) for i in 1:d]
     S2 = fill(NaN, d, d)
     for j in 1:d, k in (j+1):d
-        closed = mean(fBA[:, j] .* fAB[:, k] .- fA .* fB)
-        S2[j, k] = S2[k, j] = (closed - saltelli_first_order_variances[j] - saltelli_first_order_variances[k]) / total_variance
+        closed = mean(view(cBA, :, j) .* view(cAB, :, k) .- cA .* cB)
+        S2[j, k] = S2[k, j] = (closed - centred_first_order_variances[j] - centred_first_order_variances[k]) / total_variance
     end
     return (S1=S1, ST=ST, S2=S2)
 end
 
-#! Bounds from a set of resampled values. `quantile` refuses `NaN`, and a `NaN` here means a resample
-#! with zero variance, so the interval is undefined rather than an error.
+#! Bounds from a set of resampled values. A non-finite value means a resample with zero variance:
+#! `NaN` when its hybrid outputs are constant too, `±Inf` when they are not. Either way that draw
+#! has no index, so the interval is undefined rather than an error from `quantile` or a bound that
+#! silently mixes in infinities.
 function _percentileBounds(samples::AbstractVector{Float64}, conf_level::Float64)
-    any(isnan, samples) && return (NaN, NaN)
+    all(isfinite, samples) || return (NaN, NaN)
     α = (1 - conf_level) / 2
     return (quantile(samples, α), quantile(samples, 1 - α))
 end

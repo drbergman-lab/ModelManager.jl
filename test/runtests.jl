@@ -8497,6 +8497,27 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 @test all(r.ST_CI[:, 1] .<= r.ST_CI[:, 2])
                 @test r.S2_CI[1, 3, 1] <= 0.2437 <= r.S2_CI[1, 3, 2]
             end
+            # S2 is invariant to an additive output offset. Exhaustive ±1 design of x₁ + x₂, which
+            # has no interaction; uncentred products gave S2 = −0.97 once 10⁹ was added.
+            pm = [-1.0, 1.0]
+            rowsA = [(a1, a2) for a1 in pm for a2 in pm]
+            prs = [(a, b) for a in rowsA for b in rowsA]
+            add(x) = x[1] + x[2]
+            hyb(a, b, i) = (i == 1 ? b[1] : a[1], i == 2 ? b[2] : a[2])
+            offset_blocks(off) = ([add(a) + off for (a, b) in prs], [add(b) + off for (a, b) in prs],
+                                  hcat([[add(hyb(a, b, i)) + off for (a, b) in prs] for i in 1:2]...),
+                                  hcat([[add(hyb(b, a, i)) + off for (a, b) in prs] for i in 1:2]...))
+            mJ = (first_order=:Jansen1999, total_order=:Jansen1999)
+            r0 = ModelManager._sobolIndices(offset_blocks(0.0)..., mJ)
+            r9 = ModelManager._sobolIndices(offset_blocks(1e9)..., mJ)
+            @test r0.S2[1, 2] ≈ 0.0 atol=1e-12
+            @test r9.S2[1, 2] ≈ 0.0 atol=1e-6
+
+            # A resample with an infinite index (zero variance, varying hybrids) has no bound.
+            @test all(isnan, ModelManager._percentileBounds([0.1, 0.2, Inf], 0.95))
+            @test all(isnan, ModelManager._percentileBounds([0.1, -Inf], 0.95))
+            @test all(isnan, ModelManager._percentileBounds([0.1, NaN], 0.95))
+
             # The stored RNG is copied, never advanced.
             rng = Random.Xoshiro(3)
             snapshot = copy(rng)
