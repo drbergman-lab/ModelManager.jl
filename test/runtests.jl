@@ -9989,6 +9989,12 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
     @testset "SLURM completion detection" begin
         MM = ModelManager
         shim = mktempdir()
+        # Concurrent submissions draw job IDs from one counter file, so the read-increment-write is
+        # locked. The lock is a file created under noclobber (`set -C`), which the shell itself opens
+        # with O_EXCL. It used to be `mkdir`, which made it only as atomic as the runner's `mkdir`
+        # binary: the uutils `mkdir` on ubuntu-26.04 reports success to the loser of a creation race
+        # (uutils/coreutils#13970), two submissions then read the counter mid-write, and one got an
+        # empty job ID.
         write(joinpath(shim, "sbatch"), """
             #!/bin/sh
             echo "\$@" >> "$shim/sbatch.log"
@@ -10001,10 +10007,10 @@ _test_throwing_ss          = [QoI("x", _sim_throws)]
                 exit 1
               fi
             fi
-            while ! mkdir "$shim/sbatch.lock" 2>/dev/null; do sleep 0.01; done
+            while ! (set -C; : > "$shim/sbatch.lock") 2>/dev/null; do sleep 0.01; done
             id=\$(cat "$shim/sbatch.next_id")
             echo \$((id + 1)) > "$shim/sbatch.next_id"
-            rmdir "$shim/sbatch.lock"
+            rm -f "$shim/sbatch.lock"
             echo "\$id"
             """)
         write(joinpath(shim, "squeue"), """
