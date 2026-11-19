@@ -104,32 +104,51 @@ containing `\$`, a backtick, a double quote, or a space survives intact.
 _shQuote(s::AbstractString) = "'" * replace(s, "'" => "'\\''") * "'"
 
 """
-    _sentinelWrap(cmd_str::AbstractString, sentinel::String) → String
+    _jobScript(cmd_str::AbstractString, sentinel::String) → String
 
-Prefix `cmd_str` with a shell trap that records the command's exit code at `sentinel` when the job
-script exits.
+The bash job script that runs `cmd_str` and records its exit code at `sentinel`. Written to
+`job.sh` in the simulation's folder, so what ran on the cluster can be read afterwards.
 
-The trap writes to `<sentinel>.tmp` and `mv`s it into place. That rename is atomic, so the waiting
-worker only ever sees a sentinel whose contents are already complete. The path is fixed before
-submission -- the trap needs nothing about the job's identity -- which is what makes the name unique
-per submission and the wait race-free.
+The shape is Nextflow's `command-run.txt`. The command runs in the background and the script
+`wait`s on it, so a `TERM` or `INT` from the scheduler -- `scancel`, a time limit, preemption --
+interrupts the `wait` at once: the trap forwards it to the command, and `wait` returns 128 plus
+the signal number, which is recorded like any other exit code. A foreground command would leave
+the signal pending until the command exited. A signal that arrives before the command has a PID
+exits the script instead, so the command is never started after a cancel.
 
-The path is bound to a shell variable, single-quoted, *before* the trap is installed, and the trap
-body then refers only to that variable. Interpolating the path into the trap body directly would
-put it inside double quotes in code that is re-parsed when the trap fires, so a sentinel directory
-containing `\$`, a backtick or a `"` would be expanded or would break the quoting -- and it sits
-under the user's own `data/`. Binding it once means exactly one thing needs escaping, by exactly
-one rule.
+`<&0` keeps the job's stdin. Without it, bash gives a backgrounded command `/dev/null`, and a
+simulation reading `sbatch --input` would see an empty file.
 
-Only `EXIT` is trapped, not `TERM`. A job killed by the scheduler produces no sentinel at all, and
-that is already handled correctly: it leaves the queue, the reaper notices, and after the grace
-period the simulation is failed. Trapping signals would make that detection faster without making
-it more correct, at the cost of shell that has to be right under every `sh`.
+The `EXIT` trap writes `mm_ec`, which is set only once `wait` has returned. If the script dies
+from a signal nothing traps, `mm_ec` is unset and the sentinel says `killed`, which
+`_readSentinel` reads as a failure. It cannot record `\$?` instead: bash runs the `EXIT` trap
+when killed by a signal with `\$?` still holding the status of the last command that finished,
+typically `0`, which is how a cancelled job was once recorded as a success. A `SIGKILL` runs no
+trap at all, and the reaper fails the job.
+
+`#!/bin/bash` rather than `sbatch --wrap`'s `#!/bin/sh`, because what each `sh` does with a trap
+on a fatal signal differs and only one shell's behavior needs to be right.
+
+The write is staged through `<sentinel>.tmp` and `mv`'d into place, an atomic rename, so the
+waiting worker only ever sees a complete sentinel. The path is fixed before submission, which is
+what makes the name unique per submission and the wait race-free. It is bound to a variable,
+single-quoted, before the trap is installed, and the trap body refers only to that variable: the
+trap body is re-parsed when it fires, and the path sits under the user's own `data/`, so a `\$`, a
+backtick or a `"` interpolated into it would be expanded or break the quoting.
 """
-function _sentinelWrap(cmd_str::AbstractString, sentinel::String)
-    bind = "mm_sentinel=$(_shQuote(sentinel))"
-    trap_body = "mm_ec=\$?; echo \$mm_ec > \"\${mm_sentinel}.tmp\" && mv \"\${mm_sentinel}.tmp\" \"\${mm_sentinel}\""
-    return "$(bind); trap '$(trap_body)' EXIT; $(cmd_str)"
+function _jobScript(cmd_str::AbstractString, sentinel::String)
+    return """
+        #!/bin/bash
+        mm_sentinel=$(_shQuote(sentinel))
+        trap 'echo "\${mm_ec:-killed}" > "\${mm_sentinel}.tmp" && mv "\${mm_sentinel}.tmp" "\${mm_sentinel}"' EXIT
+        trap '[ -n "\${mm_pid:-}" ] || exit 143; kill "\$mm_pid" 2>/dev/null' TERM
+        trap '[ -n "\${mm_pid:-}" ] || exit 130; kill "\$mm_pid" 2>/dev/null' INT
+        $(cmd_str) <&0 &
+        mm_pid=\$!
+        wait "\$mm_pid"
+        mm_ec=\$?
+        exit "\$mm_ec"
+        """
 end
 
 """
@@ -163,10 +182,10 @@ end
 """
     _prepareHPCSubmitCommand(cmd::Cmd, simulation::Simulation, sentinel::String) → Cmd
 
-Wrap `cmd` in the `sbatch` invocation `_runHPCSimulation` submits: `--parsable` (never `--wait`),
-the exit-code sentinel installed by `_sentinelWrap` at `sentinel`, per-simulation
-`--output`/`--error` so each simulation keeps its own `output.log` and `output.err`, and the global
-job options.
+Write `cmd` into the simulation's `job.sh` (see `_jobScript`), with its exit-code sentinel at
+`sentinel`, and return the `sbatch` invocation `_runHPCSimulation` submits: `--parsable` (never
+`--wait`), per-simulation `--output`/`--error` so each simulation keeps its own `output.log` and
+`output.err`, and the global job options.
 
 `--chdir` honors the `Cmd`'s own `dir` when the backend set one, and falls back to the simulator
 directory otherwise -- the same rule the local path applies, so a command means the same thing on
@@ -174,14 +193,16 @@ the cluster as on a laptop.
 """
 function _prepareHPCSubmitCommand(cmd::Cmd, simulation::Simulation, sentinel::String)
     path_to_simulation_folder = trialFolder(simulation)
-    flags = ["--wrap=$(_sentinelWrap(prepCmdForWrap(Cmd(cmd.exec)), sentinel))",
-             "--parsable",
+    mkpath(path_to_simulation_folder)
+    job_script = joinpath(path_to_simulation_folder, "job.sh")
+    write(job_script, _jobScript(prepCmdForWrap(Cmd(cmd.exec)), sentinel))
+    flags = ["--parsable",
              "--output=$(joinpath(path_to_simulation_folder, "output.log"))",
              "--error=$(joinpath(path_to_simulation_folder, "output.err"))",
              "--chdir=$(_workingDirectory(cmd))"
             ]
     append!(flags, _userJobFlags(simulation))
-    return `sbatch $flags`
+    return `sbatch $flags $job_script`
 end
 
 _prepareHPCSubmitCommand(cmd::Cmd, simulation_id::Int, sentinel::String) =
